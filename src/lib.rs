@@ -1,11 +1,71 @@
 //! HybridDB - 专用分析型嵌入 AI Agent 数据引擎
 //!
-//! 核心特性：
-//! - 列式存储 + 轻量级压缩（RLE / Dictionary / Bit-packing / FOR）
-//! - 完整 ACID 事务（WAL + MVCC + 快照隔离 + 写-写冲突检测）
-//! - 多维度索引体系（稀疏主索引 / 跳表二级索引 / 位图索引 / 布隆过滤器 / HNSW 向量索引）
-//! - 单文件嵌入式部署（类似 SQLite）
-//! - 面向 AI Agent 工作负载优化（批量导入 + 交互式分析查询）
+//! 兼具 SQLite 的事务能力（ACID）与 DuckDB 的列存压缩与分析性能，
+//! 单文件嵌入式部署，面向 AI Agent 工作负载优化。
+//!
+//! # 核心特性
+//!
+//! - **列式存储**：Row Group 分组 + ClickHouse 风格分类型压缩
+//!   （RLE / Dictionary / Bit-packing / FOR / Delta / Gorilla）
+//! - **混合架构**：列存主存储 + 行存 Delta 层，兼顾分析与写入
+//! - **完整 ACID 事务**：WAL + MVCC + 快照隔离 + 写-写冲突检测 + ARIES 崩溃恢复
+//! - **多维度索引**：稀疏主索引 / 跳表二级索引 / 位图索引 / 布隆过滤器 / HNSW 向量索引
+//! - **向量化执行**：基于 DataChunk（1024 行/chunk）的向量化查询引擎
+//! - **查询优化器**：RBO 规则优化 + CBO 成本优化 + Join 顺序优化
+//! - **AI Agent 友好**：JSON 类型 + Vector 类型 + HNSW 语义检索
+//! - **单文件嵌入式**：整个数据库是一个 `.hdb` 文件，类似 SQLite
+//!
+//! # 快速开始
+//!
+//! ```no_run
+//! use hybriddb::{Connection, Value};
+//!
+//! // 打开数据库（":memory:" 为内存数据库，或传入文件路径持久化）
+//! let mut conn = Connection::open(":memory:")?;
+//!
+//! // 建表
+//! conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT)")?;
+//!
+//! // 插入
+//! conn.execute("INSERT INTO users VALUES (1, 'Alice', 30)")?;
+//!
+//! // 查询
+//! let result = conn.execute("SELECT name FROM users WHERE age > 25")?;
+//! for row in &result.rows {
+//!     println!("{}", row[0]);
+//! }
+//! # Ok::<(), hybriddb::common::error::HybridDbError>(())
+//! ```
+//!
+//! # 模块组织
+//!
+//! | 模块 | 职责 |
+//! |------|------|
+//! | [`common`] | 数据类型、错误、配置、内存池 |
+//! | [`storage`] | 存储引擎（列存/Delta/压缩/索引/缓冲池/文件格式） |
+//! | [`wal`] | WAL 预写日志 + ARIES 崩溃恢复 |
+//! | [`txn`] | 事务管理（MVCC + 快照隔离） |
+//! | [`sql`] | SQL 解析、规划、优化、UDF |
+//! | [`executor`] | 向量化执行引擎 |
+//!
+//! # 性能调优
+//!
+//! ```no_run
+//! use hybriddb::{Connection, WalFlushMode, CompactStrategy};
+//!
+//! let mut conn = Connection::open("app.hdb")?;
+//!
+//! // WAL 组提交：多条事务共享一次 fsync，吞吐提升 5-20x
+//! conn.set_wal_flush_mode(WalFlushMode::Sync);
+//! conn.set_wal_group_commit_size(16);
+//!
+//! // 自适应 Delta 合并策略
+//! conn.set_compact_strategy(CompactStrategy::default_adaptive(100_000));
+//!
+//! // 按 session_id 聚簇，加速会话范围查询
+//! conn.set_cluster_key("agent_logs", "session_id")?;
+//! # Ok::<(), hybriddb::common::error::HybridDbError>(())
+//! ```
 
 pub mod common;
 pub mod storage;

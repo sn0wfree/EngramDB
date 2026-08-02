@@ -4,6 +4,10 @@ version = "0.12.0"
 edition = "2021"
 description = "HybridDB - 专用分析型嵌入 AI Agent 数据引擎。兼具 SQLite 的事务能力与 DuckDB 的列存压缩分析性能，单文件嵌入式部署。"
 license = "MIT"
+repository = "https://github.com/sn0wfree/HybridDB"
+readme = "README.md"
+keywords = ["database", "embedded", "column-store", "analytical", "vector-search"]
+categories = ["database", "database-implementations"]
 
 [lib]
 name = "hybriddb"
