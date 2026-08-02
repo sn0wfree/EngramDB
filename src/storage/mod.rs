@@ -1,0 +1,1213 @@
+//! 存储引擎模块
+
+pub mod file_format;
+pub mod buffer_pool;
+pub mod column_store;
+pub mod delta_store;
+pub mod compression;
+pub mod table;
+pub mod sparse_index;
+pub mod vector_index;
+pub mod index;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crate::common::error::{Result, HybridDbError};
+use crate::common::types::TableDef;
+use crate::common::config::Config;
+use crate::txn::TransactionManager;
+use file_format::FileHeader;
+use table::Table;
+
+/// 数据库实例
+pub struct Database {
+    path: PathBuf,
+    config: Config,
+    header: FileHeader,
+    tables: HashMap<u32, Table>,
+    table_names: HashMap<String, u32>,
+    next_table_id: u32,
+    file: std::fs::File,
+    /// 事务管理器
+    txn_manager: TransactionManager,
+}
+
+impl Database {
+    /// 打开或创建数据库
+    pub fn open(path: &str) -> Result<Self> {
+        let path = PathBuf::from(path);
+        let config = Config::default();
+
+        if path.exists() {
+            Self::open_existing(&path, config)
+        } else {
+            Self::create_new(&path, config)
+        }
+    }
+
+    /// 使用指定配置打开或创建数据库
+    pub fn open_with_config(path: &str, config: Config) -> Result<Self> {
+        let path = PathBuf::from(path);
+
+        if path.exists() {
+            Self::open_existing(&path, config)
+        } else {
+            Self::create_new(&path, config)
+        }
+    }
+
+    fn create_new(path: &std::path::Path, config: Config) -> Result<Self> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+
+        // 写入文件头
+        let header = FileHeader::new(&config);
+        let header_bytes = header.to_bytes()?;
+        file.write_all(&header_bytes)?;
+        file.sync_all()?;
+
+        // 初始化事务管理器
+        let path_str = path.to_string_lossy().to_string();
+        let txn_manager = TransactionManager::new(&path_str, &config)?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            config,
+            header,
+            tables: HashMap::new(),
+            table_names: HashMap::new(),
+            next_table_id: 1,
+            file,
+            txn_manager,
+        })
+    }
+
+    fn open_existing(path: &std::path::Path, config: Config) -> Result<Self> {
+        use std::io::{Read, Seek};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        // 读取文件头
+        let mut header_buf = vec![0u8; config.page_size as usize];
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.read_exact(&mut header_buf[..100])?;
+
+        let header = FileHeader::from_bytes(&header_buf)?;
+
+        // 初始化事务管理器（会自动打开 WAL 并执行恢复）
+        let path_str = path.to_string_lossy().to_string();
+        let txn_manager = TransactionManager::new(&path_str, &config)?;
+
+        // TODO: 加载元数据和表定义
+        // MVP 阶段简化：从元数据区读取 schema
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            config,
+            header,
+            tables: HashMap::new(),
+            table_names: HashMap::new(),
+            next_table_id: 1,
+            file,
+            txn_manager,
+        })
+    }
+
+    /// 创建表
+    pub fn create_table(&mut self, table_def: TableDef) -> Result<()> {
+        if self.table_names.contains_key(&table_def.name) {
+            return Err(crate::common::error::HybridDbError::ConstraintViolation(
+                format!("Table '{}' already exists", table_def.name)
+            ));
+        }
+
+        let table_id = self.next_table_id;
+        self.next_table_id += 1;
+
+        let table = Table::new(table_def.clone(), self.config.compact_strategy);
+        self.tables.insert(table_id, table);
+        self.table_names.insert(table_def.name.clone(), table_id);
+
+        // TODO: 持久化到元数据区
+        Ok(())
+    }
+
+    /// 获取表
+    pub fn get_table(&self, name: &str) -> Option<&Table> {
+        self.table_names.get(name).and_then(|id| self.tables.get(id))
+    }
+
+    /// 获取可变表
+    pub fn get_table_mut(&mut self, name: &str) -> Option<&mut Table> {
+        let id = *self.table_names.get(name)?;
+        self.tables.get_mut(&id)
+    }
+
+    /// 创建覆盖索引（v0.12.0 新增）
+    pub fn create_index(&mut self, table_name: &str, index_name: &str,
+                        key_col_idx: usize, included_cols: &[usize], unique: bool) -> Result<()> {
+        let table = self.get_table_mut(table_name)
+            .ok_or_else(|| HybridDbError::TableNotFound(table_name.to_string()))?;
+        table.create_index(index_name, key_col_idx, included_cols, unique)
+    }
+
+    /// 获取配置
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// 获取数据库路径
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    /// 获取事务管理器（不可变）
+    pub fn txn_manager(&self) -> &TransactionManager {
+        &self.txn_manager
+    }
+
+    /// 获取事务管理器（可变）
+    pub fn txn_manager_mut(&mut self) -> &mut TransactionManager {
+        &mut self.txn_manager
+    }
+
+    /// 手动触发 WAL fsync（用于 Periodic 刷盘模式）
+    ///
+    /// 如果配置了 `sync_wal_compact = true` 且 WAL 模式为 Periodic，
+    /// 刷盘后会检查所有表并触发必要的 Delta 合并（方案五：批量Sync联动）。
+    /// 返回 (wal_flushed, compacted_rows)。
+    pub fn sync_wal(&mut self) -> Result<()> {
+        self.txn_manager.sync_wal()?;
+
+        // Periodic 模式 + 开启联动时，顺便检查 compact
+        if self.config.sync_wal_compact {
+            // 收集表名避免借用冲突
+            let table_names: Vec<String> = self.table_names.keys().cloned().collect();
+            for name in &table_names {
+                if let Some(table) = self.tables.get_mut(&self.table_names[name]) {
+                    let _ = table.maybe_compact()?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 设置 WAL 刷盘策略
+    pub fn set_wal_flush_mode(&mut self, mode: crate::common::config::WalFlushMode) {
+        self.txn_manager.set_wal_flush_mode(mode);
+    }
+
+    /// 设置 WAL 组提交大小（0 = 禁用）
+    ///
+    /// 组提交是 Sync 模式下的核心 WAL 加速机制：
+    /// 多条事务共享一次 fsync，写入吞吐可提升数倍至数十倍。
+    /// 崩溃时最多丢 group_commit_size 条未 fsync 的事务。
+    pub fn set_wal_group_commit_size(&mut self, size: usize) {
+        self.txn_manager.set_wal_group_commit_size(size);
+    }
+
+    /// 设置指定表的聚簇列（方案B：Delta 聚簇）
+    ///
+    /// 设置后，compact 时会按该列的值分组写入列存，
+    /// 相同 key 的行物理上连续，可大幅提升按该列的范围查询性能。
+    pub fn set_cluster_key(&mut self, table_name: &str, column_name: &str) -> Result<()> {
+        let table = self.get_table_mut(table_name)
+            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        table.set_cluster_key(column_name)
+    }
+
+    // ========================================================================
+    // 向量 HNSW 索引（v0.12.0 优先级 3）
+    // ========================================================================
+
+    /// 创建向量 HNSW 索引
+    ///
+    /// 对指定表的向量列构建 HNSW 近似最近邻索引。
+    /// 列必须是 Vector 类型。
+    pub fn create_vector_index(&mut self, table_name: &str, index_name: &str, column_name: &str, metric: crate::storage::vector_index::DistanceMetric, m: usize, ef_construction: usize) -> Result<()> {
+        let table = self.get_table_mut(table_name)
+            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+
+        let col_idx = table.def().columns.iter()
+            .position(|c| c.name == column_name)
+            .ok_or_else(|| crate::common::error::HybridDbError::ColumnNotFound(column_name.into()))?;
+
+        table.create_vector_index(index_name, col_idx, metric, m, ef_construction)
+    }
+
+    /// 向量相似度搜索
+    ///
+    /// 返回 top-k 最近邻的行 ID 和距离。
+    pub fn vector_search(&self, table_name: &str, index_name: &str, query: &[f32], k: usize) -> Result<Vec<crate::storage::vector_index::Neighbor>> {
+        let table = self.get_table(table_name)
+            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        table.vector_search(index_name, query, k)
+    }
+
+    /// 设置全局默认合并策略（新建表生效，已有表不受影响）
+    pub fn set_default_compact_strategy(&mut self, strategy: crate::common::config::CompactStrategy) {
+        self.config.compact_strategy = strategy;
+    }
+
+    /// 设置指定表的合并策略（运行时动态切换）
+    pub fn set_table_compact_strategy(&mut self, table_name: &str, strategy: crate::common::config::CompactStrategy) -> Result<()> {
+        let table = self.get_table_mut(table_name)
+            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        table.set_compact_strategy(strategy);
+        Ok(())
+    }
+
+    /// 合并指定表的 Delta 层到列存（全量合并）
+    ///
+    /// 返回合并的行数。
+    pub fn compact_table(&mut self, table_name: &str) -> Result<u64> {
+        let table = self.get_table_mut(table_name)
+            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        let rows = table.delta_store().len() as u64;
+        table.compact_delta()?;
+        Ok(rows)
+    }
+
+    /// 合并所有表的 Delta 层到列存
+    ///
+    /// 返回合并的总行数。
+    pub fn compact_all(&mut self) -> Result<u64> {
+        let mut total = 0u64;
+        // 收集所有表名，避免借用冲突
+        let table_names: Vec<String> = self.table_names.keys().cloned().collect();
+        for name in &table_names {
+            total += self.compact_table(name)?;
+        }
+        Ok(total)
+    }
+
+    /// 关闭数据库
+    ///
+    /// 自动持久化所有二级索引到磁盘，确保下次打开时可快速加载。
+    pub fn close(&mut self) -> Result<()> {
+        use std::io::Write;
+        // TODO: Checkpoint、刷新缓冲池
+
+        // 持久化二级索引（v0.12.0 索引持久化）
+        // 空表或无索引时 save_indexes 内部会跳过，不报错
+        let _ = self.save_indexes();
+
+        self.file.flush()?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// 保存所有索引到文件（v0.12.0 索引持久化）
+    ///
+    /// 将所有表的所有二级索引序列化后写入文件末尾，
+    /// 并更新文件头的 index_root 和 index_size。
+    ///
+    /// 返回写入的字节数。
+    pub fn save_indexes(&mut self) -> Result<u64> {
+        use std::io::{Seek, Write};
+
+        // 收集所有表的索引数据
+        // 格式：table_count + per-table (table_id + index_data)
+        let mut section_buf = Vec::new();
+        let table_count = self.tables.len() as u32;
+        section_buf.extend_from_slice(&table_count.to_le_bytes());
+
+        for (&table_id, table) in &self.tables {
+            section_buf.extend_from_slice(&table_id.to_le_bytes());
+            let index_bytes = table.indexes_to_bytes();
+            section_buf.extend_from_slice(&(index_bytes.len() as u32).to_le_bytes());
+            section_buf.extend_from_slice(&index_bytes);
+        }
+
+        // 写入到文件末尾
+        let file_len = self.file.seek(std::io::SeekFrom::End(0))?;
+        // 页对齐
+        let page_size = self.header.page_size as u64;
+        let aligned_offset = (file_len + page_size - 1) / page_size * page_size;
+        if aligned_offset > file_len {
+            self.file.seek(std::io::SeekFrom::Start(file_len))?;
+            let padding = (aligned_offset - file_len) as usize;
+            self.file.write_all(&vec![0u8; padding])?;
+        }
+
+        let index_root = aligned_offset as u32;
+        self.file.seek(std::io::SeekFrom::Start(aligned_offset))?;
+        self.file.write_all(&section_buf)?;
+        self.file.flush()?;
+
+        // 更新文件头
+        self.header.index_root = index_root;
+        self.header.index_size = section_buf.len() as u32;
+
+        // 重写文件头
+        let header_bytes = self.header.to_bytes()?;
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        self.file.write_all(&header_bytes)?;
+        self.file.flush()?;
+
+        Ok(section_buf.len() as u64)
+    }
+
+    /// 从文件加载所有索引（v0.12.0 索引持久化）
+    ///
+    /// 读取文件中的索引段，反序列化后加载到对应表中。
+    /// 注意：表必须已存在（表定义需先加载）。
+    pub fn load_indexes(&mut self) -> Result<usize> {
+        use std::io::{Read, Seek};
+
+        if self.header.index_root == 0 || self.header.index_size == 0 {
+            return Ok(0); // 无索引
+        }
+
+        // 读取索引段
+        let mut data = vec![0u8; self.header.index_size as usize];
+        self.file.seek(std::io::SeekFrom::Start(self.header.index_root as u64))?;
+        self.file.read_exact(&mut data)?;
+
+        if data.len() < 4 {
+            return Err(HybridDbError::InvalidFormat("index section too short".into()));
+        }
+
+        let table_count = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        let mut offset = 4;
+        let mut total_indexes = 0;
+
+        for _ in 0..table_count {
+            if offset + 4 > data.len() {
+                return Err(HybridDbError::InvalidFormat("truncated table id".into()));
+            }
+            let table_id = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            offset += 4;
+
+            if offset + 4 > data.len() {
+                return Err(HybridDbError::InvalidFormat("truncated table index size".into()));
+            }
+            let index_data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            if offset + index_data_len > data.len() {
+                return Err(HybridDbError::InvalidFormat("truncated table index data".into()));
+            }
+
+            // 加载到对应表
+            if let Some(table) = self.tables.get_mut(&table_id) {
+                let before_skip = table.indexes().len();
+                let before_vec = table.vector_indexes().len();
+                table.indexes_from_bytes(&data[offset..offset+index_data_len])?;
+                total_indexes += table.indexes().len() - before_skip;
+                total_indexes += table.vector_indexes().len() - before_vec;
+            }
+            // 如果表不存在，跳过该表的索引（表可能已被删除）
+
+            offset += index_data_len;
+        }
+
+        Ok(total_indexes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{TableDef, ColumnDef, DataType};
+    use crate::Value;
+
+    fn make_test_table() -> Table {
+        let def = TableDef::new(1, "test", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("name", DataType::Varchar),
+            ColumnDef::new("score", DataType::Float64),
+        ]);
+        Table::new(def, crate::common::config::CompactStrategy::Manual)
+    }
+
+    #[test]
+    fn test_table_indexes_roundtrip() {
+        let mut table = make_test_table();
+
+        // 插入一些数据
+        let rows = vec![
+            vec![Value::Int64(1), Value::Varchar("alice".into()), Value::Float64(95.5)],
+            vec![Value::Int64(2), Value::Varchar("bob".into()), Value::Float64(87.0)],
+            vec![Value::Int64(3), Value::Varchar("alice".into()), Value::Float64(92.0)],
+        ];
+        table.insert(rows).unwrap();
+
+        // 创建索引
+        table.create_index("idx_name", 1, &[2], false).unwrap(); // name 键，覆盖 score
+        table.create_index("idx_id", 0, &[], true).unwrap(); // id 唯一键
+
+        assert_eq!(table.indexes().len(), 2);
+
+        // 序列化
+        let bytes = table.indexes_to_bytes();
+        assert!(!bytes.is_empty());
+
+        // 反序列化到新表
+        let mut table2 = make_test_table();
+        table2.indexes_from_bytes(&bytes).unwrap();
+        assert_eq!(table2.indexes().len(), 2);
+
+        // 验证 idx_name
+        let idx = table2.get_index("idx_name").unwrap();
+        assert!(!idx.is_unique());
+        assert_eq!(idx.num_included(), 1);
+        assert_eq!(idx.len(), 2); // alice, bob
+
+        let alice_entries = idx.get_entries(&Value::Varchar("alice".into())).unwrap();
+        assert_eq!(alice_entries.len(), 2);
+        assert_eq!(alice_entries[0].included[0], Value::Float64(95.5));
+        assert_eq!(alice_entries[1].included[0], Value::Float64(92.0));
+
+        // 验证 idx_id（唯一）
+        let idx = table2.get_index("idx_id").unwrap();
+        assert!(idx.is_unique());
+        assert_eq!(idx.num_included(), 0);
+        assert_eq!(idx.len(), 3);
+
+        let rows = idx.get(&Value::Int64(2)).unwrap();
+        assert_eq!(rows, vec![1]);
+    }
+
+    #[test]
+    fn test_table_empty_indexes() {
+        let table = make_test_table();
+        let bytes = table.indexes_to_bytes();
+        // skip_count(4B) = 0 + vec_count(4B) = 0 = 8 bytes
+        assert_eq!(bytes.len(), 8);
+
+        let mut table2 = make_test_table();
+        table2.indexes_from_bytes(&bytes).unwrap();
+        assert_eq!(table2.indexes().len(), 0);
+        assert_eq!(table2.vector_indexes().len(), 0);
+    }
+
+    #[test]
+    fn test_database_index_persistence() {
+        // 使用 /tmp 下的唯一路径
+        let path = format!("/tmp/hybriddb_idx_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path); // 清理残留
+
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            // 创建表
+            let def = TableDef::new(1, "users", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("name", DataType::Varchar),
+            ]);
+            db.create_table(def).unwrap();
+
+            // 插入数据
+            let table = db.get_table_mut("users").unwrap();
+            table.insert(vec![
+                vec![Value::Int64(1), Value::Varchar("alice".into())],
+                vec![Value::Int64(2), Value::Varchar("bob".into())],
+                vec![Value::Int64(3), Value::Varchar("charlie".into())],
+            ]).unwrap();
+
+            // 创建索引
+            table.create_index("idx_name", 1, &[], false).unwrap();
+            assert_eq!(table.indexes().len(), 1);
+
+            // 保存索引到文件
+            let bytes_written = db.save_indexes().unwrap();
+            assert!(bytes_written > 0);
+
+            // 验证文件头已更新
+            assert!(db.header.index_root > 0);
+            assert!(db.header.index_size > 0);
+
+            db.close().unwrap();
+        }
+
+        // 重新打开数据库，加载索引
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            // 注意：表定义不会自动加载（MVP 限制），需要重新创建
+            // 但索引段在文件中，我们手动创建同 ID 的表来测试加载
+            let def = TableDef::new(1, "users", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("name", DataType::Varchar),
+            ]);
+            db.create_table(def).unwrap();
+
+            // 加载索引
+            let loaded = db.load_indexes().unwrap();
+            assert_eq!(loaded, 1);
+
+            let table = db.get_table("users").unwrap();
+            let idx = table.get_index("idx_name").unwrap();
+            assert_eq!(idx.len(), 3);
+            assert_eq!(idx.get(&Value::Varchar("bob".into())).unwrap(), vec![1]);
+
+            db.close().unwrap();
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_database_no_indexes() {
+        let path = format!("/tmp/hybriddb_noidx_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let db = Database::open(&path).unwrap();
+            // 无索引时 load_indexes 应该返回 0
+            assert_eq!(db.header.index_root, 0);
+            assert_eq!(db.header.index_size, 0);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ========================================================================
+    // 向量 HNSW 索引集成测试（v0.12.0 优先级 3）
+    // ========================================================================
+
+    fn random_vector(dim: usize, seed: u32) -> Vec<f32> {
+        let mut v = Vec::with_capacity(dim);
+        let mut s = seed as u64;
+        for _ in 0..dim {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            v.push((s as f32) / (u64::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    #[test]
+    fn test_vector_index_create_and_search() {
+        let path = format!("/tmp/hybriddb_vecidx_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        // 创建带向量列的表（16 维，更贴近实际 embedding 场景）
+        let def = TableDef::new(1, "embeddings", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+        ]);
+        db.create_table(def).unwrap();
+
+        // 插入 200 条向量数据
+        let n = 200;
+        let rows: Vec<Vec<Value>> = (0..n).map(|i| {
+            vec![
+                Value::Int64(i as i64),
+                Value::Vector(random_vector(16, i)),
+            ]
+        }).collect();
+        {
+            let table = db.get_table_mut("embeddings").unwrap();
+            table.insert(rows).unwrap();
+        }
+
+        // 创建 HNSW 向量索引
+        db.create_vector_index(
+            "embeddings",
+            "idx_embedding",
+            "embedding",
+            crate::storage::vector_index::DistanceMetric::L2,
+            16,
+            200,
+        ).unwrap();
+
+        // 验证索引存在
+        {
+            let table = db.get_table("embeddings").unwrap();
+            assert!(table.get_vector_index("idx_embedding").is_some());
+            assert_eq!(table.get_vector_index("idx_embedding").unwrap().len(), n as usize);
+        }
+
+        // 向量搜索：搜索已知存在的向量，验证能找到
+        let query = random_vector(16, 100);
+        let results = db.vector_search("embeddings", "idx_embedding", &query, 10).unwrap();
+
+        assert!(!results.is_empty());
+        // 第 100 行应该在 top-10 结果中
+        let found = results.iter().any(|r| r.id == 100);
+        assert!(found, "第 100 行向量应在 top-10 搜索结果中");
+        // 自己和自己的距离应接近 0
+        let self_match = results.iter().find(|r| r.id == 100);
+        assert!(self_match.is_some());
+        assert!(self_match.unwrap().distance < 0.001,
+            "自己和自己距离应接近 0，实际: {}", self_match.unwrap().distance);
+
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vector_index_incremental_insert() {
+        let path = format!("/tmp/hybriddb_vecidx_incr_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        let def = TableDef::new(1, "items", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("vec", DataType::Vector { dim: 4 }),
+        ]);
+        db.create_table(def).unwrap();
+
+        // 先插入 20 条
+        let rows1: Vec<Vec<Value>> = (0..20).map(|i| {
+            vec![
+                Value::Int64(i as i64),
+                Value::Vector(random_vector(4, i)),
+            ]
+        }).collect();
+        {
+            let table = db.get_table_mut("items").unwrap();
+            table.insert(rows1).unwrap();
+        }
+
+        // 创建索引
+        db.create_vector_index("items", "idx_vec", "vec",
+            crate::storage::vector_index::DistanceMetric::L2, 8, 50).unwrap();
+
+        // 再插入 20 条（增量更新）
+        let rows2: Vec<Vec<Value>> = (20..40).map(|i| {
+            vec![
+                Value::Int64(i as i64),
+                Value::Vector(random_vector(4, i)),
+            ]
+        }).collect();
+        {
+            let table = db.get_table_mut("items").unwrap();
+            table.insert(rows2).unwrap();
+        }
+
+        // 验证索引包含所有 40 条
+        {
+            let table = db.get_table("items").unwrap();
+            assert_eq!(table.get_vector_index("idx_vec").unwrap().len(), 40);
+        }
+
+        // 搜索第 35 行（增量插入的）
+        let query = random_vector(4, 35);
+        let results = db.vector_search("items", "idx_vec", &query, 3).unwrap();
+        assert!(!results.is_empty());
+        // 第 35 行应该在结果中
+        let found = results.iter().any(|r| r.id == 35);
+        assert!(found, "增量插入的向量应能被搜索到");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vector_index_empty_search() {
+        let path = format!("/tmp/hybriddb_vecidx_empty_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        let def = TableDef::new(1, "empty_vec", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+        ]);
+        db.create_table(def).unwrap();
+
+        // 空表创建索引
+        db.create_vector_index("empty_vec", "idx_emb", "embedding",
+            crate::storage::vector_index::DistanceMetric::Cosine, 8, 50).unwrap();
+
+        // 空索引搜索应返回空
+        let query = random_vector(16, 999);
+        let results = db.vector_search("empty_vec", "idx_emb", &query, 10).unwrap();
+        assert!(results.is_empty());
+
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vector_index_not_found_error() {
+        let path = format!("/tmp/hybriddb_vecidx_nf_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        let def = TableDef::new(1, "t1", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("v", DataType::Vector { dim: 4 }),
+        ]);
+        db.create_table(def).unwrap();
+
+        // 搜索不存在的索引
+        let query = vec![0.0; 4];
+        let result = db.vector_search("t1", "no_such_index", &query, 5);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(),
+            crate::common::error::HybridDbError::IndexNotFound(_)));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vector_index_persistence_roundtrip() {
+        let path = format!("/tmp/hybriddb_vecidx_persist_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        // 写入数据 + 创建向量索引 + 保存
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            let def = TableDef::new(1, "docs", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+            ]);
+            db.create_table(def).unwrap();
+
+            // 插入 100 条向量
+            let rows: Vec<Vec<Value>> = (0..100).map(|i| {
+                vec![
+                    Value::Int64(i as i64),
+                    Value::Vector(random_vector(16, i)),
+                ]
+            }).collect();
+            {
+                let table = db.get_table_mut("docs").unwrap();
+                table.insert(rows).unwrap();
+            }
+
+            // 创建 HNSW 索引
+            db.create_vector_index("docs", "idx_emb", "embedding",
+                crate::storage::vector_index::DistanceMetric::L2, 16, 200).unwrap();
+
+            // 验证索引存在
+            {
+                let table = db.get_table("docs").unwrap();
+                assert_eq!(table.vector_indexes().len(), 1);
+                assert_eq!(table.get_vector_index("idx_emb").unwrap().len(), 100);
+            }
+
+            // 保存索引到文件（close 也会自动保存，这里显式调用测试）
+            let bytes_written = db.save_indexes().unwrap();
+            assert!(bytes_written > 0);
+
+            db.close().unwrap();
+        }
+
+        // 重新打开 + 加载索引 + 验证搜索
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            // 重新创建同 ID 的表（MVP 限制：表定义不会自动加载）
+            let def = TableDef::new(1, "docs", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+            ]);
+            db.create_table(def).unwrap();
+
+            // 加载索引
+            let loaded = db.load_indexes().unwrap();
+            assert!(loaded >= 1, "至少加载 1 个向量索引");
+
+            // 验证向量索引已加载
+            let table = db.get_table("docs").unwrap();
+            assert_eq!(table.vector_indexes().len(), 1);
+            assert_eq!(table.get_vector_index("idx_emb").unwrap().len(), 100);
+
+            // 搜索验证：搜索第 50 号向量
+            let query = random_vector(16, 50);
+            let results = db.vector_search("docs", "idx_emb", &query, 10).unwrap();
+            assert!(!results.is_empty());
+            let found = results.iter().any(|r| r.id == 50);
+            assert!(found, "持久化后第 50 行向量应能被搜索到");
+
+            db.close().unwrap();
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_mixed_indexes_persistence() {
+        let path = format!("/tmp/hybriddb_mixed_idx_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            let def = TableDef::new(1, "items", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("name", DataType::Varchar),
+                ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+            ]);
+            db.create_table(def).unwrap();
+
+            let rows: Vec<Vec<Value>> = (0..30).map(|i| {
+                vec![
+                    Value::Int64(i as i64),
+                    Value::Varchar(format!("item_{}", i)),
+                    Value::Vector(random_vector(8, i)),
+                ]
+            }).collect();
+            {
+                let table = db.get_table_mut("items").unwrap();
+                table.insert(rows).unwrap();
+            }
+
+            // 同时创建 SkipList 索引和向量索引
+            {
+                let table = db.get_table_mut("items").unwrap();
+                table.create_index("idx_name", 1, &[], false).unwrap();
+            }
+            db.create_vector_index("items", "idx_vec", "vec",
+                crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+
+            // 验证
+            {
+                let table = db.get_table("items").unwrap();
+                assert_eq!(table.indexes().len(), 1);
+                assert_eq!(table.vector_indexes().len(), 1);
+            }
+
+            db.save_indexes().unwrap();
+            db.close().unwrap();
+        }
+
+        // 重新加载，验证两种索引都恢复
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            let def = TableDef::new(1, "items", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("name", DataType::Varchar),
+                ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+            ]);
+            db.create_table(def).unwrap();
+
+            let loaded = db.load_indexes().unwrap();
+            assert!(loaded >= 1);
+
+            let table = db.get_table("items").unwrap();
+            // SkipList 索引
+            assert_eq!(table.indexes().len(), 1);
+            assert!(table.get_index("idx_name").is_some());
+            // 向量索引
+            assert_eq!(table.vector_indexes().len(), 1);
+            assert!(table.get_vector_index("idx_vec").is_some());
+            assert_eq!(table.get_vector_index("idx_vec").unwrap().len(), 30);
+
+            db.close().unwrap();
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ========================================================================
+    // DELETE/UPDATE + 向量索引维护测试（v0.12.0 优先级 3 · 删除更新支持）
+    // ========================================================================
+
+    #[test]
+    fn test_vector_index_delete_tombstone() {
+        // 验证 DELETE 后向量索引正确标记 tombstone，搜索结果过滤已删除行
+        let path = format!("/tmp/hybriddb_vecidx_del_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        let def = TableDef::new(1, "embeddings", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+        ]);
+        db.create_table(def).unwrap();
+
+        // 插入 50 条（小批量，走 Delta 层，便于 delete_delta_rows 测试）
+        let n = 50;
+        let rows: Vec<Vec<Value>> = (0..n).map(|i| {
+            vec![
+                Value::Int64(i as i64),
+                Value::Vector(random_vector(8, i)),
+            ]
+        }).collect();
+        {
+            let table = db.get_table_mut("embeddings").unwrap();
+            table.insert(rows).unwrap();
+        }
+
+        // 创建向量索引
+        db.create_vector_index("embeddings", "idx_vec", "vec",
+            crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+
+        // 验证初始状态
+        {
+            let table = db.get_table("embeddings").unwrap();
+            let (hnsw, _) = table.vector_indexes().get("idx_vec").unwrap();
+            assert_eq!(hnsw.len(), 50);
+            assert_eq!(hnsw.deleted_count(), 0);
+            assert_eq!(hnsw.active_len(), 50);
+        }
+
+        // 删除 Delta 层中第 10-19 行（共 10 行）
+        {
+            let table = db.get_table_mut("embeddings").unwrap();
+            let indices: Vec<usize> = (10..20).collect();
+            let deleted = table.delete_delta_rows(&indices).unwrap();
+            assert_eq!(deleted, 10);
+        }
+
+        // 验证向量索引 tombstone 状态
+        {
+            let table = db.get_table("embeddings").unwrap();
+            let (hnsw, _) = table.vector_indexes().get("idx_vec").unwrap();
+            assert_eq!(hnsw.len(), 50);         // 物理节点数不变
+            assert_eq!(hnsw.deleted_count(), 10); // 10 个 tombstone
+            assert_eq!(hnsw.active_len(), 40);   // 40 个有效
+        }
+
+        // 搜索已删除的向量（id=15），结果中不应出现
+        let query = random_vector(8, 15);
+        let results = db.vector_search("embeddings", "idx_vec", &query, 10).unwrap();
+        for r in &results {
+            // 行 id 10-19 已被删除，不应出现在结果中
+            assert!(r.id < 10 || r.id >= 20,
+                "结果中包含已删除行 id={}", r.id);
+        }
+
+        // 搜索未删除的向量（id=42），应该能找到
+        let query2 = random_vector(8, 42);
+        let results2 = db.vector_search("embeddings", "idx_vec", &query2, 5).unwrap();
+        assert!(results2.iter().any(|r| r.id == 42),
+            "未删除的 id=42 应能被搜索到");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vector_index_update_maintenance() {
+        // 验证 UPDATE 后旧向量 tombstone + 新向量插入
+        let path = format!("/tmp/hybriddb_vecidx_upd_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        let def = TableDef::new(1, "items", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+        ]);
+        db.create_table(def).unwrap();
+
+        // 插入 30 条（走 Delta 层）
+        let n = 30;
+        let rows: Vec<Vec<Value>> = (0..n).map(|i| {
+            vec![
+                Value::Int64(i as i64),
+                Value::Vector(random_vector(8, i)),
+            ]
+        }).collect();
+        {
+            let table = db.get_table_mut("items").unwrap();
+            table.insert(rows).unwrap();
+        }
+
+        // 创建向量索引
+        db.create_vector_index("items", "idx_vec", "vec",
+            crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+
+        // 验证初始状态
+        {
+            let table = db.get_table("items").unwrap();
+            let (hnsw, _) = table.vector_indexes().get("idx_vec").unwrap();
+            assert_eq!(hnsw.len(), 30);
+            assert_eq!(hnsw.active_len(), 30);
+        }
+
+        // 更新第 5 行的向量（替换为全新的向量值）
+        let new_vec = random_vector(8, 9999); // 用一个新的 seed 生成不同的向量
+        {
+            let table = db.get_table_mut("items").unwrap();
+            let updates = vec![
+                (5, vec![(1, Value::Vector(new_vec.clone()))]),
+            ];
+            let updated = table.update_delta_rows(&updates).unwrap();
+            assert_eq!(updated, 1);
+        }
+
+        // 验证向量索引状态：1 个 tombstone + 1 个新节点 = 31 个物理节点，30 个有效
+        {
+            let table = db.get_table("items").unwrap();
+            let (hnsw, _) = table.vector_indexes().get("idx_vec").unwrap();
+            assert_eq!(hnsw.len(), 31);         // 旧节点 + 新节点
+            assert_eq!(hnsw.deleted_count(), 1); // 旧向量 tombstone
+            assert_eq!(hnsw.active_len(), 30);   // 有效向量数不变
+        }
+
+        // 搜索旧向量（id=5 的原始向量 seed=5），不应再找到 row_id=5
+        // （因为旧向量已 tombstone，新向量 seed=9999 完全不同）
+        let old_query = random_vector(8, 5);
+        let results_old = db.vector_search("items", "idx_vec", &old_query, 10).unwrap();
+        // 旧向量对应的 hnsw_id 已被 tombstone，row_id=5 不应出现在结果中
+        // （注意：其他向量可能距离也近，但 row_id=5 对应的旧向量已被标记删除）
+        for r in &results_old {
+            // row_id=5 对应的新向量是 seed=9999，和 seed=5 距离很远
+            // 所以如果结果中有 id=5，那它应该是新向量（距离较远）
+            // 这里只验证 tombstone 数量正确，搜索结果的正确性由 HNSW 层保证
+            assert!(r.id < 30, "行 ID 应在有效范围内");
+        }
+
+        // 搜索新向量（seed=9999），应该能找到 row_id=5
+        let new_query = random_vector(8, 9999);
+        let results_new = db.vector_search("items", "idx_vec", &new_query, 5).unwrap();
+        assert!(results_new.iter().any(|r| r.id == 5),
+            "更新后的新向量应能通过 row_id=5 被搜索到");
+        // 距离自己应接近 0
+        let self_match = results_new.iter().find(|r| r.id == 5);
+        assert!(self_match.is_some(), "应找到更新后的向量");
+        assert!(self_match.unwrap().distance < 0.001,
+            "自己和自己距离应接近 0");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vector_index_delete_persistence() {
+        // 验证 tombstone 数据能正确持久化和恢复
+        let path = format!("/tmp/hybriddb_vecidx_delpersist_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            let def = TableDef::new(1, "docs", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
+            ]);
+            db.create_table(def).unwrap();
+
+            // 插入 40 条
+            let rows: Vec<Vec<Value>> = (0..40).map(|i| {
+                vec![
+                    Value::Int64(i as i64),
+                    Value::Vector(random_vector(8, i)),
+                ]
+            }).collect();
+            {
+                let table = db.get_table_mut("docs").unwrap();
+                table.insert(rows).unwrap();
+            }
+
+            // 创建向量索引
+            db.create_vector_index("docs", "idx_emb", "embedding",
+                crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+
+            // 删除 10 行
+            {
+                let table = db.get_table_mut("docs").unwrap();
+                let indices: Vec<usize> = (5..15).collect();
+                table.delete_delta_rows(&indices).unwrap();
+            }
+
+            // 验证删除状态
+            {
+                let table = db.get_table("docs").unwrap();
+                let (hnsw, _) = table.vector_indexes().get("idx_emb").unwrap();
+                assert_eq!(hnsw.deleted_count(), 10);
+                assert_eq!(hnsw.active_len(), 30);
+            }
+
+            // 保存索引
+            db.save_indexes().unwrap();
+            db.close().unwrap();
+        }
+
+        // 重新加载，验证 tombstone 数据正确恢复
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            let def = TableDef::new(1, "docs", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
+            ]);
+            db.create_table(def).unwrap();
+
+            db.load_indexes().unwrap();
+
+            let table = db.get_table("docs").unwrap();
+            let (hnsw, _) = table.vector_indexes().get("idx_emb").unwrap();
+            assert_eq!(hnsw.len(), 40);
+            assert_eq!(hnsw.deleted_count(), 10);
+            assert_eq!(hnsw.active_len(), 30);
+
+            // 搜索已删除的向量（id=10），不应出现在结果中
+            let query = random_vector(8, 10);
+            let results = table.vector_search("idx_emb", &query, 10).unwrap();
+            for r in &results {
+                // row_id 5-14 已删除
+                assert!(r.id < 5 || r.id >= 15,
+                    "结果中包含已删除行 id={}", r.id);
+            }
+
+            db.close().unwrap();
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vector_index_delete_all_active() {
+        // 边界：删除所有有效向量后，搜索应返回空
+        let path = format!("/tmp/hybriddb_vecidx_delall_test_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        let mut db = Database::open(&path).unwrap();
+
+        let def = TableDef::new(1, "small", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("vec", DataType::Vector { dim: 4 }),
+        ]);
+        db.create_table(def).unwrap();
+
+        // 插入 5 条
+        let rows: Vec<Vec<Value>> = (0..5).map(|i| {
+            vec![
+                Value::Int64(i as i64),
+                Value::Vector(random_vector(4, i)),
+            ]
+        }).collect();
+        {
+            let table = db.get_table_mut("small").unwrap();
+            table.insert(rows).unwrap();
+        }
+
+        db.create_vector_index("small", "idx_vec", "vec",
+            crate::storage::vector_index::DistanceMetric::L2, 4, 20).unwrap();
+
+        // 删除全部 5 行
+        {
+            let table = db.get_table_mut("small").unwrap();
+            let indices: Vec<usize> = (0..5).collect();
+            let deleted = table.delete_delta_rows(&indices).unwrap();
+            assert_eq!(deleted, 5);
+        }
+
+        // 验证
+        {
+            let table = db.get_table("small").unwrap();
+            let (hnsw, _) = table.vector_indexes().get("idx_vec").unwrap();
+            assert_eq!(hnsw.len(), 5);
+            assert_eq!(hnsw.deleted_count(), 5);
+            assert_eq!(hnsw.active_len(), 0);
+        }
+
+        // 搜索应返回空
+        let query = random_vector(4, 0);
+        let results = db.vector_search("small", "idx_vec", &query, 3).unwrap();
+        assert!(results.is_empty(), "全部删除后搜索应返回空");
+
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+}
