@@ -479,6 +479,11 @@ impl Table {
         &mut self.def
     }
 
+    /// 同步列存列的 data_type（从 TableDef 修正 Vector dim 等）
+    pub fn sync_column_data_types(&mut self) {
+        self.column_store.sync_data_types(&self.def);
+    }
+
     /// 设置聚簇列（方案B：Delta 聚簇）
     ///
     /// 设置后，compact 时会按该列的值分组写入列存，

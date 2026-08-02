@@ -25,6 +25,11 @@ pub struct RowGroup {
 }
 
 /// 列 Chunk
+///
+/// **已知限制（P0-3）**：`values: Vec<Value>` 使用带 tag 的 enum，
+/// 破坏列存的内存连续性，无法做 SIMD 向量化。
+/// 后续应重构为 `enum ColumnData { Int64(Vec<i64>), Float64(Vec<f64>), ... }`，
+/// 但需同步修改 `read_column` 签名与所有调用方，工作量较大，留作独立后续任务。
 #[derive(Debug, Clone)]
 pub struct ColumnChunk {
     pub data_type: DataType,
@@ -321,6 +326,214 @@ impl ColumnStore {
             }
         }
         stats
+    }
+
+    // ========================================================================
+    // 数据持久化（v0.12.1 新增）
+    // ========================================================================
+
+    /// 序列化所有 RowGroup 数据为字节流
+    ///
+    /// 格式：
+    /// ```text
+    /// +-----------------------+
+    /// | row_group_count 4B    |
+    /// +-----------------------+
+    /// | row_group[0]          |
+    /// +-----------------------+
+    /// | ...                   |
+    /// +-----------------------+
+    /// ```
+    ///
+    /// 每个 row_group:
+    /// ```text
+    /// +-------------------------------+
+    /// | row_count 4B                  |
+    /// +-------------------------------+
+    /// | column_count 4B               |
+    /// +-------------------------------+
+    /// | column[0]                     |
+    /// +-------------------------------+
+    /// | ...                           |
+    /// +-------------------------------+
+    /// ```
+    ///
+    /// 每个 column（确保数据可读，必要时先解压）:
+    /// ```text
+    /// +-------------------------------+
+    /// | data_type 1B                  |
+    /// +-------------------------------+
+    /// | compression 1B                |
+    /// +-------------------------------+
+    /// | null_count 4B                 |
+    /// +-------------------------------+
+    /// | uncompressed_count 4B         |
+    /// +-------------------------------+
+    /// | values_len 4B                 |
+    /// +-------------------------------+
+    /// | values_bytes                  |
+    /// +-------------------------------+
+    /// ```
+    pub fn data_to_bytes(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        let rg_count = self.row_groups.len() as u32;
+        buf.extend_from_slice(&rg_count.to_le_bytes());
+
+        for rg in &mut self.row_groups {
+            buf.extend_from_slice(&rg.row_count.to_le_bytes());
+            buf.extend_from_slice(&(rg.columns.len() as u32).to_le_bytes());
+
+            for col in &mut rg.columns {
+                // 确保数据在 values 中（若已压缩，先解压）
+                if col.values.is_empty() && !col.compressed_data.is_empty() {
+                    let bytes = compression::decompress(&col.compressed_data, col.compression.clone())?;
+                    col.values = deserialize_values(&bytes, &col.data_type, col.uncompressed_count as usize);
+                }
+
+                // data_type
+                buf.push(data_type_to_u8(&col.data_type));
+                // compression
+                buf.push(col.compression as u8);
+                // null_count
+                buf.extend_from_slice(&col.null_count.to_le_bytes());
+                // uncompressed_count
+                buf.extend_from_slice(&col.uncompressed_count.to_le_bytes());
+
+                // values 序列化
+                let values_bytes = serialize_values(&col.values, &col.data_type);
+                buf.extend_from_slice(&(values_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&values_bytes);
+
+                // min/max（可选，用于 MinMax 跳过索引）
+                buf.push(if col.min_value.is_some() { 1 } else { 0 });
+                if let Some(min) = &col.min_value {
+                    let mb = serialize_values(std::slice::from_ref(min), &col.data_type);
+                    buf.extend_from_slice(&(mb.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&mb);
+                }
+                buf.push(if col.max_value.is_some() { 1 } else { 0 });
+                if let Some(max) = &col.max_value {
+                    let mb = serialize_values(std::slice::from_ref(max), &col.data_type);
+                    buf.extend_from_slice(&(mb.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&mb);
+                }
+            }
+        }
+
+        Ok(buf)
+    }
+
+    /// 从字节流反序列化 RowGroup 数据
+    pub fn data_from_bytes(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() < 4 {
+            return Ok(()); // 空数据
+        }
+
+        let rg_count = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        let mut offset = 4;
+        self.row_groups.clear();
+        self.row_groups.reserve(rg_count);
+
+        for _ in 0..rg_count {
+            if offset + 8 > data.len() {
+                return Err(crate::common::error::HybridDbError::InvalidFormat(
+                    "truncated row group header".into(),
+                ));
+            }
+            let row_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let column_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            let mut columns = Vec::with_capacity(column_count);
+            for _ in 0..column_count {
+                if offset + 10 > data.len() {
+                    return Err(crate::common::error::HybridDbError::InvalidFormat(
+                        "truncated column header".into(),
+                    ));
+                }
+                let data_type = u8_to_data_type(data[offset]);
+                offset += 1;
+                let compression = compression_type_from_u8(data[offset]);
+                offset += 1;
+                let null_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                offset += 4;
+                let uncompressed_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                offset += 4;
+
+                let values_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                offset += 4;
+                if offset + values_len > data.len() {
+                    return Err(crate::common::error::HybridDbError::InvalidFormat(
+                        "truncated column values".into(),
+                    ));
+                }
+                let values = deserialize_values(
+                    &data[offset..offset + values_len],
+                    &data_type,
+                    uncompressed_count as usize,
+                );
+                offset += values_len;
+
+                // min
+                let mut min_value = None;
+                if offset < data.len() && data[offset] == 1 {
+                    offset += 1;
+                    let mlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    let mvals = deserialize_values(&data[offset..offset + mlen], &data_type, 1);
+                    offset += mlen;
+                    if !mvals.is_empty() {
+                        min_value = Some(mvals.into_iter().next().unwrap());
+                    }
+                } else {
+                    offset += 1;
+                }
+                // max
+                let mut max_value = None;
+                if offset < data.len() && data[offset] == 1 {
+                    offset += 1;
+                    let mlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    let mvals = deserialize_values(&data[offset..offset + mlen], &data_type, 1);
+                    offset += mlen;
+                    if !mvals.is_empty() {
+                        max_value = Some(mvals.into_iter().next().unwrap());
+                    }
+                } else {
+                    offset += 1;
+                }
+
+                columns.push(ColumnChunk {
+                    data_type,
+                    values,
+                    null_count,
+                    compression,
+                    compressed_data: Vec::new(),
+                    uncompressed_count,
+                    min_value,
+                    max_value,
+                });
+            }
+
+            self.row_groups.push(RowGroup { row_count, columns });
+        }
+
+        Ok(())
+    }
+
+    /// 同步列的 data_type（从 TableDef 修正，如 Vector dim）
+    ///
+    /// 反序列化后 ColumnChunk 的 data_type 可能不精确（如 Vector dim=0），
+    /// 此方法用 TableDef 中定义的类型覆盖。
+    pub fn sync_data_types(&mut self, table_def: &TableDef) {
+        for rg in &mut self.row_groups {
+            for (col_idx, col) in rg.columns.iter_mut().enumerate() {
+                if let Some(col_def) = table_def.columns.get(col_idx) {
+                    col.data_type = col_def.data_type.clone();
+                }
+            }
+        }
     }
 
     /// 检查指定 row group 的某列是否可以被范围条件跳过
@@ -683,5 +896,50 @@ fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
             }
             size
         }
+    }
+}
+
+// ============================================================================
+// 持久化辅助：DataType / CompressionType ↔ u8
+// ============================================================================
+
+fn data_type_to_u8(dt: &DataType) -> u8 {
+    match dt {
+        DataType::Boolean => 0,
+        DataType::Int32 => 1,
+        DataType::Int64 => 2,
+        DataType::Float64 => 3,
+        DataType::Varchar => 4,
+        DataType::Json => 5,
+        DataType::Vector { .. } => 6,
+    }
+}
+
+fn u8_to_data_type(b: u8) -> DataType {
+    match b {
+        0 => DataType::Boolean,
+        1 => DataType::Int32,
+        2 => DataType::Int64,
+        3 => DataType::Float64,
+        4 => DataType::Varchar,
+        5 => DataType::Json,
+        6 => DataType::Vector { dim: 0 },
+        _ => DataType::Varchar,
+    }
+}
+
+fn compression_type_from_u8(b: u8) -> CompressionType {
+    match b {
+        0 => CompressionType::Uncompressed,
+        1 => CompressionType::Rle,
+        2 => CompressionType::BitPacking,
+        3 => CompressionType::Dictionary,
+        4 => CompressionType::For,
+        5 => CompressionType::Delta,
+        6 => CompressionType::Zstd,
+        7 => CompressionType::Gorilla,
+        8 => CompressionType::ForBitPack,
+        9 => CompressionType::BooleanPack,
+        _ => CompressionType::Uncompressed,
     }
 }

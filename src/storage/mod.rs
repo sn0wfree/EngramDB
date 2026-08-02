@@ -9,6 +9,7 @@ pub mod table;
 pub mod sparse_index;
 pub mod vector_index;
 pub mod index;
+pub mod catalog;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -101,10 +102,7 @@ impl Database {
         let path_str = path.to_string_lossy().to_string();
         let txn_manager = TransactionManager::new(&path_str, &config)?;
 
-        // TODO: 加载元数据和表定义
-        // MVP 阶段简化：从元数据区读取 schema
-
-        Ok(Self {
+        let mut db = Self {
             path: path.to_path_buf(),
             config,
             header,
@@ -113,7 +111,16 @@ impl Database {
             next_table_id: 1,
             file,
             txn_manager,
-        })
+        };
+
+        // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
+        // 索引依赖表结构，数据依赖表结构，故 catalog 必须最先加载
+        db.load_catalog()?;
+        db.load_data()?;
+        // 索引在 schema 与数据均就绪后构建
+        let _ = db.load_indexes();
+
+        Ok(db)
     }
 
     /// 创建表
@@ -131,7 +138,9 @@ impl Database {
         self.tables.insert(table_id, table);
         self.table_names.insert(table_def.name.clone(), table_id);
 
-        // TODO: 持久化到元数据区
+        // v0.12.1: 持久化 catalog 到文件
+        let _ = self.save_catalog();
+
         Ok(())
     }
 
@@ -287,14 +296,13 @@ impl Database {
 
     /// 关闭数据库
     ///
-    /// 自动持久化所有二级索引到磁盘，确保下次打开时可快速加载。
+    /// 执行 checkpoint 持久化所有状态（catalog + data + indexes），
+    /// 确保下次打开时可完整恢复。
     pub fn close(&mut self) -> Result<()> {
         use std::io::Write;
-        // TODO: Checkpoint、刷新缓冲池
-
-        // 持久化二级索引（v0.12.0 索引持久化）
-        // 空表或无索引时 save_indexes 内部会跳过，不报错
-        let _ = self.save_indexes();
+        // v0.12.1: checkpoint 持久化 catalog/data/indexes
+        // checkpoint 内部会先 compact_all，再依次保存三段
+        let _ = self.checkpoint();
 
         self.file.flush()?;
         self.file.sync_all()?;
@@ -407,6 +415,204 @@ impl Database {
         }
 
         Ok(total_indexes)
+    }
+
+    // ========================================================================
+    // Catalog 持久化（v0.12.1 新增）
+    // 解决 P0：表 schema 不持久化，重启后表全丢失
+    // ========================================================================
+
+    /// 保存 Catalog（所有表 schema）到文件
+    ///
+    /// 将所有表的 TableDef 序列化写入 Catalog 段，
+    /// 并更新文件头的 catalog_root / catalog_size。
+    pub fn save_catalog(&mut self) -> Result<u64> {
+        use std::io::{Seek, Write};
+
+        let snapshot = catalog::CatalogSnapshot::collect(
+            self.next_table_id,
+            &self.tables,
+        );
+        let section_buf = snapshot.to_bytes()?;
+
+        // 页对齐写入
+        let file_len = self.file.seek(std::io::SeekFrom::End(0))?;
+        let page_size = self.header.page_size as u64;
+        let aligned_offset = (file_len + page_size - 1) / page_size * page_size;
+        if aligned_offset > file_len {
+            self.file.seek(std::io::SeekFrom::Start(file_len))?;
+            let padding = (aligned_offset - file_len) as usize;
+            self.file.write_all(&vec![0u8; padding])?;
+        }
+
+        let catalog_root = aligned_offset as u32;
+        self.file.seek(std::io::SeekFrom::Start(aligned_offset))?;
+        self.file.write_all(&section_buf)?;
+        self.file.flush()?;
+
+        // 更新文件头
+        self.header.catalog_root = catalog_root;
+        self.header.catalog_size = section_buf.len() as u32;
+        let header_bytes = self.header.to_bytes()?;
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        self.file.write_all(&header_bytes)?;
+        self.file.flush()?;
+
+        Ok(section_buf.len() as u64)
+    }
+
+    /// 从文件加载 Catalog（恢复所有表 schema）
+    ///
+    /// 读取 Catalog 段并重建 tables / table_names / next_table_id。
+    /// **注意**：仅恢复 schema，不恢复数据（数据由 load_data 负责）。
+    pub fn load_catalog(&mut self) -> Result<usize> {
+        use std::io::{Read, Seek};
+
+        if self.header.catalog_root == 0 || self.header.catalog_size == 0 {
+            return Ok(0); // 无 catalog（空库或老格式）
+        }
+
+        let mut data = vec![0u8; self.header.catalog_size as usize];
+        self.file.seek(std::io::SeekFrom::Start(self.header.catalog_root as u64))?;
+        self.file.read_exact(&mut data)?;
+
+        let snapshot = catalog::CatalogSnapshot::from_bytes(&data)?;
+
+        self.tables.clear();
+        self.table_names.clear();
+        self.next_table_id = snapshot.next_table_id;
+
+        for (table_id, table_def) in snapshot.tables {
+            let table = Table::new(table_def.clone(), self.config.compact_strategy);
+            self.table_names.insert(table_def.name.clone(), table_id);
+            self.tables.insert(table_id, table);
+        }
+
+        Ok(self.tables.len())
+    }
+
+    // ========================================================================
+    // 数据持久化（v0.12.1 新增）
+    // 解决 P0：数据未持久化，重启后数据丢失
+    // ========================================================================
+
+    /// 保存所有表的列存数据到文件
+    ///
+    /// **注意**：仅保存列存 RowGroup 数据，Delta 层未持久化。
+    /// 调用前应先执行 compact_all() 将 Delta 合并到列存。
+    pub fn save_data(&mut self) -> Result<u64> {
+        use std::io::{Seek, Write};
+
+        // 格式：table_count + per-table (table_id + data_len + data)
+        let mut section_buf = Vec::new();
+        let table_count = self.tables.len() as u32;
+        section_buf.extend_from_slice(&table_count.to_le_bytes());
+
+        // 收集 table_id 列表（避免借用冲突）
+        let table_ids: Vec<u32> = self.tables.keys().copied().collect();
+        for table_id in table_ids {
+            let table = self.tables.get_mut(&table_id).unwrap();
+            let data_bytes = table.column_store_mut().data_to_bytes()?;
+            section_buf.extend_from_slice(&table_id.to_le_bytes());
+            section_buf.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
+            section_buf.extend_from_slice(&data_bytes);
+        }
+
+        // 页对齐写入
+        let file_len = self.file.seek(std::io::SeekFrom::End(0))?;
+        let page_size = self.header.page_size as u64;
+        let aligned_offset = (file_len + page_size - 1) / page_size * page_size;
+        if aligned_offset > file_len {
+            self.file.seek(std::io::SeekFrom::Start(file_len))?;
+            let padding = (aligned_offset - file_len) as usize;
+            self.file.write_all(&vec![0u8; padding])?;
+        }
+
+        let data_root = aligned_offset as u32;
+        self.file.seek(std::io::SeekFrom::Start(aligned_offset))?;
+        self.file.write_all(&section_buf)?;
+        self.file.flush()?;
+
+        // 更新文件头
+        self.header.data_root = data_root;
+        self.header.data_size = section_buf.len() as u32;
+        let header_bytes = self.header.to_bytes()?;
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        self.file.write_all(&header_bytes)?;
+        self.file.flush()?;
+
+        Ok(section_buf.len() as u64)
+    }
+
+    /// 从文件加载所有表的列存数据
+    ///
+    /// **前置条件**：load_catalog 必须先调用（表结构需已存在）。
+    pub fn load_data(&mut self) -> Result<usize> {
+        use std::io::{Read, Seek};
+
+        if self.header.data_root == 0 || self.header.data_size == 0 {
+            return Ok(0); // 无数据
+        }
+
+        let mut data = vec![0u8; self.header.data_size as usize];
+        self.file.seek(std::io::SeekFrom::Start(self.header.data_root as u64))?;
+        self.file.read_exact(&mut data)?;
+
+        if data.len() < 4 {
+            return Ok(0);
+        }
+
+        let table_count = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        let mut offset = 4;
+        let mut loaded = 0;
+
+        for _ in 0..table_count {
+            if offset + 8 > data.len() {
+                return Err(HybridDbError::InvalidFormat("truncated data table header".into()));
+            }
+            let table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            if offset + data_len > data.len() {
+                return Err(HybridDbError::InvalidFormat("truncated data table body".into()));
+            }
+
+            if let Some(table) = self.tables.get_mut(&table_id) {
+                table.column_store_mut().data_from_bytes(&data[offset..offset + data_len])?;
+                // 同步列的 data_type（修正 Vector dim 等）
+                table.sync_column_data_types();
+                loaded += 1;
+            }
+            // 表不存在则跳过（schema 已删但数据未清理）
+            offset += data_len;
+        }
+
+        Ok(loaded)
+    }
+
+    /// 持久化全部状态（catalog + data + indexes）
+    ///
+    /// 推荐在 close() 前调用。会先 compact Delta → 列存，
+    /// 再依次保存 catalog、data、indexes，最后更新文件头。
+    ///
+    /// **已知限制**：每次 checkpoint 追加写入文件末尾，旧段成为孤儿数据。
+    /// 文件会持续增长，生产环境应定期 VACUUM 重建文件（待实现）。
+    pub fn checkpoint(&mut self) -> Result<()> {
+        // 1. 先把 Delta 合并到列存（确保数据完整）
+        let _ = self.compact_all()?;
+
+        // 2. 保存 catalog（schema）
+        let _ = self.save_catalog()?;
+
+        // 3. 保存 data（列存数据）
+        let _ = self.save_data()?;
+
+        // 4. 保存 indexes（二级索引）
+        let _ = self.save_indexes()?;
+
+        Ok(())
     }
 }
 

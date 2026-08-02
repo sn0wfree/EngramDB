@@ -24,6 +24,18 @@ pub struct FileHeader {
     pub index_root: u32,
     /// 索引段大小（字节）
     pub index_size: u32,
+    /// Catalog 段偏移（v0.12.1 新增，0 = 无 catalog）
+    ///
+    /// 存储所有表的 schema 定义（TableDef / ColumnDef / IndexDef）。
+    pub catalog_root: u32,
+    /// Catalog 段大小（字节）
+    pub catalog_size: u32,
+    /// 数据段偏移（v0.12.1 新增，0 = 无数据）
+    ///
+    /// 存储所有表的列存 RowGroup 数据。
+    pub data_root: u32,
+    /// 数据段大小（字节）
+    pub data_size: u32,
 }
 
 impl FileHeader {
@@ -46,6 +58,10 @@ impl FileHeader {
             compression_default: config.default_compression,
             index_root: 0,
             index_size: 0,
+            catalog_root: 0,
+            catalog_size: 0,
+            data_root: 0,
+            data_size: 0,
         }
     }
 
@@ -79,6 +95,15 @@ impl FileHeader {
         buf.extend_from_slice(&self.index_root.to_le_bytes());
         // Index size (4B)
         buf.extend_from_slice(&self.index_size.to_le_bytes());
+
+        // Catalog root (4B) — v0.12.1
+        buf.extend_from_slice(&self.catalog_root.to_le_bytes());
+        // Catalog size (4B)
+        buf.extend_from_slice(&self.catalog_size.to_le_bytes());
+        // Data root (4B) — v0.12.1
+        buf.extend_from_slice(&self.data_root.to_le_bytes());
+        // Data size (4B)
+        buf.extend_from_slice(&self.data_size.to_le_bytes());
 
         // 填充到页大小
         buf.resize(self.page_size as usize, 0);
@@ -130,6 +155,21 @@ impl FileHeader {
         let index_root = u32::from_le_bytes(data[magic_len+59..magic_len+63].try_into().unwrap());
         let index_size = u32::from_le_bytes(data[magic_len+63..magic_len+67].try_into().unwrap());
 
+        // Catalog + Data 段（v0.12.1 新增）
+        // 老文件无此字段，默认为 0（无 catalog/数据，按空库处理）
+        let catalog_root = if data.len() >= magic_len + 75 {
+            u32::from_le_bytes(data[magic_len+67..magic_len+71].try_into().unwrap())
+        } else { 0 };
+        let catalog_size = if data.len() >= magic_len + 79 {
+            u32::from_le_bytes(data[magic_len+71..magic_len+75].try_into().unwrap())
+        } else { 0 };
+        let data_root = if data.len() >= magic_len + 83 {
+            u32::from_le_bytes(data[magic_len+75..magic_len+79].try_into().unwrap())
+        } else { 0 };
+        let data_size = if data.len() >= magic_len + 87 {
+            u32::from_le_bytes(data[magic_len+79..magic_len+83].try_into().unwrap())
+        } else { 0 };
+
         Ok(Self {
             magic: MAGIC.clone(),
             version,
@@ -144,6 +184,10 @@ impl FileHeader {
             compression_default,
             index_root,
             index_size,
+            catalog_root,
+            catalog_size,
+            data_root,
+            data_size,
         })
     }
 }

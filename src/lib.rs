@@ -106,19 +106,20 @@ impl PreparedStatement {
 /// 数据库连接
 pub struct Connection {
     db: Database,
+    closed: bool,
 }
 
 impl Connection {
     /// 打开或创建数据库
     pub fn open(path: &str) -> Result<Self> {
         let db = Database::open(path)?;
-        Ok(Self { db })
+        Ok(Self { db, closed: false })
     }
 
     /// 使用指定配置打开或创建数据库
     pub fn open_with_config(path: &str, config: crate::common::config::Config) -> Result<Self> {
         let db = Database::open_with_config(path, config)?;
-        Ok(Self { db })
+        Ok(Self { db, closed: false })
     }
 
     /// 执行 SQL 语句
@@ -215,7 +216,9 @@ impl Connection {
 
     /// 关闭数据库
     pub fn close(&mut self) -> Result<()> {
-        self.db.close()
+        let result = self.db.close();
+        self.closed = true;
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -332,6 +335,25 @@ impl Connection {
     /// 设置指定表的 Delta 合并策略（运行时动态切换）
     pub fn set_table_compact_strategy(&mut self, table_name: &str, strategy: crate::common::config::CompactStrategy) -> Result<()> {
         self.db.set_table_compact_strategy(table_name, strategy)
+    }
+}
+
+/// Connection 析构时自动 checkpoint，保证数据不丢
+///
+/// 即使客户端忘记调用 `close()`，Drop 也会自动持久化 catalog/data/indexes。
+/// **注意**：`:memory:` 内存库无需持久化，Drop 时跳过。
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // 已显式 close 或内存库，跳过
+        if self.closed {
+            return;
+        }
+        let path = self.db.path().to_string_lossy().to_string();
+        if path == ":memory:" || path.is_empty() {
+            return;
+        }
+        // best-effort 持久化，失败不传播 panic
+        let _ = self.db.checkpoint();
     }
 }
 
