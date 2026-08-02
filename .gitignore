@@ -1,0 +1,42 @@
+# Rust 构建产物
+/target/
+**/target/
+**/*.rs.bk
+
+# Cargo 锁文件（库类型保留，二进制类型按需）
+# 本项目为嵌入式库 + CLI，保留 Cargo.lock 以保证可复现构建
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 数据库文件（运行时生成）
+*.hdb
+*.hdb-wal
+*.hdb-shm
+*.db
+*.db-journal
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# 基准测试数据文件
+*.dat
+*.bin
+
+# Python 缓存（基准测试脚本）
+__pycache__/
+*.pyc
+.venv/
+venv/
