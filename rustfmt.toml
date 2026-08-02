@@ -1,0 +1,40 @@
+# Rust 代码格式化配置
+# 运行 `cargo fmt` 自动格式化代码
+
+# 行宽上限（默认 100，项目使用 120 适配长泛型/链式调用）
+max_width = 120
+
+# 缩进风格：4 个空格
+hard_tabs = false
+tab_spaces = 4
+
+# 导入排序
+reorder_imports = true
+reorder_modules = true
+
+# 链式调用合并策略
+chain_width = 80
+
+# 函数参数换行
+fn_args_layout = "Tall"
+
+# 结构体字段对齐
+struct_field_align_threshold = 0
+
+# 单行 if/match 风格
+control_brace_style = "AlwaysSameLine"
+
+# 注释规范
+normalize_comments = true
+wrap_comments = true
+comment_width = 100
+
+# 统一使用双引号
+normalize_doc_attributes = true
+
+# 末尾逗号：保留
+trailing_comma = "Vertical"
+
+# 格式化宏
+format_macro_matchers = true
+format_macro_bodies = true

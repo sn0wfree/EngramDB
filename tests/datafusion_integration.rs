@@ -1,6 +1,11 @@
 //! DataFusion 集成测试
 //!
 //! 验证 SQL → DataFusion → HybridDB TableProvider → 存储引擎 的完整链路
+//
+// 仅在启用 `datafusion` feature 时编译运行：
+//   cargo test --features datafusion --test datafusion_integration
+
+#![cfg(feature = "datafusion")]
 
 use std::sync::Arc;
 

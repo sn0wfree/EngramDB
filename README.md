@@ -264,13 +264,14 @@ hybriddb/
 │   │   ├── physical_plan.rs # 物理计划枚举
 │   │   ├── vector.rs        # DataChunk 向量数据块
 │   │   └── operators/       # 物理算子（scan/filter/projection/insert/aggregate/sort/hash_join）
-│   ├── datafusion_ext/      # DataFusion TableProvider 集成
-│   └── bin/                 # 二进制基准测试
+│   └── datafusion_ext/      # DataFusion TableProvider 集成（feature = "datafusion"）
 ├── tests/                   # 集成测试
-├── benches/                 # 基准测试
+├── benches/                 # 基准测试（含独立 native_bench 项目）
 ├── examples/                # 示例
 ├── docs/                    # 文档
-└── scripts/                 # 构建与快速上手脚本
+├── scripts/                 # 构建脚本、快速上手、Python 基准工具
+│   └── benchmarks/          # Python 性能对比脚本
+└── archive/                 # 归档的历史版本/重复文件（不参与编译）
 ```
 
 ## 版本历史

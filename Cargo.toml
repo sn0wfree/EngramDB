@@ -17,6 +17,11 @@ path = "src/lib.rs"
 name = "hybriddb"
 path = "src/main.rs"
 
+[features]
+default = []
+# DataFusion 互操作（启用后编译 datafusion_ext 模块与集成测试）
+datafusion = ["dep:datafusion", "dep:datafusion-common", "dep:datafusion-expr"]
+
 [dependencies]
 # 解析
 nom = "7.1"
@@ -51,6 +56,57 @@ sqlparser = "0.47"
 # JSON 处理（v0.12.0 新增，Agent 元数据存储）
 serde_json = "1.0"
 
+# DataFusion 互操作（可选，启用 datafusion feature 时生效）
+datafusion = { version = "40", optional = true }
+datafusion-common = { version = "40", optional = true }
+datafusion-expr = { version = "40", optional = true }
+
 [dev-dependencies]
 tempfile = "3.0"
+criterion = "0.5"
+
+# 基准测试目标（均自带 main()，需关闭默认 test harness）
+[[bench]]
+name = "bench_main"
+harness = false
+
+[[bench]]
+name = "bench_full"
+harness = false
+
+[[bench]]
+name = "compression_bench"
+harness = false
+
+[[bench]]
+name = "compression_bench_v2"
+harness = false
+
+[[bench]]
+name = "core_bench"
+harness = false
+
+[[bench]]
+name = "index_bench"
+harness = false
+
+[[bench]]
+name = "vector_bench"
+harness = false
+
+[[bench]]
+name = "limit_bench"
+harness = false
+
+[[bench]]
+name = "write_bench"
+harness = false
+
+[[bench]]
+name = "compact_strategy_bench"
+harness = false
+
+[[bench]]
+name = "compact_strategy_deep_bench"
+harness = false
 

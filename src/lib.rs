@@ -73,8 +73,11 @@ pub mod wal;
 pub mod txn;
 pub mod sql;
 pub mod executor;
-// Phase 1 用 sqlparser-rs 做解析器, 执行器自研向量化
-// pub mod datafusion_ext;  // 预留, 后续可切换到 DataFusion
+
+// DataFusion 互操作（需启用 datafusion feature）
+// 提供 TableProvider 实现，可将 HybridDB 表接入 DataFusion 查询引擎
+#[cfg(feature = "datafusion")]
+pub mod datafusion_ext;
 
 pub use common::config::{CompactStrategy, WalFlushMode, Config, CompressionType};
 
