@@ -9,7 +9,7 @@
 //! - 空值传播（NULL 参与运算结果为 NULL）
 //! - 布尔短路（AND/OR 提前终止）
 
-use crate::common::error::{HybridDbError, Result};
+use crate::common::error::{EngramDbError, Result};
 use crate::Value;
 use crate::sql::ast::{Expression, BinaryOperator, UnaryOperator, DataType};
 
@@ -32,7 +32,7 @@ pub fn eval_vectorized(
 
         Expression::ColumnRef { column, .. } => {
             let idx = column_names.iter().position(|c| c == column)
-                .ok_or_else(|| HybridDbError::ColumnNotFound(column.clone()))?;
+                .ok_or_else(|| EngramDbError::ColumnNotFound(column.clone()))?;
             if idx >= chunk.columns.len() {
                 // 列不存在，返回全 NULL
                 Ok(Vector::Constant(Value::Null, chunk.count))
@@ -92,7 +92,7 @@ pub fn eval_vectorized(
         }
 
         Expression::Placeholder(_) => {
-            Err(HybridDbError::Internal(
+            Err(EngramDbError::Internal(
                 "Placeholder should be resolved before execution".into()
             ))
         }
@@ -668,35 +668,35 @@ fn eval_function(
     match func_name.as_str() {
         "ABS" => {
             if args.len() != 1 {
-                return Err(HybridDbError::Parse("ABS requires 1 argument".into()));
+                return Err(EngramDbError::Parse("ABS requires 1 argument".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
             eval_abs(&vec)
         }
         "LENGTH" | "LEN" => {
             if args.len() != 1 {
-                return Err(HybridDbError::Parse("LENGTH requires 1 argument".into()));
+                return Err(EngramDbError::Parse("LENGTH requires 1 argument".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
             eval_length(&vec)
         }
         "UPPER" | "UCASE" => {
             if args.len() != 1 {
-                return Err(HybridDbError::Parse("UPPER requires 1 argument".into()));
+                return Err(EngramDbError::Parse("UPPER requires 1 argument".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
             eval_upper(&vec)
         }
         "LOWER" | "LCASE" => {
             if args.len() != 1 {
-                return Err(HybridDbError::Parse("LOWER requires 1 argument".into()));
+                return Err(EngramDbError::Parse("LOWER requires 1 argument".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
             eval_lower(&vec)
         }
         "ROUND" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(HybridDbError::Parse("ROUND requires 1-2 arguments".into()));
+                return Err(EngramDbError::Parse("ROUND requires 1-2 arguments".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
             let decimals = if args.len() == 2 {
@@ -714,7 +714,7 @@ fn eval_function(
         }
         "COALESCE" => {
             if args.is_empty() {
-                return Err(HybridDbError::Parse("COALESCE requires at least 1 argument".into()));
+                return Err(EngramDbError::Parse("COALESCE requires at least 1 argument".into()));
             }
             let arg_vecs: Result<Vec<Vector>> = args.iter()
                 .map(|a| eval_vectorized(a, chunk, column_names))
@@ -724,7 +724,7 @@ fn eval_function(
         }
         "SUBSTRING" | "SUBSTR" => {
             if args.len() < 2 || args.len() > 3 {
-                return Err(HybridDbError::Parse("SUBSTRING requires 2-3 arguments".into()));
+                return Err(EngramDbError::Parse("SUBSTRING requires 2-3 arguments".into()));
             }
             let str_vec = eval_vectorized(&args[0], chunk, column_names)?;
             let start_vec = eval_vectorized(&args[1], chunk, column_names)?;
@@ -737,7 +737,7 @@ fn eval_function(
         }
         "CONCAT" => {
             if args.len() < 2 {
-                return Err(HybridDbError::Parse("CONCAT requires at least 2 arguments".into()));
+                return Err(EngramDbError::Parse("CONCAT requires at least 2 arguments".into()));
             }
             let arg_vecs: Result<Vec<Vector>> = args.iter()
                 .map(|a| eval_vectorized(a, chunk, column_names))
@@ -748,7 +748,7 @@ fn eval_function(
         // JSON 函数（v0.12.0 新增，Agent 元数据场景）
         "JSON_EXTRACT" => {
             if args.len() != 2 {
-                return Err(HybridDbError::Parse("JSON_EXTRACT requires 2 arguments".into()));
+                return Err(EngramDbError::Parse("JSON_EXTRACT requires 2 arguments".into()));
             }
             let json_vec = eval_vectorized(&args[0], chunk, column_names)?;
             let path_vec = eval_vectorized(&args[1], chunk, column_names)?;
@@ -756,7 +756,7 @@ fn eval_function(
         }
         "JSON_CONTAINS" => {
             if args.len() < 2 || args.len() > 3 {
-                return Err(HybridDbError::Parse("JSON_CONTAINS requires 2-3 arguments".into()));
+                return Err(EngramDbError::Parse("JSON_CONTAINS requires 2-3 arguments".into()));
             }
             let json_vec = eval_vectorized(&args[0], chunk, column_names)?;
             let target_vec = eval_vectorized(&args[1], chunk, column_names)?;
@@ -769,7 +769,7 @@ fn eval_function(
         }
         "JSON_ARRAY_LENGTH" => {
             if args.len() < 1 || args.len() > 2 {
-                return Err(HybridDbError::Parse("JSON_ARRAY_LENGTH requires 1-2 arguments".into()));
+                return Err(EngramDbError::Parse("JSON_ARRAY_LENGTH requires 1-2 arguments".into()));
             }
             let json_vec = eval_vectorized(&args[0], chunk, column_names)?;
             let path_vec = if args.len() == 2 {
@@ -782,7 +782,7 @@ fn eval_function(
         // 向量函数（v0.12.0 新增，Agent 语义记忆 / RAG 场景）
         "VECTOR_DISTANCE" | "VEC_DISTANCE" => {
             if args.len() != 2 {
-                return Err(HybridDbError::Parse("VECTOR_DISTANCE requires 2 arguments".into()));
+                return Err(EngramDbError::Parse("VECTOR_DISTANCE requires 2 arguments".into()));
             }
             let v1 = eval_vectorized(&args[0], chunk, column_names)?;
             let v2 = eval_vectorized(&args[1], chunk, column_names)?;
@@ -790,7 +790,7 @@ fn eval_function(
         }
         "VECTOR_L2_DISTANCE" => {
             if args.len() != 2 {
-                return Err(HybridDbError::Parse("VECTOR_L2_DISTANCE requires 2 arguments".into()));
+                return Err(EngramDbError::Parse("VECTOR_L2_DISTANCE requires 2 arguments".into()));
             }
             let v1 = eval_vectorized(&args[0], chunk, column_names)?;
             let v2 = eval_vectorized(&args[1], chunk, column_names)?;
@@ -798,7 +798,7 @@ fn eval_function(
         }
         "VECTOR_COSINE_SIMILARITY" => {
             if args.len() != 2 {
-                return Err(HybridDbError::Parse("VECTOR_COSINE_SIMILARITY requires 2 arguments".into()));
+                return Err(EngramDbError::Parse("VECTOR_COSINE_SIMILARITY requires 2 arguments".into()));
             }
             let v1 = eval_vectorized(&args[0], chunk, column_names)?;
             let v2 = eval_vectorized(&args[1], chunk, column_names)?;
@@ -806,13 +806,13 @@ fn eval_function(
         }
         "VECTOR_NORM" => {
             if args.len() != 1 {
-                return Err(HybridDbError::Parse("VECTOR_NORM requires 1 argument".into()));
+                return Err(EngramDbError::Parse("VECTOR_NORM requires 1 argument".into()));
             }
             let v = eval_vectorized(&args[0], chunk, column_names)?;
             eval_vector_norm(&v)
         }
         _ => {
-            Err(HybridDbError::Parse(format!("Unknown function: {}", name)))
+            Err(EngramDbError::Parse(format!("Unknown function: {}", name)))
         }
     }
 }

@@ -86,8 +86,8 @@ pub struct CommitResult {
 }
 
 // 确保 Result 类型兼容
-impl From<TxnError> for crate::common::error::HybridDbError {
+impl From<TxnError> for crate::common::error::EngramDbError {
     fn from(e: TxnError) -> Self {
-        crate::common::error::HybridDbError::Transaction(e.to_string())
+        crate::common::error::EngramDbError::Transaction(e.to_string())
     }
 }

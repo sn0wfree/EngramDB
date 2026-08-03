@@ -12,7 +12,7 @@
 //! - 并发性能更好（锁粒度更细）
 
 use crate::Value;
-use crate::common::error::{Result, HybridDbError};
+use crate::common::error::{Result, EngramDbError};
 use rand::Rng;
 use std::cmp::Ordering;
 
@@ -470,7 +470,7 @@ fn encode_value(v: &Value) -> Vec<u8> {
 /// 从字节解码单个 Value，返回 (value, bytes_consumed)
 fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
     if data.is_empty() {
-        return Err(HybridDbError::InvalidFormat("empty value data".into()));
+        return Err(EngramDbError::InvalidFormat("empty value data".into()));
     }
     let tag = data[0];
     let mut offset = 1;
@@ -479,7 +479,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
         value_tag::NULL => Value::Null,
         value_tag::BOOLEAN => {
             if offset >= data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated boolean value".into()));
+                return Err(EngramDbError::InvalidFormat("truncated boolean value".into()));
             }
             let b = data[offset] != 0;
             offset += 1;
@@ -487,7 +487,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
         }
         value_tag::INT32 => {
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated int32 value".into()));
+                return Err(EngramDbError::InvalidFormat("truncated int32 value".into()));
             }
             let i = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
             offset += 4;
@@ -495,7 +495,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
         }
         value_tag::INT64 => {
             if offset + 8 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated int64 value".into()));
+                return Err(EngramDbError::InvalidFormat("truncated int64 value".into()));
             }
             let i = i64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
             offset += 8;
@@ -503,7 +503,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
         }
         value_tag::FLOAT64 => {
             if offset + 8 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated float64 value".into()));
+                return Err(EngramDbError::InvalidFormat("truncated float64 value".into()));
             }
             let f = f64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
             offset += 8;
@@ -511,41 +511,41 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
         }
         value_tag::VARCHAR => {
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated varchar length".into()));
+                return Err(EngramDbError::InvalidFormat("truncated varchar length".into()));
             }
             let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated varchar data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated varchar data".into()));
             }
             let s = String::from_utf8(data[offset..offset+len].to_vec())
-                .map_err(|e| HybridDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
             offset += len;
             Value::Varchar(s)
         }
         value_tag::JSON => {
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated json length".into()));
+                return Err(EngramDbError::InvalidFormat("truncated json length".into()));
             }
             let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated json data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated json data".into()));
             }
             let s = String::from_utf8(data[offset..offset+len].to_vec())
-                .map_err(|e| HybridDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
             offset += len;
             Value::Json(s)
         }
         value_tag::VECTOR => {
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated vector dim".into()));
+                return Err(EngramDbError::InvalidFormat("truncated vector dim".into()));
             }
             let dim = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             let byte_len = dim * 4;
             if offset + byte_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated vector data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated vector data".into()));
             }
             let mut vec = Vec::with_capacity(dim);
             for i in 0..dim {
@@ -556,7 +556,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             offset += byte_len;
             Value::Vector(vec)
         }
-        _ => return Err(HybridDbError::InvalidFormat(format!("unknown value tag: {}", tag))),
+        _ => return Err(EngramDbError::InvalidFormat(format!("unknown value tag: {}", tag))),
     };
 
     Ok((value, offset))
@@ -631,12 +631,12 @@ impl SkipListIndex {
     /// 从字节反序列化重建跳表索引（v0.12.0 索引持久化）
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 8 {
-            return Err(HybridDbError::InvalidFormat("index data too short".into()));
+            return Err(EngramDbError::InvalidFormat("index data too short".into()));
         }
 
         // 校验魔数
         if &data[..8] != INDEX_MAGIC {
-            return Err(HybridDbError::InvalidFormat(
+            return Err(EngramDbError::InvalidFormat(
                 "invalid index magic number".into()
             ));
         }
@@ -644,7 +644,7 @@ impl SkipListIndex {
 
         // Flags
         if offset >= data.len() {
-            return Err(HybridDbError::InvalidFormat("truncated index flags".into()));
+            return Err(EngramDbError::InvalidFormat("truncated index flags".into()));
         }
         let flags = data[offset];
         let unique = (flags & 1) != 0;
@@ -652,14 +652,14 @@ impl SkipListIndex {
 
         // num_included
         if offset + 4 > data.len() {
-            return Err(HybridDbError::InvalidFormat("truncated num_included".into()));
+            return Err(EngramDbError::InvalidFormat("truncated num_included".into()));
         }
         let num_included = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
         offset += 4;
 
         // key_count
         if offset + 4 > data.len() {
-            return Err(HybridDbError::InvalidFormat("truncated key_count".into()));
+            return Err(EngramDbError::InvalidFormat("truncated key_count".into()));
         }
         let key_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
         offset += 4;
@@ -674,7 +674,7 @@ impl SkipListIndex {
 
             // entry_count
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated entry_count".into()));
+                return Err(EngramDbError::InvalidFormat("truncated entry_count".into()));
             }
             let entry_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
@@ -682,7 +682,7 @@ impl SkipListIndex {
             for _ in 0..entry_count {
                 // row_id
                 if offset + 4 > data.len() {
-                    return Err(HybridDbError::InvalidFormat("truncated row_id".into()));
+                    return Err(EngramDbError::InvalidFormat("truncated row_id".into()));
                 }
                 let row_id = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
                 offset += 4;

@@ -1,6 +1,6 @@
-//! HybridDB 原生性能基准测试
+//! EngramDB 原生性能基准测试
 //!
-//! 纯 Rust 实现，对比列存（HybridDB 架构）vs 行存（传统架构）的核心操作性能。
+//! 纯 Rust 实现，对比列存（EngramDB 架构）vs 行存（传统架构）的核心操作性能。
 //! 全部为原生编译，无解释器、无外部依赖。
 
 use rand::Rng;
@@ -25,7 +25,7 @@ struct EmployeeRow {
 }
 
 // ============================================================
-// 列存结构（HybridDB 架构）
+// 列存结构（EngramDB 架构）
 // ============================================================
 
 struct ColumnarEmployees {
@@ -286,9 +286,9 @@ fn col_point_lookup(ids: &[i64], id: i64) -> Option<usize> {
 fn main() {
     println!();
     println!("{}", "=".repeat(72));
-    println!("  HybridDB 原生性能基准测试 (Rust 1.97 | {} 行)", NUM_ROWS);
+    println!("  EngramDB 原生性能基准测试 (Rust 1.97 | {} 行)", NUM_ROWS);
     println!("{}", "=".repeat(72));
-    println!("  列存 (HybridDB 架构): 列式存储 + 向量化访问 + 缓存友好");
+    println!("  列存 (EngramDB 架构): 列式存储 + 向量化访问 + 缓存友好");
     println!("  行存 (传统架构):     行式存储 + 逐字段访问 + 指针跳跃");
     println!("  全部原生 Rust 编译 (release + LTO)，无解释器开销");
     println!("{}", "=".repeat(72));
@@ -434,7 +434,7 @@ fn main() {
     println!("  说明：");
     println!("  - 全部为 Rust release + LTO 原生编译，无解释器开销");
     println!("  - 行存 = Vec<struct> 逐字段访问（模拟 SQLite/MySQL 行存）");
-    println!("  - 列存 = 独立 Vec 列式存储（HybridDB 架构）");
+    println!("  - 列存 = 独立 Vec 列式存储（EngramDB 架构）");
     println!("  - <1.0x 表示列存更快，✓ 标记列存胜出项");
     println!("  - 排序场景两者差异小（都需要构造 pair 数组）");
     println!();

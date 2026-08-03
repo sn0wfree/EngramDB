@@ -135,7 +135,7 @@ impl DeltaStore {
         
         // 检查是否已删除
         if self.deleted_ids.contains(&rowid_64) {
-            return Err(crate::common::error::HybridDbError::InvalidFormat(
+            return Err(crate::common::error::EngramDbError::InvalidFormat(
                 format!("row {} has been deleted", rowid)
             ));
         }
@@ -143,7 +143,7 @@ impl DeltaStore {
         // 获取位置索引
         let idx = self.row_id_to_idx.get(&rowid_64).copied()
             .ok_or_else(|| {
-                crate::common::error::HybridDbError::InvalidFormat(
+                crate::common::error::EngramDbError::InvalidFormat(
                     format!("row {} not found in delta store", rowid)
                 )
             })?;
@@ -231,7 +231,7 @@ impl DeltaStore {
         // 验证所有输入列长度一致
         for col in &columns {
             if col.len() != num_rows {
-                return Err(crate::common::error::HybridDbError::Internal(
+                return Err(crate::common::error::EngramDbError::Internal(
                     "insert_columns: all columns must have the same length".into()
                 ));
             }

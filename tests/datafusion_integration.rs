@@ -1,6 +1,6 @@
 //! DataFusion 集成测试
 //!
-//! 验证 SQL → DataFusion → HybridDB TableProvider → 存储引擎 的完整链路
+//! 验证 SQL → DataFusion → EngramDB TableProvider → 存储引擎 的完整链路
 //
 // 仅在启用 `datafusion` feature 时编译运行：
 //   cargo test --features datafusion --test datafusion_integration
@@ -12,13 +12,13 @@ use std::sync::Arc;
 use datafusion::prelude::*;
 use datafusion::arrow::util::pretty::print_batches;
 
-use hybriddb::datafusion_ext::catalog::HybridDBSchema;
-use hybriddb::datafusion_ext::table_provider::HybridDBTable;
-use hybriddb::common::types::DataType;
-use hybriddb::Value;
+use engramdb::datafusion_ext::catalog::EngramDBSchema;
+use engramdb::datafusion_ext::table_provider::EngramDBTable;
+use engramdb::common::types::DataType;
+use engramdb::Value;
 
 /// 创建测试表
-fn create_test_table() -> HybridDBTable {
+fn create_test_table() -> EngramDBTable {
     let columns = vec![
         ("id".to_string(), DataType::Int64, false),
         ("name".to_string(), DataType::Varchar, true),
@@ -39,7 +39,7 @@ fn create_test_table() -> HybridDBTable {
         ]);
     }
 
-    HybridDBTable::new("users".to_string(), columns, rows)
+    EngramDBTable::new("users".to_string(), columns, rows)
 }
 
 #[tokio::test]
@@ -166,29 +166,29 @@ fn create_context() -> SessionContext {
 
     // 注册测试表
     let table = create_test_table();
-    let schema = HybridDBSchema::new();
+    let schema = EngramDBSchema::new();
     schema.register_table("users".to_string(), table);
 
-    ctx.register_catalog("hybriddb", Arc::new(HybridDBCatalog::from_schema(schema)));
-    ctx.sql("USE hybriddb.public").unwrap(); // 切换到默认 schema
+    ctx.register_catalog("engramdb", Arc::new(EngramDBCatalog::from_schema(schema)));
+    ctx.sql("USE engramdb.public").unwrap(); // 切换到默认 schema
 
     ctx
 }
 
 /// 辅助: 从 Schema 构建 Catalog
-struct HybridDBCatalog {
-    schema: Arc<HybridDBSchema>,
+struct EngramDBCatalog {
+    schema: Arc<EngramDBSchema>,
 }
 
-impl HybridDBCatalog {
-    fn from_schema(schema: HybridDBSchema) -> Self {
+impl EngramDBCatalog {
+    fn from_schema(schema: EngramDBSchema) -> Self {
         Self {
             schema: Arc::new(schema),
         }
     }
 }
 
-impl datafusion::catalog::CatalogProvider for HybridDBCatalog {
+impl datafusion::catalog::CatalogProvider for EngramDBCatalog {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

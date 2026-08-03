@@ -62,7 +62,7 @@ pub fn optimize_join_order(
     let n = relations.len();
 
     if n == 0 {
-        return Err(crate::common::error::HybridDbError::Parse(
+        return Err(crate::common::error::EngramDbError::Parse(
             "Cannot optimize join order with 0 relations".into()
         ));
     }

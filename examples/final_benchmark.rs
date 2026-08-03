@@ -5,10 +5,10 @@
 //! 3. 压缩/解压速度
 //! 4. 读取性能（压缩 vs 未压缩）
 
-use hybriddb::Connection;
-use hybriddb::storage::{Database, column_store::CompressionStats};
-use hybriddb::common::types::{TableDef, ColumnDef, DataType};
-use hybriddb::Value;
+use engramdb::Connection;
+use engramdb::storage::{Database, column_store::CompressionStats};
+use engramdb::common::types::{TableDef, ColumnDef, DataType};
+use engramdb::Value;
 use std::time::Instant;
 use rand::Rng;
 use rand::SeedableRng;
@@ -48,7 +48,7 @@ fn bench_write_performance(n_rows: usize) {
     println!();
 
     let batch_size = 1000;
-    let db_path = "/tmp/hybriddb_write_bench.db";
+    let db_path = "/tmp/engramdb_write_bench.db";
 
     // --- SQL 接口写入（优化后） ---
     let _ = std::fs::remove_file(db_path);
@@ -105,7 +105,7 @@ fn bench_compression_ratio(n_rows: usize) {
     println!("数据量: {} 行/列", n_rows);
     println!();
 
-    let db_path = "/tmp/hybriddb_comp_bench.db";
+    let db_path = "/tmp/engramdb_comp_bench.db";
     let _ = std::fs::remove_file(db_path);
     let mut db = Database::open(db_path).unwrap();
     db.create_table(TableDef::new(0, "t1", vec![
@@ -141,7 +141,7 @@ fn bench_compression_ratio(n_rows: usize) {
              "列名", "原始", "压缩后", "占比", "算法");
     println!("  {}", "-".repeat(70));
 
-    use hybriddb::storage::compression;
+    use engramdb::storage::compression;
 
     // id 列 (Int32 自增)
     let id_values: Vec<u8> = (0..n_rows as i32).flat_map(|v| v.to_le_bytes()).collect();
@@ -188,7 +188,7 @@ fn bench_decompression_speed(n_rows: usize) {
     println!("═══ 3. 解压速度 & 读取性能 ═══");
     println!();
 
-    let db_path = "/tmp/hybriddb_decomp_bench.db";
+    let db_path = "/tmp/engramdb_decomp_bench.db";
     let _ = std::fs::remove_file(db_path);
     let mut db = Database::open(db_path).unwrap();
     db.create_table(TableDef::new(0, "t1", vec![
@@ -250,12 +250,12 @@ fn bench_decompression_speed(n_rows: usize) {
 // ============================================================================
 fn bench_engine_comparison(n_rows: usize) {
     println!("═══ 4. 三引擎文件大小对比 ═══");
-    println!("(SQLite vs DuckDB vs HybridDB 列式压缩)");
+    println!("(SQLite vs DuckDB vs EngramDB 列式压缩)");
     println!();
 
     // 注意：SQLite 和 DuckDB 的对比由 Python 脚本完成
-    // 这里只输出 HybridDB 的数据供参考
-    let db_path = "/tmp/hybriddb_engine_bench.db";
+    // 这里只输出 EngramDB 的数据供参考
+    let db_path = "/tmp/engramdb_engine_bench.db";
     let _ = std::fs::remove_file(db_path);
     let mut db = Database::open(db_path).unwrap();
     db.create_table(TableDef::new(0, "t1", vec![
@@ -271,7 +271,7 @@ fn bench_engine_comparison(n_rows: usize) {
     table.compact_delta().unwrap();
     let stats = table.column_store.compress_all().unwrap();
 
-    println!("  HybridDB 列式压缩数据大小: {}", fmt_bytes(stats.total_compressed));
+    println!("  EngramDB 列式压缩数据大小: {}", fmt_bytes(stats.total_compressed));
     println!("  压缩比: {:.2}x", stats.ratio());
     println!();
     println!("  注：完整三引擎对比见 Python 脚本输出");
@@ -286,7 +286,7 @@ fn main() {
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║     HybridDB 写入性能优化 + 压缩对比 综合基准测试              ║");
+    println!("║     EngramDB 写入性能优化 + 压缩对比 综合基准测试              ║");
     println!("║     数据规模: {} 行 × 4 列                                     ║", n_rows);
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();

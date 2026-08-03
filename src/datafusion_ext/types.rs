@@ -1,11 +1,11 @@
-//! 类型转换：HybridDB 类型 ↔ Arrow 类型 ↔ DataFusion 类型
+//! 类型转换：EngramDB 类型 ↔ Arrow 类型 ↔ DataFusion 类型
 
 use crate::common::types::DataType;
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::datatypes::Field;
 use datafusion_common::Result as DfResult;
 
-/// HybridDB DataType → Arrow DataType
+/// EngramDB DataType → Arrow DataType
 pub fn to_arrow_type(dt: &DataType) -> ArrowDataType {
     match dt {
         DataType::Boolean => ArrowDataType::Boolean,
@@ -26,7 +26,7 @@ pub fn to_arrow_type(dt: &DataType) -> ArrowDataType {
     }
 }
 
-/// Arrow DataType → HybridDB DataType
+/// Arrow DataType → EngramDB DataType
 pub fn from_arrow_type(at: &ArrowDataType) -> Option<DataType> {
     match at {
         ArrowDataType::Boolean => Some(DataType::Boolean),
@@ -52,7 +52,7 @@ pub fn make_field(name: &str, dt: &DataType, nullable: bool) -> Field {
     Field::new(name, to_arrow_type(dt), nullable)
 }
 
-/// 将 HybridDB 列定义转为 Arrow Schema
+/// 将 EngramDB 列定义转为 Arrow Schema
 pub fn columns_to_schema(
     columns: &[(String, DataType, bool)],
 ) -> arrow::datatypes::Schema {

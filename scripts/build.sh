@@ -1,9 +1,9 @@
 #!/bin/bash
-# HybridDB 构建脚本
+# EngramDB 构建脚本
 
 set -e
 
-echo "=== HybridDB 构建脚本 ==="
+echo "=== EngramDB 构建脚本 ==="
 echo ""
 
 # 检查 Rust
@@ -29,13 +29,13 @@ if [ "$MODE" = "release" ]; then
     cargo build --release
     echo ""
     echo "✓ 构建完成!"
-    echo "二进制文件: target/release/hybriddb"
+    echo "二进制文件: target/release/engramdb"
 else
     echo "正在构建 Debug 版本..."
     cargo build
     echo ""
     echo "✓ 构建完成!"
-    echo "二进制文件: target/debug/hybriddb"
+    echo "二进制文件: target/debug/engramdb"
 fi
 
 echo ""

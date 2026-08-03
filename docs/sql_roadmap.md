@@ -1,7 +1,7 @@
-# HybridDB SQL 完整支持路线图
+# EngramDB SQL 完整支持路线图
 
 > 目标：从当前 MVP 级 SQL 能力，演进为支持标准 SQL 的嵌入式分析型数据库引擎
-> 定位：SQLite 兼容度优先 + DuckDB 级分析能力 + HybridDB 专属压缩/索引优化
+> 定位：SQLite 兼容度优先 + DuckDB 级分析能力 + EngramDB 专属压缩/索引优化
 
 ---
 
@@ -277,9 +277,9 @@
 ### 5.1 解析器：sqlparser-rs 集成策略
 
 ```
-sqlparser-rs AST → 转换层 → HybridDB 内部 AST → Planner
+sqlparser-rs AST → 转换层 → EngramDB 内部 AST → Planner
                     ↑
-              方言扩展点（HybridDB 特有语法）
+              方言扩展点（EngramDB 特有语法）
 ```
 
 - 不直接使用 sqlparser-rs 的 AST 贯穿全链路
@@ -348,4 +348,4 @@ DataChunk: 一批行（默认 1024 行），列式存储
 
 ---
 
-*文档版本：v1.0 · 2026-08-01 · 基于 HybridDB v0.7.6 现状规划*
+*文档版本：v1.0 · 2026-08-01 · 基于 EngramDB v0.7.6 现状规划*

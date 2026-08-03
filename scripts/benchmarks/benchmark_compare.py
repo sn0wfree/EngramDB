@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-HybridDB vs SQLite vs DuckDB 对比基准测试
+EngramDB vs SQLite vs DuckDB 对比基准测试
 
 说明：
 - SQLite: Python 内置 sqlite3（C 实现，行存 B+Tree）
 - DuckDB: duckdb Python 包（C++ 实现，列存 + 向量化）
-- HybridDB: Python 模拟版（列存 + MinMax 跳过索引 + SelectionVector + 两阶段聚合）
+- EngramDB: Python 模拟版（列存 + MinMax 跳过索引 + SelectionVector + 两阶段聚合）
 
 ⚠️ 重要提示：
-  HybridDB 是 Python 模拟版，仅用于验证架构设计的性能趋势。
+  EngramDB 是 Python 模拟版，仅用于验证架构设计的性能趋势。
   真正的 Rust 实现性能会远高于 Python 模拟版（预计 10-50x）。
   本测试的意义是验证"列存 + 跳过索引"等架构选择是否正确，
   而非对比最终产品级性能。
@@ -33,7 +33,7 @@ from typing import List, Any, Optional, Tuple
 random.seed(42)
 
 # ============================================================
-# HybridDB Python 模拟版
+# EngramDB Python 模拟版
 # ============================================================
 
 @dataclass
@@ -60,9 +60,9 @@ class ColumnChunk:
         self.values.append(val)
 
 
-class HybridDBPy:
+class EngramDBPy:
     """
-    HybridDB Python 模拟版
+    EngramDB Python 模拟版
     - 列存主存储（Row Group）
     - MinMax 数据跳过索引
     - SelectionVector 零拷贝过滤
@@ -343,17 +343,17 @@ def benchmark_write(n_rows: int) -> dict:
     results['duckdb_size'] = size_duckdb
     print(f" {t_duckdb:.1f} ms ({n_rows/(t_duckdb/1000):,.0f} 行/秒)")
 
-    # HybridDB (Python 模拟)
-    print("  HybridDB (Python模拟) 写入...", end="", flush=True)
-    hdb = HybridDBPy()
+    # EngramDB (Python 模拟)
+    print("  EngramDB (Python模拟) 写入...", end="", flush=True)
+    hdb = EngramDBPy()
     hdb.create_table(SCHEMA_HDB)
 
     t0 = time.time()
     hdb.insert_rows(data)
     t_hdb = (time.time() - t0) * 1000
     size_hdb = hdb.estimated_size_bytes()
-    results['hybriddb'] = {'time_ms': t_hdb, 'rows_per_sec': n_rows / (t_hdb / 1000)}
-    results['hybriddb_size'] = size_hdb
+    results['engramdb'] = {'time_ms': t_hdb, 'rows_per_sec': n_rows / (t_hdb / 1000)}
+    results['engramdb_size'] = size_hdb
     print(f" {t_hdb:.1f} ms ({n_rows/(t_hdb/1000):,.0f} 行/秒)")
 
     return results
@@ -388,7 +388,7 @@ def benchmark_scan_aggregate(n_rows: int) -> dict:
         FROM read_csv_auto('{csv_path2}', header=false)
     """)
     os.unlink(csv_path2)
-    hdb = HybridDBPy()
+    hdb = EngramDBPy()
     hdb.create_table(SCHEMA_HDB)
     hdb.insert_rows(data)
 
@@ -412,12 +412,12 @@ def benchmark_scan_aggregate(n_rows: int) -> dict:
     results['duckdb_sum'] = t_duckdb
     print(f" {t_duckdb:.2f} ms (结果: {val_duckdb:.2f})")
 
-    # HybridDB
-    print("    HybridDB (Python模拟)...", end="", flush=True)
+    # EngramDB
+    print("    EngramDB (Python模拟)...", end="", flush=True)
     t0 = time.time()
     val_hdb = hdb.scan_aggregate(4, 'sum')
     t_hdb = (time.time() - t0) * 1000
-    results['hybriddb_sum'] = t_hdb
+    results['engramdb_sum'] = t_hdb
     print(f" {t_hdb:.2f} ms (结果: {val_hdb:.2f})")
 
     # 测试聚合：COUNT + AVG + MIN + MAX
@@ -438,8 +438,8 @@ def benchmark_scan_aggregate(n_rows: int) -> dict:
 
         results[f'sqlite_{agg}'] = t_s
         results[f'duckdb_{agg}'] = t_d
-        results[f'hybriddb_{agg}'] = t_h
-        print(f"    SQLite: {t_s:.2f} ms | DuckDB: {t_d:.2f} ms | HybridDB: {t_h:.2f} ms")
+        results[f'engramdb_{agg}'] = t_h
+        print(f"    SQLite: {t_s:.2f} ms | DuckDB: {t_d:.2f} ms | EngramDB: {t_h:.2f} ms")
 
     conn.close()
     dcon.close()
@@ -472,7 +472,7 @@ def benchmark_filter(n_rows: int) -> dict:
     dcon.execute("CREATE TABLE t (id INTEGER, val DOUBLE, category INTEGER, name VARCHAR, score DOUBLE)")
     dcon.executemany("INSERT INTO t VALUES (?,?,?,?,?)", data)
 
-    hdb = HybridDBPy()
+    hdb = EngramDBPy()
     hdb.create_table(SCHEMA_HDB)
     hdb.insert_rows(data)
 
@@ -502,8 +502,8 @@ def benchmark_filter(n_rows: int) -> dict:
         t_d = (time.time() - t0) * 1000
         print(f" {t_d:.2f} ms (命中 {len(rows_d)} 行)")
 
-        # HybridDB
-        print("    HybridDB (Python模拟)...", end="", flush=True)
+        # EngramDB
+        print("    EngramDB (Python模拟)...", end="", flush=True)
         t0 = time.time()
         rows_h = hdb.filter_scan(4, op, val, [0, 1, 2, 3, 4])
         t_h = (time.time() - t0) * 1000
@@ -512,7 +512,7 @@ def benchmark_filter(n_rows: int) -> dict:
         key = label.split()[0]
         results[f'sqlite_{key}'] = t_s
         results[f'duckdb_{key}'] = t_d
-        results[f'hybriddb_{key}'] = t_h
+        results[f'engramdb_{key}'] = t_h
         results[f'rows_{key}'] = len(rows_h)
 
     conn.close()
@@ -532,11 +532,11 @@ def main():
 
     print()
     print("╔" + "═" * 68 + "╗")
-    print("║  HybridDB vs SQLite vs DuckDB 对比基准测试              ║")
+    print("║  EngramDB vs SQLite vs DuckDB 对比基准测试              ║")
     print("║  数据量: {:,} 行 | 列数: 5 (INT/DOUBLE/INT/VARCHAR/DOUBLE)      ║".format(N_ROWS))
     print("╚" + "═" * 68 + "╝")
     print()
-    print("⚠️  HybridDB 为 Python 模拟版，仅验证架构趋势")
+    print("⚠️  EngramDB 为 Python 模拟版，仅验证架构趋势")
     print("    Rust 实现性能预计为 Python 版的 10-50x")
     print()
 
@@ -572,7 +572,7 @@ def main():
     print(f"  {'-'*25} {'-'*12} {'-'*15} {'-'*12}")
     for db, label in [('sqlite', 'SQLite (C, 行存)'),
                        ('duckdb', 'DuckDB (C++, 列存)'),
-                       ('hybriddb', 'HybridDB (Python, 列存)')]:
+                       ('engramdb', 'EngramDB (Python, 列存)')]:
         t = write_results[db]['time_ms']
         rps = write_results[db]['rows_per_sec']
         ratio = t / write_results['sqlite']['time_ms']
@@ -583,7 +583,7 @@ def main():
     print(f"  {'数据库':<25} {'大小(KB)':<12} {'压缩比':<12}")
     print(f"  {'-'*25} {'-'*12} {'-'*12}")
     raw_size = N_ROWS * (4 + 8 + 4 + 20 + 8)  # 原始数据估算
-    for db, label in [('sqlite', 'SQLite'), ('duckdb', 'DuckDB'), ('hybriddb', 'HybridDB (估算)')]:
+    for db, label in [('sqlite', 'SQLite'), ('duckdb', 'DuckDB'), ('engramdb', 'EngramDB (估算)')]:
         size = write_results[f'{db}_size']
         ratio = raw_size / size
         print(f"  {label:<25} {size/1024:<12.1f} {ratio:<12.2f}x")
@@ -592,19 +592,19 @@ def main():
     print("【全表扫描聚合 - SUM】")
     print(f"  {'数据库':<25} {'时间(ms)':<12} {'相对SQLite':<12}")
     print(f"  {'-'*25} {'-'*12} {'-'*12}")
-    for db, label in [('sqlite', 'SQLite'), ('duckdb', 'DuckDB'), ('hybriddb', 'HybridDB (Py)')]:
+    for db, label in [('sqlite', 'SQLite'), ('duckdb', 'DuckDB'), ('engramdb', 'EngramDB (Py)')]:
         t = agg_results[f'{db}_sum']
         ratio = agg_results['sqlite_sum'] / t
         print(f"  {label:<25} {t:<12.2f} {ratio:<12.2f}x")
 
     print()
     print("【条件查询性能】")
-    print(f"  {'选择性':<15} {'SQLite(ms)':<14} {'DuckDB(ms)':<14} {'HybridDB(ms)':<16}")
+    print(f"  {'选择性':<15} {'SQLite(ms)':<14} {'DuckDB(ms)':<14} {'EngramDB(ms)':<16}")
     print(f"  {'-'*15} {'-'*14} {'-'*14} {'-'*16}")
     for sel in ['高选择性', '中选择性', '低选择性', '极低选择性']:
         t_s = filter_results[f'sqlite_{sel}']
         t_d = filter_results[f'duckdb_{sel}']
-        t_h = filter_results[f'hybriddb_{sel}']
+        t_h = filter_results[f'engramdb_{sel}']
         n = filter_results[f'rows_{sel}']
         print(f"  {sel:<15} {t_s:<14.2f} {t_d:<14.2f} {t_h:<16.2f}")
 
@@ -616,14 +616,14 @@ def main():
     print("1. 写入性能：")
     print("   - SQLite 行存写入最快（成熟 C 实现 + B+Tree 批量）")
     print("   - DuckDB 列存写入次之（需要构建 Row Group + 压缩）")
-    print("   - HybridDB Python 版受语言限制，Rust 实现应接近 DuckDB")
+    print("   - EngramDB Python 版受语言限制，Rust 实现应接近 DuckDB")
     print()
     print("2. 分析查询（全表扫描 + 聚合）：")
-    print("   - 列存（DuckDB / HybridDB）显著优于行存（SQLite）")
+    print("   - 列存（DuckDB / EngramDB）显著优于行存（SQLite）")
     print("   - 核心原因：列存只需读目标列，行存需读所有列")
     print()
     print("3. 条件查询（低选择性）：")
-    print("   - HybridDB 的 MinMax 跳过索引 + PREWHERE 在低选择性下优势明显")
+    print("   - EngramDB 的 MinMax 跳过索引 + PREWHERE 在低选择性下优势明显")
     print("   - 选择性越低，跳过索引收益越大")
     print()
     print("4. 存储占用：")

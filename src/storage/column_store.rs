@@ -475,7 +475,7 @@ impl ColumnStore {
 
         for _ in 0..rg_count {
             if offset + 8 > data.len() {
-                return Err(crate::common::error::HybridDbError::InvalidFormat(
+                return Err(crate::common::error::EngramDbError::InvalidFormat(
                     "truncated row group header".into(),
                 ));
             }
@@ -487,7 +487,7 @@ impl ColumnStore {
             let mut columns = Vec::with_capacity(column_count);
             for _ in 0..column_count {
                 if offset + 10 > data.len() {
-                    return Err(crate::common::error::HybridDbError::InvalidFormat(
+                    return Err(crate::common::error::EngramDbError::InvalidFormat(
                         "truncated column header".into(),
                     ));
                 }
@@ -503,7 +503,7 @@ impl ColumnStore {
                 let values_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
                 if offset + values_len > data.len() {
-                    return Err(crate::common::error::HybridDbError::InvalidFormat(
+                    return Err(crate::common::error::EngramDbError::InvalidFormat(
                         "truncated column values".into(),
                     ));
                 }

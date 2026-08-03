@@ -1,6 +1,6 @@
-# HybridDB SQL 策略：复用成熟方案，聚焦执行器
+# EngramDB SQL 策略：复用成熟方案，聚焦执行器
 
-> 核心决策：解析器 + 优化器直接用 DataFusion 生态，HybridDB 专注存储层 + 执行层差异化
+> 核心决策：解析器 + 优化器直接用 DataFusion 生态，EngramDB 专注存储层 + 执行层差异化
 
 ---
 
@@ -13,7 +13,7 @@
 | SQL 解析器 | 极高（语法边界多、兼容性要求高） | sqlparser-rs 已被业界广泛验证 | 几乎为零 |
 | 查询优化器 | 极高（规则多、成本模型复杂、统计信息体系庞大） | DataFusion 优化器已生产可用 | 低（通用优化各数据库差异不大） |
 | **执行器** | 中 | 各数据库差异巨大 | **高（与存储层深度结合是核心竞争力）** |
-| **存储引擎** | 高 | — | **最高（压缩/索引是 HybridDB 立身之本）** |
+| **存储引擎** | 高 | — | **最高（压缩/索引是 EngramDB 立身之本）** |
 
 **结论：解析器和优化器用现成的，把 80% 精力砸在执行器 + 存储层对接上。**
 
@@ -34,7 +34,7 @@
 │  │  PhysicalPlan 生成                                │   │
 │  └───────────────────────────────────────────────────┘   │
 ├──────────────────────────────────────────────────────────┤
-│  HybridDB 扩展层（我们的工作重点）                        │
+│  EngramDB 扩展层（我们的工作重点）                        │
 │  ┌─────────────────┐  ┌──────────────────────────────┐  │
 │  │ TableProvider   │  │ 自定义物理算子                │  │
 │  │ (存储层对接)    │  │ - IndexScan (跳表/位图/布隆)  │  │
@@ -49,7 +49,7 @@
 │                       │ - 布隆过滤器下推             │  │
 │                       └──────────────────────────────┘  │
 ├──────────────────────────────────────────────────────────┤
-│  HybridDB 存储引擎（已有）                                │
+│  EngramDB 存储引擎（已有）                                │
 │  列存 + 分类型压缩 + 多维度索引 + MVCC + WAL             │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -59,7 +59,7 @@
 | 优势 | 说明 |
 |------|------|
 | **Apache 顶级项目** | 生产级质量，社区活跃（Arrow 生态核心） |
-| **Rust 原生** | 与 HybridDB 技术栈完全一致，零 FFI 开销 |
+| **Rust 原生** | 与 EngramDB 技术栈完全一致，零 FFI 开销 |
 | **高度可扩展** | TableProvider / PhysicalExpr / OptimizerRule 等 trait 均可自定义 |
 | **向量化执行** | 基于 Arrow 的向量化执行引擎，性能优秀 |
 | **SQL 覆盖完整** | 支持标准 SQL + 扩展方言，JOIN/子查询/CTE/窗口函数全有 |
@@ -77,7 +77,7 @@ datafusion = { version = "42", default-features = false, features = [
     "unicode_expressions",  # 字符串函数
 ] }
 # 不需要的 feature 全部关掉:
-# - avro / json / parquet 等外部格式（HybridDB 自己的格式）
+# - avro / json / parquet 等外部格式（EngramDB 自己的格式）
 # - jit（编译体积太大，后期再加）
 # - pyarrow / python（不需要 Python 绑定）
 ```
@@ -96,7 +96,7 @@ datafusion = { version = "42", default-features = false, features = [
 
 ```
 传统方式:  压缩块 → 完整解压 → 扫描过滤 → 结果
-HybridDB:  压缩块 → 部分解压(只需的列) → 向量化过滤 → 结果
+EngramDB:  压缩块 → 部分解压(只需的列) → 向量化过滤 → 结果
                     ↑
               只解压需要的列 + 跳过整块（粗粒度索引）
 ```
@@ -193,7 +193,7 @@ SELECT * FROM items ORDER BY embedding <-> query_vector LIMIT 10
 
 ### Phase 1：DataFusion 集成 + 基础打通（v0.8.0）
 
-**目标**：跑通 SQL → DataFusion → HybridDB 存储的完整链路
+**目标**：跑通 SQL → DataFusion → EngramDB 存储的完整链路
 
 1. **集成 DataFusion**
    - 引入 datafusion 依赖（最小 feature 集）
@@ -220,7 +220,7 @@ SELECT * FROM items ORDER BY embedding <-> query_vector LIMIT 10
 
 ### Phase 2：索引下推 + 性能优化（v0.8.x）
 
-**目标**：把 HybridDB 的索引能力全部暴露给查询引擎
+**目标**：把 EngramDB 的索引能力全部暴露给查询引擎
 
 1. **跳表索引下推**
    - 自定义 OptimizerRule：Filter + TableScan → IndexScan

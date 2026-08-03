@@ -5,7 +5,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-echo "=== HybridDB 快速体验 ==="
+echo "=== EngramDB 快速体验 ==="
 echo ""
 
 if ! command -v cargo &> /dev/null; then

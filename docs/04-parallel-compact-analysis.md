@@ -2,7 +2,7 @@
 
 **版本**: v0.11.2  
 **日期**: 2026-08-02  
-**范围**: HybridDB 列存引擎 Delta→ColumnStore 合并调度策略
+**范围**: EngramDB 列存引擎 Delta→ColumnStore 合并调度策略
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1.1 Compact 是什么
 
-在 HybridDB 的 LSM-tuple 架构中，写入分为两层：
+在 EngramDB 的 LSM-tuple 架构中，写入分为两层：
 
 - **DeltaStore**：内存列式缓冲，吸收随机写入，低延迟
 - **ColumnStore**：磁盘列存主存储，按 Row Group 组织，支持压缩和索引
@@ -22,7 +22,7 @@
 
 ### 1.2 为什么需要"并行"
 
-在传统 LSM-Tree 数据库（如 LevelDB、RocksDB）中，Compaction 由后台线程异步执行，前台写入不受影响。但 HybridDB 是**单文件嵌入式数据库**，架构约束完全不同：
+在传统 LSM-Tree 数据库（如 LevelDB、RocksDB）中，Compaction 由后台线程异步执行，前台写入不受影响。但 EngramDB 是**单文件嵌入式数据库**，架构约束完全不同：
 
 - **单线程模型**：嵌入式库，没有后台线程池
 - **单文件 I/O**：所有数据在一个文件中，不存在多文件并行写入的可能
@@ -70,7 +70,7 @@
 
 ### 3.1 当前实现
 
-当前 HybridDB 的 compact 触发策略：
+当前 EngramDB 的 compact 触发策略：
 
 ```rust
 // 在 Table::insert 中
@@ -210,7 +210,7 @@ if self.delta_store.len() >= self.def.row_count as usize + 10000 {
 - 写入路径多了一次阈值检查（开销极小）
 - 小批量写入场景下总合并次数更多
 
-**适用场景**：通用场景，HybridDB 的推荐方案
+**适用场景**：通用场景，EngramDB 的推荐方案
 
 ---
 

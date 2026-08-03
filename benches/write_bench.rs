@@ -7,13 +7,13 @@
 //! - large_batch: 大批量直接列式路径（P1 优化）
 //! - compact: Delta→列存合并速度（P4 优化）
 
-use hybriddb::{Connection, Value};
+use engramdb::{Connection, Value};
 use std::time::Instant;
 
 const TABLE_SQL: &str = "CREATE TABLE bench (id INT, name VARCHAR, age INT, score DOUBLE, active BOOLEAN)";
 
 fn main() {
-    println!("=== HybridDB v0.11.1 写入性能基准测试 ===\n");
+    println!("=== EngramDB v0.11.1 写入性能基准测试 ===\n");
 
     // 测试 1: 单条 INSERT（baseline）
     bench_single_insert(1_000);

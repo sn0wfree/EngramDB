@@ -3,7 +3,7 @@
 //! 将 AST 转换为物理执行计划。
 //! 计划树结构：TableScan -> Filter -> Aggregate -> Projection -> OrderBy -> Limit
 
-use crate::common::error::{HybridDbError, Result};
+use crate::common::error::{EngramDbError, Result};
 use crate::storage::Database;
 use crate::Value;
 use log::trace;
@@ -65,13 +65,13 @@ fn plan_create_table(stmt: CreateTableStmt) -> Result<PhysicalPlan> {
 fn plan_create_index(stmt: CreateIndexStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
     let table = db.get_table(&stmt.table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(stmt.table_name.clone()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     // 解析键列 → 列索引
     let mut key_cols = Vec::with_capacity(stmt.key_columns.len());
     for col_name in &stmt.key_columns {
         let idx = table.def.column_index(col_name)
-            .ok_or_else(|| HybridDbError::ColumnNotFound(format!(
+            .ok_or_else(|| EngramDbError::ColumnNotFound(format!(
                 "index key column '{}' not found in table '{}'", col_name, stmt.table_name
             )))?;
         key_cols.push(idx);
@@ -81,12 +81,12 @@ fn plan_create_index(stmt: CreateIndexStmt, db: &Database) -> Result<PhysicalPla
     let mut included_cols = Vec::with_capacity(stmt.included_columns.len());
     for col_name in &stmt.included_columns {
         let idx = table.def.column_index(col_name)
-            .ok_or_else(|| HybridDbError::ColumnNotFound(format!(
+            .ok_or_else(|| EngramDbError::ColumnNotFound(format!(
                 "included column '{}' not found in table '{}'", col_name, stmt.table_name
             )))?;
         // 覆盖列不能同时是键列
         if key_cols.contains(&idx) {
-            return Err(HybridDbError::Parse(format!(
+            return Err(EngramDbError::Parse(format!(
                 "column '{}' cannot be both key and included in index '{}'",
                 col_name, stmt.index_name
             )));
@@ -107,7 +107,7 @@ fn plan_create_index(stmt: CreateIndexStmt, db: &Database) -> Result<PhysicalPla
 fn plan_delete(stmt: DeleteStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
     let _table = db.get_table(&stmt.table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(stmt.table_name.clone()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     Ok(PhysicalPlan::Delete {
         table_name: stmt.table_name,
@@ -119,13 +119,13 @@ fn plan_delete(stmt: DeleteStmt, db: &Database) -> Result<PhysicalPlan> {
 fn plan_update(stmt: UpdateStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
     let table = db.get_table(&stmt.table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(stmt.table_name.clone()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     // 解析 SET 子句中的列名 → 列索引
     let mut assignments = Vec::with_capacity(stmt.assignments.len());
     for (col_name, expr) in stmt.assignments {
         let col_idx = table.def.column_index(&col_name)
-            .ok_or_else(|| HybridDbError::ColumnNotFound(format!(
+            .ok_or_else(|| EngramDbError::ColumnNotFound(format!(
                 "update column '{}' not found in table '{}'", col_name, stmt.table_name
             )))?;
         assignments.push((col_idx, expr));
@@ -141,7 +141,7 @@ fn plan_update(stmt: UpdateStmt, db: &Database) -> Result<PhysicalPlan> {
 fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<PhysicalPlan> {
     // 验证表存在
     let table = db.get_table(&stmt.table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(stmt.table_name.clone()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     let num_cols = table.def.columns.len();
     let num_rows = stmt.values.len();
@@ -208,9 +208,9 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                     let table_name = stmt.from
                         .as_ref()
                         .map(|t| t.table_name.clone())
-                        .ok_or_else(|| HybridDbError::Parse("SELECT without FROM not supported".into()))?;
+                        .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
                     let table = db.get_table(&table_name)
-                        .ok_or_else(|| HybridDbError::TableNotFound(table_name.clone()))?;
+                        .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
                     let count = table.row_count() as i64;
                     let output_name = alias.clone().unwrap_or_else(|| "count(*)".to_string());
                     trace!("Perf01: COUNT(*) fast-path for '{}' => {}", table_name, count);
@@ -223,10 +223,10 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     let table_name = stmt.from
         .as_ref()
         .map(|t| t.table_name.clone())
-        .ok_or_else(|| HybridDbError::Parse("SELECT without FROM not supported".into()))?;
+        .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
 
     let table = db.get_table(&table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(table_name.clone()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
 
     // ===== Perf03：主键点查短路（WHERE pk = Literal）=====
     // 条件：
@@ -820,11 +820,11 @@ fn eval_constant_expr(expr: &Expression, params: &[Value]) -> Result<Value> {
         Expression::Placeholder(idx) => {
             params.get(*idx)
                 .cloned()
-                .ok_or_else(|| HybridDbError::Parse(
+                .ok_or_else(|| EngramDbError::Parse(
                     format!("Parameter index {} out of bounds ({} params provided)", idx, params.len())
                 ))
         }
-        _ => Err(HybridDbError::Parse(
+        _ => Err(EngramDbError::Parse(
             "Non-constant expression in VALUES not supported".into()
         )),
     }
@@ -838,7 +838,7 @@ fn eval_constant_expr(expr: &Expression, params: &[Value]) -> Result<Value> {
 fn plan_analyze(stmt: AnalyzeStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
     let table = db.get_table(&stmt.table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(stmt.table_name.clone()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     // 确定要分析的列索引
     let column_indices = if stmt.columns.is_empty() {
@@ -849,7 +849,7 @@ fn plan_analyze(stmt: AnalyzeStmt, db: &Database) -> Result<PhysicalPlan> {
         for col_name in &stmt.columns {
             let idx = table.def.columns.iter()
                 .position(|c| c.name == *col_name)
-                .ok_or_else(|| HybridDbError::Internal(
+                .ok_or_else(|| EngramDbError::Internal(
                     format!("column '{}' not found in table '{}'", col_name, stmt.table_name)
                 ))?;
             indices.push(idx);

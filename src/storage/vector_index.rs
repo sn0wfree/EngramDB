@@ -588,14 +588,14 @@ impl HnswIndex {
     /// 从字节反序列化
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 9 {
-            return Err(crate::common::error::HybridDbError::InvalidFormat(
+            return Err(crate::common::error::EngramDbError::InvalidFormat(
                 "HNSW index data too short".into()
             ));
         }
 
         // magic
         if &data[..9] != b"HNSW_IDX1" {
-            return Err(crate::common::error::HybridDbError::InvalidFormat(
+            return Err(crate::common::error::EngramDbError::InvalidFormat(
                 "invalid HNSW index magic".into()
             ));
         }
@@ -605,7 +605,7 @@ impl HnswIndex {
         // helper functions
         let read_u32 = |data: &[u8], off: &mut usize| -> Result<u32> {
             if *off + 4 > data.len() {
-                return Err(crate::common::error::HybridDbError::InvalidFormat(
+                return Err(crate::common::error::EngramDbError::InvalidFormat(
                     "truncated HNSW index data".into()
                 ));
             }
@@ -616,7 +616,7 @@ impl HnswIndex {
 
         let read_i32 = |data: &[u8], off: &mut usize| -> Result<i32> {
             if *off + 4 > data.len() {
-                return Err(crate::common::error::HybridDbError::InvalidFormat(
+                return Err(crate::common::error::EngramDbError::InvalidFormat(
                     "truncated HNSW index data".into()
                 ));
             }
@@ -627,7 +627,7 @@ impl HnswIndex {
 
         let read_f32 = |data: &[u8], off: &mut usize| -> Result<f32> {
             if *off + 4 > data.len() {
-                return Err(crate::common::error::HybridDbError::InvalidFormat(
+                return Err(crate::common::error::EngramDbError::InvalidFormat(
                     "truncated HNSW index data".into()
                 ));
             }
@@ -645,7 +645,7 @@ impl HnswIndex {
 
         // metric
         if offset + 1 > data.len() {
-            return Err(crate::common::error::HybridDbError::InvalidFormat(
+            return Err(crate::common::error::EngramDbError::InvalidFormat(
                 "truncated HNSW metric byte".into()
             ));
         }
@@ -653,7 +653,7 @@ impl HnswIndex {
             0 => DistanceMetric::L2,
             1 => DistanceMetric::InnerProduct,
             2 => DistanceMetric::Cosine,
-            other => return Err(crate::common::error::HybridDbError::InvalidFormat(
+            other => return Err(crate::common::error::EngramDbError::InvalidFormat(
                 format!("unknown HNSW metric: {}", other)
             )),
         };

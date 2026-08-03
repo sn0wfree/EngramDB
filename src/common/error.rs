@@ -2,10 +2,10 @@
 
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, HybridDbError>;
+pub type Result<T> = std::result::Result<T, EngramDbError>;
 
 #[derive(Error, Debug)]
-pub enum HybridDbError {
+pub enum EngramDbError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -1,4 +1,4 @@
-use hybriddb::Connection;
+use engramdb::Connection;
 use std::time::Instant;
 use rand::Rng;
 use rand::SeedableRng;

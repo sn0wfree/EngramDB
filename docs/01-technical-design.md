@@ -1,4 +1,4 @@
-# HybridDB 技术方案文档
+# EngramDB 技术方案文档
 
 > 高性能压缩、支持事务的关系型单文件数据库
 > 版本：v0.7 (WAL + MVCC 完整 ACID 事务) | 日期：2026-08-01
@@ -216,7 +216,7 @@
 
 | 偏移 | 大小 | 字段 | 说明 |
 |------|------|------|------|
-| 0 | 16 | magic | "HYBRIDDB_FORMAT1\0" |
+| 0 | 16 | magic | "ENGRAMDB_FORMAT1\0" |
 | 16 | 2 | version | 格式版本号 |
 | 18 | 2 | page_size | 页大小（默认 4096） |
 | 20 | 2 | block_size | 块大小（默认 262144 = 256KB） |
@@ -690,7 +690,7 @@ Checkpoint 将 WAL 中的变更合并到主文件：
 ## 9. 模块划分
 
 ```
-hybriddb/
+engramdb/
 ├── src/
 │   ├── main.rs              # CLI 入口
 │   ├── lib.rs               # 库入口

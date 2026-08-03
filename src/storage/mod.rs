@@ -14,7 +14,7 @@ pub mod catalog;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::common::error::{Result, HybridDbError};
+use crate::common::error::{Result, EngramDbError};
 use crate::common::types::TableDef;
 use crate::common::config::Config;
 use crate::txn::TransactionManager;
@@ -41,7 +41,7 @@ impl Database {
             let mut p = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            p.push(format!("hybriddb_mem_{}_{}.hdb", std::process::id(), nanos));
+            p.push(format!("engramdb_mem_{}_{}.hdb", std::process::id(), nanos));
             p.to_string_lossy().to_string()
         } else {
             path.to_string()
@@ -62,7 +62,7 @@ impl Database {
             let mut p = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            p.push(format!("hybriddb_mem_{}_{}.hdb", std::process::id(), nanos));
+            p.push(format!("engramdb_mem_{}_{}.hdb", std::process::id(), nanos));
             p.to_string_lossy().to_string()
         } else {
             path.to_string()
@@ -144,7 +144,7 @@ impl Database {
     /// 创建表
     pub fn create_table(&mut self, table_def: TableDef) -> Result<()> {
         if self.table_names.contains_key(&table_def.name) {
-            return Err(crate::common::error::HybridDbError::ConstraintViolation(
+            return Err(crate::common::error::EngramDbError::ConstraintViolation(
                 format!("Table '{}' already exists", table_def.name)
             ));
         }
@@ -177,7 +177,7 @@ impl Database {
     pub fn create_index(&mut self, table_name: &str, index_name: &str,
                         key_col_idx: usize, included_cols: &[usize], unique: bool) -> Result<()> {
         let table = self.get_table_mut(table_name)
-            .ok_or_else(|| HybridDbError::TableNotFound(table_name.to_string()))?;
+            .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
         table.create_index(index_name, key_col_idx, included_cols, unique)
     }
 
@@ -253,7 +253,7 @@ impl Database {
     /// 相同 key 的行物理上连续，可大幅提升按该列的范围查询性能。
     pub fn set_cluster_key(&mut self, table_name: &str, column_name: &str) -> Result<()> {
         let table = self.get_table_mut(table_name)
-            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         table.set_cluster_key(column_name)
     }
 
@@ -267,11 +267,11 @@ impl Database {
     /// 列必须是 Vector 类型。
     pub fn create_vector_index(&mut self, table_name: &str, index_name: &str, column_name: &str, metric: crate::storage::vector_index::DistanceMetric, m: usize, ef_construction: usize) -> Result<()> {
         let table = self.get_table_mut(table_name)
-            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
         let col_idx = table.def().columns.iter()
             .position(|c| c.name == column_name)
-            .ok_or_else(|| crate::common::error::HybridDbError::ColumnNotFound(column_name.into()))?;
+            .ok_or_else(|| crate::common::error::EngramDbError::ColumnNotFound(column_name.into()))?;
 
         table.create_vector_index(index_name, col_idx, metric, m, ef_construction)
     }
@@ -281,7 +281,7 @@ impl Database {
     /// 返回 top-k 最近邻的行 ID 和距离。
     pub fn vector_search(&self, table_name: &str, index_name: &str, query: &[f32], k: usize) -> Result<Vec<crate::storage::vector_index::Neighbor>> {
         let table = self.get_table(table_name)
-            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         table.vector_search(index_name, query, k)
     }
 
@@ -293,7 +293,7 @@ impl Database {
     /// 设置指定表的合并策略（运行时动态切换）
     pub fn set_table_compact_strategy(&mut self, table_name: &str, strategy: crate::common::config::CompactStrategy) -> Result<()> {
         let table = self.get_table_mut(table_name)
-            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         table.set_compact_strategy(strategy);
         Ok(())
     }
@@ -303,7 +303,7 @@ impl Database {
     /// 返回合并的行数。
     pub fn compact_table(&mut self, table_name: &str) -> Result<u64> {
         let table = self.get_table_mut(table_name)
-            .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         let rows = table.delta_store().len() as u64;
         table.compact_delta()?;
         Ok(rows)
@@ -405,7 +405,7 @@ impl Database {
         self.file.read_exact(&mut data)?;
 
         if data.len() < 4 {
-            return Err(HybridDbError::InvalidFormat("index section too short".into()));
+            return Err(EngramDbError::InvalidFormat("index section too short".into()));
         }
 
         let table_count = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
@@ -414,19 +414,19 @@ impl Database {
 
         for _ in 0..table_count {
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated table id".into()));
+                return Err(EngramDbError::InvalidFormat("truncated table id".into()));
             }
             let table_id = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
             offset += 4;
 
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated table index size".into()));
+                return Err(EngramDbError::InvalidFormat("truncated table index size".into()));
             }
             let index_data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
 
             if offset + index_data_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated table index data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated table index data".into()));
             }
 
             // 加载到对应表
@@ -597,7 +597,7 @@ impl Database {
 
         for _ in 0..table_count {
             if offset + 8 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated data table header".into()));
+                return Err(EngramDbError::InvalidFormat("truncated data table header".into()));
             }
             let table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
@@ -605,7 +605,7 @@ impl Database {
             offset += 4;
 
             if offset + data_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated data table body".into()));
+                return Err(EngramDbError::InvalidFormat("truncated data table body".into()));
             }
 
             if let Some(table) = self.tables.get_mut(&table_id) {
@@ -676,7 +676,7 @@ mod tests {
             .replace([':', ' '], "_");
         // 追加 ThreadId：同进程并发跑多个测试线程时，用 PID 区分跨进程，
         // 用 tid 区分跨线程（Rust 默认 --test-threads > 1 多线程跑）
-        p.push(format!("hybriddb_{}_{}_{}.hdb", suffix, std::process::id(), tid));
+        p.push(format!("engramdb_{}_{}_{}.hdb", suffix, std::process::id(), tid));
         p.to_string_lossy().to_string()
     }
     fn cleanup_db(path: &str) {
@@ -1010,7 +1010,7 @@ mod tests {
         let result = db.vector_search("t1", "no_such_index", &query, 5);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(),
-            crate::common::error::HybridDbError::IndexNotFound(_)));
+            crate::common::error::EngramDbError::IndexNotFound(_)));
 
         cleanup_db(&path);
     }

@@ -1,4 +1,4 @@
-//! HybridDB TableProvider for DataFusion
+//! EngramDB TableProvider for DataFusion
 //!
 //! 实现 DataFusion 的 TableProvider trait，将存储引擎的数据暴露给查询引擎。
 //!
@@ -26,8 +26,8 @@ use crate::Value;
 
 use super::types::{columns_to_schema, to_arrow_type};
 
-/// HybridDB 表的 DataFusion TableProvider
-pub struct HybridDBTable {
+/// EngramDB 表的 DataFusion TableProvider
+pub struct EngramDBTable {
     table_name: String,
     schema: SchemaRef,
     /// 表数据的引用 (Arc<Table> 由 Catalog 持有)
@@ -43,7 +43,7 @@ pub struct TableRef {
     pub rows: Vec<Vec<Value>>,
 }
 
-impl HybridDBTable {
+impl EngramDBTable {
     pub fn new(table_name: String, columns: Vec<(String, DataType, bool)>, rows: Vec<Vec<Value>>) -> Self {
         let schema = Arc::new(columns_to_schema(&columns));
         let table = Arc::new(TableRef {
@@ -99,7 +99,7 @@ impl HybridDBTable {
     }
 }
 
-impl datafusion::catalog::TableProvider for HybridDBTable {
+impl datafusion::catalog::TableProvider for EngramDBTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -171,7 +171,7 @@ fn new_empty_array(dt: &DataType) -> ArrayRef {
     }
 }
 
-/// 将 HybridDB Value 列转为 Arrow Array
+/// 将 EngramDB Value 列转为 Arrow Array
 fn values_to_array(
     dt: &DataType,
     rows: &[Vec<Value>],
@@ -262,7 +262,7 @@ mod tests {
     use super::*;
     use crate::common::types::DataType;
 
-    fn make_test_table() -> HybridDBTable {
+    fn make_test_table() -> EngramDBTable {
         let columns = vec![
             ("id".to_string(), DataType::Int64, false),
             ("name".to_string(), DataType::Varchar, true),
@@ -274,7 +274,7 @@ mod tests {
             vec![Value::Int64(2), Value::Varchar("bob".into()), Value::Float64(87.0), Value::Boolean(true)],
             vec![Value::Int64(3), Value::Null, Value::Float64(72.3), Value::Boolean(false)],
         ];
-        HybridDBTable::new("test".to_string(), columns, rows)
+        EngramDBTable::new("test".to_string(), columns, rows)
     }
 
     #[test]

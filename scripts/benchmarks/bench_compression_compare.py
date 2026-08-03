@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 三引擎压缩率/文件大小对比
-HybridDB vs SQLite vs DuckDB
+EngramDB vs SQLite vs DuckDB
 100k 行 × 4 列 (id INT, category INT, value DOUBLE, name VARCHAR)
 """
 
@@ -129,9 +129,9 @@ def bench_duckdb(rows):
         "file_size": total_size,
     }
 
-def bench_hybriddb(rows):
-    """HybridDB 写入 + 文件大小（通过 Rust binary）"""
-    # 这里我们用 Python 估算 HybridDB 的内存数据大小
+def bench_engramdb(rows):
+    """EngramDB 写入 + 文件大小（通过 Rust binary）"""
+    # 这里我们用 Python 估算 EngramDB 的内存数据大小
     # 实际压缩率数据来自 Rust benchmark
     
     # 估算原始数据大小（内存中 Value 形式）
@@ -172,7 +172,7 @@ def bench_hybriddb(rows):
     total_compressed = sum(compressed_per_col.values())
     
     return {
-        "engine": "HybridDB (列式压缩)",
+        "engine": "EngramDB (列式压缩)",
         "raw_size": total_raw,
         "compressed_size": total_compressed,
         "compression_ratio": total_raw / total_compressed if total_compressed > 0 else 0,
@@ -209,9 +209,9 @@ def main():
         print("  DuckDB 未安装，跳过")
     print()
 
-    # HybridDB
-    print("--- HybridDB (列式压缩) ---")
-    hdb_result = bench_hybriddb(rows)
+    # EngramDB
+    print("--- EngramDB (列式压缩) ---")
+    hdb_result = bench_engramdb(rows)
     print(f"  原始列存大小: {fmt_bytes(hdb_result['raw_size'])}")
     print(f"  压缩后大小:   {fmt_bytes(hdb_result['compressed_size'])}")
     print(f"  压缩比:       {hdb_result['compression_ratio']:.2f}x")
@@ -240,14 +240,14 @@ def main():
     print(f"{'SQLite':<25} {sqlite_result['rows_per_sec']:>10,.0f}/s {fmt_bytes(sqlite_size):>10} {sqlite_size/sqlite_size*100:>8.1f}%")
     if duckdb_result:
         print(f"{'DuckDB':<25} {duckdb_result['rows_per_sec']:>10,.0f}/s {fmt_bytes(duck_size):>10} {duck_size/sqlite_size*100:>8.1f}%")
-    print(f"{'HybridDB (列式压缩)':<25} {'N/A':>12} {fmt_bytes(hdb_size):>10} {hdb_size/sqlite_size*100:>8.1f}%")
+    print(f"{'EngramDB (列式压缩)':<25} {'N/A':>12} {fmt_bytes(hdb_size):>10} {hdb_size/sqlite_size*100:>8.1f}%")
     print()
 
     # 注意事项
     print("说明:")
     print("  - SQLite 文件大小含 B-tree 页开销 + 元数据")
     print("  - DuckDB 含列存 + 压缩 + 索引开销")
-    print("  - HybridDB 为纯列数据压缩估算（不含文件头/元数据/索引开销）")
+    print("  - EngramDB 为纯列数据压缩估算（不含文件头/元数据/索引开销）")
     print("  - 随机 Float64 和高基数字符串几乎不可压缩，是拉低整体压缩率的主因")
     print()
 

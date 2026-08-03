@@ -1,20 +1,20 @@
 [package]
-name = "hybriddb"
+name = "engramdb"
 version = "0.12.0"
 edition = "2021"
-description = "HybridDB - 专用分析型嵌入 AI Agent 数据引擎。兼具 SQLite 的事务能力与 DuckDB 的列存压缩分析性能，单文件嵌入式部署。"
+description = "EngramDB - 专用分析型嵌入 AI Agent 数据引擎。兼具 SQLite 的事务能力与 DuckDB 的列存压缩分析性能，单文件嵌入式部署。"
 license = "MIT"
-repository = "https://github.com/sn0wfree/HybridDB"
+repository = "https://github.com/sn0wfree/EngramDB"
 readme = "README.md"
 keywords = ["database", "embedded", "column-store", "analytical", "vector-search"]
 categories = ["database", "database-implementations"]
 
 [lib]
-name = "hybriddb"
+name = "engramdb"
 path = "src/lib.rs"
 
 [[bin]]
-name = "hybriddb"
+name = "engramdb"
 path = "src/main.rs"
 
 [features]
@@ -64,6 +64,7 @@ datafusion-expr = { version = "40", optional = true }
 [dev-dependencies]
 tempfile = "3.0"
 criterion = "0.5"
+rusqlite = "0.31"
 
 # 基准测试目标（均自带 main()，需关闭默认 test harness）
 [[bench]]
@@ -109,4 +110,28 @@ harness = false
 [[bench]]
 name = "compact_strategy_deep_bench"
 harness = false
+
+[[bench]]
+name = "v0.13_acceptance_bench"
+harness = false
+
+# 编译加速配置：
+# - dev: 跳过完整 debug info（行号保留，够用），加速冷启动编译
+# - bench 目标独立 profile：基准测量需要优化，但保持轻量编译
+[profile.dev]
+debug = "line-tables-only"
+codegen-units = 256
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.bench]
+opt-level = 3
+debug = false
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+debug = false
+codegen-units = 256
 

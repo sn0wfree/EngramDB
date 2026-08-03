@@ -1,4 +1,4 @@
-//! HybridDB - 专用分析型嵌入 AI Agent 数据引擎
+//! EngramDB - 专用分析型嵌入 AI Agent 数据引擎
 //!
 //! 兼具 SQLite 的事务能力（ACID）与 DuckDB 的列存压缩与分析性能，
 //! 单文件嵌入式部署，面向 AI Agent 工作负载优化。
@@ -18,7 +18,7 @@
 //! # 快速开始
 //!
 //! ```no_run
-//! use hybriddb::{Connection, Value};
+//! use engramdb::{Connection, Value};
 //!
 //! // 打开数据库（":memory:" 为内存数据库，或传入文件路径持久化）
 //! let mut conn = Connection::open(":memory:")?;
@@ -34,7 +34,7 @@
 //! for row in &result.rows {
 //!     println!("{}", row[0]);
 //! }
-//! # Ok::<(), hybriddb::common::error::HybridDbError>(())
+//! # Ok::<(), engramdb::common::error::EngramDbError>(())
 //! ```
 //!
 //! # 模块组织
@@ -51,7 +51,7 @@
 //! # 性能调优
 //!
 //! ```no_run
-//! use hybriddb::{Connection, WalFlushMode, CompactStrategy};
+//! use engramdb::{Connection, WalFlushMode, CompactStrategy};
 //!
 //! let mut conn = Connection::open("app.hdb")?;
 //!
@@ -64,7 +64,7 @@
 //!
 //! // 按 session_id 聚簇，加速会话范围查询
 //! conn.set_cluster_key("agent_logs", "session_id")?;
-//! # Ok::<(), hybriddb::common::error::HybridDbError>(())
+//! # Ok::<(), engramdb::common::error::EngramDbError>(())
 //! ```
 
 pub mod common;
@@ -75,7 +75,7 @@ pub mod sql;
 pub mod executor;
 
 // DataFusion 互操作（需启用 datafusion feature）
-// 提供 TableProvider 实现，可将 HybridDB 表接入 DataFusion 查询引擎
+// 提供 TableProvider 实现，可将 EngramDB 表接入 DataFusion 查询引擎
 #[cfg(feature = "datafusion")]
 pub mod datafusion_ext;
 
@@ -236,10 +236,10 @@ impl Connection {
     ///
     /// 性能：比 Prepared Statement 再快约 30-50%，因为完全跳过 SQL 层。
     pub fn import_columns(&mut self, table_name: &str, columns: Vec<Vec<Value>>) -> Result<u64> {
-        use crate::common::error::HybridDbError;
+        use crate::common::error::EngramDbError;
 
         let table = self.db.get_table_mut(table_name)
-            .ok_or_else(|| HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
         let num_cols = table.def.columns.len();
         let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
@@ -250,7 +250,7 @@ impl Connection {
 
         // 验证列数匹配
         if columns.len() != num_cols {
-            return Err(HybridDbError::Internal(
+            return Err(EngramDbError::Internal(
                 format!("import_columns: column count mismatch (expected {}, got {})",
                     num_cols, columns.len())
             ));

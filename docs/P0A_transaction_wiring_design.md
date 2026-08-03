@@ -208,19 +208,19 @@ fn open_existing(path: &std::path::Path, config: Config) -> Result<Self> {
 
 ```bash
 # 启用事务模式（默认）
-hybriddb --db mydb.hdb --enable-transaction true
+engramdb --db mydb.hdb --enable-transaction true
 
 # 禁用事务模式（批量导入高性能）
-hybriddb --db bulk_import.hdb --enable-transaction false
+engramdb --db bulk_import.hdb --enable-transaction false
 
 # 指定隔离级别
-hybriddb --db mydb.hdb --enable-transaction true --isolation-level snapshot-isolation
+engramdb --db mydb.hdb --enable-transaction true --isolation-level snapshot-isolation
 ```
 
 ### 4.2 Rust API
 
 ```rust
-use hybriddb::{Database, Config, IsolationLevel};
+use engramdb::{Database, Config, IsolationLevel};
 
 // 生产环境：启用事务
 let config = Config {

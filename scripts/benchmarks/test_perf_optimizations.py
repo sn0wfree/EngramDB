@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HybridDB ClickHouse 性能优化 - 核心算法验证脚本
+EngramDB ClickHouse 性能优化 - 核心算法验证脚本
 
 用 Python 复现 Rust 代码中的核心优化逻辑，验证算法正确性和性能趋势。
 由于沙箱无 Rust 工具链，用 Python 作为功能验证的替代手段。
@@ -528,7 +528,7 @@ def test_lazy_materialization():
 def main():
     print()
     print("╔" + "═" * 58 + "╗")
-    print("║  HybridDB v0.2 - ClickHouse 性能优化验证测试           ║")
+    print("║  EngramDB v0.2 - ClickHouse 性能优化验证测试           ║")
     print("║  (Python 验证版，沙箱无 Rust 工具链)                   ║")
     print("╚" + "═" * 58 + "╝")
     print()

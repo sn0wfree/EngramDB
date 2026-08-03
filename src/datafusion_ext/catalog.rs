@@ -1,7 +1,7 @@
-//! HybridDB Catalog for DataFusion
+//! EngramDB Catalog for DataFusion
 //!
 //! 实现 DataFusion 的 CatalogProvider / SchemaProvider trait，
-//! 将 HybridDB 的表元数据暴露给查询引擎。
+//! 将 EngramDB 的表元数据暴露给查询引擎。
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -15,14 +15,14 @@ use crate::common::types::DataType;
 use crate::storage::Database;
 use crate::Value;
 
-use super::table_provider::HybridDBTable;
+use super::table_provider::EngramDBTable;
 
-/// HybridDB Catalog (实现 DataFusion CatalogProvider)
-pub struct HybridDBCatalog {
-    schemas: HashMap<String, Arc<HybridDBSchema>>,
+/// EngramDB Catalog (实现 DataFusion CatalogProvider)
+pub struct EngramDBCatalog {
+    schemas: HashMap<String, Arc<EngramDBSchema>>,
 }
 
-impl HybridDBCatalog {
+impl EngramDBCatalog {
     pub fn new() -> Self {
         let mut catalog = Self {
             schemas: HashMap::new(),
@@ -30,14 +30,14 @@ impl HybridDBCatalog {
         // 默认 public schema
         catalog.schemas.insert(
             "public".to_string(),
-            Arc::new(HybridDBSchema::new()),
+            Arc::new(EngramDBSchema::new()),
         );
         catalog
     }
 
     /// 从 Database 构建 catalog (注册所有表)
     pub fn from_database(db: &Database) -> Self {
-        let schema = HybridDBSchema::from_database(db);
+        let schema = EngramDBSchema::from_database(db);
         let mut catalog = Self::new();
         catalog.schemas.insert(
             "public".to_string(),
@@ -47,7 +47,7 @@ impl HybridDBCatalog {
     }
 
     /// 注册一张表
-    pub fn register_table(&self, name: &str, table: HybridDBTable) {
+    pub fn register_table(&self, name: &str, table: EngramDBTable) {
         if let Some(schema) = self.schemas.get("public") {
             // 内部用 Mutex 或直接重建，这里简化处理用内部可变性
             // MVP: 直接通过 unsafe 或新建方式
@@ -58,13 +58,13 @@ impl HybridDBCatalog {
     }
 }
 
-impl Default for HybridDBCatalog {
+impl Default for EngramDBCatalog {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CatalogProvider for HybridDBCatalog {
+impl CatalogProvider for EngramDBCatalog {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -80,12 +80,12 @@ impl CatalogProvider for HybridDBCatalog {
     }
 }
 
-/// HybridDB Schema (实现 DataFusion SchemaProvider)
-pub struct HybridDBSchema {
-    tables: std::sync::RwLock<HashMap<String, Arc<HybridDBTable>>>,
+/// EngramDB Schema (实现 DataFusion SchemaProvider)
+pub struct EngramDBSchema {
+    tables: std::sync::RwLock<HashMap<String, Arc<EngramDBTable>>>,
 }
 
-impl HybridDBSchema {
+impl EngramDBSchema {
     pub fn new() -> Self {
         Self {
             tables: std::sync::RwLock::new(HashMap::new()),
@@ -110,25 +110,25 @@ impl HybridDBSchema {
     }
 
     /// 注册一张表
-    pub fn register_table(&self, name: String, table: HybridDBTable) {
+    pub fn register_table(&self, name: String, table: EngramDBTable) {
         let mut tables = self.tables.write().unwrap();
         tables.insert(name, Arc::new(table));
     }
 
     /// 获取表
-    pub fn get_table(&self, name: &str) -> Option<Arc<HybridDBTable>> {
+    pub fn get_table(&self, name: &str) -> Option<Arc<EngramDBTable>> {
         let tables = self.tables.read().unwrap();
         tables.get(name).cloned()
     }
 }
 
-impl Default for HybridDBSchema {
+impl Default for EngramDBSchema {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SchemaProvider for HybridDBSchema {
+impl SchemaProvider for EngramDBSchema {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -155,7 +155,7 @@ impl SchemaProvider for HybridDBSchema {
 mod tests {
     use super::*;
 
-    fn make_test_table() -> HybridDBTable {
+    fn make_test_table() -> EngramDBTable {
         let columns = vec![
             ("id".to_string(), DataType::Int64, false),
             ("name".to_string(), DataType::Varchar, true),
@@ -164,19 +164,19 @@ mod tests {
             vec![Value::Int64(1), Value::Varchar("alice".into())],
             vec![Value::Int64(2), Value::Varchar("bob".into())],
         ];
-        HybridDBTable::new("users".to_string(), columns, rows)
+        EngramDBTable::new("users".to_string(), columns, rows)
     }
 
     #[test]
     fn test_catalog_schema_list() {
-        let catalog = HybridDBCatalog::new();
+        let catalog = EngramDBCatalog::new();
         let schemas = catalog.schema_names();
         assert!(schemas.contains(&"public".to_string()));
     }
 
     #[test]
     fn test_register_and_get_table() {
-        let schema = HybridDBSchema::new();
+        let schema = EngramDBSchema::new();
         let table = make_test_table();
         schema.register_table("users".to_string(), table);
 

@@ -1,7 +1,7 @@
-use hybriddb::Connection;
-use hybriddb::sql::optimizer;
-use hybriddb::sql::planner;
-use hybriddb::sql::parser;
+use engramdb::Connection;
+use engramdb::sql::optimizer;
+use engramdb::sql::planner;
+use engramdb::sql::parser;
 
 fn main() {
     let mut conn = Connection::open("/tmp/debug_opt.db").unwrap();

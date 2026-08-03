@@ -1,4 +1,4 @@
-// HybridDB 压缩算法全面性能测试 v2
+// EngramDB 压缩算法全面性能测试 v2
 // 覆盖: BooleanPack / Delta / Gorilla / FOR+BitPack / RLE / Dictionary / Uncompressed
 // 数据类型: Boolean / Int32 / Int64 / Float64 / Varchar
 // 多种数据分布: 时序/有序/随机/高重复/低基数/窄范围
@@ -469,7 +469,7 @@ fn main() {
     const N: usize = 50_000; // 5 万行
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  HybridDB 压缩算法全面性能测试 v2 (Rust 原生 -O 优化)        ║");
+    println!("║  EngramDB 压缩算法全面性能测试 v2 (Rust 原生 -O 优化)        ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("数据集规模: {} 行/列", N);

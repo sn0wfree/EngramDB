@@ -1,6 +1,6 @@
 # Changelog
 
-本文件记录 HybridDB 的版本变更历史。
+本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
 ## [0.12.0] - 2026-08-02
@@ -78,7 +78,7 @@
 ## [0.7.6] - 2026-08-01
 
 ### 三引擎性能对比
-- 新增 `compare_bench.py`：HybridDB vs SQLite vs DuckDB
+- 新增 `compare_bench.py`：EngramDB vs SQLite vs DuckDB
 - 覆盖数据导入、索引构建、COUNT/SUM/AVG/点查/范围扫描/GROUP BY 共 8 项
 - 10 万行 × 5 列数据集，附文件大小对比与选型指南
 

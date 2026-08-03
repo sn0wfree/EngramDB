@@ -1,5 +1,5 @@
-use hybriddb::Connection;
-use hybriddb::sql::{parser, planner};
+use engramdb::Connection;
+use engramdb::sql::{parser, planner};
 
 fn main() {
     let mut conn = Connection::open("/tmp/debug_count.db").unwrap();

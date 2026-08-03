@@ -9,7 +9,7 @@
 - **CPU**: 1 Core
 - **内存**: 4 GB
 - **存储**: SSD
-- **Python**: 3.10 (HybridDB 算法模拟)
+- **Python**: 3.10 (EngramDB 算法模拟)
 - **Rust**: 1.80.0 (release 模式, --edition 2021)
 - **SQLite**: 3.x (系统内置, C 实现)
 - **DuckDB**: 1.x (Python 绑定, C++ 实现)
@@ -37,7 +37,7 @@
 |--------|------|----------|------|
 | SQLite | C | 行存 (B+Tree) | 嵌入式事务型数据库基准 |
 | DuckDB | C++ | 列存 (Row Group) | 嵌入式分析型数据库基准 |
-| HybridDB (Py) | Python | 列存 + MinMax 索引 | 本项目架构算法验证 |
+| EngramDB (Py) | Python | 列存 + MinMax 索引 | 本项目架构算法验证 |
 
 ---
 
@@ -47,11 +47,11 @@
 |--------|-----------|-------------|-------------|
 | SQLite | 42.3 | 1,183,074 | 1.00x |
 | DuckDB | 42.1 | 1,187,199 | 1.00x |
-| HybridDB (Py) | 50.8 | 984,583 | 0.83x |
+| EngramDB (Py) | 50.8 | 984,583 | 0.83x |
 
 **分析**：
 - SQLite 与 DuckDB 写入速度接近（均为成熟 C/C++ 实现）
-- HybridDB Python 版受语言解释开销影响，略慢 ~20%
+- EngramDB Python 版受语言解释开销影响，略慢 ~20%
 - Rust 原生实现预计可达 SQLite/DuckDB 同级水平
 - 列存写入需构建 Row Group + 维护 MinMax 统计，天然略高于纯行存
 
@@ -63,12 +63,12 @@
 |--------|--------------|--------|
 | SQLite | 2,004 | 1.07x |
 | DuckDB | 1,292 | **1.66x** |
-| HybridDB (估算) | 2,148 | 1.00x |
+| EngramDB (估算) | 2,148 | 1.00x |
 
 **分析**：
 - DuckDB 压缩率最高（FSST 字符串压缩 + Chimp 浮点压缩 + RLE/Dict 全套）
 - SQLite 几乎无压缩（B+Tree 页内少量空闲空间优化）
-- HybridDB 当前 MVP 未启用轻量级压缩（RLE / Dictionary / Bit-packing），启用后预计压缩率接近 DuckDB
+- EngramDB 当前 MVP 未启用轻量级压缩（RLE / Dictionary / Bit-packing），启用后预计压缩率接近 DuckDB
 
 ---
 
@@ -77,7 +77,7 @@
 测试查询：`SELECT SUM/COUNT/AVG/MIN/MAX(score) FROM t`
 （5 次平均，单位：毫秒）
 
-| 聚合函数 | SQLite | DuckDB | HybridDB (Py) | HybridDB vs SQLite |
+| 聚合函数 | SQLite | DuckDB | EngramDB (Py) | EngramDB vs SQLite |
 |---------|--------|--------|---------------|-------------------|
 | SUM | 2.77 | **1.16** | 1.44 | 1.92x 更快 |
 | COUNT | 2.69 | 0.46 | **0.01** | 269x 更快 |
@@ -86,10 +86,10 @@
 | MAX | 2.67 | **0.60** | 1.52 | 1.76x 更快 |
 
 **分析**：
-- **列存优势明显**：DuckDB 和 HybridDB 在所有聚合查询中均优于行存 SQLite
+- **列存优势明显**：DuckDB 和 EngramDB 在所有聚合查询中均优于行存 SQLite
 - 核心原因：列存只需读取目标列（1 列），行存需读取全部列（5 列）
-- COUNT 极快：HybridDB 直接从 Row Group 元数据读取行数，无需扫描数据
-- MIN/MAX 较快：HybridDB 利用 MinMax 索引逐层聚合，无需全量扫描
+- COUNT 极快：EngramDB 直接从 Row Group 元数据读取行数，无需扫描数据
+- MIN/MAX 较快：EngramDB 利用 MinMax 索引逐层聚合，无需全量扫描
 
 ---
 
@@ -97,7 +97,7 @@
 
 测试不同选择性下的过滤查询性能（3 次平均，单位：毫秒）
 
-| 选择性 | 命中行数 | SQLite | DuckDB | HybridDB (Py) |
+| 选择性 | 命中行数 | SQLite | DuckDB | EngramDB (Py) |
 |--------|---------|--------|--------|---------------|
 | 高选择性 (90%) | 45,421 | 34.32 | **20.80** | 63.19 |
 | 中选择性 (50%) | 25,159 | 20.84 | **13.59** | 19.48 |
@@ -106,14 +106,14 @@
 
 **关键趋势**：
 
-| 指标 | SQLite | DuckDB | HybridDB (Py) |
+| 指标 | SQLite | DuckDB | EngramDB (Py) |
 |------|--------|--------|---------------|
 | 低选 vs 高选加速比 | 0.83x | **4.16x** | **6.55x** |
 
 **分析**：
-- **HybridDB 的 MinMax 跳过索引在低选择性下优势显著**：从高选择性到低选择性，加速比达 6.55x，远超 SQLite 的 0.83x
+- **EngramDB 的 MinMax 跳过索引在低选择性下优势显著**：从高选择性到低选择性，加速比达 6.55x，远超 SQLite 的 0.83x
 - 选择性越低，跳过索引收益越大——这是列存 + 数据跳过索引的核心优势
-- 高选择性下 HybridDB 较慢：Python 解释开销 + 需要物化更多行（90% 行几乎全部命中，跳过效果有限）
+- 高选择性下 EngramDB 较慢：Python 解释开销 + 需要物化更多行（90% 行几乎全部命中，跳过效果有限）
 - DuckDB 整体最快：成熟 C++ 向量化执行引擎 + 完整优化器
 
 ---
@@ -283,7 +283,7 @@
 
 ### 7.4 自动选择策略
 
-HybridDB 采用**按列自动选择**策略：
+EngramDB 采用**按列自动选择**策略：
 
 1. 写入 Row Group 时，对每列依次尝试 RLE → Dictionary → Bit-packing
 2. 计算每种算法的压缩率
@@ -300,7 +300,7 @@ HybridDB 采用**按列自动选择**策略：
 - **轻量级**：编解码极快（接近内存带宽），压缩率中等，适合热数据
 - **重量级**：压缩率高（2–10x），编解码慢，适合冷数据/归档
 
-HybridDB 的分层策略：
+EngramDB 的分层策略：
 - **热数据层**：轻量级压缩 + 内存缓存，查询性能优先
 - **冷数据层**：zstd 压缩 + 磁盘存储，存储成本优先
 
@@ -421,7 +421,7 @@ HybridDB 的分层策略：
 
 ### 📊 三方定位对比
 
-| 维度 | SQLite | DuckDB | HybridDB |
+| 维度 | SQLite | DuckDB | EngramDB |
 |------|--------|--------|----------|
 | 存储模型 | 行存 | 列存 | 列存 + Delta 行存 |
 | 事务能力 | ⭐⭐⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐⭐ |
@@ -432,7 +432,7 @@ HybridDB 的分层策略：
 | 单文件 | ✅ | ✅ | ✅ |
 | 嵌入式零依赖 | ✅ | ✅ | ✅ |
 
-### 🎯 HybridDB 核心差异化
+### 🎯 EngramDB 核心差异化
 
 1. **行存 + 列存混合架构**：兼顾事务写入与分析查询
 2. **完整 WAL + MVCC 事务**：接近 SQLite 的事务能力，远超 DuckDB
@@ -467,5 +467,5 @@ cargo bench
 
 - **SQLite**: Python `sqlite3` 模块（系统内置）
 - **DuckDB**: Python `duckdb` 包（v1.x）
-- **HybridDB**: 本项目 `benchmark_compare.py` 中的 Python 模拟实现
+- **EngramDB**: 本项目 `benchmark_compare.py` 中的 Python 模拟实现
 - 所有测试在同一沙箱环境中执行，硬件条件一致

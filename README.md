@@ -1,4 +1,4 @@
-# HybridDB
+# EngramDB
 
 > 专用分析型嵌入 AI Agent 数据引擎
 > **当前版本：v0.12.0 — JSON + Vector 类型支持**
@@ -35,7 +35,7 @@ Buffer Pool → Single File Format (.hdb)
 ### 构建
 
 ```bash
-cd hybriddb
+cd engramdb
 cargo build --release
 ```
 
@@ -70,7 +70,7 @@ cd benches/native_bench && cargo run --release
 ### 基础 CRUD
 
 ```rust
-use hybriddb::{Connection, Value};
+use engramdb::{Connection, Value};
 
 let mut conn = Connection::open(":memory:")?;
 
@@ -131,7 +131,7 @@ SELECT id FROM agent_meta WHERE JSON_CONTAINS(data, '"search"', '$.tools');
 // 建表 + 构建 HNSW 索引
 conn.execute("CREATE TABLE embeddings (id INT, vec VECTOR)")?;
 conn.create_vector_index("embeddings", "idx_vec", "vec",
-    hybriddb::storage::vector_index::DistanceMetric::Cosine, 16, 200)?;
+    engramdb::storage::vector_index::DistanceMetric::Cosine, 16, 200)?;
 
 // 插入向量后检索最近邻
 let neighbors = conn.vector_search("embeddings", "idx_vec", &query_vec, 10)?;
@@ -205,12 +205,12 @@ VECTOR_DISTANCE(vec1, vec2, 'cosine')  -- 'l2' | 'inner' | 'cosine'
 ```rust
 // Sync 模式下多条事务共享一次 fsync，吞吐提升 5-20x
 conn.set_wal_group_commit_size(16);
-conn.set_wal_flush_mode(hybriddb::WalFlushMode::Sync);
+conn.set_wal_flush_mode(engramdb::WalFlushMode::Sync);
 ```
 
 ### Delta 合并策略
 ```rust
-use hybriddb::CompactStrategy;
+use engramdb::CompactStrategy;
 
 // 自适应分桶（默认推荐）
 conn.set_compact_strategy(CompactStrategy::default_adaptive(100_000));
@@ -225,7 +225,7 @@ conn.compact_all()?;
 ## 项目结构
 
 ```
-hybriddb/
+engramdb/
 ├── src/
 │   ├── main.rs              # CLI 入口
 │   ├── lib.rs               # 库入口，Connection / Value / QueryResult

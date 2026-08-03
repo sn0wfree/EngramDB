@@ -1,19 +1,19 @@
 //! Apache Arrow 列存对接
 //!
-//! 实现 HybridDB 内部向量格式与 Apache Arrow 格式的互转，
+//! 实现 EngramDB 内部向量格式与 Apache Arrow 格式的互转，
 //! 支持 Arrow IPC 导入导出，便于与 Arrow 生态（DataFusion、Polars、Pandas 等）集成。
 //!
 //! 设计要点：
 //! - 零拷贝优先：内存布局兼容时直接引用，否则转换
 //! - IPC 格式：支持 Arrow IPC Stream / File 格式读写
-//! - Schema 映射：HybridDB 类型 ↔ Arrow DataType 双向映射
+//! - Schema 映射：EngramDB 类型 ↔ Arrow DataType 双向映射
 //! - 批量处理：按 DataChunk 粒度转换，与执行引擎批处理对齐
 //!
 //! 注意：本模块是框架层实现，定义了接口和核心转换逻辑。
 //! 完整的 Arrow 集成需要引入 arrow-rs crate，此处以类型定义和
 //! 转换 trait 形式提供抽象，便于后续接入真实 Arrow 库。
 
-use crate::common::error::{HybridDbError as DbError, Result};
+use crate::common::error::{EngramDbError as DbError, Result};
 use crate::executor::vector::{DataChunk, Vector};
 use crate::Value;
 
@@ -148,7 +148,7 @@ impl ArrowRecordBatch {
 // 类型映射
 // ============================================================
 
-/// HybridDB Value 类型 → Arrow 数据类型
+/// EngramDB Value 类型 → Arrow 数据类型
 pub fn value_type_to_arrow(value: &Value) -> ArrowDataType {
     match value {
         Value::Null => ArrowDataType::Null,
@@ -186,7 +186,7 @@ pub fn arrow_type_name(dt: &ArrowDataType) -> &'static str {
 // 双向转换
 // ============================================================
 
-/// Arrow 导入器：将 Arrow 格式数据转换为 HybridDB 内部格式
+/// Arrow 导入器：将 Arrow 格式数据转换为 EngramDB 内部格式
 pub struct ArrowImporter;
 
 impl ArrowImporter {
@@ -225,7 +225,7 @@ impl ArrowImporter {
     }
 }
 
-/// Arrow 导出器：将 HybridDB 内部格式转换为 Arrow 格式
+/// Arrow 导出器：将 EngramDB 内部格式转换为 Arrow 格式
 pub struct ArrowExporter;
 
 impl ArrowExporter {

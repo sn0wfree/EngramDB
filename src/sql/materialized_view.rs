@@ -100,7 +100,7 @@ impl MaterializedViewRegistry {
     /// 更新刷新时间
     pub fn mark_refreshed(&mut self, name: &str) -> Result<()> {
         let mv = self.views.get_mut(name)
-            .ok_or_else(|| crate::common::error::HybridDbError::Internal(
+            .ok_or_else(|| crate::common::error::EngramDbError::Internal(
                 format!("materialized view '{}' not found", name)
             ))?;
         mv.mark_refreshed();

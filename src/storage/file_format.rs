@@ -1,10 +1,10 @@
 //! 文件格式定义
 
 use crate::common::config::{Config, CompressionType};
-use crate::common::error::{HybridDbError, Result};
+use crate::common::error::{EngramDbError, Result};
 
 /// 文件魔数
-pub const MAGIC: &[u8; 17] = b"HYBRIDDB_FORMAT1\0";
+pub const MAGIC: &[u8; 17] = b"ENGRAMDB_FORMAT1\0";
 
 /// 文件头（4KB 页对齐）
 #[derive(Debug, Clone)]
@@ -113,15 +113,15 @@ impl FileHeader {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 100 {
-            return Err(HybridDbError::InvalidFormat(
+            return Err(EngramDbError::InvalidFormat(
                 "File header too short".into()
             ));
         }
 
         // 检查魔数
         if &data[..MAGIC.len()] != MAGIC {
-            return Err(HybridDbError::InvalidFormat(
-                "Invalid magic number, not a HybridDB file".into()
+            return Err(EngramDbError::InvalidFormat(
+                "Invalid magic number, not a EngramDB file".into()
             ));
         }
 
@@ -146,7 +146,7 @@ impl FileHeader {
             4 => CompressionType::For,
             5 => CompressionType::Delta,
             6 => CompressionType::Zstd,
-            _ => return Err(HybridDbError::InvalidFormat(
+            _ => return Err(EngramDbError::InvalidFormat(
                 format!("Unknown compression type: {}", data[74])
             )),
         };

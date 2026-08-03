@@ -3,7 +3,7 @@
 //! 运行：cargo bench
 
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use hybriddb::Connection;
+use engramdb::Connection;
 use tempfile::tempdir;
 
 fn bench_insert(c: &mut Criterion) {

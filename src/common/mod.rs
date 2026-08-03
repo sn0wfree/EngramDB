@@ -6,4 +6,4 @@ pub mod config;
 pub mod memory_pool;
 
 pub use types::{DataType, ColumnDef, TableDef};
-pub use error::{HybridDbError, Result};
+pub use error::{EngramDbError, Result};

@@ -1,4 +1,4 @@
-use hybriddb::sql::parser;
+use engramdb::sql::parser;
 
 fn main() {
     let queries = vec![

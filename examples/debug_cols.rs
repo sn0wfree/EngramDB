@@ -1,4 +1,4 @@
-use hybriddb::Connection;
+use engramdb::Connection;
 
 fn main() {
     let mut conn = Connection::open("/tmp/debug_cols.db").unwrap();

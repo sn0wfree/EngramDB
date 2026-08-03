@@ -6,7 +6,7 @@
 
 use log::{error, warn, info, debug, trace};
 
-use crate::common::error::{Result, HybridDbError};
+use crate::common::error::{Result, EngramDbError};
 use crate::storage::Database;
 use crate::txn::{ApplyOp, IsolationLevel};
 use crate::Value;
@@ -40,7 +40,7 @@ pub fn execute(
     let _table_id = db.table_names().get(table_name)
         .ok_or_else(|| {
             error!("Table '{}' not found", table_name);
-            HybridDbError::TableNotFound(table_name.into())
+            EngramDbError::TableNotFound(table_name.into())
         })?;
     debug!("✓ Table '{}' exists", table_name);
     
@@ -118,7 +118,7 @@ fn execute_without_txn(
     debug!("Starting non-transaction path execution...");
     
     let table = db.get_table_mut(table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(table_name.into()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
     
     debug!("Inserting {} rows directly into table '{}'...", rows.len(), table_name);
     table.insert(rows.clone())?;
@@ -167,7 +167,7 @@ pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
                 let table = db.tables_mut().get_mut(&start_tid)
                     .ok_or_else(|| {
                         error!("Table not found: table_id={}", start_tid);
-                        HybridDbError::TableNotFound(format!("id={}", start_tid))
+                        EngramDbError::TableNotFound(format!("id={}", start_tid))
                     })?;
 
                 // 只有当 row_ids 与当前 table.def.row_count 连续对齐时，才能走 table.insert()
@@ -204,7 +204,7 @@ pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
                     .ok_or_else(|| {
                         error!("Table not found: table_id={}", table_id);
                         error!("This indicates a bug in collect_apply_ops()");
-                        HybridDbError::TableNotFound(format!("id={}", table_id))
+                        EngramDbError::TableNotFound(format!("id={}", table_id))
                     })?;
                 table.insert_row(*row_id as u32, row)?;
                 debug!("✓ Insert applied: table_id={}, row_id={}", table_id, row_id);
@@ -215,7 +215,7 @@ pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
                     .ok_or_else(|| {
                         error!("Table not found: table_id={}", table_id);
                         error!("This indicates a bug in collect_apply_ops()");
-                        HybridDbError::TableNotFound(format!("id={}", table_id))
+                        EngramDbError::TableNotFound(format!("id={}", table_id))
                     })?;
                 table.update_row(*row_id as u32, new_row)?;
                 debug!("✓ Update applied: table_id={}, row_id={}", table_id, row_id);
@@ -226,7 +226,7 @@ pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
                     .ok_or_else(|| {
                         error!("Table not found: table_id={}", table_id);
                         error!("This indicates a bug in collect_apply_ops()");
-                        HybridDbError::TableNotFound(format!("id={}", table_id))
+                        EngramDbError::TableNotFound(format!("id={}", table_id))
                     })?;
                 table.delete_row(*row_id as u32)?;
                 debug!("✓ Delete applied: table_id={}, row_id={}", table_id, row_id);
@@ -250,7 +250,7 @@ pub fn execute_columns(
     columns: Vec<Vec<Value>>,
 ) -> Result<u64> {
     let table = db.get_table_mut(table_name)
-        .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
     if num_rows == 0 {

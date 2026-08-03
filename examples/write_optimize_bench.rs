@@ -2,13 +2,13 @@
 //!
 //! 1. 写入路径各阶段耗时拆解：SQL拼接 / SQL解析 / 计划生成 / 实际写入
 //! 2. 纯底层 API 写入性能（绕过 SQL 层）
-//! 3. HybridDB 各压缩算法的压缩率对比
+//! 3. EngramDB 各压缩算法的压缩率对比
 //! 4. 与 SQLite / DuckDB 文件大小对比（Python 脚本补充）
 
-use hybriddb::{Connection, Value};
-use hybriddb::storage::Database;
-use hybriddb::storage::compression;
-use hybriddb::common::types::DataType;
+use engramdb::{Connection, Value};
+use engramdb::storage::Database;
+use engramdb::storage::compression;
+use engramdb::common::types::DataType;
 use std::time::Instant;
 use rand::Rng;
 use rand::SeedableRng;
@@ -33,7 +33,7 @@ fn ratio_pct(orig: usize, compressed: usize) -> f64 {
 fn bench_write_breakdown(n_rows: usize, batch_size: usize) {
     println!("=== 写入路径耗时剖析 ({} 行, batch={}) ===", n_rows, batch_size);
 
-    let db_path = "/tmp/hybriddb_breakdown.db";
+    let db_path = "/tmp/engramdb_breakdown.db";
     let _ = std::fs::remove_file(db_path);
     let mut conn = Connection::open(db_path).unwrap();
     conn.execute("CREATE TABLE t1 (id INT, category INT, value DOUBLE, name VARCHAR);").unwrap();
@@ -102,11 +102,11 @@ fn bench_write_breakdown(n_rows: usize, batch_size: usize) {
 fn bench_raw_insert(n_rows: usize) {
     println!("=== 底层 API 直接写入 (绕过 SQL 层, {} 行) ===", n_rows);
 
-    let db_path = "/tmp/hybriddb_raw.db";
+    let db_path = "/tmp/engramdb_raw.db";
     let _ = std::fs::remove_file(db_path);
     let mut db = Database::open(db_path).unwrap();
 
-    use hybriddb::common::types::{TableDef, ColumnDef, DataType};
+    use engramdb::common::types::{TableDef, ColumnDef, DataType};
     let columns = vec![
         ColumnDef::new("id", DataType::Int32),
         ColumnDef::new("category", DataType::Int32),
@@ -180,7 +180,7 @@ fn bench_raw_insert(n_rows: usize) {
 // 3. 压缩率对比测试
 // ============================================================================
 fn bench_compression_ratios(n_rows: usize) {
-    println!("=== HybridDB 压缩率对比 ({} 行/列) ===", n_rows);
+    println!("=== EngramDB 压缩率对比 ({} 行/列) ===", n_rows);
     println!("{:<20} {:>12} {:>12} {:>10} {:>8}",
              "列类型", "原始大小", "压缩后大小", "压缩率", "算法");
     println!("{}", "-".repeat(66));
@@ -290,7 +290,7 @@ fn bench_optimized_insert(n_rows: usize) {
     println!("=== 写入优化对比 ({} 行) ===", n_rows);
 
     // 方案 1: 通过 SQL 接口（当前）
-    let db_path = "/tmp/hybriddb_opt1.db";
+    let db_path = "/tmp/engramdb_opt1.db";
     let _ = std::fs::remove_file(db_path);
     let mut conn = Connection::open(db_path).unwrap();
     conn.execute("CREATE TABLE t1 (id INT, category INT, value DOUBLE, name VARCHAR);").unwrap();
@@ -316,11 +316,11 @@ fn bench_optimized_insert(n_rows: usize) {
     let _ = std::fs::remove_file(db_path);
 
     // 方案 2: 底层 API 直接批量插入（优化后）
-    let db_path2 = "/tmp/hybriddb_opt2.db";
+    let db_path2 = "/tmp/engramdb_opt2.db";
     let _ = std::fs::remove_file(db_path2);
     let mut db = Database::open(db_path2).unwrap();
 
-    use hybriddb::common::types::{TableDef, ColumnDef, DataType};
+    use engramdb::common::types::{TableDef, ColumnDef, DataType};
     db.create_table(TableDef::new(0, "t1", vec![
         ColumnDef::new("id", DataType::Int32),
         ColumnDef::new("category", DataType::Int32),
@@ -363,7 +363,7 @@ fn main() {
     let n_rows = 100_000;
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║       HybridDB 写入性能优化 + 压缩率对比报告                ║");
+    println!("║       EngramDB 写入性能优化 + 压缩率对比报告                ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 

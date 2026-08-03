@@ -29,7 +29,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             // 目前只支持单列键索引
             let key_col_idx = key_columns.first()
                 .copied()
-                .ok_or_else(|| crate::common::error::HybridDbError::Parse(
+                .ok_or_else(|| crate::common::error::EngramDbError::Parse(
                     "Index must have at least one key column".to_string()
                 ))?;
             db.create_index(&table_name, &index_name, key_col_idx, &included_columns, unique)?;
@@ -91,11 +91,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         PhysicalPlan::IndexOnlyScan { table_name, index_name, key_value, output_column_indices, output_col_map } => {
             let table = db.get_table(&table_name)
-                .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.clone()))?;
+                .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
 
             // 从索引中查找
             let index = table.get_index(&index_name)
-                .ok_or_else(|| crate::common::error::HybridDbError::Parse(
+                .ok_or_else(|| crate::common::error::EngramDbError::Parse(
                     format!("Index '{}' not found during execution", index_name)
                 ))?;
 
@@ -291,7 +291,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         // Perf03：主键点查短路（WHERE pk = Literal）
         PhysicalPlan::PrimaryKeyLookup { table_name, pk_value } => {
             let table = db.get_table(&table_name)
-                .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.clone()))?;
+                .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
             // O(log n)：主键索引命中 row_id；命中再回表读全列
             let rows: Vec<Vec<crate::Value>> = match table.lookup_primary_key(&pk_value) {
                 Some(row_id) => table.get_row_by_id(row_id)?.into_iter().collect(),
@@ -344,7 +344,7 @@ fn collect_result(
     column_indices: &[usize],
 ) -> Result<(Vec<String>, Vec<Vec<crate::Value>>)> {
     let table = db.get_table(table_name)
-        .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     let column_names: Vec<String> = column_indices
         .iter()

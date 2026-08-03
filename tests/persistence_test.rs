@@ -7,7 +7,7 @@
 //!
 //! 测试策略：写入数据 → close → 重新 open → 验证 schema + 数据可查询
 
-use hybriddb::{Connection, Value};
+use engramdb::{Connection, Value};
 use tempfile::tempdir;
 
 /// 辅助：断言查询结果行数

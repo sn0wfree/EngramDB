@@ -9,7 +9,7 @@
 //! txn.commit().unwrap();
 //! ```
 
-use crate::common::error::{HybridDbError, Result};
+use crate::common::error::{EngramDbError, Result};
 use crate::storage::Database;
 use crate::Value;
 
@@ -49,7 +49,7 @@ impl<'a> Transaction<'a> {
     pub fn insert(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
         let table_id = self.db.get_table(table_name)
             .map(|t| t.def.id)
-            .ok_or_else(|| HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
         let txn_id = self.id;
         let mut rowid_start = 0u64;

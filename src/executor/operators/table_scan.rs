@@ -19,7 +19,7 @@ pub fn execute(
     column_indices: &[usize],
 ) -> Result<Vec<DataChunk>> {
     let table = db.get_table_mut(table_name)
-        .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     let rows = table.scan(column_indices)?;
 
@@ -52,7 +52,7 @@ pub fn execute_with_filter_pushdown(
 ) -> Result<Vec<DataChunk>> {
     // MVP 简化版：先用 MinMax 索引跳过 Row Group，再走正常扫描
     let table = db.get_table_mut(table_name)
-        .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
+        .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     // 提取过滤条件中的列和值（用于 MinMax 跳过）
     // 实际实现中应由优化器做谓词下推

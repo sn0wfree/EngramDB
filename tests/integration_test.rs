@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use hybriddb::{Connection, Value};
+    use engramdb::{Connection, Value};
     use tempfile::tempdir;
 
     fn setup_db() -> (Connection, tempfile::TempDir) {

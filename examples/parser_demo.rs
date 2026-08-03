@@ -1,8 +1,8 @@
 //! SQL Parser 验证脚本
 //! 使用 sqlparser-rs 作为解析后端，验证 Phase 1 成果
 
-use hybriddb::sql::parser::parse;
-use hybriddb::sql::ast::*;
+use engramdb::sql::parser::parse;
+use engramdb::sql::ast::*;
 
 fn main() {
     let tests = vec![

@@ -11,7 +11,7 @@ use super::column_store::ColumnStore;
 use super::delta_store::DeltaStore;
 use super::index::skiplist::SkipListIndex;
 use super::vector_index::{HnswIndex, HnswConfig, DistanceMetric, Neighbor};
-use crate::common::error::HybridDbError;
+use crate::common::error::EngramDbError;
 
 /// 按指定列对列式数据做聚簇重排
 ///
@@ -219,12 +219,12 @@ impl Table {
     /// 覆盖列冗余存储在索引条目中，查询时免回表。
     pub fn create_index(&mut self, index_name: &str, key_col_idx: usize, included_cols: &[usize], unique: bool) -> Result<()> {
         if self.indexes.contains_key(index_name) {
-            return Err(HybridDbError::ConstraintViolation(
+            return Err(EngramDbError::ConstraintViolation(
                 format!("Index '{}' already exists", index_name)
             ));
         }
         if key_col_idx >= self.def.columns.len() {
-            return Err(HybridDbError::ColumnNotFound(
+            return Err(EngramDbError::ColumnNotFound(
                 format!("index key column index {} out of bounds", key_col_idx)
             ));
         }
@@ -302,12 +302,12 @@ impl Table {
         use crate::common::types::DataType;
 
         if self.vector_indexes.contains_key(index_name) {
-            return Err(HybridDbError::ConstraintViolation(
+            return Err(EngramDbError::ConstraintViolation(
                 format!("Vector index '{}' already exists", index_name)
             ));
         }
         if col_idx >= self.def.columns.len() {
-            return Err(HybridDbError::ColumnNotFound(
+            return Err(EngramDbError::ColumnNotFound(
                 format!("column index {} out of bounds", col_idx)
             ));
         }
@@ -316,13 +316,13 @@ impl Table {
         let col_def = &self.def.columns[col_idx];
         let dim = match &col_def.data_type {
             DataType::Vector { dim } => *dim,
-            _ => return Err(HybridDbError::InvalidFormat(
+            _ => return Err(EngramDbError::InvalidFormat(
                 format!("column '{}' is not a vector type", col_def.name)
             )),
         };
 
         if dim == 0 {
-            return Err(HybridDbError::InvalidFormat(
+            return Err(EngramDbError::InvalidFormat(
                 "vector column dimension is 0".into()
             ));
         }
@@ -389,7 +389,7 @@ impl Table {
     /// 返回 top-k 最近邻的行 ID 和距离（行 ID 为表内行号）。
     pub fn vector_search(&self, index_name: &str, query: &[f32], k: usize) -> Result<Vec<Neighbor>> {
         let (index, id_mapping) = self.vector_indexes.get(index_name)
-            .ok_or_else(|| HybridDbError::IndexNotFound(index_name.into()))?;
+            .ok_or_else(|| EngramDbError::IndexNotFound(index_name.into()))?;
 
         let results = index.search(query, k);
         // 将 HNSW 内部 ID 转换为表行 ID
@@ -466,7 +466,7 @@ impl Table {
     /// 旧文件中 vector_index_count 段不存在时，读取到末尾即停止。
     pub fn indexes_from_bytes(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < 4 {
-            return Err(HybridDbError::InvalidFormat("index section too short".into()));
+            return Err(EngramDbError::InvalidFormat("index section too short".into()));
         }
 
         let mut offset = 0;
@@ -478,25 +478,25 @@ impl Table {
         for _ in 0..count {
             // name
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated index name length".into()));
+                return Err(EngramDbError::InvalidFormat("truncated index name length".into()));
             }
             let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + name_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated index name".into()));
+                return Err(EngramDbError::InvalidFormat("truncated index name".into()));
             }
             let name = String::from_utf8(data[offset..offset+name_len].to_vec())
-                .map_err(|e| HybridDbError::InvalidFormat(format!("invalid index name: {}", e)))?;
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid index name: {}", e)))?;
             offset += name_len;
 
             // index data
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated index data length".into()));
+                return Err(EngramDbError::InvalidFormat("truncated index data length".into()));
             }
             let data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + data_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated index data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated index data".into()));
             }
             let index = SkipListIndex::from_bytes(&data[offset..offset+data_len])?;
             offset += data_len;
@@ -515,37 +515,37 @@ impl Table {
         for _ in 0..vec_count {
             // name
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated vector index name length".into()));
+                return Err(EngramDbError::InvalidFormat("truncated vector index name length".into()));
             }
             let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + name_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated vector index name".into()));
+                return Err(EngramDbError::InvalidFormat("truncated vector index name".into()));
             }
             let name = String::from_utf8(data[offset..offset+name_len].to_vec())
-                .map_err(|e| HybridDbError::InvalidFormat(format!("invalid vector index name: {}", e)))?;
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid vector index name: {}", e)))?;
             offset += name_len;
 
             // hnsw data
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated hnsw data length".into()));
+                return Err(EngramDbError::InvalidFormat("truncated hnsw data length".into()));
             }
             let hnsw_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + hnsw_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated hnsw data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated hnsw data".into()));
             }
             let hnsw = HnswIndex::from_bytes(&data[offset..offset+hnsw_len])?;
             offset += hnsw_len;
 
             // id mapping
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated id mapping length".into()));
+                return Err(EngramDbError::InvalidFormat("truncated id mapping length".into()));
             }
             let map_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + map_len * 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated id mapping data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated id mapping data".into()));
             }
             let mut id_mapping = Vec::with_capacity(map_len);
             for _ in 0..map_len {
@@ -613,7 +613,7 @@ impl Table {
     /// 查询单个会话的全部消息时只需顺序扫描少量连续数据块。
     pub fn set_cluster_key(&mut self, column_name: &str) -> Result<()> {
         self.def.set_cluster_key(column_name)
-            .map_err(|e| crate::common::error::HybridDbError::ColumnNotFound(e))?;
+            .map_err(|e| crate::common::error::EngramDbError::ColumnNotFound(e))?;
         Ok(())
     }
 

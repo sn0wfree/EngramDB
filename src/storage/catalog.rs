@@ -39,7 +39,7 @@
 //! +-----------------------+
 //! ```
 
-use crate::common::error::{HybridDbError, Result};
+use crate::common::error::{EngramDbError, Result};
 use crate::common::types::TableDef;
 use std::collections::HashMap;
 
@@ -83,7 +83,7 @@ impl CatalogSnapshot {
             buf.extend_from_slice(&table_id.to_le_bytes());
             // TableDef bincode
             let def_bytes = bincode::serialize(table_def)
-                .map_err(|e| HybridDbError::Internal(format!("serialize TableDef: {}", e)))?;
+                .map_err(|e| EngramDbError::Internal(format!("serialize TableDef: {}", e)))?;
             buf.extend_from_slice(&(def_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(&def_bytes);
         }
@@ -94,7 +94,7 @@ impl CatalogSnapshot {
     /// 从字节反序列化
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 8 {
-            return Err(HybridDbError::InvalidFormat("catalog section too short".into()));
+            return Err(EngramDbError::InvalidFormat("catalog section too short".into()));
         }
 
         let next_table_id = u32::from_le_bytes(data[..4].try_into().unwrap());
@@ -104,22 +104,22 @@ impl CatalogSnapshot {
 
         for _ in 0..count {
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated table id".into()));
+                return Err(EngramDbError::InvalidFormat("truncated table id".into()));
             }
             let table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
 
             if offset + 4 > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated table def len".into()));
+                return Err(EngramDbError::InvalidFormat("truncated table def len".into()));
             }
             let def_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
             if offset + def_len > data.len() {
-                return Err(HybridDbError::InvalidFormat("truncated table def data".into()));
+                return Err(EngramDbError::InvalidFormat("truncated table def data".into()));
             }
             let table_def: TableDef = bincode::deserialize(&data[offset..offset + def_len])
-                .map_err(|e| HybridDbError::InvalidFormat(format!("deserialize TableDef: {}", e)))?;
+                .map_err(|e| EngramDbError::InvalidFormat(format!("deserialize TableDef: {}", e)))?;
             offset += def_len;
 
             tables.push((table_id, table_def));

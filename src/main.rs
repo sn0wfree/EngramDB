@@ -1,15 +1,15 @@
-//! HybridDB CLI 入口
+//! EngramDB CLI 入口
 //!
 //! 用法：
-//!   hybriddb <database_file>              # 交互模式（默认开启事务）
-//!   hybriddb --no-transaction <db>       # 交互模式（关闭事务，高性能模式）
-//!   hybriddb <database_file> "SQL"        # 单条命令模式
-//!   hybriddb --no-txn <db> "SQL"          # 单条命令（关闭事务）
-//!   hybriddb --help                       # 查看帮助
+//!   engramdb <database_file>              # 交互模式（默认开启事务）
+//!   engramdb --no-transaction <db>       # 交互模式（关闭事务，高性能模式）
+//!   engramdb <database_file> "SQL"        # 单条命令模式
+//!   engramdb --no-txn <db> "SQL"          # 单条命令（关闭事务）
+//!   engramdb --help                       # 查看帮助
 
 use std::io::{self, BufRead, Write};
 
-use hybriddb::{Connection, Config};
+use engramdb::{Connection, Config};
 
 fn main() {
     env_logger::init();
@@ -84,14 +84,14 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("HybridDB v0.12.0");
+    println!("EngramDB v0.12.0");
     println!("=================");
     println!();
     println!("用法:");
-    println!("  hybriddb <database_file>              交互模式（默认开启事务）");
-    println!("  hybriddb --no-transaction <db>         交互模式（关闭事务）");
-    println!("  hybriddb <database_file> \"<SQL>\"       单条命令执行");
-    println!("  hybriddb --no-txn <db> \"<SQL>\"         单条命令（关闭事务）");
+    println!("  engramdb <database_file>              交互模式（默认开启事务）");
+    println!("  engramdb --no-transaction <db>         交互模式（关闭事务）");
+    println!("  engramdb <database_file> \"<SQL>\"       单条命令执行");
+    println!("  engramdb --no-txn <db> \"<SQL>\"         单条命令（关闭事务）");
     println!();
     println!("参数:");
     println!("  --no-transaction, --no-txn    关闭事务支持（高性能模式）");
@@ -108,7 +108,7 @@ fn execute_single(path: &str, sql: &str, config: &Config) -> Result<(), Box<dyn 
 }
 
 fn run_interactive(path: &str, config: &Config, txn_status: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("HybridDB v0.12.0 — 输入 SQL 语句，输入 .exit 退出");
+    println!("EngramDB v0.12.0 — 输入 SQL 语句，输入 .exit 退出");
     println!("数据库: {}", path);
     println!("事务: {}", txn_status);
     println!();
@@ -119,7 +119,7 @@ fn run_interactive(path: &str, config: &Config, txn_status: &str) -> Result<(), 
     let mut buffer = String::new();
 
     loop {
-        print!("hybriddb> ");
+        print!("engramdb> ");
         io::stdout().flush()?;
 
         buffer.clear();
@@ -147,7 +147,7 @@ fn run_interactive(path: &str, config: &Config, txn_status: &str) -> Result<(), 
     Ok(())
 }
 
-fn print_result(result: &hybriddb::QueryResult) {
+fn print_result(result: &engramdb::QueryResult) {
     if result.columns.is_empty() {
         println!("OK ({} 行受影响)", result.rows_affected);
         return;

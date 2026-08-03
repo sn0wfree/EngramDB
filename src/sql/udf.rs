@@ -14,7 +14,7 @@
 //! - UDF 通过注册表动态查找，走通用调用路径
 //! - 性能上内置函数更优，UDF 更灵活
 
-use crate::common::error::{HybridDbError as DbError, Result};
+use crate::common::error::{EngramDbError as DbError, Result};
 use crate::executor::vector::Vector;
 use crate::Value;
 

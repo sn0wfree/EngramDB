@@ -281,7 +281,7 @@ mod tests {
         let tid = format!("{:?}", std::thread::current().id())
             .replace('(', "_").replace(')', "")
             .replace([':', ' '], "_");
-        p.push(format!("hybriddb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
+        p.push(format!("engramdb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
         p.to_string_lossy().to_string()
     }
 

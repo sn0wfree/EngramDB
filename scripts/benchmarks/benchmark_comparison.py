@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-HybridDB vs SQLite vs DuckDB 性能对比基准测试
+EngramDB vs SQLite vs DuckDB 性能对比基准测试
 
 测试说明：
-- HybridDB 用 Python 模拟实现其核心架构（列存 + 向量化 + Hash Join）
-  注：HybridDB 原生为 Rust 实现，Python 版仅用于验证架构设计的性能趋势
+- EngramDB 用 Python 模拟实现其核心架构（列存 + 向量化 + Hash Join）
+  注：EngramDB 原生为 Rust 实现，Python 版仅用于验证架构设计的性能趋势
 - SQLite：Python 内置 sqlite3 模块（行存、逐行执行）
 - DuckDB：duckdb Python 包（列存、向量化执行，C++ 原生）
 
@@ -76,12 +76,12 @@ def generate_join_data(num_rows: int) -> List[Tuple]:
     return rows
 
 # ============================================================
-# HybridDB Python 模拟版（列存 + 向量化）
+# EngramDB Python 模拟版（列存 + 向量化）
 # ============================================================
 
-class HybridDBMock:
+class EngramDBMock:
     """
-    HybridDB 核心架构的 Python 模拟实现。
+    EngramDB 核心架构的 Python 模拟实现。
     
     设计要点：
     - 列式存储（每列独立存储）
@@ -249,7 +249,7 @@ class HybridDBMock:
     
     def point_lookup(self, table_name: str, key_col: str, key_value: Any,
                      select_cols: List[str]) -> List[Tuple]:
-        """点查：等值查找（线性扫描模拟，实际 HybridDB 用索引）"""
+        """点查：等值查找（线性扫描模拟，实际 EngramDB 用索引）"""
         data = self.tables[table_name]
         keys = data[key_col]
         col_data = [data[c] for c in select_cols]
@@ -268,7 +268,7 @@ class HybridDBMock:
 @dataclass
 class BenchmarkResult:
     name: str
-    hybriddb_ms: float = 0
+    engramdb_ms: float = 0
     sqlite_ms: float = 0
     duckdb_ms: float = 0
     note: str = ""
@@ -276,7 +276,7 @@ class BenchmarkResult:
     def to_row(self) -> List[str]:
         return [
             self.name,
-            f"{self.hybriddb_ms:.2f}",
+            f"{self.engramdb_ms:.2f}",
             f"{self.sqlite_ms:.2f}",
             f"{self.duckdb_ms:.2f}",
             self.note,
@@ -408,7 +408,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     print(f"\n{'='*70}")
     print(f"  性能对比基准测试  |  数据量: {num_rows:,} 行")
     print(f"{'='*70}")
-    print(f"  HybridDB: Python 模拟版（列存 + 向量化 + Hash Join）")
+    print(f"  EngramDB: Python 模拟版（列存 + 向量化 + Hash Join）")
     print(f"  SQLite:    Python sqlite3（行存 + 逐行执行）")
     print(f"  DuckDB:    duckdb Python（列存 + 向量化，C++ 原生）")
     print(f"{'='*70}\n")
@@ -429,8 +429,8 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     print("  1. 数据加载（批量写入）")
     print(f"{'─'*70}")
     
-    # HybridDB
-    hdb = HybridDBMock()
+    # EngramDB
+    hdb = EngramDBMock()
     hdb.create_table('employees', [
         ('id', int), ('name', str), ('age', int),
         ('salary', int), ('department', str), ('city', str)
@@ -444,7 +444,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
         hdb.insert_batch('employees', employees_data),
         hdb.insert_batch('departments', dept_data),
     ), name="hdb_insert")
-    print(f"  HybridDB: {t_hdb_load:.2f} ms")
+    print(f"  EngramDB: {t_hdb_load:.2f} ms")
     
     # SQLite
     sq = SQLiteBench()
@@ -466,7 +466,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     
     results.append(BenchmarkResult(
         name="数据加载（批量写入）",
-        hybriddb_ms=t_hdb_load,
+        engramdb_ms=t_hdb_load,
         sqlite_ms=t_sq_load,
         duckdb_ms=t_ddb_load,
         note=f"{num_rows:,} 行 + {JOIN_TABLE_SIZE:,} 行",
@@ -485,7 +485,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_sq, r_sq = benchmark(lambda: sq.query_one("SELECT COUNT(*) FROM employees"))
     t_ddb, r_ddb = benchmark(lambda: ddb.query_one("SELECT COUNT(*) FROM employees"))
     print(f"  COUNT(*):")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (result={r_hdb})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (result={r_hdb})")
     print(f"    SQLite:   {t_sq:.2f} ms  (result={r_sq})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (result={r_ddb})")
     results.append(BenchmarkResult("COUNT(*) 全表扫描", t_hdb, t_sq, t_ddb, f"结果={r_hdb}"))
@@ -496,7 +496,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_sq, r_sq = benchmark(lambda: sq.query_one("SELECT SUM(salary) FROM employees"))
     t_ddb, r_ddb = benchmark(lambda: ddb.query_one("SELECT SUM(salary) FROM employees"))
     print(f"  SUM(salary):")
-    print(f"    HybridDB: {t_hdb:.2f} ms")
+    print(f"    EngramDB: {t_hdb:.2f} ms")
     print(f"    SQLite:   {t_sq:.2f} ms")
     print(f"    DuckDB:   {t_ddb:.2f} ms")
     results.append(BenchmarkResult("SUM(salary) 全表聚合", t_hdb, t_sq, t_ddb, ""))
@@ -506,7 +506,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_sq, r_sq = benchmark(lambda: sq.query_one("SELECT AVG(age) FROM employees"))
     t_ddb, r_ddb = benchmark(lambda: ddb.query_one("SELECT AVG(age) FROM employees"))
     print(f"  AVG(age):")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (avg={r_hdb:.1f})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (avg={r_hdb:.1f})")
     print(f"    SQLite:   {t_sq:.2f} ms  (avg={r_sq:.1f})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (avg={r_ddb:.1f})")
     results.append(BenchmarkResult("AVG(age) 全表聚合", t_hdb, t_sq, t_ddb, ""))
@@ -525,7 +525,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_ddb, r_ddb = benchmark(lambda: ddb.query_one(f"SELECT COUNT(*) FROM employees WHERE id >= {threshold_high}"))
     selectivity_high = r_hdb / num_rows * 100
     print(f"  高选择性（~{selectivity_high:.1f}% 匹配）:")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (rows={r_hdb})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (rows={r_hdb})")
     print(f"    SQLite:   {t_sq:.2f} ms  (rows={r_sq})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (rows={r_ddb})")
     results.append(BenchmarkResult(f"过滤-高选择性({selectivity_high:.0f}%)", t_hdb, t_sq, t_ddb, "id >= 99%"))
@@ -537,7 +537,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_ddb, r_ddb = benchmark(lambda: ddb.query_one(f"SELECT COUNT(*) FROM employees WHERE id < {threshold_mid}"))
     selectivity_mid = r_hdb / num_rows * 100
     print(f"  中选择性（~{selectivity_mid:.1f}% 匹配）:")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (rows={r_hdb})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (rows={r_hdb})")
     print(f"    SQLite:   {t_sq:.2f} ms  (rows={r_sq})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (rows={r_ddb})")
     results.append(BenchmarkResult(f"过滤-中选择性({selectivity_mid:.0f}%)", t_hdb, t_sq, t_ddb, "id < 50%"))
@@ -549,7 +549,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_ddb, r_ddb = benchmark(lambda: ddb.query_one(f"SELECT COUNT(*) FROM employees WHERE id >= {threshold_low}"))
     selectivity_low = r_hdb / num_rows * 100
     print(f"  低选择性（~{selectivity_low:.1f}% 匹配）:")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (rows={r_hdb})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (rows={r_hdb})")
     print(f"    SQLite:   {t_sq:.2f} ms  (rows={r_sq})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (rows={r_ddb})")
     results.append(BenchmarkResult(f"过滤-低选择性({selectivity_low:.0f}%)", t_hdb, t_sq, t_ddb, "id >= 10%"))
@@ -566,7 +566,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_sq, r_sq = benchmark(lambda: sq.query_all("SELECT department, SUM(salary) FROM employees GROUP BY department"))
     t_ddb, r_ddb = benchmark(lambda: ddb.query_all("SELECT department, SUM(salary) FROM employees GROUP BY department"))
     print(f"  低基数 GROUP BY（{NUM_GROUPS_LOW} 组）:")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (groups={len(r_hdb)})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (groups={len(r_hdb)})")
     print(f"    SQLite:   {t_sq:.2f} ms  (groups={len(r_sq)})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (groups={len(r_ddb)})")
     results.append(BenchmarkResult(f"GROUP BY 低基数({NUM_GROUPS_LOW}组)", t_hdb, t_sq, t_ddb, "SUM(salary)"))
@@ -576,7 +576,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
     t_sq, r_sq = benchmark(lambda: sq.query_all("SELECT city, AVG(salary) FROM employees GROUP BY city"))
     t_ddb, r_ddb = benchmark(lambda: ddb.query_all("SELECT city, AVG(salary) FROM employees GROUP BY city"))
     print(f"  高基数 GROUP BY（50 组）:")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (groups={len(r_hdb)})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (groups={len(r_hdb)})")
     print(f"    SQLite:   {t_sq:.2f} ms  (groups={len(r_sq)})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (groups={len(r_ddb)})")
     results.append(BenchmarkResult("GROUP BY 高基数(50组)", t_hdb, t_sq, t_ddb, "AVG(salary)"))
@@ -605,7 +605,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
         JOIN departments d ON e.department = d.dept_name
     """))
     print(f"  INNER JOIN（{num_rows:,} × {JOIN_TABLE_SIZE:,}）:")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (rows={len(r_hdb)})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (rows={len(r_hdb)})")
     print(f"    SQLite:   {t_sq:.2f} ms  (rows={len(r_sq)})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (rows={len(r_ddb)})")
     results.append(BenchmarkResult(
@@ -634,7 +634,7 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
         f"SELECT id, name, salary, department FROM employees ORDER BY salary LIMIT {sort_limit}"
     ))
     print(f"  ORDER BY + LIMIT {sort_limit}:")
-    print(f"    HybridDB: {t_hdb:.2f} ms")
+    print(f"    EngramDB: {t_hdb:.2f} ms")
     print(f"    SQLite:   {t_sq:.2f} ms")
     print(f"    DuckDB:   {t_ddb:.2f} ms")
     results.append(BenchmarkResult(f"ORDER BY + LIMIT {sort_limit}", t_hdb, t_sq, t_ddb, "全量排序取前N"))
@@ -658,10 +658,10 @@ def run_benchmarks(num_rows: int = NUM_ROWS) -> List[BenchmarkResult]:
         f"SELECT id, name, salary, department FROM employees WHERE id = {lookup_id}"
     ))
     print(f"  主键等值查询（id={lookup_id}）:")
-    print(f"    HybridDB: {t_hdb:.2f} ms  (rows={len(r_hdb)})")
+    print(f"    EngramDB: {t_hdb:.2f} ms  (rows={len(r_hdb)})")
     print(f"    SQLite:   {t_sq:.2f} ms  (rows={len(r_sq)})")
     print(f"    DuckDB:   {t_ddb:.2f} ms  (rows={len(r_ddb)})")
-    results.append(BenchmarkResult("点查（主键等值）", t_hdb, t_sq, t_ddb, "注: HybridDB未用索引"))
+    results.append(BenchmarkResult("点查（主键等值）", t_hdb, t_sq, t_ddb, "注: EngramDB未用索引"))
     
     # 清理
     sq.close()
@@ -678,23 +678,23 @@ def print_summary(results: List[BenchmarkResult]):
     print(f"  性能对比汇总表（单位：毫秒，越小越好）")
     print(f"{'='*70}")
     
-    header = f"{'测试项':<30} {'HybridDB':>10} {'SQLite':>10} {'DuckDB':>10} {'备注':<20}"
+    header = f"{'测试项':<30} {'EngramDB':>10} {'SQLite':>10} {'DuckDB':>10} {'备注':<20}"
     print(header)
     print("─" * 70)
     
     for r in results:
-        print(f"{r.name:<30} {r.hybriddb_ms:>9.2f}  {r.sqlite_ms:>9.2f}  {r.duckdb_ms:>9.2f}  {r.note:<20}")
+        print(f"{r.name:<30} {r.engramdb_ms:>9.2f}  {r.sqlite_ms:>9.2f}  {r.duckdb_ms:>9.2f}  {r.note:<20}")
     
     # 计算相对性能
     print(f"\n{'='*70}")
     print(f"  相对性能（以 SQLite 为基准 = 1.0，越大越慢）")
     print(f"{'='*70}")
-    print(f"{'测试项':<30} {'HybridDB':>10} {'SQLite':>10} {'DuckDB':>10}")
+    print(f"{'测试项':<30} {'EngramDB':>10} {'SQLite':>10} {'DuckDB':>10}")
     print("─" * 70)
     
     for r in results:
         if r.sqlite_ms > 0:
-            h_ratio = r.hybriddb_ms / r.sqlite_ms
+            h_ratio = r.engramdb_ms / r.sqlite_ms
             d_ratio = r.duckdb_ms / r.sqlite_ms
             print(f"{r.name:<30} {h_ratio:>9.2f}x {1.0:>9.2f}x {d_ratio:>9.2f}x")
     
@@ -708,16 +708,16 @@ def print_summary(results: List[BenchmarkResult]):
     d_ratios = []
     for r in results:
         if r.sqlite_ms > 0:
-            h_ratios.append(r.hybriddb_ms / r.sqlite_ms)
+            h_ratios.append(r.engramdb_ms / r.sqlite_ms)
             d_ratios.append(r.duckdb_ms / r.sqlite_ms)
     
     h_geo = math.exp(sum(math.log(x) for x in h_ratios) / len(h_ratios))
     d_geo = math.exp(sum(math.log(x) for x in d_ratios) / len(d_ratios))
     
-    print(f"  HybridDB 几何平均: {h_geo:.2f}x （相对于 SQLite）")
+    print(f"  EngramDB 几何平均: {h_geo:.2f}x （相对于 SQLite）")
     print(f"  DuckDB 几何平均:   {d_geo:.2f}x （相对于 SQLite）")
     print()
-    print(f"  注：HybridDB 为 Python 模拟版，Rust 原生版预计快 10-50x")
+    print(f"  注：EngramDB 为 Python 模拟版，Rust 原生版预计快 10-50x")
     print(f"      DuckDB 为 C++ 原生，是业界 OLAP 性能标杆")
     print(f"      SQLite 为行存事务型数据库，OLAP 非其强项")
 

@@ -1,17 +1,17 @@
-//! HybridDB 基本使用示例
+//! EngramDB 基本使用示例
 //!
 //! 演示建表、插入、查询、条件过滤、LIMIT、事务等核心功能。
 //!
 //! 运行：cargo run --example basic
 
-use hybriddb::{Connection, Value};
+use engramdb::{Connection, Value};
 
 fn main() {
     // 使用 :memory: 内存数据库，避免产生残留文件
     // 如需持久化，改为文件路径如 "example.hdb"
     let mut conn = Connection::open(":memory:").expect("Failed to open database");
 
-    println!("=== HybridDB 基本示例 ===\n");
+    println!("=== EngramDB 基本示例 ===\n");
 
     // 1. 建表
     println!("1. 创建表 users...");

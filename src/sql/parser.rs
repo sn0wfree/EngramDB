@@ -1,7 +1,7 @@
 //! SQL 解析器
 //!
 //! 基于 sqlparser-rs (Apache DataFusion 同款解析器)，
-//! 将外部 AST 转换为 HybridDB 内部精简 AST。
+//! 将外部 AST 转换为 EngramDB 内部精简 AST。
 //!
 //! 优势:
 //! - 成熟稳定，社区活跃 (DataFusion / Polars / RisingWave 均使用)
@@ -9,7 +9,7 @@
 //! - 语法覆盖全面，无需手写边界 case
 //! - 内部 AST 保持精简，只转换我们支持的语法
 
-use crate::common::error::{HybridDbError, Result};
+use crate::common::error::{EngramDbError, Result};
 use crate::common::types::DataType;
 use crate::Value;
 
@@ -32,10 +32,10 @@ pub fn parse(sql: &str) -> Result<Statement> {
     if let Some((base_sql, included_cols)) = extract_include_clause(sql) {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, &base_sql).map_err(|e| {
-            HybridDbError::Parse(format!("SQL parse error: {}", e))
+            EngramDbError::Parse(format!("SQL parse error: {}", e))
         })?;
         if stmts.is_empty() {
-            return Err(HybridDbError::Parse("Empty SQL statement".into()));
+            return Err(EngramDbError::Parse("Empty SQL statement".into()));
         }
         let mut stmt = convert_statement(&stmts[0])?;
         // 注入 INCLUDE 列
@@ -47,11 +47,11 @@ pub fn parse(sql: &str) -> Result<Statement> {
 
     let dialect = GenericDialect {};
     let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
-        HybridDbError::Parse(format!("SQL parse error: {}", e))
+        EngramDbError::Parse(format!("SQL parse error: {}", e))
     })?;
 
     if stmts.is_empty() {
-        return Err(HybridDbError::Parse("Empty SQL statement".into()));
+        return Err(EngramDbError::Parse("Empty SQL statement".into()));
     }
 
     // 只处理第一条语句
@@ -117,7 +117,7 @@ fn extract_include_clause(sql: &str) -> Option<(String, Vec<String>)> {
     Some((base_sql, columns))
 }
 
-/// sqlparser AST → HybridDB 内部 AST
+/// sqlparser AST → EngramDB 内部 AST
 fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
     match stmt {
         sqlast::Statement::CreateTable { name, columns, .. } => {
@@ -169,12 +169,12 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                     }
                     rows
                 } else {
-                    return Err(HybridDbError::Parse(
+                    return Err(EngramDbError::Parse(
                         "INSERT with subquery not supported yet".into(),
                     ));
                 }
             } else {
-                return Err(HybridDbError::Parse(
+                return Err(EngramDbError::Parse(
                     "INSERT without source not supported".into(),
                 ));
             };
@@ -278,11 +278,11 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 sqlast::FromTable::WithoutKeyword(t) => t,
             };
             let tbl_name = if tables.is_empty() {
-                return Err(HybridDbError::Parse("DELETE requires a table name".into()));
+                return Err(EngramDbError::Parse("DELETE requires a table name".into()));
             } else {
                 match &tables[0].relation {
                     sqlast::TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return Err(HybridDbError::Parse("Unsupported DELETE table type".into())),
+                    _ => return Err(EngramDbError::Parse("Unsupported DELETE table type".into())),
                 }
             };
             let where_clause = match &delete_stmt.selection {
@@ -299,7 +299,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
         sqlast::Statement::Update { table, assignments, selection, .. } => {
             let tbl_name = match &table.relation {
                 sqlast::TableFactor::Table { name, .. } => name.to_string(),
-                _ => return Err(HybridDbError::Parse("Unsupported UPDATE table type".into())),
+                _ => return Err(EngramDbError::Parse("Unsupported UPDATE table type".into())),
             };
             let mut assigns = Vec::new();
             for assign in assignments {
@@ -319,7 +319,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
         }
 
         // 暂不支持的语句
-        _ => Err(HybridDbError::Parse(format!(
+        _ => Err(EngramDbError::Parse(format!(
             "Unsupported SQL statement: {}",
             stmt_to_str(stmt)
         ))),
@@ -393,7 +393,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
             (items, from, where_clause, group_by, having)
         }
         _ => {
-            return Err(HybridDbError::Parse(
+            return Err(EngramDbError::Parse(
                 "Only SELECT queries are supported".into(),
             ));
         }
@@ -419,7 +419,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
         Some(expr) => {
             if let sqlast::Expr::Value(sqlast::Value::Number(n, _)) = expr {
                 Some(n.parse::<usize>().map_err(|_| {
-                    HybridDbError::Parse("Invalid LIMIT value".into())
+                    EngramDbError::Parse("Invalid LIMIT value".into())
                 })?)
             } else {
                 None
@@ -439,7 +439,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
     })
 }
 
-/// sqlparser Expr → HybridDB Expression
+/// sqlparser Expr → EngramDB Expression
 fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
     match expr {
         // 参数占位符（? 或 $1 / $2 ...）——必须在 Expr::Value 之前匹配
@@ -472,7 +472,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
                     column: parts[1].value.clone(),
                 })
             } else {
-                Err(HybridDbError::Parse(format!(
+                Err(EngramDbError::Parse(format!(
                     "Unsupported compound identifier with {} parts",
                     parts.len()
                 )))
@@ -502,7 +502,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
                     expr: Box::new(inner),
                 }),
                 sqlast::UnaryOperator::Plus => Ok(inner),
-                _ => Err(HybridDbError::Parse(format!(
+                _ => Err(EngramDbError::Parse(format!(
                     "Unsupported unary operator: {:?}",
                     op
                 ))),
@@ -516,7 +516,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             let (args, distinct) = match &func.args {
                 sqlast::FunctionArguments::None => (Vec::new(), false),
                 sqlast::FunctionArguments::Subquery(_) => {
-                    return Err(HybridDbError::Parse(
+                    return Err(EngramDbError::Parse(
                         "Subquery function arguments not supported".into(),
                     ));
                 }
@@ -677,7 +677,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             })
         }
 
-        _ => Err(HybridDbError::Parse(format!(
+        _ => Err(EngramDbError::Parse(format!(
             "Unsupported expression: {}",
             expr
         ))),
@@ -694,13 +694,13 @@ fn convert_value(v: &sqlast::Value) -> Result<Value> {
             } else if let Ok(f) = n.parse::<f64>() {
                 Ok(Value::Float64(f))
             } else {
-                Err(HybridDbError::Parse(format!("Invalid number: {}", n)))
+                Err(EngramDbError::Parse(format!("Invalid number: {}", n)))
             }
         }
         sqlast::Value::SingleQuotedString(s) => Ok(Value::Varchar(s.clone())),
         sqlast::Value::DollarQuotedString(s) => Ok(Value::Varchar(s.value.clone())),
         sqlast::Value::Null => Ok(Value::Null),
-        _ => Err(HybridDbError::Parse(format!("Unsupported value type: {:?}", v))),
+        _ => Err(EngramDbError::Parse(format!("Unsupported value type: {:?}", v))),
     }
 }
 
@@ -733,7 +733,7 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
             // 先用 dim=0 占位，建表时再从列定义中获取
             Ok(DataType::Vector { dim: 0 })
         }
-        _ => Err(HybridDbError::Parse(format!(
+        _ => Err(EngramDbError::Parse(format!(
             "Unsupported data type: {:?}",
             dt
         ))),
@@ -756,7 +756,7 @@ fn convert_binary_op(op: &sqlast::BinaryOperator) -> Result<BinaryOperator> {
         sqlast::BinaryOperator::And => Ok(BinaryOperator::And),
         sqlast::BinaryOperator::Or => Ok(BinaryOperator::Or),
         sqlast::BinaryOperator::StringConcat => Ok(BinaryOperator::Concat),
-        _ => Err(HybridDbError::Parse(format!(
+        _ => Err(EngramDbError::Parse(format!(
             "Unsupported binary operator: {:?}",
             op
         ))),

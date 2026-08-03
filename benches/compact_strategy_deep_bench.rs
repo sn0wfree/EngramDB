@@ -4,13 +4,13 @@
 //! 2. WAL 开启后的真实场景对比
 //! 3. sync_wal 联动 compact 的开销
 
-use hybriddb::{Connection, CompactStrategy, WalFlushMode, Config, Value};
+use engramdb::{Connection, CompactStrategy, WalFlushMode, Config, Value};
 use std::time::Instant;
 
 const TABLE_SQL: &str = "CREATE TABLE bench (id INT, name VARCHAR, age INT, score DOUBLE, active BOOLEAN)";
 
 fn main() {
-    println!("=== HybridDB v0.11.3 Compact 深度性能测试 ===\n");
+    println!("=== EngramDB v0.11.3 Compact 深度性能测试 ===\n");
 
     // 测试 1: compact 操作本身的耗时
     println!("【测试 1】Compact 操作直接耗时（不同数据量）\n");

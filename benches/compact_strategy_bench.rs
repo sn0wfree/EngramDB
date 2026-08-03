@@ -13,7 +13,7 @@
 //! 4. Compact 次数
 //! 5. 查询性能（合并后 vs 合并前）
 
-use hybriddb::{Connection, CompactStrategy, Value};
+use engramdb::{Connection, CompactStrategy, Value};
 use std::time::{Instant, Duration};
 
 const TABLE_SQL: &str = "CREATE TABLE bench (id INT, name VARCHAR, age INT, score DOUBLE, active BOOLEAN)";
@@ -21,7 +21,7 @@ const TOTAL_ROWS: usize = 200_000;
 const BATCH_SIZE: usize = 500; // 小批量写入，确保走 Delta 路径
 
 fn main() {
-    println!("=== HybridDB v0.11.3 Compact 策略性能对比测试 ===\n");
+    println!("=== EngramDB v0.11.3 Compact 策略性能对比测试 ===\n");
     println!("测试配置: {} 行，{} 行/批，5 列（Int/Varchar/Int/Double/Bool）\n", TOTAL_ROWS, BATCH_SIZE);
 
     // 测试各策略

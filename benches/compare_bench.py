@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HybridDB vs SQLite vs DuckDB 性能对比测试
+EngramDB vs SQLite vs DuckDB 性能对比测试
 测试场景: 数据导入、查询性能、压缩率、文件大小
 公平对比: 各引擎使用各自推荐的最佳实践
 """
@@ -53,7 +53,7 @@ for i in range(N):
                   categories[i % 10], random.gauss(50, 15)))
 
 print("=" * 65)
-print("  HybridDB vs SQLite vs DuckDB 性能对比")
+print("  EngramDB vs SQLite vs DuckDB 性能对比")
 print(f"  数据集: {fmt_num(N)}行 × 5列 (id/ts/value/category/score)")
 print("  环境: 1 Core CPU / 4GB RAM / Python 3.10")
 print("=" * 65)
@@ -167,8 +167,8 @@ duckdb_size = os.path.getsize(duckdb_path)
 results['duckdb']['size'] = duckdb_size
 print(f"  [存储] 文件大小 {fmt_bytes(duckdb_size)}  ({duckdb_size/N:.1f}B/行)")
 
-# ========== HybridDB ==========
-print("\n▶ HybridDB v0.7.5 (列存+分类型压缩, Rust原生)")
+# ========== EngramDB ==========
+print("\n▶ EngramDB v0.7.5 (列存+分类型压缩, Rust原生)")
 print("-" * 65)
 print("  存储引擎层性能 (Rust -O, 无SQL开销)")
 print()
@@ -187,8 +187,8 @@ print(f"  布隆(1%FPR)      ~61M行/s     布隆查询    ~57M QPS")
 print()
 print(f"  [存储] 估算文件大小 ~1.5-2.5MB  (~15-25B/行, 含压缩+索引)")
 
-# HybridDB 估算值 (基于 Rust 基准, 保守估算)
-results['hybriddb'] = {
+# EngramDB 估算值 (基于 Rust 基准, 保守估算)
+results['engramdb'] = {
     'import': N / 20_000_000 * 1000,  # 20M行/s 估算
     'index': N / 4_500_000 * 1000,    # 跳表 4.5M行/s
     'count': 0.05,   # 元数据直接读取, ~50μs
@@ -224,16 +224,16 @@ rows = [
     ("GROUP BY 10组", "groupby", "ms", lambda v: f"{v:.3f}"),
 ]
 
-print(f"  {'指标':<18} {'SQLite':>10} {'DuckDB':>10} {'HybridDB*':>10}  {'优胜':>6}")
+print(f"  {'指标':<18} {'SQLite':>10} {'DuckDB':>10} {'EngramDB*':>10}  {'优胜':>6}")
 print("  " + "-" * 62)
 
 for label, key, unit, fmt_fn in rows:
     s = results['sqlite'][key]
     d = results['duckdb'][key]
-    h = results['hybriddb'][key]
+    h = results['engramdb'][key]
 
     # 找最快的
-    vals = [('SQLite', s), ('DuckDB', d), ('HybridDB', h)]
+    vals = [('SQLite', s), ('DuckDB', d), ('EngramDB', h)]
     best = min(vals, key=lambda x: x[1])[0]
 
     print(f"  {label:<18} {fmt_fn(s):>10} {fmt_fn(d):>10} {fmt_fn(h):>10}  {best:>6}")
@@ -241,13 +241,13 @@ for label, key, unit, fmt_fn in rows:
 # 文件大小
 s_sz = results['sqlite']['size']
 d_sz = results['duckdb']['size']
-h_sz = results['hybriddb']['size']
-best_sz = min([('SQLite', s_sz), ('DuckDB', d_sz), ('HybridDB', h_sz)], key=lambda x: x[1])[0]
+h_sz = results['engramdb']['size']
+best_sz = min([('SQLite', s_sz), ('DuckDB', d_sz), ('EngramDB', h_sz)], key=lambda x: x[1])[0]
 print(f"  {'文件大小':<18} {fmt_bytes(s_sz):>10} {fmt_bytes(d_sz):>10} {fmt_bytes(h_sz):>10}  {best_sz:>6}")
 print(f"  {'每行字节':<18} {f'{s_sz/N:.1f}B':>10} {f'{d_sz/N:.1f}B':>10} {f'{h_sz/N:.1f}B':>10}  {best_sz:>6}")
 
 print()
-print("  * HybridDB 为 Rust 原生存储引擎层理论值 (无 SQL 解析开销)")
+print("  * EngramDB 为 Rust 原生存储引擎层理论值 (无 SQL 解析开销)")
 print("  * 10万行规模下各有优势; 百万级以上列存优势更显著")
 print()
 
@@ -258,12 +258,12 @@ print("=" * 65)
 print()
 print("  SQLite:    通用嵌入式 OLTP, 点查极快, 生态最成熟")
 print("  DuckDB:    单机分析型 OLAP, 复杂聚合/Join 强, 支持完整 SQL")
-print("  HybridDB:  嵌入式 AI Agent 数据引擎, 极致压缩+索引, 低资源占用")
+print("  EngramDB:  嵌入式 AI Agent 数据引擎, 极致压缩+索引, 低资源占用")
 print()
 print("  选择建议:")
 print("    • 需要完整 SQL + 复杂分析 → DuckDB")
 print("    • 需要事务 + 点查 + 生态 → SQLite")
-print("    • 嵌入式 + 极致压缩 + 索引 → HybridDB")
+print("    • 嵌入式 + 极致压缩 + 索引 → EngramDB")
 print()
 
 # 清理

@@ -412,7 +412,7 @@ mod tests {
         let tid = format!("{:?}", std::thread::current().id())
             .replace('(', "_").replace(')', "")
             .replace([':', ' '], "_");
-        p.push(format!("hybriddb_txn_{}_{}_{}.hdb", name, std::process::id(), tid));
+        p.push(format!("engramdb_txn_{}_{}_{}.hdb", name, std::process::id(), tid));
         let tmp = p.to_string_lossy().to_string();
         cleanup(&tmp);
         let config = Config::default();

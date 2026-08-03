@@ -2,13 +2,13 @@
 
 **版本**: v0.11.3  
 **日期**: 2026-08-02  
-**范围**: HybridDB Delta→ColumnStore 合并策略体系
+**范围**: EngramDB Delta→ColumnStore 合并策略体系
 
 ---
 
 ## 1. 策略体系总览
 
-HybridDB v0.11.3 实现了 **4 种 Delta 合并策略 + 1 种联动机制**，形成可组合的策略体系：
+EngramDB v0.11.3 实现了 **4 种 Delta 合并策略 + 1 种联动机制**，形成可组合的策略体系：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -299,7 +299,7 @@ conn.set_table_compact_strategy("tmp_import_batch",
 ### 8.1 默认用法（开箱即用）
 
 ```rust
-use hybriddb::Connection;
+use engramdb::Connection;
 
 let mut conn = Connection::open("data.hdb")?;
 // 默认就是 Adaptive + Sync，什么都不用配
@@ -310,7 +310,7 @@ conn.execute("INSERT INTO t VALUES (1, 'a')")?;
 ### 8.2 批量导入
 
 ```rust
-use hybriddb::{Connection, CompactStrategy, WalFlushMode};
+use engramdb::{Connection, CompactStrategy, WalFlushMode};
 
 let mut conn = Connection::open("data.hdb")?;
 
@@ -334,7 +334,7 @@ conn.set_wal_flush_mode(WalFlushMode::Sync);
 ### 8.3 高吞吐 + Periodic 模式
 
 ```rust
-use hybriddb::{Connection, CompactStrategy, WalFlushMode, Config};
+use engramdb::{Connection, CompactStrategy, WalFlushMode, Config};
 
 let config = Config {
     compact_strategy: CompactStrategy::incremental(50_000, 10_000),
@@ -361,7 +361,7 @@ loop {
 ### 8.4 按表设置不同策略
 
 ```rust
-use hybriddb::{Connection, CompactStrategy};
+use engramdb::{Connection, CompactStrategy};
 
 let mut conn = Connection::open("data.hdb")?;
 

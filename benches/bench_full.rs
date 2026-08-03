@@ -1,7 +1,7 @@
-//! HybridDB 完整性能基准测试
+//! EngramDB 完整性能基准测试
 //! 对比日常使用场景：数据加载、扫描、过滤、聚合、Join、排序
 
-use hybriddb::Connection;
+use engramdb::Connection;
 use std::time::Instant;
 use rand::Rng;
 use rand::SeedableRng;
@@ -34,11 +34,11 @@ fn main() {
         100_000
     };
 
-    println!("=== HybridDB 完整性能基准测试 ===");
+    println!("=== EngramDB 完整性能基准测试 ===");
     println!("数据规模: {} 行", n_rows);
     println!();
 
-    let db_path = format!("/tmp/hybriddb_bench_{}.db", n_rows);
+    let db_path = format!("/tmp/engramdb_bench_{}.db", n_rows);
     let _ = std::fs::remove_file(&db_path);
 
     let mut conn = Connection::open(&db_path).unwrap();

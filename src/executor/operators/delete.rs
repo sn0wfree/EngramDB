@@ -6,7 +6,7 @@
 
 use log::{error, warn, info, debug, trace};
 
-use crate::common::error::{Result, HybridDbError};
+use crate::common::error::{Result, EngramDbError};
 use crate::sql::ast::Expression;
 use crate::executor::operators;
 use crate::executor::vector::DataChunk;
@@ -49,7 +49,7 @@ pub fn execute(
     let _table_id = db.table_names().get(table_name)
         .ok_or_else(|| {
             error!("Table '{}' not found", table_name);
-            HybridDbError::TableNotFound(table_name.into())
+            EngramDbError::TableNotFound(table_name.into())
         })?;
     debug!("✓ Table '{}' exists", table_name);
     
@@ -82,7 +82,7 @@ fn execute_with_txn(
     // 步骤 1：先收集要删除的行（在开启事务之前，避免借用冲突）
     let rows_to_delete = {
         let table = db.get_table(table_name)
-            .ok_or_else(|| HybridDbError::TableNotFound(table_name.into()))?;
+            .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
         
         let num_cols = table.def.columns.len();
         if num_cols == 0 {
@@ -165,7 +165,7 @@ fn execute_without_txn(
     debug!("Starting non-transaction path DELETE execution...");
     
     let table = db.get_table_mut(table_name)
-        .ok_or_else(|| HybridDbError::TableNotFound(table_name.into()))?;
+        .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
     
     let num_cols = table.def.columns.len();
     if num_cols == 0 {
