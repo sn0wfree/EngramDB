@@ -130,7 +130,7 @@ fn execute_without_txn(
 /// 应用事务操作到存储层
 ///
 /// 遍历 apply_ops，将每个操作应用到对应的表
-fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
+pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
     trace!("apply_to_storage called with {} operations", ops.len());
     
     for (idx, op) in ops.iter().enumerate() {
@@ -151,14 +151,32 @@ fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
                 debug!("✓ Insert applied: table_id={}, row_id={}", table_id, row_id);
             }
             
-            ApplyOp::Update { table_id: _, row_id: _, new_row: _ } => {
-                // TODO: 实现 update_row() 方法
-                warn!("Update operation not yet fully supported in apply_to_storage");
+            ApplyOp::Update { table_id, row_id, new_row } => {
+                trace!("Update: table_id={}, row_id={}, new_row={:?}", table_id, row_id, new_row);
+                
+                let table = db.tables_mut().get_mut(table_id)
+                    .ok_or_else(|| {
+                        error!("Table not found: table_id={}", table_id);
+                        error!("This indicates a bug in collect_apply_ops()");
+                        HybridDbError::TableNotFound(format!("id={}", table_id))
+                    })?;
+                
+                table.update_row(*row_id as u32, new_row)?;
+                debug!("✓ Update applied: table_id={}, row_id={}", table_id, row_id);
             }
             
-            ApplyOp::Delete { table_id: _, row_id: _ } => {
-                // TODO: 实现 delete_row() 方法
-                warn!("Delete operation not yet fully supported in apply_to_storage");
+            ApplyOp::Delete { table_id, row_id } => {
+                trace!("Delete: table_id={}, row_id={}", table_id, row_id);
+                
+                let table = db.tables_mut().get_mut(table_id)
+                    .ok_or_else(|| {
+                        error!("Table not found: table_id={}", table_id);
+                        error!("This indicates a bug in collect_apply_ops()");
+                        HybridDbError::TableNotFound(format!("id={}", table_id))
+                    })?;
+                
+                table.delete_row(*row_id as u32)?;
+                debug!("✓ Delete applied: table_id={}, row_id={}", table_id, row_id);
             }
         }
     }

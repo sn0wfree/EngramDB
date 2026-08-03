@@ -96,7 +96,9 @@ impl TransactionManager {
         }
 
         ctx.state = TxnState::Committed;
-        let write_set = std::mem::take(&mut ctx.write_set);
+        // 注意：必须在 take 之前克隆 write_set，因为 collect_apply_ops 需要它
+        let write_set = ctx.write_set.clone();
+        let _dropped = std::mem::take(&mut ctx.write_set);
 
         // 写入 WAL COMMIT 记录并刷盘（根据配置的刷盘策略）
         self.wal.write_record(WalRecordType::Commit, txn_id, 0, &[])?;
@@ -113,27 +115,66 @@ impl TransactionManager {
         }
         
         // 收集待应用操作（方案 B：返回 apply_ops，由 executor 应用到存储层）
-        let apply_ops = self.collect_apply_ops(txn_id, commit_ts)?;
+        let apply_ops = self.collect_apply_ops(&write_set, txn_id)?;
 
         Ok(CommitResult { commit_ts, apply_ops })
     }
     
     /// 收集待应用操作（内部辅助方法）
-    fn collect_apply_ops(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Vec<ApplyOp>> {
-        let ctx = self.txns.get(&txn_id)
-            .ok_or_else(|| TxnError::NotFound(txn_id))?;
-        
+    ///
+    /// 根据 MVCC 版本链判断操作类型：
+    /// - Insert: rowid 之前没有已提交版本
+    /// - Update: rowid 之前有已提交版本，且事务创建了新版本
+    /// - Delete: rowid 之前有已提交版本，但事务没有创建新版本（删除标记）
+    fn collect_apply_ops(&self, write_set: &[(u32, u64)], txn_id: TxnId) -> Result<Vec<ApplyOp>> {
         let mut ops = Vec::new();
         
-        for (table_id, rowid) in &ctx.write_set {
+        for (table_id, rowid) in write_set {
             if let Some(store) = self.mvcc.get(table_id) {
-                // 从 MVCC 版本链获取提交的数据
-                if let Some(row) = store.get_for_txn(*rowid, commit_ts, txn_id) {
-                    ops.push(ApplyOp::Insert {
-                        table_id: *table_id,
-                        row_id: *rowid,
-                        row: row.clone(),
-                    });
+                // 检查是否有旧版本（用于区分 Insert 和 Update/Delete）
+                let has_old_version = store.has_committed_version_before(*rowid, txn_id);
+                
+                // 尝试获取事务创建的新版本
+                let new_version = store.get_txn_version(*rowid, txn_id);
+                
+                // 判断是否为删除操作：delete() 用空 Vec 作为 tombstone 标记删除
+                let is_delete = new_version.as_ref().map_or(false, |v| v.is_empty());
+                
+                if is_delete {
+                    // 删除操作（有旧版本且被删除
+                    if has_old_version {
+                        ops.push(ApplyOp::Delete {
+                            table_id: *table_id,
+                            row_id: *rowid,
+                        });
+                    }
+                    // 无旧版本的删除（比如删除一个不存在的行则跳过（空操作）
+                } else if let Some(new_row) = new_version {
+                    // 有新版本且非空：Insert 或 Update
+                    if has_old_version {
+                        // 有旧版本 → Update
+                        ops.push(ApplyOp::Update {
+                            table_id: *table_id,
+                            row_id: *rowid,
+                            new_row: new_row.clone(),
+                        });
+                    } else {
+                        // 无旧版本 → Insert
+                        ops.push(ApplyOp::Insert {
+                            table_id: *table_id,
+                            row_id: *rowid,
+                            row: new_row.clone(),
+                        });
+                    }
+                } else {
+                    // 无新版本且非空：Delete（有旧版本）
+                    if has_old_version {
+                        ops.push(ApplyOp::Delete {
+                            table_id: *table_id,
+                            row_id: *rowid,
+                        });
+                    }
+                    // 如果既没有旧版本也没有新版本，则跳过（可能是回滚的操作）
                 }
             }
         }

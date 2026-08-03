@@ -195,6 +195,8 @@ pub struct Config {
     /// **适用场景**：
     /// - enable_transaction=true：生产环境、需要崩溃恢复、多事务并发
     /// - enable_transaction=false：批量导入、离线分析、临时数据库
+    ///
+    /// CLI 控制：通过 `--no-transaction` 参数可在启动时关闭事务。
     pub enable_transaction: bool,
     
     /// 事务隔离级别（仅 enable_transaction=true 时生效）
@@ -235,7 +237,7 @@ impl Default for Config {
             compress_on_persist: true,
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
-            enable_transaction: false,  // 默认禁用事务（后续版本默认启用）
+            enable_transaction: true,
             default_isolation_level: IsolationLevel::default(),
         }
     }

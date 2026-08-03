@@ -567,6 +567,96 @@ impl Table {
         Ok(())
     }
     
+    /// 删除单行数据（事务提交后应用到存储层）
+    ///
+    /// 参数：row_id - 要删除的行 ID
+    ///
+    /// 流程：
+    /// 1. 从 Delta 层删除指定 row_id 的行
+    /// 2. 更新二级索引（删除对应条目）
+    /// 3. 更新向量索引（tombstone 标记）
+    /// 4. 更新总行数
+    pub fn delete_row(&mut self, row_id: u32) -> Result<()> {
+        // 从 Delta 层获取行数据（用于索引维护）
+        let row_id_64 = row_id as u64;
+        let old_row = self.delta_store.get(row_id_64);
+        
+        // 从 Delta 层删除
+        self.delta_store.delete_row(row_id)?;
+        
+        // 更新总行数
+        self.def.row_count = self.def.row_count.saturating_sub(1);
+        
+        // 如果有旧行数据，更新索引
+        if let Some(ref row) = old_row {
+            // 删除二级索引中的对应条目
+            if !self.indexes.is_empty() {
+                self.remove_indexes_for_rows(&[row.clone()], &[row_id]);
+            }
+            
+            // 标记向量索引中的删除
+            if !self.vector_indexes.is_empty() {
+                self.remove_vector_indexes_for_rows(&[row_id]);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 更新单行数据（事务提交后应用到存储层）
+    ///
+    /// 参数：
+    /// - row_id - 要更新的行 ID
+    /// - new_row - 更新后的新行数据
+    ///
+    /// 流程：
+    /// 1. 获取旧行数据
+    /// 2. 更新 Delta 层中的行
+    /// 3. 更新二级索引（删旧条目 + 插新条目）
+    /// 4. 更新向量索引
+    pub fn update_row(&mut self, row_id: u32, new_row: &[Value]) -> Result<()> {
+        // 获取旧行数据
+        let row_id_64 = row_id as u64;
+        let old_row = self.delta_store.get(row_id_64);
+        
+        // 更新 Delta 层
+        self.delta_store.update_row_by_id(row_id, new_row.to_vec())?;
+        
+        // 从 Delta 层读取更新后的新行
+        let updated_row = self.delta_store.get(row_id_64);
+        
+        // 如果有旧行数据，更新索引
+        if let Some(ref old_r) = old_row {
+            // 删除旧索引条目
+            if !self.indexes.is_empty() && !self.vector_indexes.is_empty() {
+                // 同时维护两种索引
+            }
+            
+            // 删除旧索引条目
+            if !self.indexes.is_empty() {
+                self.remove_indexes_for_rows(&[old_r.clone()], &[row_id]);
+            }
+            
+            // 标记向量索引中的旧条目为 tombstone
+            if !self.vector_indexes.is_empty() {
+                self.remove_vector_indexes_for_rows(&[row_id]);
+            }
+        }
+        
+        // 插入新索引条目
+        if let Some(ref new_r) = updated_row {
+            if !self.indexes.is_empty() {
+                self.update_indexes_for_row(row_id, new_r);
+            }
+            
+            if !self.vector_indexes.is_empty() {
+                self.update_vector_indexes_for_row(row_id, new_r);
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// 更新单行的二级索引（内部辅助方法）
     fn update_indexes_for_row(&mut self, row_id: u32, row: &[Value]) {
         for idx_def in self.def.indexes.clone() {

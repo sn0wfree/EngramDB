@@ -1,52 +1,120 @@
 //! HybridDB CLI 入口
+//!
+//! 用法：
+//!   hybriddb <database_file>              # 交互模式（默认开启事务）
+//!   hybriddb --no-transaction <db>       # 交互模式（关闭事务，高性能模式）
+//!   hybriddb <database_file> "SQL"        # 单条命令模式
+//!   hybriddb --no-txn <db> "SQL"          # 单条命令（关闭事务）
+//!   hybriddb --help                       # 查看帮助
 
 use std::io::{self, BufRead, Write};
 
-use hybriddb::Connection;
+use hybriddb::{Connection, Config};
 
 fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 2 {
-        println!("Usage: hybriddb <database_file>");
-        println!("  or: hybriddb <database_file> \"<SQL statement>\"");
-        return;
+    let mut enable_transaction: Option<bool> = None;
+    let mut db_path: Option<String> = None;
+    let mut sql_stmt: Option<String> = None;
+    let mut i = 1; // skip program name
+
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return;
+            }
+            "--no-transaction" | "--no-txn" => {
+                enable_transaction = Some(false);
+            }
+            "--enable-transaction" | "--txn" => {
+                enable_transaction = Some(true);
+            }
+            s if s.starts_with("--") => {
+                eprintln!("未知参数: {}", s);
+                eprintln!("使用 --help 查看可用参数");
+                std::process::exit(1);
+            }
+            _ => {
+                if db_path.is_none() {
+                    db_path = Some(arg.clone());
+                } else if sql_stmt.is_none() {
+                    // 剩余参数拼成 SQL 语句
+                    let remaining: Vec<String> = args[i..].to_vec();
+                    sql_stmt = Some(remaining.join(" "));
+                    break;
+                }
+            }
+        }
+        i += 1;
     }
 
-    let db_path = &args[1];
+    let db_path = match db_path {
+        Some(p) => p,
+        None => {
+            print_usage();
+            std::process::exit(1);
+        }
+    };
 
-    if args.len() >= 3 {
+    // 构建配置：默认启用事务，除非显式指定 --no-transaction
+    let mut config = Config::default();
+    if let Some(enabled) = enable_transaction {
+        config.enable_transaction = enabled;
+    }
+    let txn_status = if config.enable_transaction { "ON" } else { "OFF" };
+
+    if let Some(sql) = sql_stmt {
         // 单条命令模式
-        let sql = &args[2..].join(" ");
-        if let Err(e) = execute_single(db_path, sql) {
+        if let Err(e) = execute_single(&db_path, &sql, &config) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     } else {
         // 交互模式
-        if let Err(e) = run_interactive(db_path) {
+        if let Err(e) = run_interactive(&db_path, &config, txn_status) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     }
 }
 
-fn execute_single(path: &str, sql: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = Connection::open(path)?;
+fn print_usage() {
+    println!("HybridDB v0.12.0");
+    println!("=================");
+    println!();
+    println!("用法:");
+    println!("  hybriddb <database_file>              交互模式（默认开启事务）");
+    println!("  hybriddb --no-transaction <db>         交互模式（关闭事务）");
+    println!("  hybriddb <database_file> \"<SQL>\"       单条命令执行");
+    println!("  hybriddb --no-txn <db> \"<SQL>\"         单条命令（关闭事务）");
+    println!();
+    println!("参数:");
+    println!("  --no-transaction, --no-txn    关闭事务支持（高性能模式）");
+    println!("  --enable-transaction, --txn   强制开启事务（默认）");
+    println!("  --help, -h                    查看帮助");
+}
+
+fn execute_single(path: &str, sql: &str, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = Connection::open_with_config(path, config.clone())?;
     let result = conn.execute(sql)?;
     print_result(&result);
     conn.close()?;
     Ok(())
 }
 
-fn run_interactive(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("HybridDB v0.1.0 — 输入 SQL 语句，输入 .exit 退出");
+fn run_interactive(path: &str, config: &Config, txn_status: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("HybridDB v0.12.0 — 输入 SQL 语句，输入 .exit 退出");
     println!("数据库: {}", path);
+    println!("事务: {}", txn_status);
     println!();
 
-    let mut conn = Connection::open(path)?;
+    let mut conn = Connection::open_with_config(path, config.clone())?;
+
     let stdin = io::stdin();
     let mut buffer = String::new();
 

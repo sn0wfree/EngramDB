@@ -44,7 +44,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::Delete { table_name, condition } => {
-            let count = execute_delete(db, &table_name, condition)?;
+            let count = operators::delete::execute(db, &table_name, condition)?;
             Ok(QueryResult {
                 columns: vec!["rows_deleted".to_string()],
                 rows: vec![vec![crate::Value::Int64(count as i64)]],
@@ -53,7 +53,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::Update { table_name, assignments, condition } => {
-            let count = execute_update(db, &table_name, &assignments, condition)?;
+            let count = operators::update::execute(db, &table_name, &assignments, condition)?;
             Ok(QueryResult {
                 columns: vec!["rows_updated".to_string()],
                 rows: vec![vec![crate::Value::Int64(count as i64)]],
@@ -347,143 +347,4 @@ fn rows_to_chunks(rows: &[Vec<crate::Value>]) -> Vec<DataChunk> {
     chunks
 }
 
-// ============================================================================
-// DELETE / UPDATE 执行（v0.12.0 新增）
-// ============================================================================
 
-/// 执行 DELETE 语句
-///
-/// 策略：
-/// 1. 扫描表的所有列（用于评估 WHERE 条件和定位行）
-/// 2. 应用 WHERE 过滤，找出匹配行的 Delta 层索引
-/// 3. 从 Delta 层删除匹配行
-///
-/// 注意：当前仅支持删除 Delta 层的行。列存中的行暂不支持原地删除
-/// （LSM 风格，后续通过 tombstone + compact 实现）。
-fn execute_delete(
-    db: &mut Database,
-    table_name: &str,
-    condition: Option<Expression>,
-) -> Result<usize> {
-    let table = db.get_table_mut(table_name)
-        .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
-
-    let num_cols = table.def.columns.len();
-    if num_cols == 0 {
-        return Ok(0);
-    }
-
-    // 扫描所有列（用于评估 WHERE 条件）
-    let all_col_indices: Vec<usize> = (0..num_cols).collect();
-    let all_rows = table.scan(&all_col_indices)?;
-
-    // 计算列存的行数（用于区分列存行和 Delta 行）
-    let delta_total = table.delta_store().len();
-    let cs_rows = table.def.row_count as usize - delta_total;
-
-    // 如果没有 WHERE 条件，删除所有 Delta 行
-    if condition.is_none() {
-        let delta_indices: Vec<usize> = (0..delta_total).collect();
-        let count = table.delete_delta_rows(&delta_indices)?;
-        return Ok(count);
-    }
-
-    let cond = condition.unwrap();
-    let col_names: Vec<String> = table.def.columns.iter().map(|c| c.name.clone()).collect();
-
-    // 找出匹配的行（只处理 Delta 层的行，即 cs_rows 之后的行）
-    let mut delta_indices_to_delete: Vec<usize> = Vec::new();
-
-    for (row_idx, row) in all_rows.iter().enumerate() {
-        // 只处理 Delta 层的行（列存中的行暂不支持删除）
-        if row_idx < cs_rows {
-            continue;
-        }
-        let delta_idx = row_idx - cs_rows;
-
-        // 评估 WHERE 条件
-        let chunks = rows_to_chunks(&[row.clone()]);
-        let filtered = operators::filter::execute(&chunks, &cond, &col_names)?;
-        if !filtered.is_empty() && filtered[0].count > 0 {
-            delta_indices_to_delete.push(delta_idx);
-        }
-    }
-
-    let count = table.delete_delta_rows(&delta_indices_to_delete)?;
-    Ok(count)
-}
-
-/// 执行 UPDATE 语句
-///
-/// 策略：
-/// 1. 扫描表的所有列
-/// 2. 应用 WHERE 过滤，找出匹配行的 Delta 层索引
-/// 3. 对匹配行执行更新
-///
-/// 注意：当前仅支持更新 Delta 层的行。
-fn execute_update(
-    db: &mut Database,
-    table_name: &str,
-    assignments: &[(usize, Expression)],
-    condition: Option<Expression>,
-) -> Result<usize> {
-    let table = db.get_table_mut(table_name)
-        .ok_or_else(|| crate::common::error::HybridDbError::TableNotFound(table_name.into()))?;
-
-    let num_cols = table.def.columns.len();
-    if num_cols == 0 {
-        return Ok(0);
-    }
-
-    // 扫描所有列
-    let all_col_indices: Vec<usize> = (0..num_cols).collect();
-    let all_rows = table.scan(&all_col_indices)?;
-
-    let delta_total = table.delta_store().len();
-    let cs_rows = table.def.row_count as usize - delta_total;
-    let col_names: Vec<String> = table.def.columns.iter().map(|c| c.name.clone()).collect();
-
-    // 找出匹配的 Delta 行，并计算新值
-    let mut updates: Vec<(usize, Vec<(usize, crate::Value)>)> = Vec::new();
-
-    for (row_idx, row) in all_rows.iter().enumerate() {
-        // 只处理 Delta 层的行
-        if row_idx < cs_rows {
-            continue;
-        }
-        let delta_idx = row_idx - cs_rows;
-
-        // 评估 WHERE 条件
-        if let Some(ref cond) = condition {
-            let chunks = rows_to_chunks(&[row.clone()]);
-            let filtered = operators::filter::execute(&chunks, cond, &col_names)?;
-            if filtered.is_empty() || filtered[0].count == 0 {
-                continue;
-            }
-        }
-
-        // 计算每个 SET 列的新值
-        let mut new_vals: Vec<(usize, crate::Value)> = Vec::new();
-        for &(col_idx, ref expr) in assignments {
-            // 简单表达式求值：只支持字面量（MVP）
-            // 复杂表达式通过 expression 模块求值
-            let chunks = rows_to_chunks(&[row.clone()]);
-            let result = operators::projection::execute(
-                &chunks,
-                &[expr.clone()],
-                &col_names,
-            )?;
-            if !result.is_empty() && result[0].count > 0 {
-                let val = result[0].columns[0].get(0).clone();
-                new_vals.push((col_idx, val));
-            }
-        }
-
-        if !new_vals.is_empty() {
-            updates.push((delta_idx, new_vals));
-        }
-    }
-
-    let count = table.update_delta_rows(&updates)?;
-    Ok(count)
-}

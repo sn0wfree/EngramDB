@@ -6,4 +6,6 @@ pub mod projection;
 pub mod aggregate;
 pub mod hash_join;
 pub mod insert;
+pub mod delete;
+pub mod update;
 pub mod sort;

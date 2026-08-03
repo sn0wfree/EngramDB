@@ -138,6 +138,39 @@ impl<T: Clone> MvccStore<T> {
             chain.retain(|node| node.committed || node.txn_id != txn_id);
         }
     }
+    
+    /// 检查某个 key 是否在指定事务之前有已提交的版本
+    ///
+    /// 用于判断操作类型：
+    /// - 如果没有旧版本 → Insert
+    /// - 如果有旧版本且新版本存在 → Update
+    /// - 如果有旧版本但新版本不存在 → Delete
+    pub fn has_committed_version_before(&self, key: u64, txn_id: TxnId) -> bool {
+        if let Some(chain) = self.versions.get(&key) {
+            for node in chain {
+                // 检查是否有已提交版本，且不是当前事务创建的
+                if node.committed && node.txn_id != txn_id {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    
+    /// 获取某个 key 在指定事务的新版本（如果存在）
+    ///
+    /// 返回新版本的值，用于判断是 Update 还是 Delete
+    pub fn get_txn_version(&self, key: u64, txn_id: TxnId) -> Option<&T> {
+        if let Some(chain) = self.versions.get(&key) {
+            // 找当前事务的版本（已提交或未提交）
+            for node in chain.iter().rev() {
+                if node.txn_id == txn_id {
+                    return Some(&node.value);
+                }
+            }
+        }
+        None
+    }
 
     /// 垃圾回收：清理所有 end_ts < oldest_active_ts 的已提交版本
     /// 保留每个 key 最新的已提交版本，以及所有未提交版本
