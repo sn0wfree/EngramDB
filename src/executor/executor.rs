@@ -224,11 +224,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Sort { input, sort_keys } => {
+        PhysicalPlan::Sort { input, sort_keys, limit } => {
             let input_result = execute(*input, db)?;
             let input_chunks = rows_to_chunks(&input_result.rows);
 
-            let sorted = operators::sort::execute(&input_chunks, &sort_keys)?;
+            let sorted = operators::sort::execute(&input_chunks, &sort_keys, limit)?;
             let rows = chunks_to_rows(&sorted);
 
             Ok(QueryResult {

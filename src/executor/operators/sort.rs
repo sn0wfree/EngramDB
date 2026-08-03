@@ -12,15 +12,15 @@ use super::super::vector::DataChunk;
 /// 执行排序
 ///
 /// 将所有输入 chunk 收集为行数组，按排序键排序后重新分块。
-/// 当前为全内存排序，适用于中小数据集。
-pub fn execute(input: &[DataChunk], sort_keys: &[SortKey]) -> Result<Vec<DataChunk>> {
+/// 当 limit 有值时，使用 Top-N 部分排序优化（堆排序），避免全排序。
+pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>) -> Result<Vec<DataChunk>> {
     if input.is_empty() || sort_keys.is_empty() {
         return Ok(input.to_vec());
     }
 
     let num_columns = input[0].num_columns();
 
-    // 收集所有行（带原始行索引，用于稳定排序）
+    // 收集所有行
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
     for chunk in input {
         let rows = chunk.to_rows();
@@ -32,31 +32,83 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey]) -> Result<Vec<DataChu
         return Ok(input.to_vec());
     }
 
-    // 排序：按 sort_keys 逐列比较
     let keys = sort_keys.to_vec();
-    all_rows.sort_by(|a, b| {
-        for key in &keys {
-            let val_a = &a[key.column_index];
-            let val_b = &b[key.column_index];
-            let cmp = value_cmp(val_a, val_b);
-            match cmp {
-                std::cmp::Ordering::Equal => continue,
-                other => {
-                    return match key.direction {
-                        SortDirection::Asc => other,
-                        SortDirection::Desc => other.reverse(),
-                    };
+
+    if let Some(n) = limit {
+        // Top-N 优化：使用 BinaryHeap 只保留前 N 个
+        // 若 n >= total_rows，退化为全排序
+        if n < total_rows {
+            use std::collections::BinaryHeap;
+            // 使用反向排序的 BinaryHeap（最小堆，pop 移除最小的）
+            // 我们想要前 N 个最大的（按 sort_keys 排序），所以用反向比较
+            let mut heap: BinaryHeap<Vec<Value>> = BinaryHeap::with_capacity(n + 1);
+            for row in all_rows {
+                heap.push(row);
+                if heap.len() > n {
+                    heap.pop();
                 }
             }
+            // 提取并反转（heap 输出的是从大到小）
+            let mut top_n: Vec<Vec<Value>> = heap.into_iter().collect();
+            top_n.sort_by(|a, b| {
+                for key in &keys {
+                    let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
+                    match cmp {
+                        std::cmp::Ordering::Equal => continue,
+                        other => {
+                            return match key.direction {
+                                SortDirection::Asc => other,
+                                SortDirection::Desc => other.reverse(),
+                            };
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            all_rows = top_n;
+        } else {
+            // limit >= total_rows，全排序
+            all_rows.sort_by(|a, b| {
+                for key in &keys {
+                    let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
+                    match cmp {
+                        std::cmp::Ordering::Equal => continue,
+                        other => {
+                            return match key.direction {
+                                SortDirection::Asc => other,
+                                SortDirection::Desc => other.reverse(),
+                            };
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
         }
-        std::cmp::Ordering::Equal
-    });
+    } else {
+        // 无 limit：全排序
+        all_rows.sort_by(|a, b| {
+            for key in &keys {
+                let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
+                match cmp {
+                    std::cmp::Ordering::Equal => continue,
+                    other => {
+                        return match key.direction {
+                            SortDirection::Asc => other,
+                            SortDirection::Desc => other.reverse(),
+                        };
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
 
     // 重新分块
     let mut result = Vec::new();
     let chunk_size = crate::executor::vector::VECTOR_SIZE;
-    for chunk_start in (0..total_rows).step_by(chunk_size) {
-        let chunk_end = std::cmp::min(chunk_start + chunk_size, total_rows);
+    let total = all_rows.len();
+    for chunk_start in (0..total).step_by(chunk_size) {
+        let chunk_end = std::cmp::min(chunk_start + chunk_size, total);
         let chunk_rows = &all_rows[chunk_start..chunk_end];
 
         let mut columns = Vec::with_capacity(num_columns);

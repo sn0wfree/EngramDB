@@ -105,7 +105,7 @@ impl<'a> CostModel<'a> {
             PhysicalPlan::Limit { input, limit } => {
                 self.cost_limit(input, *limit)
             }
-            PhysicalPlan::Sort { input, sort_keys } => {
+            PhysicalPlan::Sort { input, sort_keys, .. } => {
                 self.cost_sort(input, sort_keys.len())
             }
             // 其他节点代价为 0

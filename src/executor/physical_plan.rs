@@ -89,8 +89,8 @@ pub enum PhysicalPlan {
     /// 排序（v0.12.0 新增，ORDER BY）
     Sort {
         input: Box<PhysicalPlan>,
-        /// 排序键：列索引 + 方向
         sort_keys: Vec<SortKey>,
+        limit: Option<usize>,
     },
     /// 哈希连接
     HashJoin {

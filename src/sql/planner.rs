@@ -476,6 +476,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             plan = PhysicalPlan::Sort {
                 input: Box::new(plan),
                 sort_keys,
+                limit: stmt.limit,
             };
         }
     }

@@ -32,6 +32,8 @@ pub struct Database {
     file: std::fs::File,
     /// 事务管理器
     txn_manager: TransactionManager,
+    /// 查询计划缓存（Perf02 Prepared Statement）
+    plan_cache: std::collections::HashMap<String, (crate::executor::physical_plan::PhysicalPlan, Vec<String>)>,
 }
 
 impl Database {
@@ -99,6 +101,7 @@ impl Database {
             next_table_id: 1,
             file,
             txn_manager,
+            plan_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -129,6 +132,7 @@ impl Database {
             next_table_id: 1,
             file,
             txn_manager,
+            plan_cache: std::collections::HashMap::new(),
         };
 
         // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
@@ -334,7 +338,23 @@ impl Database {
 
         self.file.flush()?;
         self.file.sync_all()?;
+        self.plan_cache.clear();
         Ok(())
+    }
+
+    /// 获取缓存的查询计划（Perf02）
+    pub fn get_plan_cache(&self, sql: &str) -> Option<&(crate::executor::physical_plan::PhysicalPlan, Vec<String>)> {
+        self.plan_cache.get(sql)
+    }
+
+    /// 设置查询计划缓存（Perf02）
+    pub fn set_plan_cache(&mut self, sql: &str, plan: crate::executor::physical_plan::PhysicalPlan, columns: Vec<String>) {
+        self.plan_cache.insert(sql.to_string(), (plan, columns));
+    }
+
+    /// 清空查询计划缓存
+    pub fn clear_plan_cache(&mut self) {
+        self.plan_cache.clear();
     }
 
     /// 保存所有索引到文件（v0.12.0 索引持久化）
