@@ -422,6 +422,7 @@ mod value_tag {
     pub const JSON: u8 = 6;
     pub const VECTOR: u8 = 7;
     pub const BLOB: u8 = 8;
+    pub const FLOAT32: u8 = 9;
 }
 
 /// 将单个 Value 编码为自描述字节（type_tag + data）
@@ -445,6 +446,10 @@ fn encode_value(v: &Value) -> Vec<u8> {
         }
         Value::Float64(f) => {
             buf.push(value_tag::FLOAT64);
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        Value::Float32(f) => {
+            buf.push(value_tag::FLOAT32);
             buf.extend_from_slice(&f.to_le_bytes());
         }
         Value::Varchar(s) => {
@@ -514,6 +519,14 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             let f = f64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
             offset += 8;
             Value::Float64(f)
+        }
+        value_tag::FLOAT32 => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated float32 value".into()));
+            }
+            let f = f32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            offset += 4;
+            Value::Float32(f)
         }
         value_tag::VARCHAR => {
             if offset + 4 > data.len() {

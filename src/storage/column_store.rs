@@ -340,6 +340,7 @@ impl ColumnStore {
                     let est_original = match col.data_type {
                         DataType::Int32 => col.uncompressed_count as usize * 4,
                         DataType::Int64 => col.uncompressed_count as usize * 8,
+                        DataType::Float32 => col.uncompressed_count as usize * 4,
                         DataType::Float64 => col.uncompressed_count as usize * 8,
                         DataType::Boolean => col.uncompressed_count as usize,
                         DataType::Varchar => col.uncompressed_count as usize * 12, // 估算
@@ -702,6 +703,7 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
             for v in values {
                 match v {
                     Value::Float64(f) => buf.extend_from_slice(&f.to_le_bytes()),
+                    Value::Float32(f) => buf.extend_from_slice(&(*f as f64).to_le_bytes()),
                     Value::Int32(i) => buf.extend_from_slice(&(*i as f64).to_le_bytes()),
                     Value::Int64(i) => buf.extend_from_slice(&(*i as f64).to_le_bytes()),
                     _ => buf.extend_from_slice(&0f64.to_le_bytes()),
@@ -715,6 +717,18 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
                     buf.extend_from_slice(s.as_bytes());
                 } else {
                     buf.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
+        DataType::Float32 => {
+            // Float32 专用路径：4 字节紧凑存储
+            for v in values {
+                match v {
+                    Value::Float32(f) => buf.extend_from_slice(&f.to_le_bytes()),
+                    Value::Float64(f) => buf.extend_from_slice(&(*f as f32).to_le_bytes()),
+                    Value::Int32(i) => buf.extend_from_slice(&(*i as f32).to_le_bytes()),
+                    Value::Int64(i) => buf.extend_from_slice(&(*i as f32).to_le_bytes()),
+                    _ => buf.extend_from_slice(&0f32.to_le_bytes()),
                 }
             }
         }
@@ -803,6 +817,17 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
                     let val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
                     values.push(Value::Float64(val));
                     offset += 8;
+                } else {
+                    values.push(Value::Null);
+                }
+            }
+        }
+        DataType::Float32 => {
+            for _ in 0..count {
+                if offset + 4 <= data.len() {
+                    let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                    values.push(Value::Float32(val));
+                    offset += 4;
                 } else {
                     values.push(Value::Null);
                 }
@@ -933,6 +958,7 @@ fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
         DataType::Boolean => values.len(),
         DataType::Int32 => values.len() * 4,
         DataType::Int64 => values.len() * 8,
+        DataType::Float32 => values.len() * 4,
         DataType::Float64 => values.len() * 8,
         DataType::Varchar => {
             let mut size = 0;
@@ -990,6 +1016,7 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Boolean => 0,
         DataType::Int32 => 1,
         DataType::Int64 => 2,
+        DataType::Float32 => 8,
         DataType::Float64 => 3,
         DataType::Varchar => 4,
         DataType::Json => 5,
@@ -1003,6 +1030,7 @@ fn u8_to_data_type(b: u8) -> DataType {
         0 => DataType::Boolean,
         1 => DataType::Int32,
         2 => DataType::Int64,
+        8 => DataType::Float32,
         3 => DataType::Float64,
         4 => DataType::Varchar,
         5 => DataType::Json,

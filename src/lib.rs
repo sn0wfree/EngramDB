@@ -408,6 +408,7 @@ pub enum Value {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
+    Float32(f32),
     Float64(f64),
     Varchar(String),
     Json(String),
@@ -434,11 +435,12 @@ impl Ord for Value {
                 Value::Boolean(_) => 1,
                 Value::Int32(_) => 2,
                 Value::Int64(_) => 3,
-                Value::Float64(_) => 4,
-                Value::Varchar(_) => 5,
-                Value::Json(_) => 6,
-                Value::Vector(_) => 7,
-                Value::Blob(_) => 8,
+                Value::Float32(_) => 4,
+                Value::Float64(_) => 5,
+                Value::Varchar(_) => 6,
+                Value::Json(_) => 7,
+                Value::Vector(_) => 8,
+                Value::Blob(_) => 9,
             }
         }
         let ord = variant_rank(self).cmp(&variant_rank(other));
@@ -450,6 +452,7 @@ impl Ord for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
             (Value::Int32(a), Value::Int32(b)) => a.cmp(b),
             (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+            (Value::Float32(a), Value::Float32(b)) => a.to_bits().cmp(&b.to_bits()),
             (Value::Float64(a), Value::Float64(b)) => a.to_bits().cmp(&b.to_bits()),
             (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
@@ -481,6 +484,7 @@ impl std::hash::Hash for Value {
             Value::Boolean(b) => b.hash(state),
             Value::Int32(i) => i.hash(state),
             Value::Int64(i) => i.hash(state),
+            Value::Float32(f) => f.to_bits().hash(state),
             Value::Float64(f) => f.to_bits().hash(state),
             Value::Varchar(s) => s.hash(state),
             Value::Json(s) => s.hash(state),
@@ -550,6 +554,7 @@ impl std::fmt::Display for Value {
             Value::Boolean(v) => write!(f, "{}", v),
             Value::Int32(v) => write!(f, "{}", v),
             Value::Int64(v) => write!(f, "{}", v),
+            Value::Float32(v) => write!(f, "{}", v),
             Value::Float64(v) => write!(f, "{}", v),
             Value::Varchar(v) => write!(f, "\"{}\"", v),
             Value::Json(v) => write!(f, "'{}'", v),
@@ -1207,5 +1212,43 @@ mod value_tests {
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Int64(1));
         assert_eq!(result.rows[0][1], Value::Varchar("hello".to_string()));
+    }
+
+    // --- T07 FLOAT32 类型测试（v0.14.0 新增）---
+
+    #[test]
+    fn test_float32_basic() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val FLOAT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3.14)").unwrap();
+
+        let result = conn.execute("SELECT val FROM t").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        match &result.rows[0][0] {
+            Value::Float32(f) => assert!((f - 3.14).abs() < 1e-5, "got {}", f),
+            Value::Float64(f) => assert!((f - 3.14).abs() < 1e-5),
+            other => panic!("expected Float32 or Float64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_float32_sort() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val FLOAT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1.0)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3.0)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2.0)").unwrap();
+
+        let result = conn.execute("SELECT val FROM t ORDER BY val ASC").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        // 顺序应是 1.0, 2.0, 3.0
+        let get_f = |v: &Value| match v {
+            Value::Float32(f) => *f as f64,
+            Value::Float64(f) => *f,
+            other => panic!("unexpected {:?}", other),
+        };
+        assert!((get_f(&result.rows[0][0]) - 1.0).abs() < 1e-5);
+        assert!((get_f(&result.rows[1][0]) - 2.0).abs() < 1e-5);
+        assert!((get_f(&result.rows[2][0]) - 3.0).abs() < 1e-5);
     }
 }

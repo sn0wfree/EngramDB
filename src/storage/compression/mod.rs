@@ -37,6 +37,7 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
         DataType::Boolean => compress_boolean(data),
         DataType::Int32 => compress_integer::<i32>(data),
         DataType::Int64 => compress_integer::<i64>(data),
+        DataType::Float32 => compress_float32(data),
         DataType::Float64 => compress_float64(data),
         DataType::Varchar => compress_varchar(data),
         // JSON 和 Vector 暂不压缩，直接存储
@@ -367,6 +368,17 @@ fn compress_float64(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
         best = (CompressionType::Rle, rle_result);
     }
 
+    Ok(best)
+}
+
+fn compress_float32(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
+    // Float32 与 Float64 同构：4 字节模式，直接复用 RLE（不分位数）
+    let mut best = (CompressionType::Uncompressed, data.to_vec());
+    let mut best_size = data.len();
+    let rle_result = rle::encode(data);
+    if rle_result.len() < best_size {
+        best = (CompressionType::Rle, rle_result);
+    }
     Ok(best)
 }
 

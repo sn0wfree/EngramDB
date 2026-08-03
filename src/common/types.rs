@@ -8,6 +8,11 @@ pub enum DataType {
     Boolean,
     Int32,
     Int64,
+    /// 单精度浮点数（v0.14.0 新增）
+    ///
+    /// 4 字节存储，比 Float64 节省 50% 空间。适合 ML embedding、
+    /// 科学计算等对精度要求不严格的场景。
+    Float32,
     Float64,
     Varchar,
     /// JSON 类型（v0.12.0 新增）
@@ -30,6 +35,7 @@ impl DataType {
             DataType::Boolean => "BOOLEAN",
             DataType::Int32 => "INT",
             DataType::Int64 => "BIGINT",
+            DataType::Float32 => "FLOAT",
             DataType::Float64 => "DOUBLE",
             DataType::Varchar => "VARCHAR",
             DataType::Json => "JSON",
@@ -43,6 +49,7 @@ impl DataType {
             DataType::Boolean => Some(1),
             DataType::Int32 => Some(4),
             DataType::Int64 => Some(8),
+            DataType::Float32 => Some(4),
             DataType::Float64 => Some(8),
             DataType::Varchar => None,
             DataType::Json => None,

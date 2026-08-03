@@ -155,6 +155,7 @@ pub fn value_type_to_arrow(value: &Value) -> ArrowDataType {
         Value::Boolean(_) => ArrowDataType::Boolean,
         Value::Int32(_) => ArrowDataType::Int32,
         Value::Int64(_) => ArrowDataType::Int64,
+        Value::Float32(_) => ArrowDataType::Float64, // 简化：映射到 Float64
         Value::Float64(_) => ArrowDataType::Float64,
         Value::Varchar(_) => ArrowDataType::Utf8,
         Value::Json(_) => ArrowDataType::Utf8,

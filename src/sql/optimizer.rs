@@ -538,12 +538,14 @@ fn eval_constant_cast(v: &Value, target: &crate::common::types::DataType) -> Opt
                 None
             }
         }
+        DataType::Float32 => v.as_f64().map(|f| Value::Float32(f as f32)),
         DataType::Float64 => v.as_f64().map(Value::Float64),
         DataType::Varchar => match v {
             Value::Varchar(s) => Some(Value::Varchar(s.clone())),
             Value::Int32(i) => Some(Value::Varchar(i.to_string())),
             Value::Int64(i) => Some(Value::Varchar(i.to_string())),
             Value::Float64(f) => Some(Value::Varchar(f.to_string())),
+            Value::Float32(f) => Some(Value::Varchar(f.to_string())),
             Value::Boolean(b) => Some(Value::Varchar(b.to_string())),
             Value::Null => Some(Value::Null),
             Value::Json(s) => Some(Value::Varchar(s.clone())),

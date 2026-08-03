@@ -256,11 +256,12 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
                         Value::Boolean(_) => 1,
                         Value::Int32(_) => 2,
                         Value::Int64(_) => 3,
-                        Value::Float64(_) => 4,
-                        Value::Varchar(_) => 5,
-                        Value::Json(_) => 6,
-                        Value::Vector(_) => 7,
-                        Value::Blob(_) => 8,
+                        Value::Float32(_) => 4,
+                        Value::Float64(_) => 5,
+                        Value::Varchar(_) => 6,
+                        Value::Json(_) => 7,
+                        Value::Vector(_) => 8,
+                        Value::Blob(_) => 9,
                     }
                 }
                 value_tag(a).cmp(&value_tag(b))
