@@ -213,6 +213,38 @@ impl Table {
         }
     }
 
+    /// 从列存 + Delta 层重建主键索引（重启后恢复用）
+    pub fn rebuild_primary_index(&mut self) -> Result<()> {
+        let pk_idx = match self.def.primary_key_index() {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let idx = match self.primary_index.as_mut() {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        idx.clear();
+
+        // 从列存遍历
+        let mut row_id = 0u32;
+        for rg_idx in 0..self.column_store.row_group_count() {
+            let col_data = self.column_store.read_column(rg_idx, pk_idx)?;
+            for val in col_data.iter() {
+                idx.insert(val.clone(), row_id);
+                row_id += 1;
+            }
+        }
+
+        // 从 Delta 层遍历
+        for (delta_row_id, row) in self.delta_store.all_rows() {
+            if let Some(pk_val) = row.get(pk_idx) {
+                idx.insert(pk_val.clone(), delta_row_id as u32);
+            }
+        }
+
+        Ok(())
+    }
+
     /// 创建覆盖索引（v0.12.0 新增）
     ///
     /// 遍历现有数据构建索引。键列只支持单列（首列），

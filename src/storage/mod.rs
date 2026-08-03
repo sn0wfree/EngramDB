@@ -612,6 +612,8 @@ impl Database {
                 table.column_store_mut().data_from_bytes(&data[offset..offset + data_len])?;
                 // 同步列的 data_type（修正 Vector dim 等）
                 table.sync_column_data_types();
+                // 重建主键索引（重启后恢复）
+                table.rebuild_primary_index()?;
                 loaded += 1;
             }
             // 表不存在则跳过（schema 已删但数据未清理）
