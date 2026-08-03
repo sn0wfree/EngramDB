@@ -9,3 +9,5 @@ pub mod insert;
 pub mod delete;
 pub mod update;
 pub mod sort;
+pub mod alter_table;
+pub mod pragma;

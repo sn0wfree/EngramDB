@@ -122,7 +122,9 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::Analyze { .. }
             | PhysicalPlan::CreateMaterializedView { .. }
             | PhysicalPlan::RefreshMaterializedView { .. }
-            | PhysicalPlan::DropMaterializedView { .. } => {
+            | PhysicalPlan::DropMaterializedView { .. }
+            | PhysicalPlan::AlterTable(_)
+            | PhysicalPlan::Pragma(_) => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
         }

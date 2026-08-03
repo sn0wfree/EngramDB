@@ -15,14 +15,32 @@ pub enum Statement {
     BeginTransaction,
     Commit,
     Rollback,
-    /// ANALYZE：收集表的统计信息（供 CBO 使用）
     Analyze(AnalyzeStmt),
-    /// CREATE MATERIALIZED VIEW
     CreateMaterializedView(CreateMaterializedViewStmt),
-    /// REFRESH MATERIALIZED VIEW
     RefreshMaterializedView(RefreshMaterializedViewStmt),
-    /// DROP MATERIALIZED VIEW
     DropMaterializedView(DropMaterializedViewStmt),
+    AlterTable(AlterTableStmt),
+    Pragma(PragmaStmt),
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterTableStmt {
+    pub table_name: String,
+    pub operation: AlterTableOp,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterTableOp {
+    AddColumn { column_def: ColumnDef, position: Option<String> },
+    DropColumn { column_name: String },
+    RenameColumn { old_name: String, new_name: String },
+    RenameTable { new_name: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct PragmaStmt {
+    pub name: String,
+    pub arg: Option<String>,
 }
 
 /// CREATE INDEX 语句（v0.12.0 新增，覆盖索引）
@@ -60,7 +78,20 @@ pub struct InsertStmt {
     pub table_name: String,
     pub columns: Option<Vec<String>>,
     pub values: Vec<Vec<Expression>>,
+    pub returning: Option<Vec<SelectItem>>,
+    pub on_conflict: Option<OnConflictClause>,
 }
+
+#[derive(Debug, Clone)]
+pub struct OnConflictClause {
+    pub conflict_columns: Vec<String>,
+    pub action: OnConflictAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum OnConflictAction {
+    DoNothing,
+    DoUpdate { assignments: Vec<(String, Expression)> }}
 
 /// DELETE 语句（v0.12.0 新增）
 #[derive(Debug, Clone)]

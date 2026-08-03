@@ -1,6 +1,8 @@
 //! 数据类型定义
 
 /// 列的数据类型
+
+/// 列的数据类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     Boolean,
@@ -59,6 +61,8 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: bool,
     pub is_primary_key: bool,
+    pub default_value: Option<String>,
+    pub auto_increment: bool,
 }
 
 impl ColumnDef {
@@ -68,6 +72,8 @@ impl ColumnDef {
             data_type,
             nullable: true,
             is_primary_key: false,
+            default_value: None,
+            auto_increment: false,
         }
     }
 
@@ -79,6 +85,16 @@ impl ColumnDef {
 
     pub fn not_null(mut self) -> Self {
         self.nullable = false;
+        self
+    }
+
+    pub fn default(mut self, val: &str) -> Self {
+        self.default_value = Some(val.to_string());
+        self
+    }
+
+    pub fn auto_inc(mut self) -> Self {
+        self.auto_increment = true;
         self
     }
 }

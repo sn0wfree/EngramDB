@@ -344,6 +344,12 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
+        PhysicalPlan::AlterTable(stmt) => {
+            crate::executor::operators::alter_table::execute(db, stmt)
+        }
+        PhysicalPlan::Pragma(stmt) => {
+            crate::executor::operators::pragma::execute(db, stmt)
+        }
     }
 }
 

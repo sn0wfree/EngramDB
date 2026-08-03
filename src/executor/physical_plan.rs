@@ -3,6 +3,7 @@
 use crate::common::types::TableDef;
 use crate::Value;
 use crate::sql::ast::Expression;
+use crate::sql::ast::{AlterTableStmt, PragmaStmt};
 
 /// 物理计划节点
 #[derive(Debug, Clone)]
@@ -151,6 +152,10 @@ pub enum PhysicalPlan {
     Commit,
     /// 回滚
     Rollback,
+    /// 修改表
+    AlterTable(AlterTableStmt),
+    /// PRAGMA
+    Pragma(PragmaStmt),
 }
 
 /// 聚合表达式

@@ -670,6 +670,20 @@ impl Table {
     /// Compact 调度：写入 Delta 后根据策略决定是否触发合并
     pub fn insert(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
         let count = rows.len() as u64;
+
+        // NOT NULL 约束检查
+        for (col_idx, col_def) in self.def.columns.iter().enumerate() {
+            if !col_def.nullable {
+                for (row_idx, row) in rows.iter().enumerate() {
+                    if row_idx < row.len() && row[col_idx].is_null() {
+                        return Err(EngramDbError::ConstraintViolation(
+                            format!("NOT NULL constraint failed: column '{}'", col_def.name)
+                        ));
+                    }
+                }
+            }
+        }
+
         let direct_threshold = (self.column_store.row_group_size() / 4) as usize;
 
         // 计算插入前的总行数，用于索引 row_id 计算
@@ -713,6 +727,15 @@ impl Table {
     /// 2. row_id 由事务管理器分配（避免重复）
     /// 3. 直接写入 Delta 层（单行场景不需要列式路径优化）
     pub fn insert_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
+        // NOT NULL 约束检查
+        for (col_idx, col_def) in self.def.columns.iter().enumerate() {
+            if !col_def.nullable && col_idx < row.len() && row[col_idx].is_null() {
+                return Err(EngramDbError::ConstraintViolation(
+                    format!("NOT NULL constraint failed: column '{}'", col_def.name)
+                ));
+            }
+        }
+
         // 写入 Delta 层（单行直接插入）
         self.delta_store.insert_row(row_id, row.to_vec())?;
         

@@ -183,6 +183,8 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 table_name: tbl_name,
                 columns: col_names,
                 values,
+                returning: None,
+                on_conflict: None,
             }))
         }
 

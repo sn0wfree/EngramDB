@@ -27,7 +27,17 @@ pub fn plan(stmt: Statement, db: &Database) -> Result<PhysicalPlan> {
         Statement::CreateMaterializedView(s) => plan_create_mv(s, db),
         Statement::RefreshMaterializedView(s) => plan_refresh_mv(s),
         Statement::DropMaterializedView(s) => plan_drop_mv(s),
+        Statement::AlterTable(s) => plan_alter_table(s),
+        Statement::Pragma(s) => plan_pragma(s),
     }
+}
+
+fn plan_alter_table(stmt: AlterTableStmt) -> Result<PhysicalPlan> {
+    Ok(PhysicalPlan::AlterTable(stmt))
+}
+
+fn plan_pragma(stmt: PragmaStmt) -> Result<PhysicalPlan> {
+    Ok(PhysicalPlan::Pragma(stmt))
 }
 
 /// 带参数绑定的规划（用于 prepared statement）
