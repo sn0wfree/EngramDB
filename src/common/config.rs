@@ -12,6 +12,28 @@ pub enum WalFlushMode {
     Periodic = 2,
 }
 
+/// 事务隔离级别
+///
+/// 控制事务之间的可见性和隔离程度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// 读未提交（当前未实现）
+    ReadUncommitted,
+    /// 快照隔离（MVCC，当前默认）
+    ///
+    /// 事务看到的是事务开始时的数据快照，其他事务的修改不可见。
+    /// 写写冲突检测：如果两个事务同时修改同一行，后提交者会失败。
+    SnapshotIsolation,
+    /// 可序列化（当前未实现）
+    Serializable,
+}
+
+impl Default for IsolationLevel {
+    fn default() -> Self {
+        IsolationLevel::SnapshotIsolation
+    }
+}
+
 /// WAL 压缩算法
 ///
 /// 压缩 WAL payload 可以减少 I/O 量，加速 fsync，同时减少 WAL 文件大小。
@@ -164,6 +186,19 @@ pub struct Config {
     /// 仅在 wal_flush_mode = Periodic 时生效。
     /// 开启后，sync_wal() 会在刷盘后检查所有表是否需要合并。
     pub sync_wal_compact: bool,
+    
+    /// 是否启用事务支持（默认 true）
+    ///
+    /// - true: SQL INSERT/UPDATE/DELETE 走 WAL + MVCC 事务路径，保证 ACID
+    /// - false: 直接写存储层，跳过 WAL/MVCC，性能最优（适合批量导入、临时分析）
+    ///
+    /// **适用场景**：
+    /// - enable_transaction=true：生产环境、需要崩溃恢复、多事务并发
+    /// - enable_transaction=false：批量导入、离线分析、临时数据库
+    pub enable_transaction: bool,
+    
+    /// 事务隔离级别（仅 enable_transaction=true 时生效）
+    pub default_isolation_level: IsolationLevel,
 }
 
 /// 压缩类型
@@ -200,6 +235,8 @@ impl Default for Config {
             compress_on_persist: true,
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
+            enable_transaction: true,  // 默认启用事务
+            default_isolation_level: IsolationLevel::default(),
         }
     }
 }
