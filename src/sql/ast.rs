@@ -70,6 +70,8 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    /// AUTO_INCREMENT 自增主键（v0.14.0 新增）
+    pub auto_increment: bool,
 }
 
 /// INSERT 语句

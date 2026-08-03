@@ -1295,4 +1295,72 @@ mod value_tests {
         assert_eq!(get_ts(&result.rows[1][0]), 2000);
         assert_eq!(get_ts(&result.rows[2][0]), 3000);
     }
+
+    // --- C02 AUTO_INCREMENT 测试（v0.14.0 新增）---
+
+    #[test]
+    fn test_auto_increment_basic() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)").unwrap();
+
+        // 不提供 id 值 → 自动从 1 开始
+        conn.execute("INSERT INTO t (name) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO t (name) VALUES ('b')").unwrap();
+        conn.execute("INSERT INTO t (name) VALUES ('c')").unwrap();
+
+        let result = conn.execute("SELECT id, name FROM t ORDER BY id ASC").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+        assert_eq!(result.rows[0][1], Value::Varchar("a".to_string()));
+        assert_eq!(result.rows[1][0], Value::Int64(2));
+        assert_eq!(result.rows[1][1], Value::Varchar("b".to_string()));
+        assert_eq!(result.rows[2][0], Value::Int64(3));
+        assert_eq!(result.rows[2][1], Value::Varchar("c".to_string()));
+    }
+
+    #[test]
+    fn test_auto_increment_explicit_value() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)").unwrap();
+
+        conn.execute("INSERT INTO t (name) VALUES ('a')").unwrap();
+        // 显式指定 id=100
+        conn.execute("INSERT INTO t VALUES (100, 'b')").unwrap();
+        // 下一个自动 id 应为 101
+        conn.execute("INSERT INTO t (name) VALUES ('c')").unwrap();
+
+        let result = conn.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+        assert_eq!(result.rows[1][0], Value::Int64(100));
+        assert_eq!(result.rows[2][0], Value::Int64(101));
+    }
+
+    #[test]
+    fn test_auto_increment_persist() {
+        // 验证重启后 auto_increment 计数器持久化
+        let path = format!("/tmp/engramdb_auto_inc_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY)").unwrap();
+            conn.execute("INSERT INTO t (id) VALUES (NULL)").unwrap();
+            conn.execute("INSERT INTO t (id) VALUES (NULL)").unwrap();
+            // IDs: 1, 2
+            conn.close().unwrap();
+        }
+
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute("INSERT INTO t (id) VALUES (NULL)").unwrap();
+            // 重启后下一个 ID 应该是 3
+            let r = conn.execute("SELECT id FROM t ORDER BY id ASC").unwrap();
+            assert_eq!(r.rows[0][0], Value::Int64(1));
+            assert_eq!(r.rows[1][0], Value::Int64(2));
+            assert_eq!(r.rows[2][0], Value::Int64(3));
+            conn.close().unwrap();
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

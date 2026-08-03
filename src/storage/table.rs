@@ -4,7 +4,7 @@
 
 use crate::common::config::CompactStrategy;
 use crate::common::error::Result;
-use crate::common::types::{TableDef, IndexDef};
+use crate::common::types::{TableDef, IndexDef, ColumnDef};
 use crate::Value;
 
 use super::column_store::ColumnStore;
@@ -684,8 +684,51 @@ impl Table {
     /// 阈值：超过 row_group_size 的 1/4 时直接走列式路径，避免行存→列存转换开销
     ///
     /// Compact 调度：写入 Delta 后根据策略决定是否触发合并
-    pub fn insert(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
+    pub fn insert(&mut self, mut rows: Vec<Vec<Value>>) -> Result<u64> {
         let count = rows.len() as u64;
+
+        // AUTO_INCREMENT 自增分配（v0.14.0）
+        // 用户未提供 auto_increment 列的值（或提供 0/NULL）时，自动分配并递增
+        let auto_inc_cols: Vec<(usize, &ColumnDef)> = self.def.columns.iter().enumerate()
+            .filter(|(_, c)| c.auto_increment)
+            .collect();
+        if !auto_inc_cols.is_empty() {
+            for row in rows.iter_mut() {
+                for (col_idx, col_def) in &auto_inc_cols {
+                    if *col_idx >= row.len() {
+                        if *col_idx >= row.len() {
+                            row.resize(*col_idx + 1, Value::Null);
+                        }
+                        row[*col_idx] = Value::Int64(self.def.next_auto_increment_id as i64);
+                        self.def.next_auto_increment_id += 1;
+                        continue;
+                    }
+                    match &row[*col_idx] {
+                        Value::Null => {
+                            row[*col_idx] = Value::Int64(self.def.next_auto_increment_id as i64);
+                            self.def.next_auto_increment_id += 1;
+                        }
+                        Value::Int64(n) => {
+                            if *n == 0 {
+                                row[*col_idx] = Value::Int64(self.def.next_auto_increment_id as i64);
+                                self.def.next_auto_increment_id += 1;
+                            } else if (*n as u64) >= self.def.next_auto_increment_id {
+                                self.def.next_auto_increment_id = (*n as u64) + 1;
+                            }
+                        }
+                        Value::Int32(n) => {
+                            if *n == 0 {
+                                row[*col_idx] = Value::Int64(self.def.next_auto_increment_id as i64);
+                                self.def.next_auto_increment_id += 1;
+                            } else if (*n as u64) >= self.def.next_auto_increment_id {
+                                self.def.next_auto_increment_id = (*n as u64) + 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // NOT NULL 约束检查
         for (col_idx, col_def) in self.def.columns.iter().enumerate() {
@@ -743,9 +786,36 @@ impl Table {
     /// 2. row_id 由事务管理器分配（避免重复）
     /// 3. 直接写入 Delta 层（单行场景不需要列式路径优化）
     pub fn insert_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
-        // NOT NULL 约束检查
+        // NOT NULL 约束检查 + AUTO_INCREMENT 自动分配
+        let mut owned_row: Vec<Value> = row.to_vec();
         for (col_idx, col_def) in self.def.columns.iter().enumerate() {
-            if !col_def.nullable && col_idx < row.len() && row[col_idx].is_null() {
+            if col_def.auto_increment && col_idx < owned_row.len() {
+                match &owned_row[col_idx] {
+                    Value::Null => {
+                        owned_row[col_idx] = Value::Int64(self.def.next_auto_increment_id as i64);
+                        self.def.next_auto_increment_id += 1;
+                    }
+                    Value::Int64(n) => {
+                        if *n == 0 {
+                            owned_row[col_idx] = Value::Int64(self.def.next_auto_increment_id as i64);
+                            self.def.next_auto_increment_id += 1;
+                        } else if (*n as u64) >= self.def.next_auto_increment_id {
+                            // 显式提供大于当前计数器的值，更新计数器
+                            self.def.next_auto_increment_id = (*n as u64) + 1;
+                        }
+                    }
+                    Value::Int32(n) => {
+                        if *n == 0 {
+                            owned_row[col_idx] = Value::Int64(self.def.next_auto_increment_id as i64);
+                            self.def.next_auto_increment_id += 1;
+                        } else if (*n as u64) >= self.def.next_auto_increment_id {
+                            self.def.next_auto_increment_id = (*n as u64) + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !col_def.nullable && col_idx < owned_row.len() && owned_row[col_idx].is_null() {
                 return Err(EngramDbError::ConstraintViolation(
                     format!("NOT NULL constraint failed: column '{}'", col_def.name)
                 ));
@@ -753,7 +823,7 @@ impl Table {
         }
 
         // 写入 Delta 层（单行直接插入）
-        self.delta_store.insert_row(row_id, row.to_vec())?;
+        self.delta_store.insert_row(row_id, owned_row)?;
         
         // 更新总行数
         self.def.row_count += 1;

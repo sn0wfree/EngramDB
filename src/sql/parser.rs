@@ -134,11 +134,24 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                     let primary_key = col_def.options.iter().any(|o| {
                         matches!(o.option, sqlast::ColumnOption::Unique { is_primary: true, .. })
                     });
+                    // 检测 AUTO_INCREMENT 关键字
+                    // sqlparser 把它解析为 ColumnOption::DialectSpecific([Token::AUTO_INCREMENT])
+                    let auto_increment = col_def.options.iter().any(|o| {
+                        if let sqlast::ColumnOption::DialectSpecific(tokens) = &o.option {
+                            tokens.iter().any(|t| {
+                                let s = t.to_string().to_uppercase();
+                                s == "AUTO_INCREMENT" || s == "AUTOINCREMENT"
+                            })
+                        } else {
+                            false
+                        }
+                    });
                     cols.push(ColumnDef {
                         name: col_name,
                         data_type: dt,
                         nullable,
                         primary_key,
+                        auto_increment,
                     });
                 }
             }

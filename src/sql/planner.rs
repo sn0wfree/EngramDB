@@ -62,6 +62,9 @@ fn plan_create_table(stmt: CreateTableStmt) -> Result<PhysicalPlan> {
             if !c.nullable {
                 col = col.not_null();
             }
+            if c.auto_increment {
+                col = col.auto_inc();
+            }
             col
         })
         .collect();

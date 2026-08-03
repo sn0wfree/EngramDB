@@ -136,6 +136,11 @@ pub struct TableDef {
     pub indexes: Vec<IndexDef>,
     pub cluster_key: Option<usize>,
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// AUTO_INCREMENT 计数器（v0.14.0 新增）
+    ///
+    /// 下一个待分配的自增 ID。每次 INSERT 自增列时从该值分配并 +1。
+    /// 持久化到 TableDef，自动通过 serde 处理。
+    pub next_auto_increment_id: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -166,6 +171,7 @@ impl TableDef {
             indexes: Vec::new(),
             cluster_key: None,
             foreign_keys: Vec::new(),
+            next_auto_increment_id: 1,
         }
     }
 
