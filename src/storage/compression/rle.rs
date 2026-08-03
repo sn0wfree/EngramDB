@@ -37,6 +37,13 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
             result.extend_from_slice(&count.to_le_bytes());
             result.extend_from_slice(current_val);
             i = j;
+        } else if current_val[0] == 0xFF {
+            // 单次出现的值但首字节为 0xFF：必须转义，否则解码器会误判为 RLE 标记。
+            // 用 count=1 的 RLE 段编码（13 字节 vs 裸 8 字节，但保证正确性）。
+            result.push(0xFF);
+            result.extend_from_slice(&1u32.to_le_bytes());
+            result.extend_from_slice(current_val);
+            i += value_size;
         } else {
             // 原值输出
             result.extend_from_slice(current_val);
@@ -58,7 +65,9 @@ pub fn decode(data: &[u8]) -> Vec<u8> {
     let mut i = 0;
 
     while i < data.len() {
-        if data[i] == 0xFF && i + 5 <= data.len() {
+        // i+5 < len（而非 <=）确保 count 之后至少有 1 字节 value 数据，
+        // 防止短尾数据中恰好出现 0xFF 时被误判为 RLE 段。
+        if data[i] == 0xFF && i + 5 < data.len() {
             // RLE 编码段
             let count = u32::from_le_bytes(data[i + 1..i + 5].try_into().unwrap());
             let val_start = i + 5;
@@ -222,6 +231,40 @@ mod tests {
         assert!(encoded.len() < 50);
         let decoded = decode(&encoded);
         assert_eq!(decoded.len(), data.len());
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_rle_value_starting_with_0xff() {
+        // 非重复值首字节为 0xFF：编码器必须转义，否则解码器误判为 RLE 标记
+        let mut data = Vec::new();
+        // 一个首字节为 0xFF 的 8 字节值（如 i64 = -1 → 0xFFFFFFFFFFFFFFFF）
+        data.extend_from_slice(&(-1i64).to_le_bytes());
+        // 一个普通值
+        data.extend_from_slice(&12345u64.to_le_bytes());
+        let encoded = encode(&data);
+        let decoded = decode(&encoded);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_rle_mixed_with_0xff_prefixes() {
+        // 混合场景：重复值 + 0xFF 开头的非重复值 + 普通值
+        let mut data = Vec::new();
+        // 10 个相同的值
+        for _ in 0..10 {
+            data.extend_from_slice(&0xAAAAAAAAu64.to_le_bytes());
+        }
+        // 一个 0xFF 开头的值（i64 = -256 → 字节序开头是 0x00, 但 -1 开头是 0xFF）
+        data.extend_from_slice(&(-1i64).to_le_bytes());
+        // 5 个另一个相同值
+        for _ in 0..5 {
+            data.extend_from_slice(&0xBBBBBBBBu64.to_le_bytes());
+        }
+        // 又一个 0xFF 开头的值（LE 首字节为 0xFF）
+        data.extend_from_slice(&0x00FFFFFFFFFFFFFFu64.to_le_bytes());
+        let encoded = encode(&data);
+        let decoded = decode(&encoded);
         assert_eq!(decoded, data);
     }
 }

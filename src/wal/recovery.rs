@@ -189,6 +189,15 @@ mod tests {
     use crate::wal::{WalWriter, WalRecordType, make_insert_payload};
     use crate::Value;
 
+    fn tmp(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace('(', "_").replace(')', "")
+            .replace([':', ' '], "_");
+        p.push(format!("hybriddb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
+        p.to_string_lossy().to_string()
+    }
+
     #[test]
     fn test_recover_empty_wal() {
         let result = recover("/tmp/nonexistent_wal.hdb-wal").unwrap();
@@ -199,11 +208,11 @@ mod tests {
 
     #[test]
     fn test_recover_committed_txn() {
-        let tmp = "/tmp/test_recover_committed.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("recover_committed");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             let payload = make_insert_payload(1, &[Value::Int64(42)]);
             writer.write_record(WalRecordType::Insert, 1, 1, &payload).unwrap();
@@ -211,23 +220,23 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        let result = recover(tmp).unwrap();
+        let result = recover(&tmp).unwrap();
         assert_eq!(result.transactions_committed, 1);
         assert_eq!(result.transactions_rolled_back, 0);
         assert_eq!(result.records_redone, 1);
         assert_eq!(result.records_undone, 0);
         assert!(result.success);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_recover_aborted_txn() {
-        let tmp = "/tmp/test_recover_aborted.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("recover_aborted");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             let payload = make_insert_payload(1, &[Value::Int64(42)]);
             writer.write_record(WalRecordType::Insert, 1, 1, &payload).unwrap();
@@ -235,23 +244,23 @@ mod tests {
             writer.flush().unwrap();
         }
 
-        let result = recover(tmp).unwrap();
+        let result = recover(&tmp).unwrap();
         assert_eq!(result.transactions_committed, 0);
         assert_eq!(result.transactions_rolled_back, 1);
         assert_eq!(result.records_redone, 1); // Redo 阶段重做了
         assert_eq!(result.records_undone, 1);  // Undo 阶段回滚了
         assert!(result.success);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_recover_mixed_txns() {
-        let tmp = "/tmp/test_recover_mixed.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("recover_mixed");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             // Txn 1: 已提交
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.write_record(WalRecordType::Insert, 1, 1, &[1]).unwrap();
@@ -264,23 +273,23 @@ mod tests {
             writer.flush().unwrap();
         }
 
-        let result = recover(tmp).unwrap();
+        let result = recover(&tmp).unwrap();
         assert_eq!(result.transactions_committed, 1);
         assert_eq!(result.transactions_rolled_back, 1);
         assert_eq!(result.records_redone, 3); // 1 (txn1) + 2 (txn2)
         assert_eq!(result.records_undone, 2);  // txn2 的 2 条
         assert!(result.success);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_recover_multiple_committed_txns() {
-        let tmp = "/tmp/test_recover_multi_committed.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("recover_multi_committed");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 1..=5 {
                 writer.write_record(WalRecordType::Begin, i, 0, &[]).unwrap();
                 writer.write_record(WalRecordType::Insert, i, 1, &[i as u8]).unwrap();
@@ -289,23 +298,23 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        let result = recover(tmp).unwrap();
+        let result = recover(&tmp).unwrap();
         assert_eq!(result.transactions_committed, 5);
         assert_eq!(result.transactions_rolled_back, 0);
         assert_eq!(result.records_redone, 5);
         assert_eq!(result.records_undone, 0);
         assert!(result.success);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_recover_multiple_aborted_txns() {
-        let tmp = "/tmp/test_recover_multi_aborted.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("recover_multi_aborted");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 1..=3 {
                 writer.write_record(WalRecordType::Begin, i, 0, &[]).unwrap();
                 writer.write_record(WalRecordType::Insert, i, 1, &[i as u8]).unwrap();
@@ -314,44 +323,44 @@ mod tests {
             writer.flush().unwrap();
         }
 
-        let result = recover(tmp).unwrap();
+        let result = recover(&tmp).unwrap();
         assert_eq!(result.transactions_committed, 0);
         assert_eq!(result.transactions_rolled_back, 3);
         assert_eq!(result.records_redone, 3);
         assert_eq!(result.records_undone, 3);
         assert!(result.success);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_recover_rollback_record() {
-        let tmp = "/tmp/test_recover_rollback.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("recover_rollback");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.write_record(WalRecordType::Insert, 1, 1, &[1, 2, 3]).unwrap();
             writer.write_record(WalRecordType::Rollback, 1, 0, &[]).unwrap();
             writer.sync().unwrap();
         }
 
-        let result = recover(tmp).unwrap();
+        let result = recover(&tmp).unwrap();
         // 有 Rollback 记录的事务不算 rolled_back（它已经显式回滚了）
         assert_eq!(result.transactions_committed, 0);
         assert!(result.success);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_get_redo_records_committed() {
-        let tmp = "/tmp/test_redo_records.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("recover_get_redo_records");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.write_record(WalRecordType::Insert, 1, 1, &[10]).unwrap();
             writer.write_record(WalRecordType::Insert, 1, 1, &[20]).unwrap();
@@ -359,13 +368,13 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        let redo = get_redo_records(tmp).unwrap();
+        let redo = get_redo_records(&tmp).unwrap();
         // 只有 Insert 记录是 redo 数据操作
         assert_eq!(redo.len(), 2);
         assert_eq!(redo[0].payload, vec![10]);
         assert_eq!(redo[1].payload, vec![20]);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

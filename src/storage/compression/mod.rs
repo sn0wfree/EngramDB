@@ -47,7 +47,11 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
 }
 
 /// 解压一列数据
-pub fn decompress(data: &[u8], compression_type: CompressionType) -> Result<Vec<u8>> {
+///
+/// `data_type` 用于消歧整数列的宽度（Int32 vs Int64）——
+/// Delta / ForBitPack 编码内部统一用 i64，解压时需按列真实类型输出字节，
+/// 否则 `deserialize_values` 会按错误步长读取，导致数据错位。
+pub fn decompress(data: &[u8], compression_type: CompressionType, data_type: &DataType) -> Result<Vec<u8>> {
     match compression_type {
         CompressionType::Uncompressed => Ok(data.to_vec()),
         CompressionType::Rle => Ok(rle::decode(data)),
@@ -56,18 +60,15 @@ pub fn decompress(data: &[u8], compression_type: CompressionType) -> Result<Vec<
             // 实际使用通过 ForBitPack / BooleanPack 等组合类型
             Ok(data.to_vec())
         }
-        CompressionType::Dictionary => {
-            // 字典编码需要额外元数据，通过 Varchar 专用路径
-            Ok(data.to_vec())
-        }
+        CompressionType::Dictionary => decompress_dictionary(data),
         CompressionType::For => {
             // FOR 编码需配合 bit-packing 使用，走 ForBitPack 路径
             Ok(data.to_vec())
         }
-        CompressionType::Delta => decompress_delta(data),
+        CompressionType::Delta => decompress_delta(data, data_type),
         CompressionType::Zstd => Ok(data.to_vec()),
         CompressionType::Gorilla => decompress_gorilla(data),
-        CompressionType::ForBitPack => decompress_for_bitpack(data),
+        CompressionType::ForBitPack => decompress_for_bitpack(data, data_type),
         CompressionType::BooleanPack => decompress_boolean_pack(data),
     }
 }
@@ -283,26 +284,18 @@ fn bytes_to_f64(data: &[u8]) -> Option<Vec<f64>> {
 // Delta 解压（整数通用）
 // ============================================================================
 
-fn decompress_delta(data: &[u8]) -> Result<Vec<u8>> {
-    // 尝试 i64 解码（如果值范围在 i32 内，也能用 i64 正确解码）
-    // 我们需要根据上下文判断是 i32 还是 i64，但这里只有压缩类型信息
-    // 策略：尝试 i64 解码，如果失败或结果不合理，返回原始数据
+fn decompress_delta(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> {
+    // delta::encode_i32 内部转 i64 编码，decode_i64 可正确解码两者。
+    // 关键：输出字节宽度必须匹配列真实类型，否则 deserialize_values 步长错位。
     if let Some(values) = delta::decode_i64(data) {
-        // 检查是否所有值都在 i32 范围内（简单启发：如果原始数据长度
-        // 暗示是 i32，则按 i32 输出）
-        // 更稳妥的方式：通过压缩后数据的特征判断
-        // 这里采用保守策略：一律按 i64 返回（调用方根据 DataType 处理）
-        // 但 decompress 接口只返回 Vec<u8>，调用方知道类型
-        // 所以我们需要一个方法来区分...
-        //
-        // 实际上，delta encode_i32 内部也是转 i64 编码的，
-        // 所以 decode_i64 可以正确解码 i32 编码的数据，
-        // 只是值会被 sign-extend 到 i64。
-        // 调用方如果知道是 i32 列，取低 4 字节即可。
-        //
-        // 为简化，这里统一按 i64 返回原始字节序列。
-        // i32 列的调用方需要自己截断。
-        Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        match data_type {
+            DataType::Int32 => {
+                // Int32 列：每值 4 字节
+                Ok(values.iter().flat_map(|v| (*v as i32).to_le_bytes()).collect())
+            }
+            // Int64（及其它整数宽度的兜底）：每值 8 字节
+            _ => Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
+        }
     } else {
         Ok(data.to_vec())
     }
@@ -312,27 +305,43 @@ fn decompress_delta(data: &[u8]) -> Result<Vec<u8>> {
 // FOR + Bit-packing 解压
 // ============================================================================
 
-fn decompress_for_bitpack(data: &[u8]) -> Result<Vec<u8>> {
-    // 格式：[min_val: 8 bytes (i64)][for_bitpack data...]
-    // 对于 i32 列，min_val 是前 4 字节
-    // 这里我们无法区分 i32/i64，统一按 i64 处理
-    // 调用方根据 DataType 截断
-    if data.len() < 8 {
-        return Ok(data.to_vec());
+fn decompress_for_bitpack(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> {
+    // 编码格式因类型而异：
+    //   i32 列：[min_val: 4 bytes (i32 LE)][for_bitpack data...]
+    //   i64 列：[min_val: 8 bytes (i64 LE)][for_bitpack data...]
+    // for_bitpack data 内部：[base: 8B][count: 4B][bit_width: 1B][packed...]
+    match data_type {
+        DataType::Int32 => {
+            if data.len() < 4 {
+                return Ok(data.to_vec());
+            }
+            let min_val = i32::from_le_bytes(data[0..4].try_into().unwrap());
+            let uvalues = for_encoding::decode_for_bitpack(&data[4..]);
+            if uvalues.is_empty() {
+                return Ok(Vec::new());
+            }
+            let values: Vec<i32> = uvalues
+                .iter()
+                .map(|&u| (min_val as i64 + u as i64) as i32)
+                .collect();
+            Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
+        _ => {
+            if data.len() < 8 {
+                return Ok(data.to_vec());
+            }
+            let min_val = i64::from_le_bytes(data[0..8].try_into().unwrap());
+            let uvalues = for_encoding::decode_for_bitpack(&data[8..]);
+            if uvalues.is_empty() {
+                return Ok(Vec::new());
+            }
+            let values: Vec<i64> = uvalues
+                .iter()
+                .map(|&u| min_val.wrapping_add(u as i64))
+                .collect();
+            Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
     }
-
-    // 尝试按 i64 解码（min_val 占 8 字节）
-    let min_val = i64::from_le_bytes(data[0..8].try_into().unwrap());
-    let for_data = &data[8..];
-    let uvalues = for_encoding::decode_for_bitpack(for_data);
-    if !uvalues.is_empty() {
-        let values: Vec<i64> = uvalues.iter()
-            .map(|&u| min_val + u as i64)
-            .collect();
-        return Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect());
-    }
-
-    Ok(data.to_vec())
 }
 
 // ============================================================================
@@ -432,6 +441,62 @@ fn serialize_dictionary(encoded: &dictionary::DictionaryEncoded) -> Vec<u8> {
     result
 }
 
+/// 字典解码：反向 `serialize_dictionary`，重建 Varchar 列的原始字节序列
+///
+/// 输入格式（`serialize_dictionary` 产物）：
+/// ```text
+/// [dict_count: 4B]
+/// for each entry: [len: 4B][value bytes]
+/// [index_count: 4B]
+/// for each index: [idx: 4B]
+/// ```
+///
+/// 输出：Varchar 列的 `[len: 4B][value bytes]...` 序列（与 `serialize_values` 格式一致），
+/// 供 `deserialize_values` 直接消费。
+fn decompress_dictionary(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let mut offset = 0;
+    let dict_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let mut dictionary: Vec<&[u8]> = Vec::with_capacity(dict_count);
+    for _ in 0..dict_count {
+        if offset + 4 > data.len() {
+            return Ok(data.to_vec());
+        }
+        let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + len > data.len() {
+            return Ok(data.to_vec());
+        }
+        dictionary.push(&data[offset..offset + len]);
+        offset += len;
+    }
+
+    if offset + 4 > data.len() {
+        return Ok(data.to_vec());
+    }
+    let index_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    // 重建 Varchar 列格式：[len: 4B][value bytes]...
+    let mut result = Vec::new();
+    for _ in 0..index_count {
+        if offset + 4 > data.len() {
+            break;
+        }
+        let idx = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let entry = dictionary.get(idx).copied().unwrap_or(&[]);
+        result.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        result.extend_from_slice(entry);
+    }
+
+    Ok(result)
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -457,7 +522,7 @@ mod tests {
         let (ctype, compressed) = compress(&data, &DataType::Boolean).unwrap();
         assert_eq!(ctype, CompressionType::BooleanPack);
         assert!(compressed.len() < data.len());
-        let decompressed = decompress(&compressed, ctype).unwrap();
+        let decompressed = decompress(&compressed, ctype, &DataType::Boolean).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -468,7 +533,7 @@ mod tests {
         assert_eq!(ctype, CompressionType::BooleanPack);
         // 4 (count) + 8 (64 bits) = 12 bytes vs 64 bytes original
         assert_eq!(compressed.len(), 12);
-        let decompressed = decompress(&compressed, ctype).unwrap();
+        let decompressed = decompress(&compressed, ctype, &DataType::Boolean).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -482,8 +547,7 @@ mod tests {
         let (ctype, compressed) = compress(&data, &DataType::Int64).unwrap();
         assert_eq!(ctype, CompressionType::Delta);
         assert!(compressed.len() < data.len() / 4, "压缩率不足: {} / {}", compressed.len(), data.len());
-        let decompressed = decompress(&compressed, ctype).unwrap();
-        // 注意：decompress 返回 i64 字节
+        let decompressed = decompress(&compressed, ctype, &DataType::Int64).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -495,7 +559,7 @@ mod tests {
         let (ctype, compressed) = compress(&data, &DataType::Int64).unwrap();
         // 应该选择 Delta 或 ForBitPack，取决于数据模式
         assert!(compressed.len() < data.len());
-        let decompressed = decompress(&compressed, ctype).unwrap();
+        let decompressed = decompress(&compressed, ctype, &DataType::Int64).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -506,7 +570,7 @@ mod tests {
         let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let (ctype, compressed) = compress(&data, &DataType::Int64).unwrap();
         assert!(compressed.len() < data.len());
-        let decompressed = decompress(&compressed, ctype).unwrap();
+        let decompressed = decompress(&compressed, ctype, &DataType::Int64).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -517,7 +581,7 @@ mod tests {
         let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let (ctype, compressed) = compress(&data, &DataType::Int64).unwrap();
         // 数据量小可能不压缩，但必须能正确 roundtrip
-        let decompressed = decompress(&compressed, ctype).unwrap();
+        let decompressed = decompress(&compressed, ctype, &DataType::Int64).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -529,14 +593,21 @@ mod tests {
         let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let (ctype, compressed) = compress(&data, &DataType::Int32).unwrap();
         assert!(compressed.len() < data.len());
-        // Int32 的 delta 编码存为 i64，解压后也是 i64 字节
-        // 这里验证值的正确性
-        let decompressed = decompress(&compressed, ctype).unwrap();
-        // 解压后是 i64 字节，需要转回 i32 比较
-        let decoded_values: Vec<i32> = decompressed.chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as i32)
-            .collect();
-        assert_eq!(decoded_values, values);
+        // v0.12.x 修复：decompress 现按 data_type 输出正确宽度（i32=4B），
+        // 解压后字节与原始 data 直接相等，无需手动截断
+        let decompressed = decompress(&compressed, ctype, &DataType::Int32).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_int32_for_bitpack_compress() {
+        // 小范围 Int32，FOR+Bit-packing 效果好
+        let values: Vec<i32> = (0..100).map(|i| 1000 + (i % 50)).collect();
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (ctype, compressed) = compress(&data, &DataType::Int32).unwrap();
+        assert!(compressed.len() < data.len());
+        let decompressed = decompress(&compressed, ctype, &DataType::Int32).unwrap();
+        assert_eq!(decompressed, data);
     }
 
     // --- Float64 列 ---
@@ -554,7 +625,7 @@ mod tests {
         let (ctype, compressed) = compress(&data, &DataType::Float64).unwrap();
         assert_eq!(ctype, CompressionType::Gorilla);
         assert!(compressed.len() < data.len());
-        let decompressed = decompress(&compressed, ctype).unwrap();
+        let decompressed = decompress(&compressed, ctype, &DataType::Float64).unwrap();
         assert_eq!(decompressed.len(), data.len());
         for (a, b) in decompressed.chunks_exact(8).zip(data.chunks_exact(8)) {
             let fa = f64::from_le_bytes(a.try_into().unwrap());
@@ -570,7 +641,7 @@ mod tests {
         let (ctype, compressed) = compress(&data, &DataType::Float64).unwrap();
         // 全部相同的值，RLE 或 Gorilla 都可能被选中（取决于谁更小）
         assert!(compressed.len() < data.len() / 2);
-        let decompressed = decompress(&compressed, ctype).unwrap();
+        let decompressed = decompress(&compressed, ctype, &DataType::Float64).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -590,6 +661,9 @@ mod tests {
         let (ctype, compressed) = compress(&data, &DataType::Varchar).unwrap();
         assert_eq!(ctype, CompressionType::Dictionary);
         assert!(compressed.len() < data.len());
+        // v0.12.x 修复：Dictionary 解压原为空实现，现重建 Varchar 列字节
+        let decompressed = decompress(&compressed, ctype, &DataType::Varchar).unwrap();
+        assert_eq!(decompressed, data);
     }
 
     #[test]
@@ -626,24 +700,42 @@ mod tests {
         // Boolean
         let bool_data: Vec<u8> = (0..50).map(|i| (i % 2) as u8).collect();
         let (bc, bcomp) = compress(&bool_data, &DataType::Boolean).unwrap();
-        let bdec = decompress(&bcomp, bc).unwrap();
+        let bdec = decompress(&bcomp, bc, &DataType::Boolean).unwrap();
         assert_eq!(bdec, bool_data);
 
         // Int64
         let i64_values: Vec<i64> = (0..100).map(|i| i * 1000).collect();
         let i64_data: Vec<u8> = i64_values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let (ic, icomp) = compress(&i64_data, &DataType::Int64).unwrap();
-        let idec = decompress(&icomp, ic).unwrap();
+        let idec = decompress(&icomp, ic, &DataType::Int64).unwrap();
         assert_eq!(idec, i64_data);
+
+        // Int32
+        let i32_values: Vec<i32> = (0..100).collect();
+        let i32_data: Vec<u8> = i32_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (i32c, i32comp) = compress(&i32_data, &DataType::Int32).unwrap();
+        let i32dec = decompress(&i32comp, i32c, &DataType::Int32).unwrap();
+        assert_eq!(i32dec, i32_data);
 
         // Float64
         let f64_values: Vec<f64> = (0..50).map(|i| i as f64 * 0.1).collect();
         let f64_data: Vec<u8> = f64_values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let (fc, fcomp) = compress(&f64_data, &DataType::Float64).unwrap();
-        let fdec = decompress(&fcomp, fc).unwrap();
+        let fdec = decompress(&fcomp, fc, &DataType::Float64).unwrap();
         assert_eq!(fdec.len(), f64_data.len());
         for (a, b) in fdec.chunks_exact(8).zip(f64_data.chunks_exact(8)) {
             assert_eq!(a, b);
         }
+
+        // Varchar（低基数 → Dictionary）
+        let mut vc_data = Vec::new();
+        for i in 0..100 {
+            let s: &[u8] = if i % 2 == 0 { b"yes" } else { b"no" };
+            vc_data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            vc_data.extend_from_slice(s);
+        }
+        let (vc, vcomp) = compress(&vc_data, &DataType::Varchar).unwrap();
+        let vdec = decompress(&vcomp, vc, &DataType::Varchar).unwrap();
+        assert_eq!(vdec, vc_data);
     }
 }

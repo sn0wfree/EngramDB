@@ -134,14 +134,23 @@ mod tests {
     use super::*;
     use crate::wal::{WalWriter, WalRecordType};
 
+    fn tmp(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace('(', "_").replace(')', "")
+            .replace([':', ' '], "_");
+        p.push(format!("hybriddb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
+        p.to_string_lossy().to_string()
+    }
+
     #[test]
     fn test_reader_basic() {
-        let tmp = "/tmp/test_wal_reader.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("reader_basic");
+        let _ = std::fs::remove_file(&tmp);
 
         // 写入
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.write_record(WalRecordType::Insert, 1, 1, &[10, 20, 30]).unwrap();
             writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
@@ -149,7 +158,7 @@ mod tests {
         }
 
         // 读取
-        let mut reader = WalReader::open(tmp).unwrap();
+        let mut reader = WalReader::open(&tmp).unwrap();
         let records = reader.read_all().unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].record_type, WalRecordType::Begin);
@@ -157,36 +166,36 @@ mod tests {
         assert_eq!(records[2].record_type, WalRecordType::Commit);
         assert_eq!(records[1].payload, vec![10, 20, 30]);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_reader_empty_file() {
-        let tmp = "/tmp/test_wal_empty.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
-        std::fs::File::create(tmp).unwrap();
+        let tmp = tmp("reader_empty");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::File::create(&tmp).unwrap();
 
-        let mut reader = WalReader::open(tmp).unwrap();
+        let mut reader = WalReader::open(&tmp).unwrap();
         let records = reader.read_all().unwrap();
         assert!(records.is_empty());
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_reader_seek_and_position() {
-        let tmp = "/tmp/test_wal_seek.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("reader_seek");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.write_record(WalRecordType::Insert, 1, 1, &[1, 2]).unwrap();
             writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
             writer.sync().unwrap();
         }
 
-        let mut reader = WalReader::open(tmp).unwrap();
+        let mut reader = WalReader::open(&tmp).unwrap();
         assert_eq!(reader.position(), 0);
 
         // 读第一条
@@ -210,22 +219,22 @@ mod tests {
         let rec2_again = reader.read_next().unwrap().unwrap();
         assert_eq!(rec2_again.record_type, WalRecordType::Insert);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_reader_reset() {
-        let tmp = "/tmp/test_wal_reset.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("reader_reset");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
             writer.sync().unwrap();
         }
 
-        let mut reader = WalReader::open(tmp).unwrap();
+        let mut reader = WalReader::open(&tmp).unwrap();
         let first = reader.read_all().unwrap();
         assert_eq!(first.len(), 2);
 
@@ -235,18 +244,18 @@ mod tests {
         assert_eq!(second.len(), 2);
         assert_eq!(second[0].record_type, first[0].record_type);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_reader_partial_write_at_end() {
-        let tmp = "/tmp/test_wal_partial.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("reader_partial");
+        let _ = std::fs::remove_file(&tmp);
 
         // 写入一条完整记录 + 半条（模拟崩溃时的部分写入）
         {
             use std::io::Write;
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.sync().unwrap();
         }
@@ -254,27 +263,27 @@ mod tests {
         // 追加垃圾数据模拟部分写入
         {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().append(true).open(tmp).unwrap();
+            let mut file = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
             file.write_all(&[0x57, 0x41, 0x01, 0x00]).unwrap(); // 只有 magic + type + 部分 txn_id
         }
 
-        let mut reader = WalReader::open(tmp).unwrap();
+        let mut reader = WalReader::open(&tmp).unwrap();
         let records = reader.read_all().unwrap();
         // 应该能读到第一条完整的，第二条部分写入的被跳过
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_type, WalRecordType::Begin);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_reader_many_records() {
-        let tmp = "/tmp/test_wal_many.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("reader_many");
+        let _ = std::fs::remove_file(&tmp);
 
         let n = 1000;
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 0..n {
                 let payload = vec![i as u8; 20];
                 writer.write_record(WalRecordType::Insert, i, 1, &payload).unwrap();
@@ -282,7 +291,7 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        let mut reader = WalReader::open(tmp).unwrap();
+        let mut reader = WalReader::open(&tmp).unwrap();
         let records = reader.read_all().unwrap();
         assert_eq!(records.len(), n as usize);
 
@@ -292,6 +301,6 @@ mod tests {
             assert_eq!(rec.payload[0], i as u8);
         }
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

@@ -148,6 +148,13 @@ pub struct Config {
     pub wal_group_commit_max_bytes: usize,
     /// 默认压缩算法
     pub default_compression: CompressionType,
+    /// 列存持久化时是否启用压缩（v0.12.x 压缩接线）
+    ///
+    /// 开启后：checkpoint 时对列存调用 `compress_all`（内存中按 RowGroup 压缩），
+    /// `save_data` 将压缩后的字节直接落盘；`load_data` 以压缩态惰性加载，
+    /// `read_column` 在首次访问时解压。`append_*` 在追加到已压缩 RowGroup 前自动解压。
+    /// 关闭后：保持旧行为（裸存，运行时压缩率 1.0x）。
+    pub compress_on_persist: bool,
     /// Delta 合并策略（数据库级默认）
     ///
     /// 新建的表默认使用此策略，也可以在表级别单独设置。
@@ -190,6 +197,7 @@ impl Default for Config {
             wal_group_commit_size: 0, // 默认关闭，每次 commit 都 fsync（最安全）
             wal_group_commit_max_bytes: 65536, // 64KB，按大小兜底
             default_compression: CompressionType::Uncompressed,
+            compress_on_persist: true,
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
         }

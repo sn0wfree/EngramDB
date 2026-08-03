@@ -87,6 +87,8 @@ impl ColumnStore {
                 self.row_groups.len() - 1
             };
 
+            // 追加前确保目标 RowGroup 已解压（兼容从磁盘惰性加载的压缩态）
+            self.ensure_rg_decompressed(current_rg)?;
             let rg = &mut self.row_groups[current_rg];
             let space = (self.row_group_size - rg.row_count) as usize;
             let take = std::cmp::min(space, remaining.len());
@@ -162,6 +164,7 @@ impl ColumnStore {
                 self.row_groups.len() - 1
             };
 
+            self.ensure_rg_decompressed(current_rg)?;
             let rg = &mut self.row_groups[current_rg];
             let space = (self.row_group_size - rg.row_count) as usize;
             let take = std::cmp::min(space, remaining_rows);
@@ -210,6 +213,24 @@ impl ColumnStore {
         Ok(())
     }
 
+    /// 确保指定 RowGroup 的所有列处于解压态（values 非空）
+    ///
+    /// 追加数据到已压缩的 RowGroup 前必须调用：压缩态下 `values` 为空，
+    /// 直接 `extend` 会丢失原有数据。解压后清空 `compressed_data`，后续追加正常写入 `values`。
+    fn ensure_rg_decompressed(&mut self, rg_idx: usize) -> Result<()> {
+        let rg = &mut self.row_groups[rg_idx];
+        for col in &mut rg.columns {
+            if col.values.is_empty() && !col.compressed_data.is_empty() {
+                let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
+                col.values = deserialize_values(&bytes, &col.data_type, col.uncompressed_count as usize);
+                col.compressed_data.clear();
+                col.compressed_data.shrink_to_fit();
+                col.compression = CompressionType::Uncompressed;
+            }
+        }
+        Ok(())
+    }
+
     /// 读取指定 row group 的指定列
     ///
     /// 如果列数据已压缩，会自动解压到 values 中（惰性解压）。
@@ -219,8 +240,12 @@ impl ColumnStore {
 
         // 惰性解压：如果数据是压缩状态，先解压
         if !col.compressed_data.is_empty() && col.values.is_empty() {
-            let bytes = compression::decompress(&col.compressed_data, col.compression.clone())?;
+            let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
             col.values = deserialize_values(&bytes, &col.data_type, col.uncompressed_count as usize);
+            // 清空压缩态，避免后续 append / data_to_bytes 误用陈旧的 compressed_data
+            col.compressed_data.clear();
+            col.compressed_data.shrink_to_fit();
+            col.compression = CompressionType::Uncompressed;
         }
 
         Ok(&col.values)
@@ -288,7 +313,7 @@ impl ColumnStore {
                     continue; // 未压缩
                 }
 
-                let bytes = compression::decompress(&col.compressed_data, col.compression.clone())?;
+                let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
                 col.values = bytes_to_values(&bytes, &col.data_type, col.uncompressed_count as usize);
                 col.compressed_data.clear();
                 col.compressed_data.shrink_to_fit();
@@ -358,7 +383,7 @@ impl ColumnStore {
     /// +-------------------------------+
     /// ```
     ///
-    /// 每个 column（确保数据可读，必要时先解压）:
+    /// 每个 column（compression 字段决定 payload 是压缩字节还是裸序列化字节）:
     /// ```text
     /// +-------------------------------+
     /// | data_type 1B                  |
@@ -374,7 +399,7 @@ impl ColumnStore {
     /// | values_bytes                  |
     /// +-------------------------------+
     /// ```
-    pub fn data_to_bytes(&mut self) -> Result<Vec<u8>> {
+    pub fn data_to_bytes(&mut self, compress: bool) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let rg_count = self.row_groups.len() as u32;
         buf.extend_from_slice(&rg_count.to_le_bytes());
@@ -384,25 +409,34 @@ impl ColumnStore {
             buf.extend_from_slice(&(rg.columns.len() as u32).to_le_bytes());
 
             for col in &mut rg.columns {
-                // 确保数据在 values 中（若已压缩，先解压）
-                if col.values.is_empty() && !col.compressed_data.is_empty() {
-                    let bytes = compression::decompress(&col.compressed_data, col.compression.clone())?;
-                    col.values = deserialize_values(&bytes, &col.data_type, col.uncompressed_count as usize);
-                }
+                // 计算落盘的 (compression, payload, uncompressed_count)——不修改内存状态
+                // - 内存中已压缩（compress_all 产物）：直接写压缩字节
+                // - 未压缩：序列化后按 `compress` 开关决定是否压缩
+                let (ctype, payload, ucount): (CompressionType, Vec<u8>, u32) =
+                    if !col.compressed_data.is_empty() {
+                        (col.compression, col.compressed_data.clone(), col.uncompressed_count)
+                    } else {
+                        let serialized = serialize_values(&col.values, &col.data_type);
+                        let count = col.values.len() as u32;
+                        if compress && !serialized.is_empty() {
+                            let (c, comp) = compression::compress(&serialized, &col.data_type)?;
+                            (c, comp, count)
+                        } else {
+                            (CompressionType::Uncompressed, serialized, count)
+                        }
+                    };
 
                 // data_type
                 buf.push(data_type_to_u8(&col.data_type));
                 // compression
-                buf.push(col.compression as u8);
+                buf.push(ctype as u8);
                 // null_count
                 buf.extend_from_slice(&col.null_count.to_le_bytes());
-                // uncompressed_count
-                buf.extend_from_slice(&col.uncompressed_count.to_le_bytes());
-
-                // values 序列化
-                let values_bytes = serialize_values(&col.values, &col.data_type);
-                buf.extend_from_slice(&(values_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&values_bytes);
+                // uncompressed_count（始终为该列真实行数，修复旧版未压缩列写 0 的 bug）
+                buf.extend_from_slice(&ucount.to_le_bytes());
+                // payload（压缩字节或裸序列化字节）
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&payload);
 
                 // min/max（可选，用于 MinMax 跳过索引）
                 buf.push(if col.min_value.is_some() { 1 } else { 0 });
@@ -468,11 +502,16 @@ impl ColumnStore {
                         "truncated column values".into(),
                     ));
                 }
-                let values = deserialize_values(
-                    &data[offset..offset + values_len],
-                    &data_type,
-                    uncompressed_count as usize,
-                );
+                let payload = &data[offset..offset + values_len];
+                // compression 字段决定 payload 语义：
+                // - Uncompressed → 裸序列化字节，直接解出 values
+                // - 其它 → 压缩字节，惰性存入 compressed_data，由 read_column 首次访问时解压
+                let (values, compressed_data): (Vec<Value>, Vec<u8>) =
+                    if compression == CompressionType::Uncompressed {
+                        (deserialize_values(payload, &data_type, uncompressed_count as usize), Vec::new())
+                    } else {
+                        (Vec::new(), payload.to_vec())
+                    };
                 offset += values_len;
 
                 // min
@@ -509,7 +548,7 @@ impl ColumnStore {
                     values,
                     null_count,
                     compression,
-                    compressed_data: Vec::new(),
+                    compressed_data,
                     uncompressed_count,
                     min_value,
                     max_value,

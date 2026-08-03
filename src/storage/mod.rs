@@ -37,6 +37,15 @@ pub struct Database {
 impl Database {
     /// 打开或创建数据库
     pub fn open(path: &str) -> Result<Self> {
+        let path = if path == ":memory:" {
+            let mut p = std::env::temp_dir();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            p.push(format!("hybriddb_mem_{}_{}.hdb", std::process::id(), nanos));
+            p.to_string_lossy().to_string()
+        } else {
+            path.to_string()
+        };
         let path = PathBuf::from(path);
         let config = Config::default();
 
@@ -49,6 +58,15 @@ impl Database {
 
     /// 使用指定配置打开或创建数据库
     pub fn open_with_config(path: &str, config: Config) -> Result<Self> {
+        let path = if path == ":memory:" {
+            let mut p = std::env::temp_dir();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            p.push(format!("hybriddb_mem_{}_{}.hdb", std::process::id(), nanos));
+            p.to_string_lossy().to_string()
+        } else {
+            path.to_string()
+        };
         let path = PathBuf::from(path);
 
         if path.exists() {
@@ -510,9 +528,10 @@ impl Database {
 
         // 收集 table_id 列表（避免借用冲突）
         let table_ids: Vec<u32> = self.tables.keys().copied().collect();
+        let compress = self.config.compress_on_persist;
         for table_id in table_ids {
             let table = self.tables.get_mut(&table_id).unwrap();
-            let data_bytes = table.column_store_mut().data_to_bytes()?;
+            let data_bytes = table.column_store_mut().data_to_bytes(compress)?;
             section_buf.extend_from_slice(&table_id.to_le_bytes());
             section_buf.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
             section_buf.extend_from_slice(&data_bytes);
@@ -603,6 +622,15 @@ impl Database {
         // 1. 先把 Delta 合并到列存（确保数据完整）
         let _ = self.compact_all()?;
 
+        // 1.5 压缩列存（v0.12.x 压缩接线）
+        // compact 后对每张表调用 compress_all：数据以压缩态落盘 + 降低内存占用。
+        // 后续 append 路径会通过 ensure_rg_decompressed 按需惰性解压。
+        if self.config.compress_on_persist {
+            for table in self.tables.values_mut() {
+                let _ = table.column_store_mut().compress_all()?;
+            }
+        }
+
         // 2. 保存 catalog（schema）
         let _ = self.save_catalog()?;
 
@@ -629,6 +657,21 @@ mod tests {
             ColumnDef::new("score", DataType::Float64),
         ]);
         Table::new(def, crate::common::config::CompactStrategy::Manual)
+    }
+
+    fn temp_db_path(suffix: &str) -> String {
+        let mut p = std::env::temp_dir();
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace('(', "_").replace(')', "")
+            .replace([':', ' '], "_");
+        // 追加 ThreadId：同进程并发跑多个测试线程时，用 PID 区分跨进程，
+        // 用 tid 区分跨线程（Rust 默认 --test-threads > 1 多线程跑）
+        p.push(format!("hybriddb_{}_{}_{}.hdb", suffix, std::process::id(), tid));
+        p.to_string_lossy().to_string()
+    }
+    fn cleanup_db(path: &str) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path));
     }
 
     #[test]
@@ -694,9 +737,8 @@ mod tests {
 
     #[test]
     fn test_database_index_persistence() {
-        // 使用 /tmp 下的唯一路径
-        let path = format!("/tmp/hybriddb_idx_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path); // 清理残留
+        let path = temp_db_path("db_idx");
+        cleanup_db(&path);
 
         {
             let mut db = Database::open(&path).unwrap();
@@ -735,19 +777,25 @@ mod tests {
         {
             let mut db = Database::open(&path).unwrap();
 
-            // 注意：表定义不会自动加载（MVP 限制），需要重新创建
-            // 但索引段在文件中，我们手动创建同 ID 的表来测试加载
-            let def = TableDef::new(1, "users", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("name", DataType::Varchar),
-            ]);
-            db.create_table(def).unwrap();
+            // v0.12.1：catalog 已在 open_existing 中自动加载
+            // 若表不存在（旧文件未存 catalog），则手动创建同 ID 表兼容旧格式
+            if db.get_table("users").is_none() {
+                let def = TableDef::new(1, "users", vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("name", DataType::Varchar),
+                ]);
+                db.create_table(def).unwrap();
+            }
 
             // 加载索引
-            let loaded = db.load_indexes().unwrap();
-            assert_eq!(loaded, 1);
-
+            // v0.12.1+：open_existing 已自动 load_indexes（catalog 存在时）。
+            // 为兼容双路径（catalog 存在/不存在），断言最终索引实体存在并数量正确，
+            // 而非单次 load_indexes 的增量返回值。
+            let _ = db.load_indexes();
             let table = db.get_table("users").unwrap();
+            let total_idx = table.indexes().len() + table.vector_indexes().len();
+            assert_eq!(total_idx, 1);
+
             let idx = table.get_index("idx_name").unwrap();
             assert_eq!(idx.len(), 3);
             assert_eq!(idx.get(&Value::Varchar("bob".into())).unwrap(), vec![1]);
@@ -755,14 +803,13 @@ mod tests {
             db.close().unwrap();
         }
 
-        // 清理
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_database_no_indexes() {
-        let path = format!("/tmp/hybriddb_noidx_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("db_noidx");
+        cleanup_db(&path);
 
         {
             let db = Database::open(&path).unwrap();
@@ -771,7 +818,7 @@ mod tests {
             assert_eq!(db.header.index_size, 0);
         }
 
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     // ========================================================================
@@ -790,8 +837,8 @@ mod tests {
 
     #[test]
     fn test_vector_index_create_and_search() {
-        let path = format!("/tmp/hybriddb_vecidx_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_basic");
+        cleanup_db(&path);
 
         let mut db = Database::open(&path).unwrap();
 
@@ -847,13 +894,13 @@ mod tests {
             "自己和自己距离应接近 0，实际: {}", self_match.unwrap().distance);
 
         db.close().unwrap();
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_vector_index_incremental_insert() {
-        let path = format!("/tmp/hybriddb_vecidx_incr_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_incr");
+        cleanup_db(&path);
 
         let mut db = Database::open(&path).unwrap();
 
@@ -906,13 +953,13 @@ mod tests {
         assert!(found, "增量插入的向量应能被搜索到");
 
         db.close().unwrap();
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_vector_index_empty_search() {
-        let path = format!("/tmp/hybriddb_vecidx_empty_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_empty");
+        cleanup_db(&path);
 
         let mut db = Database::open(&path).unwrap();
 
@@ -932,13 +979,13 @@ mod tests {
         assert!(results.is_empty());
 
         db.close().unwrap();
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_vector_index_not_found_error() {
-        let path = format!("/tmp/hybriddb_vecidx_nf_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_nf");
+        cleanup_db(&path);
 
         let mut db = Database::open(&path).unwrap();
 
@@ -955,13 +1002,13 @@ mod tests {
         assert!(matches!(result.unwrap_err(),
             crate::common::error::HybridDbError::IndexNotFound(_)));
 
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_vector_index_persistence_roundtrip() {
-        let path = format!("/tmp/hybriddb_vecidx_persist_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_persist");
+        cleanup_db(&path);
 
         // 写入数据 + 创建向量索引 + 保存
         {
@@ -1007,20 +1054,26 @@ mod tests {
         {
             let mut db = Database::open(&path).unwrap();
 
-            // 重新创建同 ID 的表（MVP 限制：表定义不会自动加载）
-            let def = TableDef::new(1, "docs", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
-            ]);
-            db.create_table(def).unwrap();
+            // v0.12.1：catalog 已在 open_existing 中自动加载
+            // 若表不存在（旧文件未存 catalog），则手动创建同 ID 表兼容旧格式
+            if db.get_table("docs").is_none() {
+                let def = TableDef::new(1, "docs", vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+                ]);
+                db.create_table(def).unwrap();
+            }
 
             // 加载索引
-            let loaded = db.load_indexes().unwrap();
-            assert!(loaded >= 1, "至少加载 1 个向量索引");
+            // v0.12.1+：open_existing 已自动 load_indexes（catalog 存在时）。
+            // 为兼容双路径，断言最终索引实体存在并数量正确。
+            let _ = db.load_indexes();
 
             // 验证向量索引已加载
             let table = db.get_table("docs").unwrap();
             assert_eq!(table.vector_indexes().len(), 1);
+            let total_idx = table.indexes().len() + table.vector_indexes().len();
+            assert!(total_idx >= 1, "至少存在 1 个索引（向量索引）");
             assert_eq!(table.get_vector_index("idx_emb").unwrap().len(), 100);
 
             // 搜索验证：搜索第 50 号向量
@@ -1033,13 +1086,13 @@ mod tests {
             db.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_mixed_indexes_persistence() {
-        let path = format!("/tmp/hybriddb_mixed_idx_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("mixed_idx");
+        cleanup_db(&path);
 
         {
             let mut db = Database::open(&path).unwrap();
@@ -1086,17 +1139,23 @@ mod tests {
         {
             let mut db = Database::open(&path).unwrap();
 
-            let def = TableDef::new(1, "items", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("name", DataType::Varchar),
-                ColumnDef::new("vec", DataType::Vector { dim: 8 }),
-            ]);
-            db.create_table(def).unwrap();
+            if db.get_table("items").is_none() {
+                let def = TableDef::new(1, "items", vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("name", DataType::Varchar),
+                    ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+                ]);
+                db.create_table(def).unwrap();
+            }
 
-            let loaded = db.load_indexes().unwrap();
-            assert!(loaded >= 1);
+            // v0.12.1+：open_existing 已自动 load_indexes（catalog 存在时）。
+            // 为兼容双路径，断言最终索引实体存在并数量正确。
+            let _ = db.load_indexes();
 
             let table = db.get_table("items").unwrap();
+            let total_idx = table.indexes().len() + table.vector_indexes().len();
+            assert!(total_idx >= 1);
+
             // SkipList 索引
             assert_eq!(table.indexes().len(), 1);
             assert!(table.get_index("idx_name").is_some());
@@ -1108,7 +1167,7 @@ mod tests {
             db.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     // ========================================================================
@@ -1118,8 +1177,8 @@ mod tests {
     #[test]
     fn test_vector_index_delete_tombstone() {
         // 验证 DELETE 后向量索引正确标记 tombstone，搜索结果过滤已删除行
-        let path = format!("/tmp/hybriddb_vecidx_del_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_del");
+        cleanup_db(&path);
 
         let mut db = Database::open(&path).unwrap();
 
@@ -1188,14 +1247,14 @@ mod tests {
             "未删除的 id=42 应能被搜索到");
 
         db.close().unwrap();
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_vector_index_update_maintenance() {
         // 验证 UPDATE 后旧向量 tombstone + 新向量插入
-        let path = format!("/tmp/hybriddb_vecidx_upd_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_upd");
+        cleanup_db(&path);
 
         let mut db = Database::open(&path).unwrap();
 
@@ -1275,14 +1334,14 @@ mod tests {
             "自己和自己距离应接近 0");
 
         db.close().unwrap();
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_vector_index_delete_persistence() {
         // 验证 tombstone 数据能正确持久化和恢复
-        let path = format!("/tmp/hybriddb_vecidx_delpersist_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_delpersist");
+        cleanup_db(&path);
 
         {
             let mut db = Database::open(&path).unwrap();
@@ -1333,11 +1392,13 @@ mod tests {
         {
             let mut db = Database::open(&path).unwrap();
 
-            let def = TableDef::new(1, "docs", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
-            ]);
-            db.create_table(def).unwrap();
+            if db.get_table("docs").is_none() {
+                let def = TableDef::new(1, "docs", vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
+                ]);
+                db.create_table(def).unwrap();
+            }
 
             db.load_indexes().unwrap();
 
@@ -1359,14 +1420,14 @@ mod tests {
             db.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
     }
 
     #[test]
     fn test_vector_index_delete_all_active() {
         // 边界：删除所有有效向量后，搜索应返回空
-        let path = format!("/tmp/hybriddb_vecidx_delall_test_{}.hdb", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        let path = temp_db_path("vecidx_delall");
+        cleanup_db(&path);
 
         let mut db = Database::open(&path).unwrap();
 
@@ -1414,6 +1475,185 @@ mod tests {
         assert!(results.is_empty(), "全部删除后搜索应返回空");
 
         db.close().unwrap();
-        let _ = std::fs::remove_file(&path);
+        cleanup_db(&path);
+    }
+
+    // ========================================================================
+    // 压缩持久化往返测试（v0.12.x P0：接通压缩到 compact）
+    // ========================================================================
+
+    #[test]
+    fn test_compression_persistence_roundtrip() {
+        let path = temp_db_path("compress_rt");
+        cleanup_db(&path);
+
+        // 1. 创建数据库，插入多类型数据，checkpoint（compact → compress_all → save）
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            let def = TableDef::new(1, "mixed", vec![
+                ColumnDef::new("id", DataType::Int32),       // Delta/FOR 压缩
+                ColumnDef::new("name", DataType::Varchar),    // Dictionary 压缩
+                ColumnDef::new("score", DataType::Float64),   // Gorilla 压缩
+                ColumnDef::new("active", DataType::Boolean),  // BooleanPack 压缩
+            ]);
+            db.create_table(def).unwrap();
+
+            let table = db.get_table_mut("mixed").unwrap();
+            let names = ["alice", "bob", "charlie"];
+            let rows: Vec<Vec<Value>> = (0..300u32).map(|i| {
+                vec![
+                    Value::Int32(i as i32),
+                    Value::Varchar(names[(i % 3) as usize].into()),
+                    Value::Float64(i as f64 * 0.1),
+                    Value::Boolean(i % 2 == 0),
+                ]
+            }).collect();
+            table.insert(rows).unwrap();
+
+            db.checkpoint().unwrap();
+            db.close().unwrap();
+        }
+
+        // 2. 重新打开，验证数据完整性（read_column 惰性解压）
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            // load_catalog + load_data 已在 open_existing 中完成
+            let table = db.get_table_mut("mixed").unwrap();
+            assert_eq!(table.column_store().total_rows(), 300);
+
+            // scan 会触发 read_column → 惰性解压
+            let rows = table.scan(&[0, 1, 2, 3]).unwrap();
+            assert_eq!(rows.len(), 300);
+
+            // 验证首行
+            assert_eq!(rows[0][0], Value::Int32(0));
+            assert_eq!(rows[0][1], Value::Varchar("alice".into()));
+            assert_eq!(rows[0][3], Value::Boolean(true));
+
+            // 验证末行
+            assert_eq!(rows[299][0], Value::Int32(299));
+            assert_eq!(rows[299][1], Value::Varchar("charlie".into()));
+            assert_eq!(rows[299][3], Value::Boolean(false));
+
+            // 验证中间行（name 按 i%3 循环：151 % 3 = 1 → "bob"）
+            assert_eq!(rows[151][1], Value::Varchar("bob".into()));
+
+            db.close().unwrap();
+        }
+
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn test_append_after_compressed_load() {
+        // 场景：数据以压缩态落盘 → 重新加载 → 追加新行 → 验证全部数据
+        // 核心验证点：ensure_rg_decompressed 在 append 前正确解压旧数据
+        let path = temp_db_path("compress_append");
+        cleanup_db(&path);
+
+        // 1. 第一阶段：插入 200 行，checkpoint 压缩落盘
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            let def = TableDef::new(1, "events", vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("label", DataType::Varchar),
+            ]);
+            db.create_table(def).unwrap();
+
+            let table = db.get_table_mut("events").unwrap();
+            let rows: Vec<Vec<Value>> = (0..200i64).map(|i| {
+                vec![
+                    Value::Int64(i),
+                    Value::Varchar(if i % 2 == 0 { "even" } else { "odd" }.into()),
+                ]
+            }).collect();
+            table.insert(rows).unwrap();
+
+            db.checkpoint().unwrap();
+            db.close().unwrap();
+        }
+
+        // 2. 第二阶段：重新打开，追加 50 行，验证全部 250 行
+        {
+            let mut db = Database::open(&path).unwrap();
+
+            // 追加新数据（触发 ensure_rg_decompressed）
+            let table = db.get_table_mut("events").unwrap();
+            let new_rows: Vec<Vec<Value>> = (200..250i64).map(|i| {
+                vec![
+                    Value::Int64(i),
+                    Value::Varchar(if i % 2 == 0 { "even" } else { "odd" }.into()),
+                ]
+            }).collect();
+            table.insert(new_rows).unwrap();
+
+            // compact 把新 Delta 合并到列存
+            db.compact_table("events").unwrap();
+
+            // 验证全部数据
+            let table = db.get_table_mut("events").unwrap();
+            let rows = table.scan(&[0, 1]).unwrap();
+            assert_eq!(rows.len(), 250);
+
+            // 验证旧数据（前 200 行）
+            assert_eq!(rows[0][0], Value::Int64(0));
+            assert_eq!(rows[199][0], Value::Int64(199));
+
+            // 验证新追加的数据（后 50 行）
+            assert_eq!(rows[200][0], Value::Int64(200));
+            assert_eq!(rows[249][0], Value::Int64(249));
+            assert_eq!(rows[249][1], Value::Varchar("odd".into()));
+
+            db.close().unwrap();
+        }
+
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn test_compression_disabled_persist() {
+        // compress_on_persist = false 时，数据以裸存方式落盘，同样能正确往返
+        let path = temp_db_path("compress_off");
+        cleanup_db(&path);
+
+        {
+            let mut config = crate::common::config::Config::default();
+            config.compress_on_persist = false;
+            let mut db = Database::open_with_config(&path, config).unwrap();
+
+            let def = TableDef::new(1, "raw", vec![
+                ColumnDef::new("id", DataType::Int32),
+                ColumnDef::new("tag", DataType::Varchar),
+            ]);
+            db.create_table(def).unwrap();
+
+            let table = db.get_table_mut("raw").unwrap();
+            let rows: Vec<Vec<Value>> = (0..100u32).map(|i| {
+                vec![
+                    Value::Int32(i as i32),
+                    Value::Varchar(format!("item_{}", i % 5)),
+                ]
+            }).collect();
+            table.insert(rows).unwrap();
+
+            db.checkpoint().unwrap();
+            db.close().unwrap();
+        }
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            let table = db.get_table_mut("raw").unwrap();
+            let rows = table.scan(&[0, 1]).unwrap();
+            assert_eq!(rows.len(), 100);
+            assert_eq!(rows[0][0], Value::Int32(0));
+            assert_eq!(rows[99][0], Value::Int32(99));
+            assert_eq!(rows[99][1], Value::Varchar("item_4".into()));
+            db.close().unwrap();
+        }
+
+        cleanup_db(&path);
     }
 }

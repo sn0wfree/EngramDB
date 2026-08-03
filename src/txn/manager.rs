@@ -330,20 +330,26 @@ impl TransactionManager {
 mod tests {
     use super::*;
 
-    fn setup_manager() -> TransactionManager {
-        let tmp = "/tmp/test_txn_manager.hdb";
-        let _ = std::fs::remove_file(format!("{}-wal", tmp));
+    fn setup_manager(name: &str) -> (TransactionManager, String) {
+        let mut p = std::env::temp_dir();
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace('(', "_").replace(')', "")
+            .replace([':', ' '], "_");
+        p.push(format!("hybriddb_txn_{}_{}_{}.hdb", name, std::process::id(), tid));
+        let tmp = p.to_string_lossy().to_string();
+        cleanup(&tmp);
         let config = Config::default();
-        TransactionManager::new(tmp, &config).unwrap()
+        (TransactionManager::new(&tmp, &config).unwrap(), tmp)
     }
 
     fn cleanup(path: &str) {
+        let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}-wal", path));
     }
 
     #[test]
     fn test_begin_commit() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("begin_commit");
         let txn_id = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         assert_eq!(mgr.state(txn_id), Some(TxnState::Active));
         assert_eq!(mgr.active_count(), 1);
@@ -353,12 +359,12 @@ mod tests {
         assert_eq!(mgr.state(txn_id), Some(TxnState::Committed));
         assert_eq!(mgr.active_count(), 0);
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_begin_rollback() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("begin_rollback");
         let txn_id = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         assert_eq!(mgr.active_count(), 1);
 
@@ -366,12 +372,12 @@ mod tests {
         assert_eq!(mgr.state(txn_id), Some(TxnState::RolledBack));
         assert_eq!(mgr.active_count(), 0);
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_insert_and_read() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("insert_and_read");
         let table_id = 1;
 
         // Txn 1: 插入并提交
@@ -386,12 +392,12 @@ mod tests {
         assert_eq!(val.unwrap(), &vec![Value::Int64(42)]);
         mgr.commit(txn2).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_write_write_conflict() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("write_write_conflict");
         let table_id = 1;
 
         let txn1 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
@@ -407,12 +413,12 @@ mod tests {
         mgr.rollback(txn1).unwrap();
         mgr.rollback(txn2).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_snapshot_isolation() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("snapshot_isolation");
         let table_id = 1;
 
         // Txn 1: 插入数据并提交
@@ -440,12 +446,12 @@ mod tests {
 
         mgr.commit(txn2).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_rollback_removes_versions() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("rollback_removes_versions");
         let table_id = 1;
 
         let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
@@ -458,12 +464,12 @@ mod tests {
         assert!(val.is_none());
         mgr.commit(txn2).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_update_operation() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("update_operation");
         let table_id = 1;
 
         // 插入初始值
@@ -482,12 +488,12 @@ mod tests {
         assert_eq!(val.unwrap(), &vec![Value::Int64(200)]);
         mgr.commit(txn3).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_delete_operation() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("delete_operation");
         let table_id = 1;
 
         // 插入
@@ -507,12 +513,12 @@ mod tests {
         assert!(val.unwrap().is_empty()); // tombstone
         mgr.commit(txn3).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_checkpoint() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("checkpoint");
         let table_id = 1;
 
         // 插入一些数据
@@ -527,12 +533,12 @@ mod tests {
         let lsn_after = mgr.current_wal_lsn();
         assert!(lsn_after <= lsn_before || lsn_after == checkpoint_lsn);
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_gc_old_versions() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("gc_old_versions");
         let table_id = 1;
 
         // 提交多个版本
@@ -550,12 +556,12 @@ mod tests {
         assert!(val.is_some());
         mgr.commit(txn_active).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_commit_already_committed_fails() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("commit_already_committed_fails");
         let txn_id = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         mgr.commit(txn_id).unwrap();
 
@@ -563,12 +569,12 @@ mod tests {
         let result = mgr.commit(txn_id);
         assert!(result.is_err());
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_rollback_already_committed_fails() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("rollback_already_committed_fails");
         let txn_id = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         mgr.commit(txn_id).unwrap();
 
@@ -576,12 +582,12 @@ mod tests {
         let result = mgr.rollback(txn_id);
         assert!(result.is_err());
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_read_nonexistent_row() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("read_nonexistent_row");
         let table_id = 1;
 
         let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
@@ -589,23 +595,23 @@ mod tests {
         assert!(val.is_none());
         mgr.commit(txn).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_read_nonexistent_table() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("read_nonexistent_table");
         let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         let val = mgr.read(txn, 999, 1);
         assert!(val.is_none());
         mgr.commit(txn).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_wal_lsn_increases() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("wal_lsn_increases");
         let table_id = 1;
 
         let lsn0 = mgr.current_wal_lsn();
@@ -622,12 +628,12 @@ mod tests {
         let lsn3 = mgr.current_wal_lsn();
         assert!(lsn3 > lsn2);
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_multiple_tables() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("multiple_tables");
 
         // 在两个不同的表中插入数据
         let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
@@ -644,12 +650,12 @@ mod tests {
         assert_eq!(val2.unwrap(), &vec![Value::Varchar("hello".to_string())]);
         mgr.commit(txn2).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_start_ts() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("start_ts");
         let txn_id = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         let ts = mgr.start_ts(txn_id);
         assert!(ts.is_some());
@@ -662,12 +668,12 @@ mod tests {
         // 提交后仍然能查到 start_ts
         assert!(mgr.start_ts(txn_id).is_some());
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_state_transitions() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("state_transitions");
         let txn_id = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
         assert_eq!(mgr.state(txn_id), Some(TxnState::Active));
 
@@ -677,12 +683,12 @@ mod tests {
         // 不存在的事务
         assert!(mgr.state(9999).is_none());
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_multiple_concurrent_txns() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("multiple_concurrent_txns");
         let table_id = 1;
 
         // 开启 3 个并发事务
@@ -711,12 +717,12 @@ mod tests {
         assert_eq!(mgr.read(txn4, table_id, 3).unwrap(), &vec![Value::Int64(3)]);
         mgr.commit(txn4).unwrap();
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 
     #[test]
     fn test_mvcc_store_accessor() {
-        let mut mgr = setup_manager();
+        let (mut mgr, path) = setup_manager("mvcc_store_accessor");
         let table_id = 1;
 
         // 没有数据时 mvcc_store 返回 None
@@ -730,6 +736,6 @@ mod tests {
         assert!(mgr.mvcc_store(table_id).is_some());
         assert!(mgr.mvcc_store(999).is_none());
 
-        cleanup("/tmp/test_txn_manager.hdb");
+        cleanup(&path);
     }
 }

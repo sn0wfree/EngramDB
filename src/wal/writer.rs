@@ -231,9 +231,30 @@ impl WalWriter {
     /// 截断到指定 LSN（Checkpoint 后清理 WAL）
     pub fn truncate(&mut self, lsn: u64) -> Result<()> {
         self.flush()?;
-        self.file.set_len(lsn)?;
-        self.file.seek(SeekFrom::Start(lsn))?;
-        self.offset = lsn;
+
+        // Windows 下，通过 .append(true) 打开的文件句柄调用 `set_len` 可能
+        // 失败（PermissionDenied / ERROR_ACCESS_DENIED）——因为该句柄缺少
+        // 修改文件结束位置所需的访问掩码。
+        //
+        // 跨平台安全策略：不对 self.file 本身 set_len；改为对同一路径再开
+        // 一把 `write + create` 的独立句柄执行 set_len。Rust 在 Windows 上
+        // 默认带 FILE_SHARE_READ|WRITE，并发打开不会冲突。
+        {
+            let resizer = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&self.path)?;
+            resizer.set_len(lsn)?;
+        }
+
+        // 同步 self.file 的 offset 到新长度（若 lsn < 旧尾部则回退）
+        // append 模式下所有 write 会自动 seek 到 end，但我们需要让
+        // self.offset 与真实文件大小对齐。
+        let file_size = self.file.metadata()?.len();
+        self.offset = file_size;
+        use std::io::Seek;
+        self.file.seek(SeekFrom::Start(file_size))?;
+
         Ok(())
     }
 
@@ -255,13 +276,22 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn tmp(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace('(', "_").replace(')', "")
+            .replace([':', ' '], "_");
+        p.push(format!("hybriddb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
+        p.to_string_lossy().to_string()
+    }
+
     #[test]
     fn test_wal_write_and_read() {
-        let tmp = "/tmp/test_wal_writer.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_basic");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             let lsn1 = writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             let lsn2 = writer.write_record(WalRecordType::Insert, 1, 1, &[1, 2, 3]).unwrap();
             writer.sync().unwrap();
@@ -271,7 +301,7 @@ mod tests {
         }
 
         // 读取验证
-        let mut file = std::fs::File::open(tmp).unwrap();
+        let mut file = std::fs::File::open(&tmp).unwrap();
         let mut data = Vec::new();
         file.read_to_end(&mut data).unwrap();
 
@@ -286,15 +316,15 @@ mod tests {
         assert_eq!(rec2.table_id, 1);
         assert_eq!(rec2.payload, vec![1, 2, 3]);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_wal_buffer_batching() {
-        let tmp = "/tmp/test_wal_buffer.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_buffer");
+        let _ = std::fs::remove_file(&tmp);
 
-        let mut writer = WalWriter::open(tmp).unwrap();
+        let mut writer = WalWriter::open(&tmp).unwrap();
         // 写入多条，验证 LSN 连续
         let mut prev_lsn = 0;
         for i in 0..100 {
@@ -304,16 +334,16 @@ mod tests {
         }
         writer.sync().unwrap();
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_wal_empty_payload_records() {
-        let tmp = "/tmp/test_wal_empty.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_empty_payload");
+        let _ = std::fs::remove_file(&tmp);
 
         {
-            let mut writer = WalWriter::open(tmp).unwrap();
+            let mut writer = WalWriter::open(&tmp).unwrap();
             // Begin/Commit/Rollback/Checkpoint 都有空 payload
             writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
             writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
@@ -323,18 +353,18 @@ mod tests {
         }
 
         // 验证文件大小：4 条记录 × 19 字节头 + 8 字节 checkpoint payload
-        let meta = std::fs::metadata(tmp).unwrap();
+        let meta = std::fs::metadata(&tmp).unwrap();
         assert_eq!(meta.len(), (19 * 4 + 8) as u64);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_wal_lsn_monotonic() {
-        let tmp = "/tmp/test_wal_lsn.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_lsn_monotonic");
+        let _ = std::fs::remove_file(&tmp);
 
-        let mut writer = WalWriter::open(tmp).unwrap();
+        let mut writer = WalWriter::open(&tmp).unwrap();
         let mut last_lsn = u64::MAX;
 
         for i in 0..50 {
@@ -345,15 +375,15 @@ mod tests {
             last_lsn = lsn;
         }
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_wal_current_lsn_matches_durable_after_sync() {
-        let tmp = "/tmp/test_wal_durable.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_current_lsn");
+        let _ = std::fs::remove_file(&tmp);
 
-        let mut writer = WalWriter::open(tmp).unwrap();
+        let mut writer = WalWriter::open(&tmp).unwrap();
         let lsn = writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
 
         // sync 前 current_lsn 应该已经是写入后的位置
@@ -362,50 +392,50 @@ mod tests {
         writer.sync().unwrap();
         assert_eq!(writer.durable_lsn(), writer.current_lsn());
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_wal_flush_clears_buffer() {
-        let tmp = "/tmp/test_wal_flush.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_flush");
+        let _ = std::fs::remove_file(&tmp);
 
-        let mut writer = WalWriter::open(tmp).unwrap();
+        let mut writer = WalWriter::open(&tmp).unwrap();
         writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
         writer.flush().unwrap();
 
         // flush 后文件应该有数据
-        let meta = std::fs::metadata(tmp).unwrap();
+        let meta = std::fs::metadata(&tmp).unwrap();
         assert!(meta.len() > 0);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_wal_large_record_spans_buffer() {
-        let tmp = "/tmp/test_wal_large.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_large");
+        let _ = std::fs::remove_file(&tmp);
 
-        let mut writer = WalWriter::open(tmp).unwrap();
+        let mut writer = WalWriter::open(&tmp).unwrap();
         // 写入一条大于默认 buffer size (64KB) 的记录
         let large_payload = vec![42u8; 100_000];
         let lsn = writer.write_record(WalRecordType::Insert, 1, 1, &large_payload).unwrap();
         writer.sync().unwrap();
 
-        let file_size = std::fs::metadata(tmp).unwrap().len();
+        let file_size = std::fs::metadata(&tmp).unwrap().len();
         assert_eq!(file_size, lsn + 19 + large_payload.len() as u64);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_group_commit_by_size() {
-        let tmp = "/tmp/test_wal_group_size.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_group_size");
+        let _ = std::fs::remove_file(&tmp);
 
         // 组提交：每 4 次 commit fsync 一次
         let mut writer = WalWriter::with_config(
-            tmp,
+            &tmp,
             WalFlushMode::Sync,
             65536,
             4,  // group_commit_size = 4
@@ -429,17 +459,17 @@ mod tests {
         assert_eq!(writer.bytes_since_sync(), 0);
 
         writer.sync().unwrap();
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_group_commit_by_bytes() {
-        let tmp = "/tmp/test_wal_group_bytes.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_group_bytes");
+        let _ = std::fs::remove_file(&tmp);
 
         // 组提交：按字节触发（100 字节），不按次数
         let mut writer = WalWriter::with_config(
-            tmp,
+            &tmp,
             WalFlushMode::Sync,
             65536,
             0,   // 不按次数触发
@@ -460,16 +490,16 @@ mod tests {
         assert!(count > 1, "should have at least 2 commits before trigger");
 
         writer.sync().unwrap();
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_group_commit_sync_forces_flush() {
-        let tmp = "/tmp/test_wal_group_sync.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_group_sync");
+        let _ = std::fs::remove_file(&tmp);
 
         let mut writer = WalWriter::with_config(
-            tmp,
+            &tmp,
             WalFlushMode::Sync,
             65536,
             100, // 大的 group size，不会自动触发
@@ -488,17 +518,17 @@ mod tests {
         assert_eq!(writer.pending_commits(), 0);
         assert_eq!(writer.bytes_since_sync(), 0);
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_group_commit_disabled_is_sync() {
-        let tmp = "/tmp/test_wal_group_disabled.hdb-wal";
-        let _ = std::fs::remove_file(tmp);
+        let tmp = tmp("writer_group_disabled");
+        let _ = std::fs::remove_file(&tmp);
 
         // 禁用组提交（默认行为）
         let mut writer = WalWriter::with_config(
-            tmp,
+            &tmp,
             WalFlushMode::Sync,
             65536,
             0, // 禁用
@@ -512,6 +542,6 @@ mod tests {
             assert_eq!(writer.pending_commits(), 0);
         }
 
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
