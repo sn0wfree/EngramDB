@@ -27,6 +27,10 @@ pub enum DataType {
     Vector { dim: usize },
     /// BLOB 二进制数据（v0.13.0 新增）
     Blob,
+    /// 时间戳（v0.14.0 新增）
+    ///
+    /// 内部存储为 Unix 毫秒（i64 UTC），适合 Agent 日志/记忆等时间序列场景。
+    Timestamp,
 }
 
 impl DataType {
@@ -41,6 +45,7 @@ impl DataType {
             DataType::Json => "JSON",
             DataType::Vector { .. } => "VECTOR",
             DataType::Blob => "BLOB",
+            DataType::Timestamp => "TIMESTAMP",
         }
     }
 
@@ -55,6 +60,7 @@ impl DataType {
             DataType::Json => None,
             DataType::Vector { .. } => None,
             DataType::Blob => None,
+            DataType::Timestamp => Some(8),
         }
     }
 }

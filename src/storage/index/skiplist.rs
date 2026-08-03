@@ -423,6 +423,7 @@ mod value_tag {
     pub const VECTOR: u8 = 7;
     pub const BLOB: u8 = 8;
     pub const FLOAT32: u8 = 9;
+    pub const TIMESTAMP: u8 = 10;
 }
 
 /// 将单个 Value 编码为自描述字节（type_tag + data）
@@ -451,6 +452,10 @@ fn encode_value(v: &Value) -> Vec<u8> {
         Value::Float32(f) => {
             buf.push(value_tag::FLOAT32);
             buf.extend_from_slice(&f.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            buf.push(value_tag::TIMESTAMP);
+            buf.extend_from_slice(&t.to_le_bytes());
         }
         Value::Varchar(s) => {
             buf.push(value_tag::VARCHAR);
@@ -587,6 +592,14 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             let blob = data[offset..offset+len].to_vec();
             offset += len;
             Value::Blob(blob)
+        }
+        value_tag::TIMESTAMP => {
+            if offset + 8 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated timestamp value".into()));
+            }
+            let t = i64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+            offset += 8;
+            Value::Timestamp(t)
         }
         _ => return Err(EngramDbError::InvalidFormat(format!("unknown value tag: {}", tag))),
     };

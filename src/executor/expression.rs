@@ -262,6 +262,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
                         Value::Json(_) => 7,
                         Value::Vector(_) => 8,
                         Value::Blob(_) => 9,
+                        Value::Timestamp(_) => 10,
                     }
                 }
                 value_tag(a).cmp(&value_tag(b))

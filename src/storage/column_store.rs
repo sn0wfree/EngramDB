@@ -347,6 +347,7 @@ impl ColumnStore {
                         DataType::Json => col.uncompressed_count as usize * 32, // 估算
                         DataType::Vector { .. } => col.uncompressed_count as usize * 64, // 估算
                         DataType::Blob => col.uncompressed_count as usize * 64, // 估算
+                        DataType::Timestamp => col.uncompressed_count as usize * 8,
                     };
                     stats.total_original += est_original;
                 } else {
@@ -766,6 +767,16 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
                 }
             }
         }
+        DataType::Timestamp => {
+            for v in values {
+                match v {
+                    Value::Timestamp(t) => buf.extend_from_slice(&t.to_le_bytes()),
+                    Value::Int64(i) => buf.extend_from_slice(&i.to_le_bytes()),
+                    Value::Int32(i) => buf.extend_from_slice(&(*i as i64).to_le_bytes()),
+                    _ => buf.extend_from_slice(&0i64.to_le_bytes()),
+                }
+            }
+        }
     }
     buf
 }
@@ -906,6 +917,17 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
                 }
             }
         }
+        DataType::Timestamp => {
+            for _ in 0..count {
+                if offset + 8 <= data.len() {
+                    let t = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                    values.push(Value::Timestamp(t));
+                    offset += 8;
+                } else {
+                    values.push(Value::Null);
+                }
+            }
+        }
     }
 
     values
@@ -1004,6 +1026,7 @@ fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
             }
             size
         }
+        DataType::Timestamp => values.len() * 8,
     }
 }
 
@@ -1022,6 +1045,7 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Json => 5,
         DataType::Vector { .. } => 6,
         DataType::Blob => 7,
+        DataType::Timestamp => 9,
     }
 }
 
@@ -1036,6 +1060,7 @@ fn u8_to_data_type(b: u8) -> DataType {
         5 => DataType::Json,
         6 => DataType::Vector { dim: 0 },
         7 => DataType::Blob,
+        9 => DataType::Timestamp,
         _ => DataType::Varchar,
     }
 }

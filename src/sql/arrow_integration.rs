@@ -157,6 +157,7 @@ pub fn value_type_to_arrow(value: &Value) -> ArrowDataType {
         Value::Int64(_) => ArrowDataType::Int64,
         Value::Float32(_) => ArrowDataType::Float64, // 简化：映射到 Float64
         Value::Float64(_) => ArrowDataType::Float64,
+        Value::Timestamp(_) => ArrowDataType::Int64, // 简化：映射到 Int64
         Value::Varchar(_) => ArrowDataType::Utf8,
         Value::Json(_) => ArrowDataType::Utf8,
         Value::Vector(_) => ArrowDataType::Utf8, // 序列化为字符串表示

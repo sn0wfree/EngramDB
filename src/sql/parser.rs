@@ -730,6 +730,7 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         sqlast::DataType::Float(_) | sqlast::DataType::Double | sqlast::DataType::Float64 => {
             Ok(DataType::Float64)
         }
+        sqlast::DataType::Timestamp(_, _) | sqlast::DataType::Datetime(_) => Ok(DataType::Timestamp),
         sqlast::DataType::Varchar(_)
         | sqlast::DataType::Char(_)
         | sqlast::DataType::Text

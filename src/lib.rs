@@ -414,6 +414,8 @@ pub enum Value {
     Json(String),
     Vector(Vec<f32>),
     Blob(Vec<u8>),
+    /// Unix 毫秒时间戳（UTC，v0.14.0 新增）
+    Timestamp(i64),
 }
 
 // 手动实现 Eq：Float64 按位模式比较（含 NaN 自等）
@@ -441,6 +443,7 @@ impl Ord for Value {
                 Value::Json(_) => 7,
                 Value::Vector(_) => 8,
                 Value::Blob(_) => 9,
+                Value::Timestamp(_) => 10,
             }
         }
         let ord = variant_rank(self).cmp(&variant_rank(other));
@@ -454,6 +457,7 @@ impl Ord for Value {
             (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
             (Value::Float32(a), Value::Float32(b)) => a.to_bits().cmp(&b.to_bits()),
             (Value::Float64(a), Value::Float64(b)) => a.to_bits().cmp(&b.to_bits()),
+            (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Vector(a), Value::Vector(b)) => {
@@ -495,6 +499,7 @@ impl std::hash::Hash for Value {
                 }
             }
             Value::Blob(b) => b.hash(state),
+            Value::Timestamp(t) => t.hash(state),
         }
     }
 }
@@ -560,6 +565,7 @@ impl std::fmt::Display for Value {
             Value::Json(v) => write!(f, "'{}'", v),
             Value::Vector(v) => write!(f, "vector[{}]", v.len()),
             Value::Blob(b) => write!(f, "blob[{}]", b.len()),
+            Value::Timestamp(t) => write!(f, "ts({})", t),
         }
     }
 }
@@ -1250,5 +1256,43 @@ mod value_tests {
         assert!((get_f(&result.rows[0][0]) - 1.0).abs() < 1e-5);
         assert!((get_f(&result.rows[1][0]) - 2.0).abs() < 1e-5);
         assert!((get_f(&result.rows[2][0]) - 3.0).abs() < 1e-5);
+    }
+
+    // --- T13 DATETIME/TIMESTAMP 类型测试（v0.14.0 新增）---
+
+    #[test]
+    fn test_timestamp_basic() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (ts TIMESTAMP, name VARCHAR)").unwrap();
+
+        // 2026-01-15 00:00:00 UTC = 1768435200000 ms
+        conn.execute("INSERT INTO t VALUES (1768435200000, 'event_a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (1768521600000, 'event_b')").unwrap();
+
+        let result = conn.execute("SELECT ts, name FROM t ORDER BY ts ASC").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][1], Value::Varchar("event_a".to_string()));
+        assert_eq!(result.rows[1][1], Value::Varchar("event_b".to_string()));
+    }
+
+    #[test]
+    fn test_timestamp_sort() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (ts TIMESTAMP)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3000)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1000)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2000)").unwrap();
+
+        let result = conn.execute("SELECT ts FROM t ORDER BY ts ASC").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        // 顺序应为 1000, 2000, 3000
+        let get_ts = |v: &Value| match v {
+            Value::Timestamp(t) => *t,
+            Value::Int64(t) => *t,
+            other => panic!("unexpected {:?}", other),
+        };
+        assert_eq!(get_ts(&result.rows[0][0]), 1000);
+        assert_eq!(get_ts(&result.rows[1][0]), 2000);
+        assert_eq!(get_ts(&result.rows[2][0]), 3000);
     }
 }
