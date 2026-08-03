@@ -14,7 +14,7 @@ use crate::common::config::{Config, WalFlushMode};
 use crate::wal::{WalWriter, WalRecordType, make_insert_payload, make_update_payload, make_delete_payload};
 use crate::Value;
 
-use super::{TxnState, IsolationLevel, TxnError, TxnId, Timestamp, MvccStore, ActiveTxnTable};
+use super::{TxnState, IsolationLevel, TxnError, TxnId, Timestamp, MvccStore, ActiveTxnTable, ApplyOp, CommitResult};
 
 /// 事务上下文（单个事务的状态）
 #[derive(Debug)]
@@ -84,7 +84,7 @@ impl TransactionManager {
     }
 
     /// 提交事务
-    pub fn commit(&mut self, txn_id: TxnId) -> Result<Timestamp> {
+    pub fn commit(&mut self, txn_id: TxnId) -> Result<CommitResult> {
         // 检查状态
         let ctx = self.txns.get_mut(&txn_id)
             .ok_or_else(|| TxnError::NotFound(txn_id))?;
@@ -111,8 +111,34 @@ impl TransactionManager {
                 store.commit_txn(txn_id, commit_ts);
             }
         }
+        
+        // 收集待应用操作（方案 B：返回 apply_ops，由 executor 应用到存储层）
+        let apply_ops = self.collect_apply_ops(txn_id, commit_ts)?;
 
-        Ok(commit_ts)
+        Ok(CommitResult { commit_ts, apply_ops })
+    }
+    
+    /// 收集待应用操作（内部辅助方法）
+    fn collect_apply_ops(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Vec<ApplyOp>> {
+        let ctx = self.txns.get(&txn_id)
+            .ok_or_else(|| TxnError::NotFound(txn_id))?;
+        
+        let mut ops = Vec::new();
+        
+        for (table_id, rowid) in &ctx.write_set {
+            if let Some(store) = self.mvcc.get(table_id) {
+                // 从 MVCC 版本链获取提交的数据
+                if let Some(row) = store.get_for_txn(*rowid, commit_ts, txn_id) {
+                    ops.push(ApplyOp::Insert {
+                        table_id: *table_id,
+                        row_id: *rowid,
+                        row: row.clone(),
+                    });
+                }
+            }
+        }
+        
+        Ok(ops)
     }
 
     /// 回滚事务

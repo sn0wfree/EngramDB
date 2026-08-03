@@ -24,21 +24,8 @@ pub enum TxnState {
     RolledBack,
 }
 
-/// 事务隔离级别
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationLevel {
-    ReadUncommitted,
-    ReadCommitted,
-    RepeatableRead,
-    SnapshotIsolation,
-    Serializable,
-}
-
-impl Default for IsolationLevel {
-    fn default() -> Self {
-        IsolationLevel::SnapshotIsolation
-    }
-}
+// 使用 config 模块中的 IsolationLevel 定义
+pub use crate::common::config::IsolationLevel;
 
 /// 事务错误
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +52,38 @@ impl std::error::Error for TxnError {}
 
 /// 事务结果
 pub type TxnResult<T> = std::result::Result<T, TxnError>;
+
+/// 待应用操作（MVCC 提交后应用到存储层）
+///
+/// 设计背景：`TransactionManager.commit()` 时需要将 MVCC 版本应用到存储层，
+/// 但 Rust 借用规则不允许同时持有 `&mut TransactionManager` 和 `&mut Database`。
+/// 解决方案：`commit()` 返回待应用操作，由 executor 调用存储层。
+#[derive(Debug, Clone)]
+pub enum ApplyOp {
+    Insert {
+        table_id: u32,
+        row_id: u64,
+        row: Vec<crate::Value>,
+    },
+    Update {
+        table_id: u32,
+        row_id: u64,
+        new_row: Vec<crate::Value>,
+    },
+    Delete {
+        table_id: u32,
+        row_id: u64,
+    },
+}
+
+/// 提交结果
+#[derive(Debug)]
+pub struct CommitResult {
+    /// 提交时间戳
+    pub commit_ts: Timestamp,
+    /// 待应用到存储层的操作列表
+    pub apply_ops: Vec<ApplyOp>,
+}
 
 // 确保 Result 类型兼容
 impl From<TxnError> for crate::common::error::HybridDbError {
