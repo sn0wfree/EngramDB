@@ -62,6 +62,44 @@ impl DeltaStore {
         self.row_count += 1;
         Ok(rowid)
     }
+    
+    /// 插入一行（指定 rowid，用于事务提交后应用）
+    ///
+    /// 与 `insert()` 不同，此方法允许指定 rowid：
+    /// - 由事务管理器在 commit 后调用
+    /// - rowid 由事务管理器分配（避免重复）
+    pub fn insert_row(&mut self, rowid: u32, row: Vec<Value>) -> Result<()> {
+        let row_len = row.len();
+        let num_table_cols = self.table_def.columns.len();
+
+        // 按列追加（rowid 由事务管理器保证唯一）
+        for (col_idx, val) in row.into_iter().enumerate() {
+            if col_idx < self.columns.len() {
+                self.columns[col_idx].push(val);
+            } else {
+                // 列数不足时补 NULL（前面的行也要补）
+                while self.columns.len() <= col_idx {
+                    let mut new_col = Vec::with_capacity(self.row_count + 1);
+                    for _ in 0..self.row_count {
+                        new_col.push(Value::Null);
+                    }
+                    self.columns.push(new_col);
+                }
+                self.columns[col_idx].push(val);
+            }
+        }
+        // 如果行的列数少于表列数，补 NULL
+        for col_idx in row_len..num_table_cols {
+            if col_idx < self.columns.len() {
+                self.columns[col_idx].push(Value::Null);
+            }
+        }
+
+        // 更新 next_rowid（如果需要）
+        self.next_rowid = self.next_rowid.max(rowid as u64 + 1);
+        self.row_count += 1;
+        Ok(())
+    }
 
     /// 批量插入（主要优化路径）
     pub fn insert_batch(&mut self, batch: Vec<Vec<Value>>) -> Result<u64> {

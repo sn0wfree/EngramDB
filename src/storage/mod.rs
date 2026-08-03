@@ -181,6 +181,16 @@ impl Database {
         table.create_index(index_name, key_col_idx, included_cols, unique)
     }
 
+    /// 获取表名到 ID 的映射（只读）
+    pub fn table_names(&self) -> &HashMap<String, u32> {
+        &self.table_names
+    }
+    
+    /// 获取所有表的可变引用（用于事务提交后应用）
+    pub fn tables_mut(&mut self) -> &mut HashMap<u32, table::Table> {
+        &mut self.tables
+    }
+
     /// 获取配置
     pub fn config(&self) -> &Config {
         &self.config

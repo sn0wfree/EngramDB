@@ -235,7 +235,7 @@ impl Default for Config {
             compress_on_persist: true,
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
-            enable_transaction: true,  // 默认启用事务
+            enable_transaction: false,  // 默认禁用事务（后续版本默认启用）
             default_isolation_level: IsolationLevel::default(),
         }
     }

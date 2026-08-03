@@ -540,6 +540,62 @@ impl Table {
 
         Ok(count)
     }
+    
+    /// 插入单行数据（事务提交后应用到存储层）
+    ///
+    /// 与 `insert()` 不同，此方法用于事务路径：
+    /// 1. 由 executor 在 commit 后调用
+    /// 2. row_id 由事务管理器分配（避免重复）
+    /// 3. 直接写入 Delta 层（单行场景不需要列式路径优化）
+    pub fn insert_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
+        // 写入 Delta 层（单行直接插入）
+        self.delta_store.insert_row(row_id, row.to_vec())?;
+        
+        // 更新总行数
+        self.def.row_count += 1;
+        
+        // 更新所有二级索引
+        if !self.indexes.is_empty() {
+            self.update_indexes_for_row(row_id, row);
+        }
+        
+        // 更新所有向量索引
+        if !self.vector_indexes.is_empty() {
+            self.update_vector_indexes_for_row(row_id, row);
+        }
+        
+        Ok(())
+    }
+    
+    /// 更新单行的二级索引（内部辅助方法）
+    fn update_indexes_for_row(&mut self, row_id: u32, row: &[Value]) {
+        for idx_def in self.def.indexes.clone() {
+            if let Some(index) = self.indexes.get_mut(&idx_def.name) {
+                let key = row[idx_def.key_columns[0]].clone();
+                let included_vals: Vec<Value> = idx_def.included_columns.iter()
+                    .map(|&ci| row[ci].clone())
+                    .collect();
+                index.insert_with_included(key, row_id, &included_vals);
+            }
+        }
+    }
+    
+    /// 更新单行的向量索引（内部辅助方法）
+    fn update_vector_indexes_for_row(&mut self, _row_id: u32, row: &[Value]) {
+        // 向量索引更新逻辑：遍历 vector_indexes，尝试插入
+        // vector_indexes 类型: HashMap<String, (HnswIndex, Vec<u32>)>
+        for (_idx_name, (hnsw_idx, _row_ids)) in self.vector_indexes.iter_mut() {
+            // 查找第一个向量类型的列
+            for val in row.iter() {
+                if let Value::Vector(ref vec) = val {
+                    // 插入向量到 HnswIndex（返回分配的 ID）
+                    // TODO: 将分配的 ID 与 row_id 关联存储
+                    let _ = hnsw_idx.insert(vec.clone());
+                    break; // 只处理第一个向量列
+                }
+            }
+        }
+    }
 
     /// 为一批行更新所有二级索引（内部辅助方法）
     fn update_indexes_for_rows(&mut self, rows: &[Vec<Value>], base_row_id: u32) {

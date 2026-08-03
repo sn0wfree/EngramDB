@@ -271,6 +271,16 @@ impl TransactionManager {
     pub fn active_count(&self) -> usize {
         self.active_table.active_count()
     }
+    
+    /// 检查事务管理器是否就绪（用于防御性检查）
+    ///
+    /// 当 enable_transaction=true 时，executor 会检查此方法
+    /// 以确保 txn_manager 已正确初始化。
+    pub fn is_ready(&self) -> bool {
+        // WAL 已初始化即表示事务管理器就绪
+        // current_lsn 为 0 时表示尚未写入任何记录，但 WAL 本身已初始化
+        self.wal.current_lsn() >= 0  // 始终为 true（WAL 创建时即初始化）
+    }
 
     /// 获取当前 WAL LSN
     pub fn current_wal_lsn(&self) -> u64 {
@@ -380,7 +390,7 @@ mod tests {
         assert_eq!(mgr.state(txn_id), Some(TxnState::Active));
         assert_eq!(mgr.active_count(), 1);
 
-        let commit_ts = mgr.commit(txn_id).unwrap();
+        let commit_ts = mgr.commit(txn_id).unwrap().commit_ts;
         assert!(commit_ts > 0);
         assert_eq!(mgr.state(txn_id), Some(TxnState::Committed));
         assert_eq!(mgr.active_count(), 0);

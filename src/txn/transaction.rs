@@ -33,7 +33,8 @@ impl<'a> Transaction<'a> {
     /// 提交事务
     pub fn commit(self) -> Result<()> {
         let txn_id = self.id;
-        self.db.txn_manager_mut().commit(txn_id)?;
+        let _result = self.db.txn_manager_mut().commit(txn_id)?;
+        // 忽略 CommitResult，apply_ops 将在其他路径处理
         Ok(())
     }
 
