@@ -120,14 +120,27 @@ pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub row_count: u64,
-    /// 索引列表
     pub indexes: Vec<IndexDef>,
-    /// 聚簇列索引（可选）
-    ///
-    /// 设置后，Delta 合并到列存时会按该列分组写入，
-    /// 同值行物理上连续，提升按该列查询的性能。
-    /// 典型场景：Agent 消息表按 session_id 聚簇。
     pub cluster_key: Option<usize>,
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForeignKeyDef {
+    pub local_columns: Vec<usize>,
+    pub foreign_table: String,
+    pub foreign_columns: Vec<usize>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
 }
 
 impl TableDef {
@@ -139,6 +152,7 @@ impl TableDef {
             row_count: 0,
             indexes: Vec::new(),
             cluster_key: None,
+            foreign_keys: Vec::new(),
         }
     }
 
