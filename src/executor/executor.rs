@@ -194,7 +194,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_chunks = rows_to_chunks(&input_result.rows);
 
             let agg_funcs: Vec<_> = aggregates.iter()
-                .map(|a| (a.func, a.input))
+                .map(|a| (a.func, a.input, a.distinct))
                 .collect();
 
             let result = if group_by.is_empty() {

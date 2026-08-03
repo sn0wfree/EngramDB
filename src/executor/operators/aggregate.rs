@@ -19,7 +19,7 @@ use crate::Value;
 use super::super::physical_plan::AggregateFunc;
 use super::super::vector::{DataChunk, Vector, VECTOR_SIZE};
 
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 
 // ============================================================================
 // 部分聚合状态（Partial Aggregation State）
@@ -182,9 +182,10 @@ impl PartialAggState {
 /// 执行简单聚合（无 GROUP BY）
 ///
 /// 使用两阶段聚合：每个 chunk 先 partial，再 merge。
+/// 对于 DISTINCT 聚合，使用 HashSet 去重路径。
 pub fn execute(
     input: &[DataChunk],
-    aggregates: &[(AggregateFunc, usize)],
+    aggregates: &[(AggregateFunc, usize, bool)],
 ) -> Result<Vec<DataChunk>> {
     if input.is_empty() {
         return Ok(vec![]);
@@ -192,15 +193,37 @@ pub fn execute(
 
     let mut results: Vec<Value> = Vec::with_capacity(aggregates.len());
 
-    for (func, col_idx) in aggregates {
-        // 第一阶段：每个 chunk 计算 partial
-        let mut merged = PartialAggState::new(*func);
-        for chunk in input {
-            let partial = aggregate_chunk_partial(chunk, *func, *col_idx);
-            merged.merge(&partial);
+    for (func, col_idx, distinct) in aggregates {
+        if *distinct {
+            // DISTINCT 路径：收集唯一值后聚合
+            let mut seen: FxHashSet<Value> = FxHashSet::default();
+            for chunk in input {
+                if *col_idx >= chunk.columns.len() {
+                    continue;
+                }
+                let col = &chunk.columns[*col_idx];
+                for i in 0..chunk.count {
+                    let val = col.get(i);
+                    if !val.is_null() {
+                        seen.insert(val.clone());
+                    }
+                }
+            }
+            let mut merged = PartialAggState::new(*func);
+            for val in &seen {
+                merged.accumulate(val);
+            }
+            results.push(merged.finalize());
+        } else {
+            // 第一阶段：每个 chunk 计算 partial
+            let mut merged = PartialAggState::new(*func);
+            for chunk in input {
+                let partial = aggregate_chunk_partial(chunk, *func, *col_idx);
+                merged.merge(&partial);
+            }
+            // 第二阶段：finalize
+            results.push(merged.finalize());
         }
-        // 第二阶段：finalize
-        results.push(merged.finalize());
     }
 
     let chunk = DataChunk::from_rows(&[results]);
@@ -239,10 +262,17 @@ fn aggregate_chunk_partial(chunk: &DataChunk, func: AggregateFunc, col_idx: usiz
 pub fn execute_grouped(
     input: &[DataChunk],
     group_by: &[usize],
-    aggregates: &[(AggregateFunc, usize)],
+    aggregates: &[(AggregateFunc, usize, bool)],
 ) -> Result<Vec<DataChunk>> {
     if input.is_empty() {
         return Ok(vec![]);
+    }
+
+    // 检查是否有 DISTINCT 聚合
+    let has_distinct = aggregates.iter().any(|(_, _, d)| *d);
+
+    if has_distinct {
+        return execute_grouped_distinct(input, group_by, aggregates);
     }
 
     // 第一阶段：每个 chunk 计算 partial 哈希表
@@ -264,12 +294,10 @@ pub fn execute_grouped(
     for (key, states) in &merged_map {
         let mut row = Vec::with_capacity(total_cols);
 
-        // 分组列
         for v in key {
             row.push(v.clone());
         }
 
-        // 聚合列
         for state in states {
             row.push(state.clone().finalize());
         }
@@ -288,16 +316,95 @@ pub fn execute_grouped(
     Ok(result_chunks)
 }
 
+/// DISTINCT 分组聚合：每组维护独立 HashSet 去重
+fn execute_grouped_distinct(
+    input: &[DataChunk],
+    group_by: &[usize],
+    aggregates: &[(AggregateFunc, usize, bool)],
+) -> Result<Vec<DataChunk>> {
+    let mut group_sets: FxHashMap<Vec<Value>, Vec<Option<FxHashSet<Value>>>> = FxHashMap::default();
+
+    for chunk in input {
+        for row_idx in 0..chunk.count {
+            let key: Vec<Value> = group_by.iter()
+                .map(|&col| {
+                    if col < chunk.columns.len() {
+                        chunk.columns[col].get(row_idx).clone()
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect();
+
+            let sets = group_sets.entry(key).or_insert_with(|| {
+                aggregates.iter()
+                    .map(|(_, _, d)| if *d { Some(FxHashSet::default()) } else { None })
+                    .collect()
+            });
+
+            for (agg_idx, (_, col_idx, distinct)) in aggregates.iter().enumerate() {
+                if !distinct {
+                    continue;
+                }
+                if *col_idx < chunk.columns.len() {
+                    let val = chunk.columns[*col_idx].get(row_idx);
+                    if !val.is_null() {
+                        if let Some(Some(s)) = sets.get_mut(agg_idx) {
+                            s.insert(val.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let num_group_cols = group_by.len();
+    let num_agg_cols = aggregates.len();
+    let total_cols = num_group_cols + num_agg_cols;
+
+    let mut result_chunks = Vec::new();
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(VECTOR_SIZE);
+
+    for (key, sets) in &group_sets {
+        let mut row = Vec::with_capacity(total_cols);
+        for v in key {
+            row.push(v.clone());
+        }
+        for (agg_idx, (func, _, distinct)) in aggregates.iter().enumerate() {
+            if *distinct {
+                let set = sets[agg_idx].as_ref().unwrap();
+                let mut state = PartialAggState::new(*func);
+                for val in set {
+                    state.accumulate(val);
+                }
+                row.push(state.finalize());
+            } else {
+                row.push(Value::Null);
+            }
+        }
+        rows.push(row);
+        if rows.len() >= VECTOR_SIZE {
+            result_chunks.push(DataChunk::from_rows(&rows));
+            rows.clear();
+        }
+    }
+
+    if !rows.is_empty() {
+        result_chunks.push(DataChunk::from_rows(&rows));
+    }
+
+    Ok(result_chunks)
+}
+
 /// 对单个 DataChunk 计算分组 partial 聚合
 fn aggregate_chunk_grouped_partial(
     chunk: &DataChunk,
     group_by: &[usize],
-    aggregates: &[(AggregateFunc, usize)],
+    aggregates: &[(AggregateFunc, usize, bool)],
 ) -> FxHashMap<Vec<Value>, Vec<PartialAggState>> {
     let mut map: FxHashMap<Vec<Value>, Vec<PartialAggState>> = FxHashMap::default();
 
     for row_idx in 0..chunk.count {
-        // 提取分组键
         let key: Vec<Value> = group_by.iter()
             .map(|&col| {
                 if col < chunk.columns.len() {
@@ -308,15 +415,13 @@ fn aggregate_chunk_grouped_partial(
             })
             .collect();
 
-        // 获取或创建该组的聚合状态
         let states = map.entry(key).or_insert_with(|| {
             aggregates.iter()
-                .map(|(func, _)| PartialAggState::new(*func))
+                .map(|(func, _, _)| PartialAggState::new(*func))
                 .collect()
         });
 
-        // 累积每个聚合函数
-        for (agg_idx, (_, col_idx)) in aggregates.iter().enumerate() {
+        for (agg_idx, (_, col_idx, _)) in aggregates.iter().enumerate() {
             if *col_idx < chunk.columns.len() {
                 let val = chunk.columns[*col_idx].get(row_idx);
                 states[agg_idx].accumulate(val);
@@ -399,7 +504,7 @@ mod tests {
     #[test]
     fn test_simple_count() {
         let chunk = make_test_chunk();
-        let result = execute(&[chunk], &[(AggregateFunc::Count, 1)]).unwrap();
+        let result = execute(&[chunk], &[(AggregateFunc::Count, 1, false)]).unwrap();
         assert_eq!(result.len(), 1);
         let rows = result[0].to_rows();
         assert_eq!(rows[0][0], Value::Int64(6));
@@ -408,7 +513,7 @@ mod tests {
     #[test]
     fn test_simple_sum() {
         let chunk = make_test_chunk();
-        let result = execute(&[chunk], &[(AggregateFunc::Sum, 1)]).unwrap();
+        let result = execute(&[chunk], &[(AggregateFunc::Sum, 1, false)]).unwrap();
         let rows = result[0].to_rows();
         // 5000 + 6000 + 5500 + 7000 + 6500 + 4500 = 34500
         match &rows[0][0] {
@@ -421,9 +526,9 @@ mod tests {
     fn test_simple_avg_min_max() {
         let chunk = make_test_chunk();
         let aggs = vec![
-            (AggregateFunc::Avg, 1),
-            (AggregateFunc::Min, 1),
-            (AggregateFunc::Max, 1),
+            (AggregateFunc::Avg, 1, false),
+            (AggregateFunc::Min, 1, false),
+            (AggregateFunc::Max, 1, false),
         ];
         let result = execute(&[chunk], &aggs).unwrap();
         let rows = result[0].to_rows();
@@ -451,7 +556,7 @@ mod tests {
         let result = execute_grouped(
             &[chunk],
             &[0],  // GROUP BY dept_id
-            &[(AggregateFunc::Count, 1)],
+            &[(AggregateFunc::Count, 1, false)],
         ).unwrap();
 
         let total_rows: usize = result.iter().map(|c| c.count).sum();
@@ -479,7 +584,7 @@ mod tests {
         let result = execute_grouped(
             &[chunk],
             &[0],
-            &[(AggregateFunc::Sum, 1), (AggregateFunc::Avg, 1)],
+            &[(AggregateFunc::Sum, 1, false), (AggregateFunc::Avg, 1, false)],
         ).unwrap();
 
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -511,7 +616,7 @@ mod tests {
         let result = execute_grouped(
             &[chunk1, chunk2],
             &[0],
-            &[(AggregateFunc::Count, 1), (AggregateFunc::Sum, 1)],
+            &[(AggregateFunc::Count, 1, false), (AggregateFunc::Sum, 1, false)],
         ).unwrap();
 
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -545,7 +650,7 @@ mod tests {
         let result = execute_grouped(
             &[chunk],
             &[0],
-            &[(AggregateFunc::Count, 1)],
+            &[(AggregateFunc::Count, 1, false)],
         ).unwrap();
 
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -564,7 +669,7 @@ mod tests {
         let result = execute_grouped(
             &[],
             &[0],
-            &[(AggregateFunc::Count, 1)],
+            &[(AggregateFunc::Count, 1, false)],
         ).unwrap();
         assert!(result.is_empty());
     }

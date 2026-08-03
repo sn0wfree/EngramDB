@@ -158,6 +158,7 @@ pub enum PhysicalPlan {
 pub struct AggregateExpr {
     pub func: AggregateFunc,
     pub input: usize, // 输入列索引
+    pub distinct: bool, // DISTINCT 去重
 }
 
 /// 聚合函数

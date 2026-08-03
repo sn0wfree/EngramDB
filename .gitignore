@@ -40,3 +40,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# graphify 输出
+graphify-out/

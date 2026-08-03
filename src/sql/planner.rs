@@ -357,7 +357,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         let (agg_exprs, _non_agg_exprs) = extract_aggregates_from_select(&stmt.select_list);
 
         aggregates = agg_exprs.iter()
-            .filter_map(|(func_name, arg_expr)| {
+            .filter_map(|(func_name, arg_expr, distinct)| {
                 // 解析聚合函数的输入列索引
                 let input_col = match arg_expr {
                     Expression::ColumnRef { column, .. } => {
@@ -375,7 +375,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                     _ => return None,
                 };
 
-                Some(AggregateExpr { func, input: input_col })
+                Some(AggregateExpr { func, input: input_col, distinct: *distinct })
             })
             .collect();
 
@@ -747,20 +747,20 @@ fn expr_has_aggregate(expr: &Expression) -> bool {
 }
 
 /// 从 SELECT 列表中提取聚合函数
-fn extract_aggregates_from_select(items: &[SelectItem]) -> (Vec<(String, Expression)>, Vec<Expression>) {
+fn extract_aggregates_from_select(items: &[SelectItem]) -> (Vec<(String, Expression, bool)>, Vec<Expression>) {
     let mut aggs = Vec::new();
     let mut non_aggs = Vec::new();
 
     for item in items {
         match item {
             SelectItem::Expression(expr, _) => {
-                if let Expression::Function { name, args, .. } = expr {
+                if let Expression::Function { name, args, distinct, .. } = expr {
                     if matches!(
                         name.to_uppercase().as_str(),
                         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
                     ) {
                         let arg = args.first().cloned().unwrap_or(Expression::Literal(Value::Null));
-                        aggs.push((name.clone(), arg));
+                        aggs.push((name.clone(), arg, *distinct));
                         continue;
                     }
                 }
