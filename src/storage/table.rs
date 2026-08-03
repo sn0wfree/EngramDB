@@ -249,33 +249,48 @@ impl Table {
     ///
     /// 遍历现有数据构建索引。键列只支持单列（首列），
     /// 覆盖列冗余存储在索引条目中，查询时免回表。
-    pub fn create_index(&mut self, index_name: &str, key_col_idx: usize, included_cols: &[usize], unique: bool) -> Result<()> {
+    pub fn create_index(&mut self, index_name: &str, key_cols: &[usize], included_cols: &[usize], unique: bool) -> Result<()> {
         if self.indexes.contains_key(index_name) {
             return Err(EngramDbError::ConstraintViolation(
                 format!("Index '{}' already exists", index_name)
             ));
         }
-        if key_col_idx >= self.def.columns.len() {
-            return Err(EngramDbError::ColumnNotFound(
-                format!("index key column index {} out of bounds", key_col_idx)
-            ));
+        for &k in key_cols {
+            if k >= self.def.columns.len() {
+                return Err(EngramDbError::ColumnNotFound(
+                    format!("index key column index {} out of bounds", k)
+                ));
+            }
         }
 
         let mut skiplist = SkipListIndex::with_included(unique, included_cols.len());
         let mut next_row_id: u32 = 0;
 
-        // 从列存主存储加载数据构建索引
+        let make_key = |row: &[Value]| -> Value {
+            if key_cols.len() == 1 {
+                row[key_cols[0]].clone()
+            } else {
+                let parts: Vec<String> = key_cols.iter().map(|&k| format!("{:?}", row[k])).collect();
+                Value::Varchar(parts.join("|"))
+            }
+        };
+
         let num_row_groups = self.column_store.row_group_count();
         for rg_idx in 0..num_row_groups {
-            // 读取键列
-            let key_col = self.column_store.read_column(rg_idx, key_col_idx)?.to_vec();
-            // 读取所有覆盖列
+            let mut key_data: Vec<Vec<Value>> = Vec::with_capacity(key_cols.len());
+            for &k in key_cols {
+                key_data.push(self.column_store.read_column(rg_idx, k)?.to_vec());
+            }
             let mut included_data: Vec<Vec<Value>> = Vec::with_capacity(included_cols.len());
             for &col_idx in included_cols {
                 included_data.push(self.column_store.read_column(rg_idx, col_idx)?.to_vec());
             }
-            for row_idx in 0..key_col.len() {
-                let key = key_col[row_idx].clone();
+            let row_count = key_data[0].len();
+            for row_idx in 0..row_count {
+                let row_vals: Vec<Value> = key_data.iter().map(|col| col[row_idx].clone()).collect();
+                let key = if key_cols.len() == 1 { row_vals[0].clone() } else {
+                    Value::Varchar(key_cols.iter().map(|&k| format!("{:?}", row_vals[key_cols.iter().position(|&x| x == k).unwrap_or(0)])).collect::<Vec<_>>().join("|"))
+                };
                 let mut inc_vals = Vec::with_capacity(included_cols.len());
                 for col in &included_data {
                     inc_vals.push(col[row_idx].clone());
@@ -289,10 +304,9 @@ impl Table {
             }
         }
 
-        // 从 Delta 层加载数据构建索引
         let delta_data = self.delta_store.all_rows();
         for (_rowid, row) in &delta_data {
-            let key = row[key_col_idx].clone();
+            let key = make_key(row);
             let mut inc_vals = Vec::with_capacity(included_cols.len());
             for &col_idx in included_cols {
                 inc_vals.push(row[col_idx].clone());
@@ -305,12 +319,12 @@ impl Table {
             next_row_id += 1;
         }
 
-        // 保存索引定义到表元数据
         let index_def = IndexDef {
             name: index_name.to_string(),
-            key_columns: vec![key_col_idx],
+            key_columns: key_cols.to_vec(),
             included_columns: included_cols.to_vec(),
             unique,
+            index_type: "skiplist".to_string(),
         };
         self.def.indexes.push(index_def);
         self.indexes.insert(index_name.to_string(), skiplist);
@@ -749,7 +763,7 @@ impl Table {
         
         // 更新所有二级索引
         if !self.indexes.is_empty() {
-            self.update_indexes_for_row(row_id, row);
+            self.update_indexes_for_row(row_id, row)?;
         }
         
         // 更新所有向量索引
@@ -849,7 +863,7 @@ impl Table {
             }
             
             if !self.indexes.is_empty() {
-                self.update_indexes_for_row(row_id, new_r);
+                self.update_indexes_for_row(row_id, new_r)?;
             }
             
             if !self.vector_indexes.is_empty() {
@@ -861,16 +875,24 @@ impl Table {
     }
     
     /// 更新单行的二级索引（内部辅助方法）
-    fn update_indexes_for_row(&mut self, row_id: u32, row: &[Value]) {
+    fn update_indexes_for_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
         for idx_def in self.def.indexes.clone() {
             if let Some(index) = self.indexes.get_mut(&idx_def.name) {
                 let key = row[idx_def.key_columns[0]].clone();
                 let included_vals: Vec<Value> = idx_def.included_columns.iter()
                     .map(|&ci| row[ci].clone())
                     .collect();
-                index.insert_with_included(key, row_id, &included_vals);
+                if idx_def.unique && !index.insert_with_included(key.clone(), row_id, &included_vals) {
+                    return Err(EngramDbError::ConstraintViolation(
+                        format!("UNIQUE constraint failed: index '{}'", idx_def.name)
+                    ));
+                }
+                if !idx_def.unique {
+                    index.insert_with_included(key, row_id, &included_vals);
+                }
             }
         }
+        Ok(())
     }
     
     /// 更新单行的向量索引（内部辅助方法）

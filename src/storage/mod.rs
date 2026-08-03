@@ -175,10 +175,10 @@ impl Database {
 
     /// 创建覆盖索引（v0.12.0 新增）
     pub fn create_index(&mut self, table_name: &str, index_name: &str,
-                        key_col_idx: usize, included_cols: &[usize], unique: bool) -> Result<()> {
+                        key_cols: &[usize], included_cols: &[usize], unique: bool) -> Result<()> {
         let table = self.get_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
-        table.create_index(index_name, key_col_idx, included_cols, unique)
+        table.create_index(index_name, key_cols, included_cols, unique)
     }
 
     /// 获取表名到 ID 的映射（只读）

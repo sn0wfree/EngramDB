@@ -26,13 +26,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::CreateIndex { table_name, index_name, key_columns, included_columns, unique } => {
-            // 目前只支持单列键索引
-            let key_col_idx = key_columns.first()
-                .copied()
-                .ok_or_else(|| crate::common::error::EngramDbError::Parse(
-                    "Index must have at least one key column".to_string()
-                ))?;
-            db.create_index(&table_name, &index_name, key_col_idx, &included_columns, unique)?;
+            db.create_index(&table_name, &index_name, &key_columns, &included_columns, unique)?;
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
                 rows: vec![vec![crate::Value::Varchar(format!(

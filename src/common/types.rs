@@ -103,12 +103,10 @@ impl ColumnDef {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexDef {
     pub name: String,
-    /// 索引键列的列索引（按顺序）
     pub key_columns: Vec<usize>,
-    /// 覆盖列的列索引（INCLUDE 子句）
     pub included_columns: Vec<usize>,
-    /// 是否唯一索引
     pub unique: bool,
+    pub index_type: String,
 }
 
 /// 表定义
