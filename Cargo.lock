@@ -1186,7 +1186,7 @@ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "engramdb"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "bincode",
  "bytes",

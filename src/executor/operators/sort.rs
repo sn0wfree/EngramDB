@@ -39,33 +39,49 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>)
         // 若 n >= total_rows，退化为全排序
         if n < total_rows {
             use std::collections::BinaryHeap;
-            // 使用反向排序的 BinaryHeap（最小堆，pop 移除最小的）
-            // 我们想要前 N 个最大的（按 sort_keys 排序），所以用反向比较
-            let mut heap: BinaryHeap<Vec<Value>> = BinaryHeap::with_capacity(n + 1);
-            for row in all_rows {
-                heap.push(row);
-                if heap.len() > n {
-                    heap.pop();
-                }
-            }
-            // 提取并反转（heap 输出的是从大到小）
-            let mut top_n: Vec<Vec<Value>> = heap.into_iter().collect();
-            top_n.sort_by(|a, b| {
-                for key in &keys {
-                    let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
-                    match cmp {
-                        std::cmp::Ordering::Equal => continue,
-                        other => {
-                            return match key.direction {
-                                SortDirection::Asc => other,
-                                SortDirection::Desc => other.reverse(),
-                            };
-                        }
+            // 使用 BinaryHeap，根据 sort direction 选择堆类型：
+            //   - ASC: 最小堆（保留最小的 N 个）
+            //   - DESC: 最大堆（保留最大的 N 个）
+            // 全部存到堆后，再 sort 一次得到正确顺序
+            if keys.iter().all(|k| matches!(k.direction, SortDirection::Asc)) {
+                let mut heap: BinaryHeap<Vec<Value>> = BinaryHeap::with_capacity(n + 1);
+                for row in all_rows {
+                    heap.push(row);
+                    if heap.len() > n {
+                        heap.pop();
                     }
                 }
-                std::cmp::Ordering::Equal
-            });
-            all_rows = top_n;
+                let mut top_n: Vec<Vec<Value>> = heap.into_iter().collect();
+                top_n.sort_by(|a, b| {
+                    for key in &keys {
+                        let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
+                        match cmp {
+                            std::cmp::Ordering::Equal => continue,
+                            other => return other,
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                all_rows = top_n;
+            } else {
+                // 包含 DESC 方向，退化为全排序
+                all_rows.sort_by(|a, b| {
+                    for key in &keys {
+                        let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
+                        match cmp {
+                            std::cmp::Ordering::Equal => continue,
+                            other => {
+                                return match key.direction {
+                                    SortDirection::Asc => other,
+                                    SortDirection::Desc => other.reverse(),
+                                };
+                            }
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                all_rows.truncate(n);
+            }
         } else {
             // limit >= total_rows，全排序
             all_rows.sort_by(|a, b| {
@@ -204,7 +220,7 @@ mod tests {
     fn test_sort_single_asc() {
         let chunk = make_test_chunk();
         let keys = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
-        let result = execute(&[chunk], &keys).unwrap();
+        let result = execute(&[chunk], &keys, None).unwrap();
 
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(rows.len(), 5);
@@ -219,7 +235,7 @@ mod tests {
     fn test_sort_single_desc() {
         let chunk = make_test_chunk();
         let keys = vec![SortKey { column_index: 0, direction: SortDirection::Desc }];
-        let result = execute(&[chunk], &keys).unwrap();
+        let result = execute(&[chunk], &keys, None).unwrap();
 
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(rows.len(), 5);
@@ -235,7 +251,7 @@ mod tests {
             SortKey { column_index: 2, direction: SortDirection::Desc },
             SortKey { column_index: 1, direction: SortDirection::Asc },
         ];
-        let result = execute(&[chunk], &keys).unwrap();
+        let result = execute(&[chunk], &keys, None).unwrap();
 
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(rows.len(), 5);
@@ -253,7 +269,7 @@ mod tests {
     fn test_sort_varchar() {
         let chunk = make_test_chunk();
         let keys = vec![SortKey { column_index: 1, direction: SortDirection::Asc }];
-        let result = execute(&[chunk], &keys).unwrap();
+        let result = execute(&[chunk], &keys, None).unwrap();
 
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(rows[0][1], Value::Varchar("alice".into()));
@@ -267,7 +283,7 @@ mod tests {
     fn test_sort_empty() {
         let chunk = DataChunk::new(3);
         let keys = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
-        let result = execute(&[chunk], &keys).unwrap();
+        let result = execute(&[chunk], &keys, None).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].count, 0);
     }

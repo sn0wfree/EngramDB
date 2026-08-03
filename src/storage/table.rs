@@ -295,7 +295,8 @@ impl Table {
                 for col in &included_data {
                     inc_vals.push(col[row_idx].clone());
                 }
-                if unique && !skiplist.insert_with_included(key, next_row_id, &inc_vals) {
+                let inserted = skiplist.insert_with_included(key, next_row_id, &inc_vals);
+                if unique && !inserted {
                     return Err(EngramDbError::ConstraintViolation(
                         format!("Duplicate key in unique index '{}'", index_name)
                     ));
@@ -311,7 +312,8 @@ impl Table {
             for &col_idx in included_cols {
                 inc_vals.push(row[col_idx].clone());
             }
-            if unique && !skiplist.insert_with_included(key, next_row_id, &inc_vals) {
+            let inserted = skiplist.insert_with_included(key, next_row_id, &inc_vals);
+            if unique && !inserted {
                 return Err(EngramDbError::ConstraintViolation(
                     format!("Duplicate key in unique index '{}'", index_name)
                 ));

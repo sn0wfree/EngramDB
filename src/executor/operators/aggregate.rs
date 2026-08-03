@@ -673,4 +673,35 @@ mod tests {
         ).unwrap();
         assert!(result.is_empty());
     }
+
+    #[test]
+    fn test_count_distinct() {
+        let chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![
+                    Value::Int64(10), Value::Int64(20), Value::Int64(10),
+                    Value::Int64(30), Value::Int64(20), Value::Int64(10),
+                ]),
+            ],
+            count: 6,
+        };
+        let result = execute(&[chunk], &[(AggregateFunc::Count, 0, true)]).unwrap();
+        let rows = result[0].to_rows();
+        assert_eq!(rows[0][0], Value::Int64(3));
+    }
+
+    #[test]
+    fn test_count_distinct_all_null() {
+        let chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![
+                    Value::Null, Value::Null, Value::Null,
+                ]),
+            ],
+            count: 3,
+        };
+        let result = execute(&[chunk], &[(AggregateFunc::Count, 0, true)]).unwrap();
+        let rows = result[0].to_rows();
+        assert_eq!(rows[0][0], Value::Int64(0));
+    }
 }

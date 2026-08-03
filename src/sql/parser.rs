@@ -958,4 +958,43 @@ mod tests {
         let stmt = parse(sql).unwrap();
         assert!(matches!(stmt, Statement::Select(_)));
     }
+
+    #[test]
+    fn test_select_distinct() {
+        let sql = "SELECT DISTINCT id FROM t";
+        let stmt = parse(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert!(s.distinct);
+                assert_eq!(s.select_list.len(), 1);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_blob() {
+        let sql = "CREATE TABLE t (data BLOB)";
+        let stmt = parse(sql).unwrap();
+        match stmt {
+            Statement::CreateTable(s) => {
+                assert_eq!(s.columns[0].name, "data");
+                assert_eq!(s.columns[0].data_type, DataType::Blob);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_tinyint_type_alias() {
+        let sql = "CREATE TABLE t (val TINYINT)";
+        let stmt = parse(sql).unwrap();
+        match stmt {
+            Statement::CreateTable(s) => {
+                assert_eq!(s.columns[0].name, "val");
+                assert_eq!(s.columns[0].data_type, DataType::Int32);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
 }

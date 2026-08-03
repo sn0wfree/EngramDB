@@ -1058,48 +1058,23 @@ fn eval_concat_func(vecs: &[Vector]) -> Result<Vector> {
 }
 
 fn eval_mod(a: &Vector, b: &Vector) -> Result<Vector> {
-    match (a, b) {
-        (Vector::Constant(a_val, n), Vector::Constant(b_val, _)) => {
-            let v = match (a_val, b_val) {
-                (Value::Int64(a), Value::Int64(b)) => {
-                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
-                    Value::Int64(a.rem_euclid(*b))
-                }
-                (Value::Int32(a), Value::Int32(b)) => {
-                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
-                    Value::Int32(a.rem_euclid(*b))
-                }
-                (Value::Int64(a), Value::Int32(b)) => {
-                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
-                    Value::Int64(a.rem_euclid(*b as i64))
-                }
-                (Value::Int32(a), Value::Int64(b)) => {
-                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
-                    Value::Int64((*a as i64).rem_euclid(*b))
-                }
-                _ => Value::Null,
-            };
-            Ok(Vector::Constant(v, *n))
-        }
-        (Vector::Flat(a_vals), Vector::Flat(b_vals)) => {
-            let len = a_vals.len().min(b_vals.len());
-            let mut result = Vec::with_capacity(len);
-            for i in 0..len {
-                let v = match (&a_vals[i], &b_vals[i]) {
-                    (Value::Int64(a), Value::Int64(b)) => {
-                        if *b == 0 { Value::Null } else { Value::Int64(a.rem_euclid(*b)) }
-                    }
-                    (Value::Int32(a), Value::Int32(b)) => {
-                        if *b == 0 { Value::Null } else { Value::Int32(a.rem_euclid(*b)) }
-                    }
-                    _ => Value::Null,
-                };
-                result.push(v);
+    let a_vals = a.to_flat();
+    let b_vals = b.to_flat();
+    let len = a_vals.len().min(b_vals.len());
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let v = match (&a_vals[i], &b_vals[i]) {
+            (Value::Int64(a), Value::Int64(b)) => {
+                if *b == 0 { Value::Null } else { Value::Int64(a.rem_euclid(*b)) }
             }
-            Ok(Vector::Flat(result))
-        }
-        _ => Ok(Vector::Flat(vec![Value::Null; a.len()])),
+            (Value::Int32(a), Value::Int32(b)) => {
+                if *b == 0 { Value::Null } else { Value::Int32(a.rem_euclid(*b)) }
+            }
+            _ => Value::Null,
+        };
+        result.push(v);
     }
+    Ok(Vector::Flat(result))
 }
 
 fn eval_replace(str_vec: &Vector, from_vec: &Vector, to_vec: &Vector) -> Result<Vector> {
@@ -1771,5 +1746,90 @@ mod tests {
         let v2 = Value::Vector(vec![1.0, 2.0, 3.0]);
         assert_eq!(vector_l2_distance(&v1, &v2), Value::Null);
         assert_eq!(vector_cosine_sim(&v1, &v2), Value::Null);
+    }
+
+    // ============ v0.13.0 新增函数测试 ============
+
+    fn func_expr(name: &str, args: Vec<Expression>) -> Expression {
+        Expression::Function {
+            name: name.to_string(),
+            args,
+            distinct: false,
+            count_star: false,
+        }
+    }
+
+    #[test]
+    fn test_ifnull_first_non_null() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![
+                Value::Int64(1), Value::Null, Value::Int64(3),
+            ])],
+            count: 3,
+        };
+        let expr = func_expr("IFNULL", vec![
+            Expression::ColumnRef { table: None, column: "c".to_string() },
+            Expression::Literal(Value::Int64(99)),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Int64(1));
+        assert_eq!(flat[1], Value::Int64(99));
+        assert_eq!(flat[2], Value::Int64(3));
+    }
+
+    #[test]
+    fn test_replace_basic() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![
+                Value::Varchar("hello world".into()),
+                Value::Varchar("foo bar".into()),
+            ])],
+            count: 2,
+        };
+        let expr = func_expr("REPLACE", vec![
+            Expression::ColumnRef { table: None, column: "c".to_string() },
+            Expression::Literal(Value::Varchar("world".into())),
+            Expression::Literal(Value::Varchar("there".into())),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Varchar("hello there".into()));
+        assert_eq!(flat[1], Value::Varchar("foo bar".into())); // no match
+    }
+
+    #[test]
+    fn test_mod_basic() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![
+                Value::Int64(10), Value::Int64(7), Value::Int64(100),
+            ])],
+            count: 3,
+        };
+        let expr = func_expr("MOD", vec![
+            Expression::ColumnRef { table: None, column: "c".to_string() },
+            Expression::Literal(Value::Int64(3)),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Int64(1));
+        assert_eq!(flat[1], Value::Int64(1));
+        assert_eq!(flat[2], Value::Int64(1));
+    }
+
+    #[test]
+    fn test_mod_by_zero_returns_null() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![Value::Int64(10), Value::Int64(7)])],
+            count: 2,
+        };
+        let expr = func_expr("MOD", vec![
+            Expression::ColumnRef { table: None, column: "c".to_string() },
+            Expression::Literal(Value::Int64(0)),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Null);
+        assert_eq!(flat[1], Value::Null);
     }
 }

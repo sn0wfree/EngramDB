@@ -719,8 +719,8 @@ mod tests {
         table.insert(rows).unwrap();
 
         // 创建索引
-        table.create_index("idx_name", 1, &[2], false).unwrap(); // name 键，覆盖 score
-        table.create_index("idx_id", 0, &[], true).unwrap(); // id 唯一键
+        table.create_index("idx_name", &[1], &[2], false).unwrap(); // name 键，覆盖 score
+        table.create_index("idx_id", &[0], &[], true).unwrap(); // id 唯一键
 
         assert_eq!(table.indexes().len(), 2);
 
@@ -791,7 +791,7 @@ mod tests {
             ]).unwrap();
 
             // 创建索引
-            table.create_index("idx_name", 1, &[], false).unwrap();
+            table.create_index("idx_name", &[1], &[], false).unwrap();
             assert_eq!(table.indexes().len(), 1);
 
             // 保存索引到文件
@@ -1151,7 +1151,7 @@ mod tests {
             // 同时创建 SkipList 索引和向量索引
             {
                 let table = db.get_table_mut("items").unwrap();
-                table.create_index("idx_name", 1, &[], false).unwrap();
+table.create_index("idx_name", &[1], &[], false).unwrap();
             }
             db.create_vector_index("items", "idx_vec", "vec",
                 crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();

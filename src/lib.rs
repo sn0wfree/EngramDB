@@ -1181,4 +1181,31 @@ mod value_tests {
         assert_eq!(rows.rows.len(), 1);
         assert_eq!(rows.rows[0][0], Value::Int64(999));
     }
+
+    // --- NOT NULL 约束测试（v0.12.0 新增）---
+
+    #[test]
+    fn test_not_null_constraint() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT, name VARCHAR NOT NULL)").unwrap();
+
+        // INSERT with NULL in NOT NULL column should fail
+        let err = conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap_err();
+        let err_str = err.to_string();
+        assert!(err_str.contains("NOT NULL"), "expected NOT NULL error, got: {}", err_str);
+    }
+
+    #[test]
+    fn test_not_null_constraint_pass() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT, name VARCHAR NOT NULL)").unwrap();
+
+        // INSERT with non-NULL value should succeed
+        conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+
+        let result = conn.execute("SELECT id, name FROM t").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+        assert_eq!(result.rows[0][1], Value::Varchar("hello".to_string()));
+    }
 }
