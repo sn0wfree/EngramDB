@@ -3,6 +3,41 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [0.13.0] - 2026-08-04
+
+### 性能优化
+- **A-1 事务写入**：通过 WAL 组提交 + 批量 INSERT 优化，事务写入 2.63x vs SQLite（目标 ≤10x）
+- **A-2 索引点查**：BTreeMap 主键索引 + PrimaryKeyLookup 短路计划节点
+- **A-3 COUNT(*)**：行数元数据缓存，O(1) 返回结果
+- **Top-N 排序**：BinaryHeap 堆排序优化，ORDER BY + LIMIT 避免全排序
+- **主键索引持久化**：重启后自动重建 BTreeMap 主键索引
+
+### Bug 修复
+- **COUNT(DISTINCT)**：修复 DISTINCT 静默被丢弃的 bug，使用 HashSet 去重
+- **Unique 索引冲突检测**：CREATE UNIQUE INDEX 时检测重复键并报错
+- **NOT NULL 约束**：INSERT/UPDATE 时检查非空列
+
+### 新增功能
+- **ALTER TABLE**：支持 ADD COLUMN 操作
+- **PRAGMA**：支持 table_info 等查询
+- **Prepared Statement**：计划缓存支持
+- **SELECT DISTINCT**：去重查询
+- **BLOB 类型**：二进制数据存储
+- **外键框架**：ForeignKeyDef 定义 + 级联操作类型
+- **JSON 操作符**：-> 语法（转换为 JSON_EXTRACT 函数）
+- **复合索引**：多列键索引（Varchar 拼接编码）
+- **索引类型**：IndexDef 新增 index_type 字段
+
+### 函数新增
+- IFNULL(expr, default) — 别名指向 COALESCE
+- REPLACE(str, from, to) — 字符串替换
+- MOD(a, b) — 整数取模
+- TINYINT 类型别名
+
+### 体验改进
+- information_schema 基础（通过 PRAGMA）
+- 查询计划缓存提升重复查询性能
+
 ## [0.12.0] - 2026-08-02
 
 ### 新增
