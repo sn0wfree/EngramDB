@@ -114,7 +114,7 @@ impl Table {
     /// row_id 分配规则：
     /// - 0..column_store.total_rows()：列存主存储中的行
     /// - 其后：Delta 层中的行（内部使用绝对 row_id 存储）
-    pub fn get_row_by_id(&self, row_id: u32) -> Result<Option<Vec<crate::Value>>> {
+    pub fn get_row_by_id(&mut self, row_id: u32) -> Result<Option<Vec<crate::Value>>> {
         let cs_rows = self.column_store.total_rows();
         let row_id_u = row_id as u64;
         if row_id_u < cs_rows {

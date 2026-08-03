@@ -290,14 +290,24 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         // Perf03：主键点查短路（WHERE pk = Literal）
         PhysicalPlan::PrimaryKeyLookup { table_name, pk_value } => {
-            let table = db.get_table(&table_name)
-                .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
-            // O(log n)：主键索引命中 row_id；命中再回表读全列
-            let rows: Vec<Vec<crate::Value>> = match table.lookup_primary_key(&pk_value) {
-                Some(row_id) => table.get_row_by_id(row_id)?.into_iter().collect(),
+            // Phase 1：不可变借 -> 查主键索引拿 row_id + 列名
+            let (row_id_opt, columns): (Option<u32>, Vec<String>) = {
+                let table = db.get_table(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                (
+                    table.lookup_primary_key(&pk_value),
+                    table.def.columns.iter().map(|c| c.name.clone()).collect(),
+                )
+            };
+            // Phase 2：可变借 -> 回表读全列
+            let rows: Vec<Vec<crate::Value>> = match row_id_opt {
+                Some(row_id) => {
+                    let table = db.get_table_mut(&table_name)
+                        .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                    table.get_row_by_id(row_id)?.into_iter().collect()
+                }
                 None => Vec::new(),
             };
-            let columns: Vec<String> = table.def.columns.iter().map(|c| c.name.clone()).collect();
             Ok(QueryResult {
                 columns,
                 rows,

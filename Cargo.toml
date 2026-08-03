@@ -112,7 +112,7 @@ name = "compact_strategy_deep_bench"
 harness = false
 
 [[bench]]
-name = "v0.13_acceptance_bench"
+name = "v0_13_acceptance_bench"
 harness = false
 
 # 编译加速配置：

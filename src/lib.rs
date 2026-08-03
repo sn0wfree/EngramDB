@@ -426,6 +426,57 @@ pub enum Value {
 // Vector 按 f32 字节序列比较（与 Float64 同样的 NaN 处理思路）
 impl Eq for Value {}
 
+// 手动实现 PartialOrd/Ord：与 Hash 一致，Float64 用 to_bits()，Vector 用 f32 to_bits 序列
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn variant_rank(v: &Value) -> u8 {
+            match v {
+                Value::Null => 0,
+                Value::Boolean(_) => 1,
+                Value::Int32(_) => 2,
+                Value::Int64(_) => 3,
+                Value::Float64(_) => 4,
+                Value::Varchar(_) => 5,
+                Value::Json(_) => 6,
+                Value::Vector(_) => 7,
+            }
+        }
+        let ord = variant_rank(self).cmp(&variant_rank(other));
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+        match (self, other) {
+            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::Int32(a), Value::Int32(b)) => a.cmp(b),
+            (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+            (Value::Float64(a), Value::Float64(b)) => a.to_bits().cmp(&b.to_bits()),
+            (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
+            (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Vector(a), Value::Vector(b)) => {
+                let len_ord = a.len().cmp(&b.len());
+                if len_ord != std::cmp::Ordering::Equal {
+                    return len_ord;
+                }
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let bits_ord = x.to_bits().cmp(&y.to_bits());
+                    if bits_ord != std::cmp::Ordering::Equal {
+                        return bits_ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            }
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
 // 手动实现 Hash：Float64 用 to_bits()，Vector 用 f32 to_bits 序列
 impl std::hash::Hash for Value {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

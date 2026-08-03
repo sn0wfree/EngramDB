@@ -301,7 +301,8 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
 
     let can_use_index_only = !has_group_by && !has_having && !has_order_by && !has_agg;
 
-    let mut plan = if let Some(pk_val) = pk_short_circuit {
+    let had_pk = pk_short_circuit.is_some();
+    let mut plan = if let Some(pk_val) = pk_short_circuit.take() {
         trace!("Perf03: PrimaryKeyLookup fast-path for '{}' pk={:?}", table_name, pk_val);
         PhysicalPlan::PrimaryKeyLookup {
             table_name: table_name.clone(),
@@ -321,7 +322,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     };
 
     // Filter（WHERE）：主键短路已吸收 WHERE 条件，跳过
-    if pk_short_circuit.is_none() {
+    if !had_pk {
         if let Some(where_expr) = stmt.where_clause {
             plan = PhysicalPlan::Filter {
                 input: Box::new(plan),

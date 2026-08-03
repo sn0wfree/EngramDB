@@ -70,12 +70,12 @@ fn a1_engramdb() -> Duration {
 
     let start = Instant::now();
     for i in 0..1000 {
-        let txn = conn.begin().unwrap();
+        let mut txn = conn.begin().unwrap();
         txn.insert(
             "t",
             vec![vec![
-                Value::Int(i),
-                Value::Double(i as f64 * 1.5),
+                Value::Int64(i),
+                Value::Float64(i as f64 * 1.5),
                 Value::Varchar(format!("row_{}", i)),
             ]],
         )
