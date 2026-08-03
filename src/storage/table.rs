@@ -73,6 +73,14 @@ pub struct Table {
     /// key 为索引名，value 为 (HNSW 索引, hnsw_id -> row_id 映射)。
     /// 用于向量列的近似最近邻搜索，支持 L2/内积/余弦距离。
     vector_indexes: std::collections::HashMap<String, (HnswIndex, Vec<u32>)>,
+    /// Perf03：主键索引（BTreeMap<主键值, row_id>）
+    ///
+    /// 第一阶段用 `std::collections::BTreeMap` 快速接线（O(log n) 点查），
+    /// 后续升级为页式持久化 B+Tree。
+    /// - 表定义中包含 PRIMARY KEY 列时自动启用
+    /// - INSERT/UPDATE/DELETE 所有写路径均维护
+    /// - WHERE pk=? 查询短路直接命中
+    primary_index: Option<std::collections::BTreeMap<crate::Value, u32>>,
 }
 
 impl Table {
@@ -81,6 +89,7 @@ impl Table {
             CompactStrategy::Adaptive { max_threshold, .. } => max_threshold as u32,
             _ => 122_880,
         };
+        let has_pk = def.primary_key_index().is_some();
         let cs = ColumnStore::new(def.clone(), row_group_size);
         let ds = DeltaStore::new(def.clone());
         Self {
@@ -90,6 +99,117 @@ impl Table {
             compact_strategy: strategy,
             indexes: std::collections::HashMap::new(),
             vector_indexes: std::collections::HashMap::new(),
+            primary_index: if has_pk { Some(std::collections::BTreeMap::new()) } else { None },
+        }
+    }
+
+    /// 是否启用了主键索引
+    #[inline]
+    pub fn has_primary_index(&self) -> bool {
+        self.primary_index.is_some()
+    }
+
+    /// Perf03：通过全局 row_id 读取完整行（用于 PrimaryKeyLookup 命中后回表）
+    ///
+    /// row_id 分配规则：
+    /// - 0..column_store.total_rows()：列存主存储中的行
+    /// - 其后：Delta 层中的行（内部使用绝对 row_id 存储）
+    pub fn get_row_by_id(&self, row_id: u32) -> Result<Option<Vec<crate::Value>>> {
+        let cs_rows = self.column_store.total_rows();
+        let row_id_u = row_id as u64;
+        if row_id_u < cs_rows {
+            // 位于列存主存储：定位 row_group 和 row_idx
+            let mut remaining = row_id_u;
+            let num_cols = self.def.columns.len();
+            let mut located_rg: Option<usize> = None;
+            let mut located_row_in_rg: Option<usize> = None;
+            for (rg_idx, rg) in self.column_store.row_groups().iter().enumerate() {
+                let rc = rg.row_count as u64;
+                if remaining < rc {
+                    located_rg = Some(rg_idx);
+                    located_row_in_rg = Some(remaining as usize);
+                    break;
+                }
+                remaining -= rc;
+            }
+            let rg_idx = match located_rg {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            let row_in_rg = located_row_in_rg.unwrap();
+            let mut row: Vec<crate::Value> = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let col_data = self.column_store.read_column(rg_idx, col_idx)?;
+                if row_in_rg < col_data.len() {
+                    row.push(col_data[row_in_rg].clone());
+                } else {
+                    row.push(crate::Value::Null);
+                }
+            }
+            Ok(Some(row))
+        } else {
+            // 位于 Delta 层：使用绝对 row_id 读取
+            Ok(self.delta_store.get(row_id_u).map(|r| r.to_vec()))
+        }
+    }
+
+    /// 通过主键值查找 row_id（O(log n)）
+    pub fn lookup_primary_key(&self, key: &crate::Value) -> Option<u32> {
+        self.primary_index.as_ref().and_then(|idx| idx.get(key).copied())
+    }
+
+    /// 获取主键索引引用（用于 planner/executor 检测）
+    pub fn primary_index(&self) -> Option<&std::collections::BTreeMap<crate::Value, u32>> {
+        self.primary_index.as_ref()
+    }
+
+    // ---------- Perf03：主键索引内部维护方法 ----------
+
+    /// 向主键索引插入单条 (pk_value, row_id)
+    #[inline]
+    fn primary_index_insert(&mut self, row: &[crate::Value], row_id: u32) {
+        if let Some(pk_idx) = self.def.primary_key_index() {
+            if let Some(pk_val) = row.get(pk_idx).cloned() {
+                if let Some(idx) = self.primary_index.as_mut() {
+                    idx.insert(pk_val, row_id);
+                }
+            }
+        }
+    }
+
+    /// 从主键索引删除单条 (pk_value, _)
+    #[inline]
+    fn primary_index_remove(&mut self, row: &[crate::Value]) {
+        if let Some(pk_idx) = self.def.primary_key_index() {
+            if let Some(pk_val) = row.get(pk_idx) {
+                if let Some(idx) = self.primary_index.as_mut() {
+                    idx.remove(pk_val);
+                }
+            }
+        }
+    }
+
+    /// 向主键索引批量插入多行（使用 base_row_id 递增编号）
+    #[inline]
+    fn primary_index_insert_batch(&mut self, rows: &[Vec<crate::Value>], base_row_id: u32) {
+        if let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_mut()) {
+            for (i, row) in rows.iter().enumerate() {
+                if let Some(pk_val) = row.get(pk_idx).cloned() {
+                    idx.insert(pk_val, base_row_id + i as u32);
+                }
+            }
+        }
+    }
+
+    /// 从主键索引批量删除多行
+    #[inline]
+    fn primary_index_remove_batch(&mut self, rows: &[Vec<crate::Value>]) {
+        if let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_mut()) {
+            for row in rows {
+                if let Some(pk_val) = row.get(pk_idx) {
+                    idx.remove(pk_val);
+                }
+            }
         }
     }
 
@@ -528,6 +648,11 @@ impl Table {
         // 更新总行数
         self.def.row_count += count;
 
+        // Perf03：更新主键索引
+        if self.primary_index.is_some() {
+            self.primary_index_insert_batch(&rows, base_row_id);
+        }
+
         // 更新所有二级索引（v0.12.0 覆盖索引）
         if !self.indexes.is_empty() {
             self.update_indexes_for_rows(&rows, base_row_id);
@@ -553,6 +678,11 @@ impl Table {
         
         // 更新总行数
         self.def.row_count += 1;
+        
+        // Perf03：更新主键索引
+        if self.primary_index.is_some() {
+            self.primary_index_insert(row, row_id);
+        }
         
         // 更新所有二级索引
         if !self.indexes.is_empty() {
@@ -589,6 +719,11 @@ impl Table {
         
         // 如果有旧行数据，更新索引
         if let Some(ref row) = old_row {
+            // Perf03：删除主键索引条目
+            if self.primary_index.is_some() {
+                self.primary_index_remove(row);
+            }
+            
             // 删除二级索引中的对应条目
             if !self.indexes.is_empty() {
                 self.remove_indexes_for_rows(&[row.clone()], &[row_id]);
@@ -627,9 +762,9 @@ impl Table {
         
         // 如果有旧行数据，更新索引
         if let Some(ref old_r) = old_row {
-            // 删除旧索引条目
-            if !self.indexes.is_empty() && !self.vector_indexes.is_empty() {
-                // 同时维护两种索引
+            // Perf03：删除旧主键索引条目
+            if self.primary_index.is_some() {
+                self.primary_index_remove(old_r);
             }
             
             // 删除旧索引条目
@@ -645,6 +780,11 @@ impl Table {
         
         // 插入新索引条目
         if let Some(ref new_r) = updated_row {
+            // Perf03：插入新主键索引条目
+            if self.primary_index.is_some() {
+                self.primary_index_insert(new_r, row_id);
+            }
+            
             if !self.indexes.is_empty() {
                 self.update_indexes_for_row(row_id, new_r);
             }
@@ -882,9 +1022,11 @@ impl Table {
         Ok(actual_rows)
     }
 
-    /// 总行数
+    /// 总行数（元数据级 O(1)，已通过 INSERT/DELETE/UPDATE 所有写路径精确维护）
+    ///
+    /// Perf01：供 COUNT(*) 短路和优化器估计行数使用。
     pub fn row_count(&self) -> u64 {
-        self.def.row_count + self.delta_store.len() as u64
+        self.def.row_count
     }
 
     /// 删除行（v0.12.0 新增，DELETE 支持）
@@ -908,6 +1050,11 @@ impl Table {
         // 先收集被删除的行（用于索引维护）
         let deleted_rows = self.delta_store.delete_rows(delta_row_indices);
         let count = deleted_rows.len();
+
+        // Perf03：更新主键索引（删除条目）
+        if self.primary_index.is_some() && !deleted_rows.is_empty() {
+            self.primary_index_remove_batch(&deleted_rows);
+        }
 
         // 更新所有二级索引：删除对应的条目
         if !self.indexes.is_empty() && !deleted_rows.is_empty() {
@@ -955,6 +1102,14 @@ impl Table {
         }
 
         // 更新索引：先删旧条目，再插新条目
+        if self.primary_index.is_some() && !old_rows.is_empty() {
+            // Perf03：先删旧主键索引，再插新主键索引
+            self.primary_index_remove_batch(&old_rows);
+            for (i, new_row) in new_rows.iter().enumerate() {
+                self.primary_index_insert(new_row, row_ids[i]);
+            }
+        }
+
         if !self.indexes.is_empty() && !old_rows.is_empty() {
             self.remove_indexes_for_rows(&old_rows, &row_ids);
             // 重新插入更新后的行

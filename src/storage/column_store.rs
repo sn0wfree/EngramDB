@@ -256,6 +256,11 @@ impl ColumnStore {
         self.row_groups.len()
     }
 
+    /// 只读访问所有 row groups（用于扫描定位 row_id）
+    pub fn row_groups(&self) -> &[RowGroup] {
+        &self.row_groups
+    }
+
     /// 获取每个 row group 的目标大小
     pub fn row_group_size(&self) -> u32 {
         self.row_group_size

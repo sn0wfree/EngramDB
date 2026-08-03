@@ -126,6 +126,25 @@ pub enum PhysicalPlan {
         view_name: String,
         if_exists: bool,
     },
+    /// 行数元数据级短路查询（Perf01）
+    ///
+    /// 单表、无 WHERE、无 GROUP BY、无 HAVING、纯 COUNT(*) 等情况下，
+    /// 直接从 `Table.def.row_count` 读元数据，跳过 TableScan→Aggregate 的逐行扫路径。
+    /// `output_name` 为输出列名（如 `"count(*)"`），`count` 为预取的行数。
+    CountStar {
+        output_name: String,
+        count: i64,
+    },
+    /// 主键点查物理节点（Perf03）
+    ///
+    /// 触发条件：单表查询，WHERE 唯一条件为 `pk_col = Literal`，
+    /// 且表定义包含 PRIMARY KEY，且主键索引已启用。
+    /// - O(log n) 命中 primary_index 得到 row_id
+    /// - 回表取 0/1 行，输出列顺序与表 schema 一致（后续 Projection 做列裁剪）
+    PrimaryKeyLookup {
+        table_name: String,
+        pk_value: crate::Value,
+    },
     /// 开始事务
     BeginTransaction,
     /// 提交

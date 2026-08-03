@@ -6,6 +6,7 @@
 use crate::common::error::{HybridDbError, Result};
 use crate::storage::Database;
 use crate::Value;
+use log::trace;
 
 use super::ast::*;
 use crate::executor::physical_plan::*;
@@ -187,6 +188,38 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
 }
 
 fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
+    // ===== Perf01：COUNT(*) 元数据级短路 =====
+    // 条件：单表、无 WHERE、无 GROUP BY、无 HAVING、无 ORDER BY、无 LIMIT
+    // 且 SELECT 列表唯一一项为 COUNT(*) 或 COUNT(1) 等常量输入
+    if stmt.where_clause.is_none()
+        && stmt.group_by.is_empty()
+        && stmt.having.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && stmt.select_list.len() == 1
+    {
+        if let SelectItem::Expression(expr, alias) = &stmt.select_list[0] {
+            if let Expression::Function { name, args, distinct: false, count_star } = expr {
+                let is_count_star = *count_star
+                    || (name.eq_ignore_ascii_case("COUNT")
+                        && (args.is_empty()
+                            || matches!(args.as_slice(), [Expression::Literal(_)])));
+                if name.eq_ignore_ascii_case("COUNT") && is_count_star {
+                    let table_name = stmt.from
+                        .as_ref()
+                        .map(|t| t.table_name.clone())
+                        .ok_or_else(|| HybridDbError::Parse("SELECT without FROM not supported".into()))?;
+                    let table = db.get_table(&table_name)
+                        .ok_or_else(|| HybridDbError::TableNotFound(table_name.clone()))?;
+                    let count = table.row_count() as i64;
+                    let output_name = alias.clone().unwrap_or_else(|| "count(*)".to_string());
+                    trace!("Perf01: COUNT(*) fast-path for '{}' => {}", table_name, count);
+                    return Ok(PhysicalPlan::CountStar { output_name, count });
+                }
+            }
+        }
+    }
+
     let table_name = stmt.from
         .as_ref()
         .map(|t| t.table_name.clone())
@@ -194,6 +227,44 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
 
     let table = db.get_table(&table_name)
         .ok_or_else(|| HybridDbError::TableNotFound(table_name.clone()))?;
+
+    // ===== Perf03：主键点查短路（WHERE pk = Literal）=====
+    // 条件：
+    // 1. 表有 PRIMARY KEY 索引
+    // 2. WHERE 唯一条件为 `pk_col = Literal`（BinaryEq）
+    // 3. 无 GROUP BY / HAVING / ORDER BY / LIMIT（简化，后续可扩展）
+    let mut pk_short_circuit: Option<crate::Value> = None;
+    if table.has_primary_index()
+        && stmt.group_by.is_empty()
+        && stmt.having.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+    {
+        if let Some(ref where_expr) = stmt.where_clause {
+            if let Expression::BinaryOp { left, op, right } = where_expr {
+                if *op == BinaryOperator::Eq {
+                    let pk_idx = table.def.primary_key_index().unwrap();
+                    let pk_name = &table.def.columns[pk_idx].name;
+                    let mut maybe_pk_value: Option<crate::Value> = None;
+                    // 接受 (pk_col = literal) 或 (literal = pk_col)
+                    match (left.as_ref(), right.as_ref()) {
+                        (Expression::ColumnRef { column, .. }, Expression::Literal(v))
+                            if column == pk_name =>
+                        {
+                            maybe_pk_value = Some(v.clone());
+                        }
+                        (Expression::Literal(v), Expression::ColumnRef { column, .. })
+                            if column == pk_name =>
+                        {
+                            maybe_pk_value = Some(v.clone());
+                        }
+                        _ => {}
+                    }
+                    pk_short_circuit = maybe_pk_value;
+                }
+            }
+        }
+    }
 
     // 确定扫描的列（所有被引用的列）
     let all_referenced_cols = collect_referenced_columns(&stmt, &table.def.columns);
@@ -205,6 +276,11 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     let has_agg_in_select = select_list_has_aggregates(&stmt.select_list);
     if scan_column_indices.is_empty() && has_agg_in_select && !table.def.columns.is_empty() {
         scan_column_indices.push(0);
+    }
+
+    // ===== Perf03：主键短路时输出全列（Projection 裁剪列，避免列映射错乱）=====
+    if pk_short_circuit.is_some() {
+        scan_column_indices = (0..table.def.columns.len()).collect();
     }
 
     // 扫描阶段的列名映射（扫描输出的列名）
@@ -225,7 +301,13 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
 
     let can_use_index_only = !has_group_by && !has_having && !has_order_by && !has_agg;
 
-    let mut plan = if can_use_index_only {
+    let mut plan = if let Some(pk_val) = pk_short_circuit {
+        trace!("Perf03: PrimaryKeyLookup fast-path for '{}' pk={:?}", table_name, pk_val);
+        PhysicalPlan::PrimaryKeyLookup {
+            table_name: table_name.clone(),
+            pk_value: pk_val,
+        }
+    } else if can_use_index_only {
         try_index_only_scan(&stmt, db, &table_name, &scan_column_indices)
             .unwrap_or_else(|| PhysicalPlan::TableScan {
                 table_name: table_name.clone(),
@@ -238,12 +320,14 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         }
     };
 
-    // Filter（WHERE）
-    if let Some(where_expr) = stmt.where_clause {
-        plan = PhysicalPlan::Filter {
-            input: Box::new(plan),
-            condition: where_expr,
-        };
+    // Filter（WHERE）：主键短路已吸收 WHERE 条件，跳过
+    if pk_short_circuit.is_none() {
+        if let Some(where_expr) = stmt.where_clause {
+            plan = PhysicalPlan::Filter {
+                input: Box::new(plan),
+                condition: where_expr,
+            };
+        }
     }
 
     // 检查是否需要聚合（GROUP BY 或 SELECT 中有聚合函数）

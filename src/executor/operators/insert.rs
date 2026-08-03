@@ -129,58 +129,113 @@ fn execute_without_txn(
 
 /// 应用事务操作到存储层
 ///
-/// 遍历 apply_ops，将每个操作应用到对应的表
+/// M02 优化：将连续的同表 Insert 段打包走 `table.insert(batch_rows)`，
+/// 减少 N 次单条 insert_row 的方法调用与索引维护开销。
+/// Update/Delete 仍按原顺序逐行应用（保持操作顺序正确性）。
 pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
     trace!("apply_to_storage called with {} operations", ops.len());
-    
-    for (idx, op) in ops.iter().enumerate() {
+
+    let mut idx = 0;
+    while idx < ops.len() {
+        // 检测当前位置开始的「连续同表 Insert」段
+        if let ApplyOp::Insert { table_id: start_tid, .. } = ops[idx] {
+            // 收集后续与 start_tid 相同的 Insert
+            let mut run_end = idx + 1;
+            while run_end < ops.len() {
+                if let ApplyOp::Insert { table_id: tid, .. } = ops[run_end] {
+                    if tid == start_tid {
+                        run_end += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            let run_len = run_end - idx;
+
+            if run_len > 1 {
+                // M02：批量 Insert，尝试走 table.insert(rows) 接口
+                // 收集 rows 与预期 row_id 序列
+                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(run_len);
+                let mut row_ids: Vec<u32> = Vec::with_capacity(run_len);
+                for op in &ops[idx..run_end] {
+                    if let ApplyOp::Insert { table_id: _, row_id, row } = op {
+                        rows.push(row.clone());
+                        row_ids.push(*row_id as u32);
+                    }
+                }
+
+                let table = db.tables_mut().get_mut(&start_tid)
+                    .ok_or_else(|| {
+                        error!("Table not found: table_id={}", start_tid);
+                        HybridDbError::TableNotFound(format!("id={}", start_tid))
+                    })?;
+
+                // 只有当 row_ids 与当前 table.def.row_count 连续对齐时，才能走 table.insert()
+                // （因为 insert() 内部使用 def.row_count 作为 base_row_id）
+                let base = table.def.row_count as u32;
+                let contiguous = row_ids.iter().enumerate()
+                    .all(|(i, &rid)| rid == base + i as u32);
+
+                if contiguous {
+                    // 走批量路径（内部一次 row_count += N，一次索引批量构建）
+                    let inserted = table.insert(rows)?;
+                    debug!("✓ M02 Batch Insert applied: table_id={}, rows={}", start_tid, inserted);
+                } else {
+                    // 非连续 row_id（罕见场景），退回逐行
+                    for (i, row) in rows.into_iter().enumerate() {
+                        table.insert_row(row_ids[i], &row)?;
+                    }
+                    debug!("✓ Insert applied (non-contiguous): table_id={}, count={}", start_tid, run_len);
+                }
+
+                idx = run_end;
+                continue;
+            }
+        }
+
+        // 非批量路径：单个操作
+        let op = &ops[idx];
         trace!("Applying operation {}/{}: {:?}", idx + 1, ops.len(), op);
-        
+
         match op {
             ApplyOp::Insert { table_id, row_id, row } => {
                 trace!("Insert: table_id={}, row_id={}, row={:?}", table_id, row_id, row);
-                
                 let table = db.tables_mut().get_mut(table_id)
                     .ok_or_else(|| {
                         error!("Table not found: table_id={}", table_id);
                         error!("This indicates a bug in collect_apply_ops()");
                         HybridDbError::TableNotFound(format!("id={}", table_id))
                     })?;
-                
                 table.insert_row(*row_id as u32, row)?;
                 debug!("✓ Insert applied: table_id={}, row_id={}", table_id, row_id);
             }
-            
             ApplyOp::Update { table_id, row_id, new_row } => {
                 trace!("Update: table_id={}, row_id={}, new_row={:?}", table_id, row_id, new_row);
-                
                 let table = db.tables_mut().get_mut(table_id)
                     .ok_or_else(|| {
                         error!("Table not found: table_id={}", table_id);
                         error!("This indicates a bug in collect_apply_ops()");
                         HybridDbError::TableNotFound(format!("id={}", table_id))
                     })?;
-                
                 table.update_row(*row_id as u32, new_row)?;
                 debug!("✓ Update applied: table_id={}, row_id={}", table_id, row_id);
             }
-            
             ApplyOp::Delete { table_id, row_id } => {
                 trace!("Delete: table_id={}, row_id={}", table_id, row_id);
-                
                 let table = db.tables_mut().get_mut(table_id)
                     .ok_or_else(|| {
                         error!("Table not found: table_id={}", table_id);
                         error!("This indicates a bug in collect_apply_ops()");
                         HybridDbError::TableNotFound(format!("id={}", table_id))
                     })?;
-                
                 table.delete_row(*row_id as u32)?;
                 debug!("✓ Delete applied: table_id={}, row_id={}", table_id, row_id);
             }
         }
+
+        idx += 1;
     }
-    
+
     info!("✓ All {} operations applied to storage", ops.len());
     Ok(())
 }

@@ -112,7 +112,7 @@ impl<'a> CostModel<'a> {
             PhysicalPlan::Insert { .. } | PhysicalPlan::InsertColumns { .. } | PhysicalPlan::CreateTable { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
-            PhysicalPlan::BeginTransaction | PhysicalPlan::Commit | PhysicalPlan::Rollback => {
+            PhysicalPlan::BeginTransaction | PhysicalPlan::Commit | PhysicalPlan::Rollback | PhysicalPlan::CountStar { .. } | PhysicalPlan::PrimaryKeyLookup { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
             // DDL/管理语句：代价为 0
