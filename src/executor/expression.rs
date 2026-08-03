@@ -745,6 +745,33 @@ fn eval_function(
             let arg_vecs = arg_vecs?;
             eval_concat_func(&arg_vecs)
         }
+        "IFNULL" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("IFNULL requires 2 arguments".into()));
+            }
+            let arg_vecs: Result<Vec<Vector>> = args.iter()
+                .map(|a| eval_vectorized(a, chunk, column_names))
+                .collect();
+            let arg_vecs = arg_vecs?;
+            eval_coalesce(&arg_vecs)
+        }
+        "REPLACE" => {
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("REPLACE requires 3 arguments".into()));
+            }
+            let str_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let from_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let to_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            eval_replace(&str_vec, &from_vec, &to_vec)
+        }
+        "MOD" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("MOD requires 2 arguments".into()));
+            }
+            let a_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let b_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            eval_mod(&a_vec, &b_vec)
+        }
         // JSON 函数（v0.12.0 新增，Agent 元数据场景）
         "JSON_EXTRACT" => {
             if args.len() != 2 {
@@ -1026,6 +1053,69 @@ fn eval_concat_func(vecs: &[Vector]) -> Result<Vector> {
         }
     }
 
+    Ok(Vector::Flat(result))
+}
+
+fn eval_mod(a: &Vector, b: &Vector) -> Result<Vector> {
+    match (a, b) {
+        (Vector::Constant(a_val, n), Vector::Constant(b_val, _)) => {
+            let v = match (a_val, b_val) {
+                (Value::Int64(a), Value::Int64(b)) => {
+                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
+                    Value::Int64(a.rem_euclid(*b))
+                }
+                (Value::Int32(a), Value::Int32(b)) => {
+                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
+                    Value::Int32(a.rem_euclid(*b))
+                }
+                (Value::Int64(a), Value::Int32(b)) => {
+                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
+                    Value::Int64(a.rem_euclid(*b as i64))
+                }
+                (Value::Int32(a), Value::Int64(b)) => {
+                    if *b == 0 { return Err(EngramDbError::Parse("MOD by zero".into())); }
+                    Value::Int64((*a as i64).rem_euclid(*b))
+                }
+                _ => Value::Null,
+            };
+            Ok(Vector::Constant(v, *n))
+        }
+        (Vector::Flat(a_vals), Vector::Flat(b_vals)) => {
+            let len = a_vals.len().min(b_vals.len());
+            let mut result = Vec::with_capacity(len);
+            for i in 0..len {
+                let v = match (&a_vals[i], &b_vals[i]) {
+                    (Value::Int64(a), Value::Int64(b)) => {
+                        if *b == 0 { Value::Null } else { Value::Int64(a.rem_euclid(*b)) }
+                    }
+                    (Value::Int32(a), Value::Int32(b)) => {
+                        if *b == 0 { Value::Null } else { Value::Int32(a.rem_euclid(*b)) }
+                    }
+                    _ => Value::Null,
+                };
+                result.push(v);
+            }
+            Ok(Vector::Flat(result))
+        }
+        _ => Ok(Vector::Flat(vec![Value::Null; a.len()])),
+    }
+}
+
+fn eval_replace(str_vec: &Vector, from_vec: &Vector, to_vec: &Vector) -> Result<Vector> {
+    let str_vals = str_vec.to_flat();
+    let from_vals = from_vec.to_flat();
+    let to_vals = to_vec.to_flat();
+    let len = str_vals.len().min(from_vals.len()).min(to_vals.len());
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let r = match (&str_vals[i], &from_vals[i], &to_vals[i]) {
+            (Value::Varchar(s), Value::Varchar(from), Value::Varchar(to)) => {
+                Value::Varchar(s.replace(from.as_str(), to.as_str()))
+            }
+            _ => Value::Null,
+        };
+        result.push(r);
+    }
     Ok(Vector::Flat(result))
 }
 

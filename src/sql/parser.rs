@@ -712,6 +712,7 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         | sqlast::DataType::BigInt(_)
         | sqlast::DataType::Int64 => Ok(DataType::Int64),
         sqlast::DataType::SmallInt(_) => Ok(DataType::Int32),
+        sqlast::DataType::TinyInt(_) => Ok(DataType::Int32),
         sqlast::DataType::Float(_) | sqlast::DataType::Double | sqlast::DataType::Float64 => {
             Ok(DataType::Float64)
         }
