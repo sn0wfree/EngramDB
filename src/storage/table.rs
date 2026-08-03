@@ -280,7 +280,11 @@ impl Table {
                 for col in &included_data {
                     inc_vals.push(col[row_idx].clone());
                 }
-                skiplist.insert_with_included(key, next_row_id, &inc_vals);
+                if unique && !skiplist.insert_with_included(key, next_row_id, &inc_vals) {
+                    return Err(EngramDbError::ConstraintViolation(
+                        format!("Duplicate key in unique index '{}'", index_name)
+                    ));
+                }
                 next_row_id += 1;
             }
         }
@@ -293,7 +297,11 @@ impl Table {
             for &col_idx in included_cols {
                 inc_vals.push(row[col_idx].clone());
             }
-            skiplist.insert_with_included(key, next_row_id, &inc_vals);
+            if unique && !skiplist.insert_with_included(key, next_row_id, &inc_vals) {
+                return Err(EngramDbError::ConstraintViolation(
+                    format!("Duplicate key in unique index '{}'", index_name)
+                ));
+            }
             next_row_id += 1;
         }
 
