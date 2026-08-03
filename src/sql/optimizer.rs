@@ -548,6 +548,7 @@ fn eval_constant_cast(v: &Value, target: &crate::common::types::DataType) -> Opt
             Value::Null => Some(Value::Null),
             Value::Json(s) => Some(Value::Varchar(s.clone())),
             Value::Vector(_) => None,
+            Value::Blob(_) => None,
         },
         DataType::Json => match v {
             Value::Json(s) => Some(Value::Json(s.clone())),
@@ -557,6 +558,11 @@ fn eval_constant_cast(v: &Value, target: &crate::common::types::DataType) -> Opt
         },
         DataType::Vector { .. } => match v {
             Value::Vector(v) => Some(Value::Vector(v.clone())),
+            Value::Null => Some(Value::Null),
+            _ => None,
+        },
+        DataType::Blob => match v {
+            Value::Blob(b) => Some(Value::Blob(b.clone())),
             Value::Null => Some(Value::Null),
             _ => None,
         },

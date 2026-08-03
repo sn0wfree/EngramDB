@@ -40,7 +40,7 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
         DataType::Float64 => compress_float64(data),
         DataType::Varchar => compress_varchar(data),
         // JSON 和 Vector 暂不压缩，直接存储
-        DataType::Json | DataType::Vector { .. } => {
+        DataType::Json | DataType::Vector { .. } | DataType::Blob => {
             Ok((CompressionType::Uncompressed, data.to_vec()))
         }
     }

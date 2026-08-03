@@ -328,6 +328,11 @@ fn serialize_value(val: &Value, buf: &mut Vec<u8>) {
                 buf.extend_from_slice(&f.to_le_bytes());
             }
         }
+        Value::Blob(b) => {
+            buf.push(8);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
     }
 }
 
@@ -384,6 +389,12 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
                 vec.push(f);
             }
             Some((Value::Vector(vec), 5 + byte_len))
+        }
+        8 => {
+            if data.len() < 5 { return None; }
+            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            if data.len() < 5 + len { return None; }
+            Some((Value::Blob(data[5..5 + len].to_vec()), 5 + len))
         }
         _ => None,
     }

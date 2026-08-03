@@ -260,6 +260,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
                         Value::Varchar(_) => 5,
                         Value::Json(_) => 6,
                         Value::Vector(_) => 7,
+                        Value::Blob(_) => 8,
                     }
                 }
                 value_tag(a).cmp(&value_tag(b))

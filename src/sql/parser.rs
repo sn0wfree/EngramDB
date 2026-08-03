@@ -329,6 +329,11 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
 }
 
 fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
+    // 提取 DISTINCT 标志
+    let distinct = match &query.body.as_ref() {
+        sqlast::SetExpr::Select(select) => select.distinct.is_some(),
+        _ => false,
+    };
     // 处理 body (SELECT 主体)
     let (select_list, from, where_clause, group_by, having) = match query.body.as_ref() {
         sqlast::SetExpr::Select(select) => {
@@ -438,6 +443,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
         having,
         order_by,
         limit,
+        distinct,
     })
 }
 
@@ -679,6 +685,11 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             })
         }
 
+        // JSON 操作符 -> / ->>
+        // sqlparser 0.47 has Expr::JsonAccess { value: Box<Expr>, path: JsonPath }
+        // where JsonPath is a struct, not an Expr, so we skip it and fall through
+        // to the unsupported expression error below.
+
         _ => Err(EngramDbError::Parse(format!(
             "Unsupported expression: {}",
             expr
@@ -722,6 +733,7 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         | sqlast::DataType::Char(_)
         | sqlast::DataType::Text
         | sqlast::DataType::String(_) => Ok(DataType::Varchar),
+        sqlast::DataType::Blob(_) | sqlast::DataType::Bytea => Ok(DataType::Blob),
         // JSON 类型（v0.12.0 新增）
         // sqlparser 0.47 有原生 JSON 变体，同时保留 Custom 兜底
         sqlast::DataType::JSON => Ok(DataType::Json),

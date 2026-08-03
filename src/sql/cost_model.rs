@@ -124,7 +124,8 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::RefreshMaterializedView { .. }
             | PhysicalPlan::DropMaterializedView { .. }
             | PhysicalPlan::AlterTable(_)
-            | PhysicalPlan::Pragma(_) => {
+            | PhysicalPlan::Pragma(_)
+            | PhysicalPlan::Distinct { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
         }

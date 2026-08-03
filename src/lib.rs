@@ -410,16 +410,9 @@ pub enum Value {
     Int64(i64),
     Float64(f64),
     Varchar(String),
-    /// JSON 值（v0.12.0 新增）
-    ///
-    /// 用字符串存储 JSON 文本，支持路径查询和基本操作。
-    /// 适合 Agent 场景存储工具参数、调用结果、状态元数据等半结构化数据。
     Json(String),
-    /// 向量值（v0.12.0 新增）
-    ///
-    /// 存储 f32 向量，支持 HNSW 近似最近邻搜索。
-    /// 用于 Agent 语义记忆、RAG 检索等场景。
     Vector(Vec<f32>),
+    Blob(Vec<u8>),
 }
 
 // 手动实现 Eq：Float64 按位模式比较（含 NaN 自等）
@@ -445,6 +438,7 @@ impl Ord for Value {
                 Value::Varchar(_) => 5,
                 Value::Json(_) => 6,
                 Value::Vector(_) => 7,
+                Value::Blob(_) => 8,
             }
         }
         let ord = variant_rank(self).cmp(&variant_rank(other));
@@ -472,6 +466,7 @@ impl Ord for Value {
                 }
                 std::cmp::Ordering::Equal
             }
+            (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
             _ => std::cmp::Ordering::Equal,
         }
     }
@@ -495,6 +490,7 @@ impl std::hash::Hash for Value {
                     x.to_bits().hash(state);
                 }
             }
+            Value::Blob(b) => b.hash(state),
         }
     }
 }
@@ -558,6 +554,7 @@ impl std::fmt::Display for Value {
             Value::Varchar(v) => write!(f, "\"{}\"", v),
             Value::Json(v) => write!(f, "'{}'", v),
             Value::Vector(v) => write!(f, "vector[{}]", v.len()),
+            Value::Blob(b) => write!(f, "blob[{}]", b.len()),
         }
     }
 }

@@ -345,6 +345,7 @@ impl ColumnStore {
                         DataType::Varchar => col.uncompressed_count as usize * 12, // 估算
                         DataType::Json => col.uncompressed_count as usize * 32, // 估算
                         DataType::Vector { .. } => col.uncompressed_count as usize * 64, // 估算
+                        DataType::Blob => col.uncompressed_count as usize * 64, // 估算
                     };
                     stats.total_original += est_original;
                 } else {
@@ -741,6 +742,16 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
                 }
             }
         }
+        DataType::Blob => {
+            for v in values {
+                if let Value::Blob(b) = v {
+                    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(b);
+                } else {
+                    buf.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
     }
     buf
 }
@@ -854,6 +865,22 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
                 }
             }
         }
+        DataType::Blob => {
+            for _ in 0..count {
+                if offset + 4 <= data.len() {
+                    let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if offset + len <= data.len() {
+                        values.push(Value::Blob(data[offset..offset + len].to_vec()));
+                        offset += len;
+                    } else {
+                        values.push(Value::Null);
+                    }
+                } else {
+                    values.push(Value::Null);
+                }
+            }
+        }
     }
 
     values
@@ -940,6 +967,17 @@ fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
             }
             size
         }
+        DataType::Blob => {
+            let mut size = 0;
+            for v in values {
+                if let Value::Blob(b) = v {
+                    size += 4 + b.len();
+                } else {
+                    size += 4;
+                }
+            }
+            size
+        }
     }
 }
 
@@ -956,6 +994,7 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Varchar => 4,
         DataType::Json => 5,
         DataType::Vector { .. } => 6,
+        DataType::Blob => 7,
     }
 }
 
@@ -968,6 +1007,7 @@ fn u8_to_data_type(b: u8) -> DataType {
         4 => DataType::Varchar,
         5 => DataType::Json,
         6 => DataType::Vector { dim: 0 },
+        7 => DataType::Blob,
         _ => DataType::Varchar,
     }
 }

@@ -489,6 +489,13 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         };
     }
 
+    // DISTINCT
+    if stmt.distinct {
+        plan = PhysicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+
     Ok(plan)
 }
 

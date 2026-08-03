@@ -156,6 +156,10 @@ pub enum PhysicalPlan {
     AlterTable(AlterTableStmt),
     /// PRAGMA
     Pragma(PragmaStmt),
+    /// DISTINCT 去重
+    Distinct {
+        input: Box<PhysicalPlan>,
+    },
 }
 
 /// 聚合表达式

@@ -11,6 +11,7 @@ use super::physical_plan::{PhysicalPlan, JoinType};
 use super::vector::DataChunk;
 use super::operators;
 use crate::sql::ast::Expression;
+use fxhash::FxHashSet;
 
 /// 执行物理计划
 pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
@@ -343,6 +344,21 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
         PhysicalPlan::Pragma(stmt) => {
             crate::executor::operators::pragma::execute(db, stmt)
+        }
+        PhysicalPlan::Distinct { input } => {
+            let input_result = execute(*input, db)?;
+            let mut seen = FxHashSet::default();
+            let mut deduped = Vec::with_capacity(input_result.rows.len());
+            for row in input_result.rows {
+                if seen.insert(row.clone()) {
+                    deduped.push(row);
+                }
+            }
+            Ok(QueryResult {
+                columns: input_result.columns,
+                rows: deduped,
+                rows_affected: 0,
+            })
         }
     }
 }

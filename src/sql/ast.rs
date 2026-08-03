@@ -119,6 +119,7 @@ pub struct SelectStmt {
     pub having: Option<Expression>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<usize>,
+    pub distinct: bool,
 }
 
 /// ANALYZE 语句：收集表的统计信息

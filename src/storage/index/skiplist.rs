@@ -421,6 +421,7 @@ mod value_tag {
     pub const VARCHAR: u8 = 5;
     pub const JSON: u8 = 6;
     pub const VECTOR: u8 = 7;
+    pub const BLOB: u8 = 8;
 }
 
 /// 将单个 Value 编码为自描述字节（type_tag + data）
@@ -462,6 +463,11 @@ fn encode_value(v: &Value) -> Vec<u8> {
             for f in vec {
                 buf.extend_from_slice(&f.to_le_bytes());
             }
+        }
+        Value::Blob(b) => {
+            buf.push(value_tag::BLOB);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
         }
     }
     buf
@@ -555,6 +561,19 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             }
             offset += byte_len;
             Value::Vector(vec)
+        }
+        value_tag::BLOB => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated blob length".into()));
+            }
+            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated blob data".into()));
+            }
+            let blob = data[offset..offset+len].to_vec();
+            offset += len;
+            Value::Blob(blob)
         }
         _ => return Err(EngramDbError::InvalidFormat(format!("unknown value tag: {}", tag))),
     };

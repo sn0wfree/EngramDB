@@ -20,6 +20,8 @@ pub enum DataType {
     /// 存储固定维度的 f32 向量，支持 HNSW 近似最近邻搜索。
     /// 维度在建表时指定（如 `VECTOR(1536)`），默认 0 表示动态维度。
     Vector { dim: usize },
+    /// BLOB 二进制数据（v0.13.0 新增）
+    Blob,
 }
 
 impl DataType {
@@ -32,6 +34,7 @@ impl DataType {
             DataType::Varchar => "VARCHAR",
             DataType::Json => "JSON",
             DataType::Vector { .. } => "VECTOR",
+            DataType::Blob => "BLOB",
         }
     }
 
@@ -44,6 +47,7 @@ impl DataType {
             DataType::Varchar => None,
             DataType::Json => None,
             DataType::Vector { .. } => None,
+            DataType::Blob => None,
         }
     }
 }
