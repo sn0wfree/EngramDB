@@ -62,6 +62,15 @@ pub enum PhysicalPlan {
         table_name: String,
         columns: Vec<Vec<Value>>,
     },
+    /// INSERT ... SELECT（v0.15.0 新增）
+    ///
+    /// 执行 source 子计划，将结果行插入目标表。
+    /// 支持 INSERT ... SELECT ... FROM ... WHERE ...
+    InsertSelect {
+        table_name: String,
+        columns: Option<Vec<String>>,
+        source: Box<PhysicalPlan>,
+    },
     /// 创建表
     CreateTable {
         table_def: TableDef,

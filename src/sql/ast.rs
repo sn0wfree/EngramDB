@@ -88,7 +88,10 @@ pub struct ColumnDef {
 pub struct InsertStmt {
     pub table_name: String,
     pub columns: Option<Vec<String>>,
+    /// INSERT ... VALUES 的字面值
     pub values: Vec<Vec<Expression>>,
+    /// INSERT ... SELECT 的 SELECT 子查询（v0.15.0 新增）
+    pub select: Option<Box<SelectStmt>>,
     pub returning: Option<Vec<SelectItem>>,
     pub on_conflict: Option<OnConflictClause>,
 }

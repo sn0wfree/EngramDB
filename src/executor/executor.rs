@@ -132,6 +132,49 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        PhysicalPlan::InsertSelect { table_name, columns, source } => {
+            // INSERT ... SELECT：先执行 source 计划，将结果行插入目标表
+            let source_result = execute(*source, db)?;
+
+            // 验证表存在
+            let table = db.get_table(&table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?
+                .def.clone();
+            let num_cols = table.columns.len();
+
+            // 计算列索引映射
+            let col_map: Vec<usize> = if let Some(col_names) = columns {
+                col_names.iter()
+                    .filter_map(|name| table.column_index(name))
+                    .collect()
+            } else {
+                // 无列名时，按源结果的列顺序填入
+                (0..source_result.rows.first().map(|r| r.len()).unwrap_or(num_cols)).collect()
+            };
+
+            // 将 source 行映射到目标表行格式
+            let mut rows = Vec::with_capacity(source_result.rows.len());
+            for source_row in source_result.rows {
+                let mut full_row = vec![crate::Value::Null; num_cols];
+                for (i, &target_idx) in col_map.iter().enumerate() {
+                    if let Some(val) = source_row.get(i) {
+                        if target_idx < num_cols {
+                            full_row[target_idx] = val.clone();
+                        }
+                    }
+                }
+                rows.push(full_row);
+            }
+
+            let count = operators::insert::execute(db, &table_name, rows)?;
+
+            Ok(QueryResult {
+                columns: vec!["rows_inserted".to_string()],
+                rows: vec![vec![crate::Value::Int64(count as i64)]],
+                rows_affected: count,
+            })
+        }
+
         PhysicalPlan::TableScan { table_name, column_indices } => {
             let chunks = operators::table_scan::execute(db, &table_name, &column_indices)?;
             let (columns, rows) = collect_result(&chunks, db, &table_name, &column_indices)?;
@@ -514,6 +557,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Aggregate { .. } => "Aggregate",
         PhysicalPlan::Insert { .. } => "Insert",
         PhysicalPlan::InsertColumns { .. } => "InsertColumns",
+        PhysicalPlan::InsertSelect { .. } => "InsertSelect",
         PhysicalPlan::CreateTable { .. } => "CreateTable",
         PhysicalPlan::CreateIndex { .. } => "CreateIndex",
         PhysicalPlan::Delete { .. } => "Delete",
@@ -609,6 +653,9 @@ fn format_plan_tree(plan: &PhysicalPlan, indent: usize) -> String {
         PhysicalPlan::SetUnion { left, right, .. } => {
             result.push_str(&format_plan_tree(left, indent + 1));
             result.push_str(&format_plan_tree(right, indent + 1));
+        }
+        PhysicalPlan::InsertSelect { source, .. } => {
+            result.push_str(&format_plan_tree(source, indent + 1));
         }
         _ => {}
     }

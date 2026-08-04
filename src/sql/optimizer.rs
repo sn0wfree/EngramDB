@@ -167,6 +167,9 @@ fn collect_joins_and_tables(plan: &PhysicalPlan, joins: &mut Vec<()>, tables: &m
         PhysicalPlan::SubqueryScan { plan } => {
             collect_joins_and_tables(plan, joins, tables);
         }
+        PhysicalPlan::InsertSelect { source, .. } => {
+            collect_joins_and_tables(source, joins, tables);
+        }
         _ => {}
     }
 }
@@ -262,6 +265,14 @@ fn optimize_build_sides(plan: PhysicalPlan) -> Result<PhysicalPlan> {
             let opt_plan = optimize_build_sides(*plan)?;
             Ok(PhysicalPlan::SubqueryScan { plan: Box::new(opt_plan) })
         }
+        PhysicalPlan::InsertSelect { table_name, columns, source } => {
+            let opt_source = optimize_build_sides(*source)?;
+            Ok(PhysicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source: Box::new(opt_source),
+            })
+        }
         other => Ok(other),
     }
 }
@@ -285,6 +296,7 @@ fn estimate_rows(plan: &PhysicalPlan) -> u64 {
             (((estimate_rows(left) as f64) * (estimate_rows(right) as f64) * 0.1) as u64).max(1)
         }
         PhysicalPlan::SubqueryScan { plan } => estimate_rows(plan),
+        PhysicalPlan::InsertSelect { source, .. } => estimate_rows(source),
         _ => 1000,
     }
 }

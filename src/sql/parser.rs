@@ -174,22 +174,25 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 Some(insert.columns.iter().map(|c| c.value.clone()).collect())
             };
 
-            // 解析 VALUES
-            let values = if let Some(source) = &insert.source {
-                if let sqlast::SetExpr::Values(vals) = source.body.as_ref() {
-                    let mut rows = Vec::new();
-                    for row in &vals.rows {
-                        let mut exprs = Vec::new();
-                        for e in row {
-                            exprs.push(convert_expression(e)?);
+            // 解析 VALUES 或 SELECT 子查询
+            let (values, select) = if let Some(source) = &insert.source {
+                match source.body.as_ref() {
+                    sqlast::SetExpr::Values(vals) => {
+                        let mut rows = Vec::new();
+                        for row in &vals.rows {
+                            let mut exprs = Vec::new();
+                            for e in row {
+                                exprs.push(convert_expression(e)?);
+                            }
+                            rows.push(exprs);
                         }
-                        rows.push(exprs);
+                        (rows, None)
                     }
-                    rows
-                } else {
-                    return Err(EngramDbError::Parse(
-                        "INSERT with subquery not supported yet".into(),
-                    ));
+                    _ => {
+                        // INSERT ... SELECT：source.body 是 SELECT 或集合操作
+                        let select_stmt = convert_query(source)?;
+                        (vec![], Some(Box::new(select_stmt)))
+                    }
                 }
             } else {
                 return Err(EngramDbError::Parse(
@@ -268,6 +271,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 table_name: tbl_name,
                 columns: col_names,
                 values,
+                select,
                 returning,
                 on_conflict,
             }))

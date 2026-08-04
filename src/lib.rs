@@ -1841,4 +1841,58 @@ mod value_tests {
         let result = conn.execute("SELECT id FROM t1 WHERE val > 15 UNION ALL SELECT id FROM t2 WHERE val > 35").unwrap();
         assert_eq!(result.rows.len(), 4, "t1(val>15): 2 行, t2(val>35): 2 行");
     }
+
+    #[test]
+    fn test_insert_select_basic() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        // 源表
+        conn.execute("CREATE TABLE src (id INT64, name VARCHAR)").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+
+        // 目标表
+        conn.execute("CREATE TABLE dst (id INT64, name VARCHAR)").unwrap();
+
+        // INSERT ... SELECT
+        let result = conn.execute("INSERT INTO dst SELECT id, name FROM src").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3));
+
+        // 验证目标表有 3 行
+        let result = conn.execute("SELECT COUNT(*) FROM dst").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3));
+    }
+
+    #[test]
+    fn test_insert_select_with_where() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE products (id INT64, price INT64)").unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 50), (2, 150), (3, 500), (4, 1000)").unwrap();
+
+        conn.execute("CREATE TABLE cheap_products (id INT64, price INT64)").unwrap();
+
+        // INSERT ... SELECT ... WHERE — 只插入价格 < 200 的
+        conn.execute("INSERT INTO cheap_products SELECT id, price FROM products WHERE price < 200").unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM cheap_products").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(2), "price < 200 的产品有 2 个");
+    }
+
+    #[test]
+    fn test_insert_select_with_columns() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE src (a INT64, b INT64, c INT64)").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 10, 100), (2, 20, 200)").unwrap();
+
+        conn.execute("CREATE TABLE dst (x INT64, y INT64)").unwrap();
+
+        // 指定列插入（重排列）
+        conn.execute("INSERT INTO dst (x, y) SELECT c, a FROM src").unwrap();
+
+        let result = conn.execute("SELECT * FROM dst ORDER BY x").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0], vec![Value::Int64(100), Value::Int64(1)]);
+        assert_eq!(result.rows[1], vec![Value::Int64(200), Value::Int64(2)]);
+    }
 }

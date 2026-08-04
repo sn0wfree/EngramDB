@@ -124,6 +124,7 @@ pub fn try_parse_insert(sql: &str) -> Option<Statement> {
         table_name,
         columns,
         values: rows,
+        select: None,
         returning: None,
         on_conflict: None,
     }))

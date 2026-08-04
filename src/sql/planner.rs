@@ -283,6 +283,16 @@ fn plan_update(stmt: UpdateStmt, db: &Database) -> Result<PhysicalPlan> {
 }
 
 fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<PhysicalPlan> {
+    // INSERT ... SELECT：先规划 SELECT 子查询，再包装为 InsertSelect 节点
+    if let Some(select) = stmt.select {
+        let source_plan = plan_select(*select, db)?;
+        return Ok(PhysicalPlan::InsertSelect {
+            table_name: stmt.table_name,
+            columns: stmt.columns,
+            source: Box::new(source_plan),
+        });
+    }
+
     // 验证表存在
     let table = db.get_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
@@ -848,6 +858,8 @@ fn find_scan_plan(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
         PhysicalPlan::Limit { input, .. } => find_scan_plan(input),
         PhysicalPlan::Window { input, .. } => find_scan_plan(input),
         PhysicalPlan::SubqueryScan { plan } => find_scan_plan(plan),
+        PhysicalPlan::SetUnion { left, .. } => find_scan_plan(left),
+        PhysicalPlan::InsertSelect { source, .. } => find_scan_plan(source),
         _ => None,
     }
 }
@@ -1262,6 +1274,8 @@ fn extract_column_names(plan: &PhysicalPlan) -> Vec<String> {
             names
         }
         PhysicalPlan::SubqueryScan { plan } => extract_column_names(plan),
+        PhysicalPlan::SetUnion { left, .. } => extract_column_names(left),
+        PhysicalPlan::InsertSelect { source, .. } => extract_column_names(source),
         _ => vec![],
     }
 }
