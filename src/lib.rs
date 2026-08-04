@@ -2097,4 +2097,110 @@ mod value_tests {
         assert_eq!(result.rows[2][0], Value::Int64(256)); // 16^2 = 256 (整数)
         assert_eq!(result.rows[2][1], Value::Int64(4)); // sqrt(16) = 4 (整数)
     }
+
+    #[test]
+    fn test_json_object() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE _dummy (x INT64)").unwrap();
+        conn.execute("INSERT INTO _dummy VALUES (1)").unwrap();
+        // JSON_OBJECT('name', 'alice', 'age', 30) → {"name":"alice","age":30}
+        let result = conn.execute("SELECT JSON_OBJECT('name', 'alice', 'age', 30) FROM _dummy").unwrap();
+        let json = match &result.rows[0][0] {
+            Value::Json(s) => s.clone(),
+            _ => panic!("Expected JSON value"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["name"], "alice");
+        assert_eq!(parsed["age"], 30);
+    }
+
+    #[test]
+    fn test_json_array() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE _dummy (x INT64)").unwrap();
+        conn.execute("INSERT INTO _dummy VALUES (1)").unwrap();
+        // JSON_ARRAY(1, 'two', 3.0) → [1, "two", 3.0]
+        let result = conn.execute("SELECT JSON_ARRAY(1, 'two', 3.0) FROM _dummy").unwrap();
+        let json = match &result.rows[0][0] {
+            Value::Json(s) => s.clone(),
+            _ => panic!("Expected JSON value"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0], 1);
+        assert_eq!(parsed[1], "two");
+        assert_eq!(parsed[2], 3.0);
+    }
+
+    #[test]
+    fn test_json_array_length_function() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE _dummy (x INT64)").unwrap();
+        conn.execute("INSERT INTO _dummy VALUES (1)").unwrap();
+        // JSON_ARRAY_LENGTH('[1,2,3,4,5]') = 5
+        let result = conn.execute("SELECT JSON_ARRAY_LENGTH('[1,2,3,4,5]') FROM _dummy").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(5));
+
+        // 嵌套路径
+        let result = conn.execute("SELECT JSON_ARRAY_LENGTH('{\"a\":[1,2,3]}', '$.a') FROM _dummy").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3));
+
+        // 非数组应返回 NULL
+        let result = conn.execute("SELECT JSON_ARRAY_LENGTH('{\"a\":1}') FROM _dummy").unwrap();
+        assert_eq!(result.rows[0][0], Value::Null);
+    }
+
+    #[test]
+    fn test_json_set_insert_replace() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE _dummy (x INT64)").unwrap();
+        conn.execute("INSERT INTO _dummy VALUES (1)").unwrap();
+
+        // JSON_SET：设置已存在的路径，覆盖
+        let result = conn.execute("SELECT JSON_SET('{\"a\":1}', '$.a', 99) FROM _dummy").unwrap();
+        let json = match &result.rows[0][0] {
+            Value::Json(s) => s.clone(),
+            _ => panic!("Expected JSON"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["a"], 99);
+
+        // JSON_SET：创建新路径
+        let result = conn.execute("SELECT JSON_SET('{\"a\":1}', '$.b', 42) FROM _dummy").unwrap();
+        let json = match &result.rows[0][0] {
+            Value::Json(s) => s.clone(),
+            _ => panic!("Expected JSON"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], 42);
+
+        // JSON_INSERT：仅当路径不存在时设置
+        let result = conn.execute("SELECT JSON_INSERT('{\"a\":1}', '$.b', 99) FROM _dummy").unwrap();
+        let json = match &result.rows[0][0] {
+            Value::Json(s) => s.clone(),
+            _ => panic!("Expected JSON"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], 99);
+
+        // JSON_INSERT：路径存在时不动
+        let result = conn.execute("SELECT JSON_INSERT('{\"a\":1}', '$.a', 999) FROM _dummy").unwrap();
+        let json = match &result.rows[0][0] {
+            Value::Json(s) => s.clone(),
+            _ => panic!("Expected JSON"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["a"], 1, "JSON_INSERT 在路径存在时不应修改");
+
+        // JSON_REPLACE：仅当路径存在时替换
+        let result = conn.execute("SELECT JSON_REPLACE('{\"a\":1}', '$.b', 99) FROM _dummy").unwrap();
+        let json = match &result.rows[0][0] {
+            Value::Json(s) => s.clone(),
+            _ => panic!("Expected JSON"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert!(parsed.get("b").is_none(), "JSON_REPLACE 在路径不存在时不应创建");
+    }
 }

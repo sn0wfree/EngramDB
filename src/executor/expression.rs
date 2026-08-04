@@ -917,6 +917,59 @@ fn eval_function(
             };
             eval_json_array_length(&json_vec, path_vec.as_ref())
         }
+        // JSON_OBJECT(k1, v1, k2, v2, ...) — 构造 JSON 对象（v0.15.0 新增）
+        "JSON_OBJECT" => {
+            if args.len() % 2 != 0 {
+                return Err(EngramDbError::Parse("JSON_OBJECT requires even number of arguments (key, value pairs)".into()));
+            }
+            // 每行都需要构造一个对象，但这里所有行共享同一个 JSON_OBJECT（无列引用作为参数）
+            // 简化为对所有行应用同一个 JSON
+            let key_vecs: Vec<Vector> = args.iter().step_by(2)
+                .map(|a| eval_vectorized(a, chunk, column_names))
+                .collect::<Result<Vec<_>>>()?;
+            let val_vecs: Vec<Vector> = args.iter().skip(1).step_by(2)
+                .map(|a| eval_vectorized(a, chunk, column_names))
+                .collect::<Result<Vec<_>>>()?;
+            eval_json_object(&key_vecs, &val_vecs)
+        }
+        // JSON_ARRAY(v1, v2, ...) — 构造 JSON 数组（v0.15.0 新增）
+        "JSON_ARRAY" => {
+            let val_vecs: Vec<Vector> = args.iter()
+                .map(|a| eval_vectorized(a, chunk, column_names))
+                .collect::<Result<Vec<_>>>()?;
+            eval_json_array(&val_vecs)
+        }
+        // JSON_SET(json, path, value) — 设置/创建路径的值（v0.15.0 新增）
+        "JSON_SET" => {
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("JSON_SET requires 3 arguments".into()));
+            }
+            let json_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let path_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let val_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            eval_json_set(&json_vec, &path_vec, &val_vec, false)
+        }
+        // JSON_INSERT(json, path, value) — 仅当路径不存在时设置（v0.15.0 新增）
+        "JSON_INSERT" => {
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("JSON_INSERT requires 3 arguments".into()));
+            }
+            let json_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let path_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let val_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            eval_json_set(&json_vec, &path_vec, &val_vec, true)
+        }
+        // JSON_REPLACE(json, path, value) — 仅当路径存在时替换（v0.15.0 新增）
+        "JSON_REPLACE" => {
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("JSON_REPLACE requires 3 arguments".into()));
+            }
+            let json_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let path_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let val_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            // JSON_REPLACE = JSON_SET 但只在路径存在时生效
+            eval_json_replace(&json_vec, &path_vec, &val_vec)
+        }
         // 向量函数（v0.12.0 新增，Agent 语义记忆 / RAG 场景）
         "VECTOR_DISTANCE" | "VEC_DISTANCE" => {
             if args.len() != 2 {
@@ -2143,6 +2196,255 @@ fn json_array_length_value(json_val: &Value, path_val: Option<&Value>) -> Value 
     match current.as_array() {
         Some(arr) => Value::Int64(arr.len() as i64),
         None => Value::Null,
+    }
+}
+
+/// 将 Value 转为 serde_json::Value
+fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Int32(n) => serde_json::Value::from(*n),
+        Value::Int64(n) => serde_json::Value::from(*n),
+        Value::Float32(n) => serde_json::Value::from(*n as f64),
+        Value::Float64(n) => serde_json::Value::from(*n),
+        Value::Varchar(s) | Value::Json(s) => {
+            // 先尝试解析为 JSON，否则当作字符串
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        }
+        Value::Blob(_) => serde_json::Value::String("<blob>".to_string()),
+        Value::Vector(_) | Value::VectorInt8(_) => serde_json::Value::String("<vector>".to_string()),
+        Value::Timestamp(t) => serde_json::Value::from(*t),
+    }
+}
+
+/// 将 serde_json::Value 转回 Value::Json 字符串
+fn json_to_value(v: &serde_json::Value) -> Value {
+    Value::Json(v.to_string())
+}
+
+/// JSON_OBJECT(k1, v1, k2, v2, ...) — 构造 JSON 对象
+fn eval_json_object(key_vecs: &[Vector], val_vecs: &[Vector]) -> Result<Vector> {
+    let count = if let Some(v) = key_vecs.first() { v.len() } else { 1 };
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut obj = serde_json::Map::new();
+        for (k_vec, v_vec) in key_vecs.iter().zip(val_vecs.iter()) {
+            let k_val = k_vec.get(i);
+            let v_val = v_vec.get(i);
+            let key = match k_val {
+                Value::Varchar(s) | Value::Json(s) => s.clone(),
+                _ => format!("{}", k_val),
+            };
+            obj.insert(key, value_to_json(&v_val));
+        }
+        result.push(json_to_value(&serde_json::Value::Object(obj)));
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// JSON_ARRAY(v1, v2, ...) — 构造 JSON 数组
+fn eval_json_array(val_vecs: &[Vector]) -> Result<Vector> {
+    let count = if let Some(v) = val_vecs.first() { v.len() } else { 1 };
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut arr = Vec::new();
+        for v_vec in val_vecs.iter() {
+            arr.push(value_to_json(&v_vec.get(i)));
+        }
+        result.push(json_to_value(&serde_json::Value::Array(arr)));
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// 在 serde_json::Value 上设置路径的值（递归）
+///
+/// path 是 JSONPath 片段列表（如 ["a", "b"] 表示 $.a.b）
+/// insert_only=true: 仅当路径不存在时设置
+fn json_set_path(
+    root: &mut serde_json::Value,
+    path: &[serde_json::Value],
+    value: serde_json::Value,
+    insert_only: bool,
+) {
+    if path.is_empty() {
+        *root = value;
+        return;
+    }
+    let key = &path[0];
+    let rest = &path[1..];
+
+    match root {
+        serde_json::Value::Object(map) => {
+            let key_str = match key {
+                serde_json::Value::String(s) => s.clone(),
+                _ => key.to_string(),
+            };
+            if rest.is_empty() {
+                if insert_only && map.contains_key(&key_str) {
+                    return;
+                }
+                map.insert(key_str, value);
+            } else {
+                let entry = map.entry(key_str.clone()).or_insert(serde_json::Value::Null);
+                json_set_path(entry, rest, value, insert_only);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            // 数组索引路径
+            if let Some(idx) = key.as_u64() {
+                let idx = idx as usize;
+                if idx <= arr.len() {
+                    if rest.is_empty() {
+                        if idx == arr.len() {
+                            arr.push(value);
+                        } else if !insert_only {
+                            arr[idx] = value;
+                        }
+                    } else if idx < arr.len() {
+                        json_set_path(&mut arr[idx], rest, value, insert_only);
+                    }
+                }
+            }
+        }
+        _ => {
+            // 非对象/数组：替换为对象
+            if !insert_only {
+                let mut map = serde_json::Map::new();
+                let key_str = match key {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => key.to_string(),
+                };
+                if rest.is_empty() {
+                    map.insert(key_str, value);
+                } else {
+                    let mut new_val = serde_json::Value::Null;
+                    json_set_path(&mut new_val, rest, value, insert_only);
+                    map.insert(key_str, new_val);
+                }
+                *root = serde_json::Value::Object(map);
+            }
+        }
+    }
+}
+
+/// JSON_SET / JSON_INSERT：路径设置/创建值
+fn eval_json_set(json_vec: &Vector, path_vec: &Vector, val_vec: &Vector, insert_only: bool) -> Result<Vector> {
+    let json_flat = json_vec.to_flat();
+    let path_flat = path_vec.to_flat();
+    let val_flat = val_vec.to_flat();
+    let len = json_flat.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let jv = &json_flat[i];
+        let pv = &path_flat[i.min(path_flat.len() - 1)];
+        let vv = &val_flat[i];
+        if jv.is_null() || pv.is_null() {
+            result.push(Value::Null);
+            continue;
+        }
+        let json_str = match jv.as_str() {
+            Some(s) => s,
+            None => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let path_str = match pv.as_str() {
+            Some(s) => s,
+            None => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let mut parsed = match serde_json::from_str::<serde_json::Value>(json_str) {
+            Ok(v) => v,
+            Err(_) => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let path = parse_json_path(path_str);
+        json_set_path(&mut parsed, &path, value_to_json(vv), insert_only);
+        result.push(json_to_value(&parsed));
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// JSON_REPLACE：仅当路径存在时替换
+fn eval_json_replace(json_vec: &Vector, path_vec: &Vector, val_vec: &Vector) -> Result<Vector> {
+    let json_flat = json_vec.to_flat();
+    let path_flat = path_vec.to_flat();
+    let val_flat = val_vec.to_flat();
+    let len = json_flat.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let jv = &json_flat[i];
+        let pv = &path_flat[i.min(path_flat.len() - 1)];
+        let vv = &val_flat[i];
+        if jv.is_null() || pv.is_null() {
+            result.push(Value::Null);
+            continue;
+        }
+        let json_str = match jv.as_str() {
+            Some(s) => s,
+            None => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let path_str = match pv.as_str() {
+            Some(s) => s,
+            None => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let mut parsed = match serde_json::from_str::<serde_json::Value>(json_str) {
+            Ok(v) => v,
+            Err(_) => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let path = parse_json_path(path_str);
+        // 仅当路径存在时替换
+        if json_path_exists(&parsed, &path) {
+            json_set_path(&mut parsed, &path, value_to_json(vv), false);
+        }
+        result.push(json_to_value(&parsed));
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// 检查 JSON 路径是否存在
+fn json_path_exists(root: &serde_json::Value, path: &[serde_json::Value]) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    let key = &path[0];
+    let rest = &path[1..];
+    match root {
+        serde_json::Value::Object(map) => {
+            let key_str = match key {
+                serde_json::Value::String(s) => s.clone(),
+                _ => return false,
+            };
+            if rest.is_empty() {
+                map.contains_key(&key_str)
+            } else {
+                map.get(&key_str).map_or(false, |v| json_path_exists(v, rest))
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            if let Some(idx) = key.as_u64() {
+                let idx = idx as usize;
+                arr.get(idx).map_or(false, |v| json_path_exists(v, rest))
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 
