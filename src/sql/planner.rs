@@ -541,6 +541,23 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         };
     }
 
+    // HAVING：在聚合之上添加 Filter 节点（v0.15.0 新增）
+    if let Some(having_expr) = &stmt.having {
+        if needs_aggregate {
+            // 将 HAVING 中的聚合函数调用替换为 ColumnRef（引用 Aggregate 输出列）
+            let rewritten = rewrite_having_aggregates(
+                having_expr,
+                &group_by_indices,
+                &aggregates,
+                &scan_column_names,
+            );
+            plan = PhysicalPlan::Filter {
+                input: Box::new(plan),
+                condition: rewritten,
+            };
+        }
+    }
+
     // 检测窗口函数
     let has_window = stmt.select_list.iter().any(|item| {
         if let SelectItem::Expression(expr, _) = item {
@@ -973,6 +990,95 @@ fn extract_aggregates_from_select(items: &[SelectItem]) -> (Vec<(String, Express
     }
 
     (aggs, non_aggs)
+}
+
+/// 将 HAVING 中的聚合函数调用替换为 ColumnRef
+///
+/// HAVING 条件中的聚合函数（如 SUM(x) > 100）应引用 Aggregate 节点的输出列，
+/// 而不是重新执行聚合计算。该函数将聚合函数调用替换为对应的列引用。
+///
+/// 返回 (替换后的表达式, 聚合列索引列表)
+fn rewrite_having_aggregates(
+    expr: &Expression,
+    group_by_indices: &[usize],
+    aggregates: &[AggregateExpr],
+    scan_column_names: &[String],
+) -> Expression {
+    match expr {
+        Expression::Function { name, args, distinct, .. } => {
+            let upper = name.to_uppercase();
+            let is_agg = matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX");
+            if is_agg {
+                // 找到该聚合在 aggregates 列表中的索引
+                let input_col = match args.first() {
+                    Some(Expression::ColumnRef { column, .. }) => {
+                        scan_column_names.iter().position(|c| c == column).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                let agg_idx = aggregates.iter().position(|a| {
+                    let func_name = format!("{:?}", a.func).to_uppercase();
+                    func_name == upper && a.input == input_col
+                });
+                if let Some(idx) = agg_idx {
+                    // 使用与 Aggregate 输出相同的列名格式
+                    let col_name = format!("{:?}({})", aggregates[idx].func, aggregates[idx].input);
+                    return Expression::ColumnRef {
+                        table: None,
+                        column: col_name,
+                    };
+                }
+            }
+            // 非聚合函数，递归处理参数
+            let new_args: Vec<Expression> = args.iter()
+                .map(|a| rewrite_having_aggregates(a, group_by_indices, aggregates, scan_column_names))
+                .collect();
+            Expression::Function {
+                name: name.clone(),
+                args: new_args,
+                distinct: *distinct,
+                count_star: false,
+                over: None,
+            }
+        }
+        Expression::BinaryOp { left, op, right } => {
+            Expression::BinaryOp {
+                left: Box::new(rewrite_having_aggregates(left, group_by_indices, aggregates, scan_column_names)),
+                op: *op,
+                right: Box::new(rewrite_having_aggregates(right, group_by_indices, aggregates, scan_column_names)),
+            }
+        }
+        Expression::UnaryOp { op, expr } => {
+            Expression::UnaryOp {
+                op: *op,
+                expr: Box::new(rewrite_having_aggregates(expr, group_by_indices, aggregates, scan_column_names)),
+            }
+        }
+        Expression::Literal(_) | Expression::ColumnRef { .. } | Expression::Placeholder(_) => expr.clone(),
+        Expression::Subquery(_) | Expression::Exists { .. } | Expression::InSubquery { .. } => expr.clone(),
+        Expression::Like { expr, pattern } => {
+            Expression::Like {
+                expr: Box::new(rewrite_having_aggregates(expr, group_by_indices, aggregates, scan_column_names)),
+                pattern: Box::new(rewrite_having_aggregates(pattern, group_by_indices, aggregates, scan_column_names)),
+            }
+        }
+        Expression::Case { when_then, else_expr } => {
+            Expression::Case {
+                when_then: when_then.iter().map(|(w, t)| {
+                    (rewrite_having_aggregates(w, group_by_indices, aggregates, scan_column_names),
+                     rewrite_having_aggregates(t, group_by_indices, aggregates, scan_column_names))
+                }).collect(),
+                else_expr: else_expr.as_ref().map(|e| Box::new(rewrite_having_aggregates(e, group_by_indices, aggregates, scan_column_names))),
+            }
+        }
+        Expression::InList { expr, list } => {
+            Expression::InList {
+                expr: Box::new(rewrite_having_aggregates(expr, group_by_indices, aggregates, scan_column_names)),
+                list: list.iter().map(|e| rewrite_having_aggregates(e, group_by_indices, aggregates, scan_column_names)).collect(),
+            }
+        }
+        _ => expr.clone(),
+    }
 }
 
 /// 规划投影表达式和列名

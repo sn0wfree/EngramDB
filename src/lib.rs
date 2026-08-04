@@ -1689,4 +1689,46 @@ mod value_tests {
         let all = table.scan(&[0, 1]).unwrap();
         assert_eq!(all.len(), 1, "compaction 后只有新数据");
     }
+
+    #[test]
+    fn test_having_basic() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        // 创建表
+        conn.execute("CREATE TABLE sales (id INT64, product VARCHAR, amount INT64)").unwrap();
+        conn.execute("INSERT INTO sales VALUES (1, 'A', 100)").unwrap();
+        conn.execute("INSERT INTO sales VALUES (2, 'A', 200)").unwrap();
+        conn.execute("INSERT INTO sales VALUES (3, 'B', 150)").unwrap();
+        conn.execute("INSERT INTO sales VALUES (4, 'B', 50)").unwrap();
+        conn.execute("INSERT INTO sales VALUES (5, 'C', 300)").unwrap();
+
+        // 先验证分组查询基础
+        let result = conn.execute("SELECT product, SUM(amount) FROM sales GROUP BY product").unwrap();
+        assert_eq!(result.rows.len(), 3, "应有 3 个分组");
+
+        // HAVING SUM(amount) > 250: A=300, B=200, C=300 → A 和 C 通过
+        let result = conn.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 250").unwrap();
+        assert_eq!(result.rows.len(), 2, "A(total=300) 和 C(total=300) 应被选中");
+
+        // HAVING SUM(amount) < 250: A=300, B=200, C=300 → B 通过
+        let result = conn.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) < 250").unwrap();
+        assert_eq!(result.rows.len(), 1, "B(total=200) 应被选中");
+    }
+
+    #[test]
+    fn test_having_with_count() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE orders (id INT64, customer VARCHAR, amount INT64)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 'Alice', 100)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (2, 'Bob', 200)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (3, 'Alice', 150)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (4, 'Charlie', 50)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (5, 'Bob', 300)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (6, 'Alice', 200)").unwrap();
+
+        // HAVING COUNT(*) > 1: Alice=3, Bob=2, Charlie=1 → Alice 和 Bob 通过
+        let result = conn.execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) > 1").unwrap();
+        assert_eq!(result.rows.len(), 2, "Alice(3) 和 Bob(2) 应有多个订单");
+    }
 }
