@@ -312,6 +312,22 @@ impl Database {
         table.vector_search(index_name, query, k)
     }
 
+    /// 向量相似度搜索 + 搜索 trace（v0.15.0 V13 新增）
+    ///
+    /// 返回 (top-k 最近邻, 搜索 trace)。trace 包含访问路径、入口点、候选节点数等
+    /// 可追溯信息，Agent 场景下用于溯源推理路径。
+    pub fn vector_search_with_trace(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<(Vec<crate::storage::vector_index::Neighbor>, crate::storage::vector_index::SearchTrace)> {
+        let table = self.get_table(table_name)
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
+        table.vector_search_with_trace(index_name, query, k)
+    }
+
     /// 混合搜索（向量近似搜索 + 标量条件过滤）
     ///
     /// 流程：

@@ -197,6 +197,49 @@ pub struct Neighbor {
     pub distance: f32,
 }
 
+/// 搜索 trace（v0.15.0 V13 新增）
+///
+/// 返回向量搜索的可追溯路径，Agent 场景下用于溯源：
+/// - 入口点：搜索从哪个节点开始
+/// - 访问路径：搜索过程中访问的节点 ID 序列（按访问顺序）
+/// - 候选节点数：搜索过程中评估的候选节点总数
+/// - 层数遍历：从顶层到 0 层
+/// - 索引类型：HNSW / 量化
+#[derive(Debug, Clone)]
+pub struct SearchTrace {
+    /// 入口点节点 ID（搜索起始节点）
+    pub entry_point: Option<u32>,
+    /// 搜索过程中访问的节点 ID 序列（按访问顺序，可能重复）
+    pub visited_nodes: Vec<u32>,
+    /// 评估的候选节点总数（去重）
+    pub candidates_visited: usize,
+    /// 遍历的层数（从顶层到 0 层）
+    pub layers_traversed: usize,
+    /// 索引类型描述（如 "HNSW" / "HNSW-INT8"）
+    pub index_type: String,
+    /// 使用的度量函数名称
+    pub metric: String,
+    /// 最终 top-k 结果的节点 ID（按距离升序）
+    pub top_k_ids: Vec<u32>,
+    /// 最终 top-k 结果的距离（与 top_k_ids 一一对应）
+    pub top_k_distances: Vec<f32>,
+}
+
+impl SearchTrace {
+    pub fn new() -> Self {
+        Self {
+            entry_point: None,
+            visited_nodes: Vec::new(),
+            candidates_visited: 0,
+            layers_traversed: 0,
+            index_type: "HNSW".to_string(),
+            metric: "L2".to_string(),
+            top_k_ids: Vec::new(),
+            top_k_distances: Vec::new(),
+        }
+    }
+}
+
 /// HNSW 向量索引
 pub struct HnswIndex {
     config: HnswConfig,
@@ -482,21 +525,28 @@ impl HnswIndex {
         &self.config
     }
 
-    /// K 近邻搜索
+    /// K 近邻搜索（带 trace，v0.15.0 V13 新增）
     ///
-    /// 自动过滤已逻辑删除（tombstone）的节点。
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
+    /// 返回 (top-k 邻居, 搜索 trace)。自动过滤已逻辑删除（tombstone）的节点。
+    pub fn search_with_trace(&self, query: &[f32], k: usize) -> (Vec<Neighbor>, SearchTrace) {
+        let mut trace = SearchTrace::new();
+        trace.index_type = if self.config.quantize { "HNSW-INT8".to_string() } else { "HNSW".to_string() };
+        trace.metric = match self.config.metric {
+            DistanceMetric::L2 => "L2".to_string(),
+            DistanceMetric::InnerProduct => "InnerProduct".to_string(),
+            DistanceMetric::Cosine => "Cosine".to_string(),
+        };
+
         assert_eq!(query.len(), self.config.dim, "向量维度不匹配");
 
         if self.nodes.is_empty() {
-            return Vec::new();
+            return (Vec::new(), trace);
         }
 
         // 如果删除比例较高，扩大 ef 确保能找到足够有效结果
         let effective_k = if self.deleted.is_empty() {
             k
         } else {
-            // 预估需要搜索更多候选才能凑够 k 个有效结果
             let ratio = self.nodes.len() as f64 / (self.nodes.len() - self.deleted.len()).max(1) as f64;
             (k as f64 * ratio * 1.5) as usize
         };
@@ -505,8 +555,12 @@ impl HnswIndex {
         let mut current_enter = self.enter_point.unwrap();
         let mut current_dist = self.distance(query, &self.nodes[current_enter as usize].vector);
 
+        trace.entry_point = Some(current_enter);
+        trace.visited_nodes.push(current_enter);
+
         // 从顶层贪婪下降到第 0 层
         for level in (1..=self.max_level).rev() {
+            trace.layers_traversed += 1;
             let mut changed = true;
             while changed {
                 changed = false;
@@ -516,6 +570,7 @@ impl HnswIndex {
                 }
                 for &neighbor_id in &node.layers[level as usize] {
                     let d = self.distance(query, &self.nodes[neighbor_id as usize].vector);
+                    trace.visited_nodes.push(neighbor_id);
                     if d < current_dist {
                         current_dist = d;
                         current_enter = neighbor_id;
@@ -525,16 +580,107 @@ impl HnswIndex {
             }
         }
 
-        // 在第 0 层做完整搜索
+        // 在第 0 层做完整搜索（带 trace 的版本）
         let entry_points = vec![(current_dist, current_enter)];
-        let results = self.search_layer(query, &entry_points, 0, ef);
+        let (results, layer_visited) = self.search_layer_with_trace(query, &entry_points, 0, ef);
+        trace.visited_nodes.extend(layer_visited);
+
+        // 去重统计
+        let mut seen = std::collections::HashSet::new();
+        for &n in &trace.visited_nodes {
+            seen.insert(n);
+        }
+        trace.candidates_visited = seen.len();
 
         // 过滤 tombstone 节点，取前 k 个有效结果
-        results.into_iter()
+        let neighbors: Vec<Neighbor> = results.into_iter()
             .filter(|(_, id)| !self.deleted.contains(id))
             .take(k)
             .map(|(dist, id)| Neighbor { id, distance: dist })
-            .collect()
+            .collect();
+
+        // 填充 trace 的 top-k
+        for n in &neighbors {
+            trace.top_k_ids.push(n.id);
+            trace.top_k_distances.push(n.distance);
+        }
+
+        (neighbors, trace)
+    }
+
+    /// K 近邻搜索
+    ///
+    /// 自动过滤已逻辑删除（tombstone）的节点。
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
+        let (results, _trace) = self.search_with_trace(query, k);
+        results
+    }
+
+    /// 在指定层中找最近的 ef 个邻居（带 trace）
+    fn search_layer_with_trace(
+        &self,
+        query: &[f32],
+        entry_points: &[(f32, u32)],
+        level: i32,
+        ef: usize,
+    ) -> (Vec<(f32, u32)>, Vec<u32>) {
+        let mut visited = vec![false; self.nodes.len()];
+        let mut candidates: BinaryHeap<Reverse<SearchCandidate>> = BinaryHeap::new();
+        let mut results: BinaryHeap<SearchCandidate> = BinaryHeap::new();
+        let mut visited_ids = Vec::new();
+
+        for &(dist, id) in entry_points {
+            if !visited[id as usize] {
+                visited[id as usize] = true;
+                visited_ids.push(id);
+                candidates.push(Reverse(SearchCandidate { distance: dist, id }));
+                results.push(SearchCandidate { distance: dist, id });
+            }
+        }
+
+        while let Some(Reverse(c)) = candidates.pop() {
+            if results.len() >= ef {
+                if let Some(farthest) = results.peek() {
+                    if c.distance > farthest.distance {
+                        break;
+                    }
+                }
+            }
+
+            let node = &self.nodes[c.id as usize];
+            if level as usize >= node.layers.len() {
+                continue;
+            }
+
+            for &neighbor_id in &node.layers[level as usize] {
+                if visited[neighbor_id as usize] {
+                    continue;
+                }
+                visited[neighbor_id as usize] = true;
+                visited_ids.push(neighbor_id);
+
+                let neighbor = &self.nodes[neighbor_id as usize];
+                let dist = self.distance(query, &neighbor.vector);
+
+                candidates.push(Reverse(SearchCandidate { distance: dist, id: neighbor_id }));
+
+                if results.len() < ef {
+                    results.push(SearchCandidate { distance: dist, id: neighbor_id });
+                } else if let Some(farthest) = results.peek() {
+                    if dist < farthest.distance {
+                        results.pop();
+                        results.push(SearchCandidate { distance: dist, id: neighbor_id });
+                    }
+                }
+            }
+        }
+
+        let mut result_vec: Vec<(f32, u32)> = results.into_vec()
+            .into_iter()
+            .map(|s| (s.distance, s.id))
+            .collect();
+        result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        (result_vec, visited_ids)
     }
 
     /// 逻辑删除一个节点（tombstone）

@@ -11,7 +11,7 @@ use super::column_store::ColumnStore;
 use super::delta_store::DeltaStore;
 use super::index::inverted_index::InvertedIndex;
 use super::index::skiplist::SkipListIndex;
-use super::vector_index::{HnswIndex, HnswConfig, DistanceMetric, Neighbor};
+use super::vector_index::{HnswIndex, HnswConfig, DistanceMetric, Neighbor, SearchTrace};
 use crate::common::error::EngramDbError;
 
 /// 按指定列对列式数据做聚簇重排
@@ -504,17 +504,37 @@ impl Table {
     ///
     /// 返回 top-k 最近邻的行 ID 和距离（行 ID 为表内行号）。
     pub fn vector_search(&self, index_name: &str, query: &[f32], k: usize) -> Result<Vec<Neighbor>> {
+        let (results, _trace) = self.vector_search_with_trace(index_name, query, k)?;
+        Ok(results)
+    }
+
+    /// 向量相似度搜索 + 搜索 trace（v0.15.0 V13 新增）
+    ///
+    /// 返回 (top-k 最近邻, 搜索 trace)。trace 包含访问路径、入口点、候选节点数等
+    /// 可追溯信息，Agent 场景下用于溯源推理路径。
+    pub fn vector_search_with_trace(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<(Vec<Neighbor>, SearchTrace)> {
         let (index, id_mapping) = self.vector_indexes.get(index_name)
             .ok_or_else(|| EngramDbError::IndexNotFound(index_name.into()))?;
 
-        let results = index.search(query, k);
+        let (hnsw_results, mut trace) = index.search_with_trace(query, k);
         // 将 HNSW 内部 ID 转换为表行 ID
-        Ok(results.into_iter()
+        let neighbors: Vec<Neighbor> = hnsw_results.into_iter()
             .map(|n| Neighbor {
                 id: id_mapping.get(n.id as usize).copied().unwrap_or(n.id),
                 distance: n.distance,
             })
-            .collect())
+            .collect();
+
+        // 更新 trace 中的 top_k_ids 为表行 ID（而非 HNSW 内部 ID）
+        trace.top_k_ids = neighbors.iter().map(|n| n.id).collect();
+        // 距离不变（id_mapping 只影响 ID，不影响距离）
+
+        Ok((neighbors, trace))
     }
 
     /// 序列化所有索引为字节（v0.12.0 索引持久化）

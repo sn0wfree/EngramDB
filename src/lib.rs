@@ -1626,6 +1626,95 @@ mod value_tests {
     }
 
     #[test]
+    fn test_search_trace() {
+        use crate::storage::vector_index::DistanceMetric;
+        use crate::common::types::{TableDef, ColumnDef, DataType};
+
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int64).primary_key(),
+            ColumnDef::new("vec", DataType::Vector { dim: 4 }),
+        ];
+        let table_def = TableDef::new(0, "items", columns);
+        let db = conn.database_mut();
+        db.create_table(table_def).unwrap();
+
+        // 插入 10 个向量
+        let rows: Vec<Vec<Value>> = (0..10).map(|i| {
+            let v = vec![i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1];
+            vec![Value::Int64(i as i64), Value::Vector(v)]
+        }).collect();
+        let table = db.get_table_mut("items").unwrap();
+        table.insert(rows).unwrap();
+
+        // 创建 HNSW 索引
+        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50).unwrap();
+
+        // 带 trace 的搜索
+        let query = vec![0.5, 0.5, 0.5, 0.5];
+        let (results, trace) = db.vector_search_with_trace("items", "idx_vec", &query, 3).unwrap();
+
+        // 验证返回结果
+        assert_eq!(results.len(), 3, "应返回 3 个最近邻");
+
+        // 验证 trace 内容
+        assert!(trace.entry_point.is_some(), "trace 应包含入口点");
+        assert!(!trace.visited_nodes.is_empty(), "trace 应包含访问节点序列");
+        assert_eq!(trace.index_type, "HNSW", "索引类型应为 HNSW（非量化）");
+        assert_eq!(trace.metric, "L2", "度量应为 L2");
+        assert_eq!(trace.top_k_ids.len(), 3, "top_k_ids 应包含 3 个 ID");
+        assert_eq!(trace.top_k_distances.len(), 3, "top_k_distances 应包含 3 个距离");
+        assert!(trace.candidates_visited > 0, "候选节点数应 > 0");
+
+        // 验证 top_k_ids 与 results 一致
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(trace.top_k_ids[i], r.id, "trace.top_k_ids 与 results 应一致");
+            assert!((trace.top_k_distances[i] - r.distance).abs() < 1e-6, "距离应一致");
+        }
+
+        // 验证 visited_nodes 是有效的 row_id
+        for &id in &trace.visited_nodes {
+            assert!(id < 10, "访问的节点 ID 应在 0..10 范围内");
+        }
+    }
+
+    #[test]
+    fn test_search_trace_with_quantization() {
+        use crate::storage::vector_index::DistanceMetric;
+        use crate::common::types::{TableDef, ColumnDef, DataType};
+
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int64).primary_key(),
+            ColumnDef::new("vec", DataType::VectorInt8 { dim: 4 }),
+        ];
+        let table_def = TableDef::new(0, "items", columns);
+        let db = conn.database_mut();
+        db.create_table(table_def).unwrap();
+
+        // 插入 20 个向量
+        let rows: Vec<Vec<Value>> = (0..20).map(|i| {
+            let v: Vec<i8> = (0..4).map(|j| ((i + j) as f32 * 10.0) as i8).collect();
+            vec![Value::Int64(i as i64), Value::VectorInt8(v)]
+        }).collect();
+        let table = db.get_table_mut("items").unwrap();
+        table.insert(rows).unwrap();
+
+        // 创建量化 HNSW 索引
+        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50).unwrap();
+
+        // 带 trace 的搜索（query 需要是 f32，向量内部会自动转换）
+        let query = vec![0.5, 0.5, 0.5, 0.5];
+        let (results, trace) = db.vector_search_with_trace("items", "idx_vec", &query, 3).unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(trace.index_type, "HNSW-INT8", "量化索引应标记为 HNSW-INT8");
+        assert!(trace.candidates_visited > 0);
+    }
+
+    #[test]
     fn test_ttl_expiration() {
         use crate::common::types::{TableDef, ColumnDef, DataType};
 
