@@ -115,6 +115,10 @@ harness = false
 name = "v0_13_acceptance_bench"
 harness = false
 
+[[bench]]
+name = "select_star_bench"
+harness = false
+
 # 编译加速配置：
 # - dev: 跳过完整 debug info（行号保留，够用），加速冷启动编译
 # - bench 目标独立 profile：基准测量需要优化，但保持轻量编译

@@ -21,18 +21,8 @@ pub fn execute(
     let table = db.get_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
-    let rows = table.scan(column_indices)?;
-
-    // 分批，每批 VECTOR_SIZE 行
-    let mut chunks = Vec::new();
-    let batch_size = super::super::vector::VECTOR_SIZE;
-
-    for batch in rows.chunks(batch_size) {
-        let chunk = DataChunk::from_rows(batch);
-        chunks.push(chunk);
-    }
-
-    Ok(chunks)
+    // 性能优化：直接走 scan_to_chunks，跳过 row→chunk 转置（每次转置都做 cell 级 clone）
+    table.scan_to_chunks(column_indices)
 }
 
 /// 带条件下推的表扫描（PREWHERE 优化）

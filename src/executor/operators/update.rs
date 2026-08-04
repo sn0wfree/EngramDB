@@ -125,6 +125,7 @@ fn execute_with_txn(
                     &chunks,
                     &[expr.clone()],
                     &col_names,
+                    &[],  // output column_names（DataChunk 不使用）
                 )?;
                 if !result.is_empty() && result[0].count > 0 {
                     let val = result[0].columns[0].get(0).clone();
@@ -242,6 +243,7 @@ fn execute_without_txn(
                 &chunks,
                 &[expr.clone()],
                 &col_names,
+                &[],
             )?;
             if !result.is_empty() && result[0].count > 0 {
                 let val = result[0].columns[0].get(0).clone();

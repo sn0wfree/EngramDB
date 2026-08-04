@@ -20,6 +20,7 @@ use crate::sql::ast::{BinaryOperator, Expression, UnaryOperator};
 use crate::sql::cost_model::CostModel;
 use crate::sql::statistics::TableStatistics;
 use crate::Value;
+use log::trace;
 
 /// 优化执行计划（RBO + CBO 两级优化）
 ///
@@ -83,6 +84,15 @@ fn rbo_optimize(plan: PhysicalPlan) -> Result<PhysicalPlan> {
         if !plan_eq(&reordered, &current) {
             changed = true;
             current = reordered;
+        }
+
+        // 规则 5: 恒等投影消除（IdentityProjection Elimination）
+        // 当 Projection 节点的所有表达式都是 ColumnRef、且与 TableScan column_indices 一一对应时，
+        // 该 Projection 是恒等变换，直接消除。
+        let id_elim = identity_projection_elimination(current.clone());
+        if !plan_eq(&id_elim, &current) {
+            changed = true;
+            current = id_elim;
         }
 
         iterations += 1;
@@ -939,6 +949,99 @@ fn collect_plan_output_columns(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::Limit { input, .. } => collect_plan_output_columns(input),
         PhysicalPlan::Aggregate { .. } => Vec::new(), // 聚合输出列名不确定
         _ => Vec::new(),
+    }
+}
+
+/// 恒等投影消除（IdentityProjection Elimination）
+///
+/// 检测 `Projection { all ColumnRef, 输出顺序与输入列一致 }` 的恒等变换，
+/// 直接消除该节点以避免 `chunk.columns[idx].clone()` × N 次重复深克隆。
+///
+/// 适用场景：`SELECT *` 与 `SELECT col1, col2, ...`（显式列出且与扫描列顺序一致）。
+///
+/// 注意：planner 的 `collect_referenced_columns` 已保证 `scan_column_indices` 与 SELECT 列顺序一致，
+/// 所以 `expressions[i].column` 必对应 `scan_column_indices[i]`。IdentityProjection 检查仅需验证：
+/// - 所有表达式都是 ColumnRef
+/// - expressions 数量 == column_indices 数量
+fn identity_projection_elimination(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Projection { input, expressions, column_names } => {
+            // 递归处理子节点
+            let new_input = identity_projection_elimination(*input);
+
+            // 仅处理输入是 TableScan 的情况
+            if let PhysicalPlan::TableScan { ref table_name, ref column_indices } = new_input {
+                // 检查：所有表达式都是纯 ColumnRef
+                if !expressions.iter().all(|e| matches!(e, Expression::ColumnRef { .. })) {
+                    return PhysicalPlan::Projection {
+                        input: Box::new(new_input),
+                        expressions,
+                        column_names,
+                    };
+                }
+
+                // 检查：expressions 数量 == scan 的列数
+                if expressions.len() != column_indices.len() {
+                    return PhysicalPlan::Projection {
+                        input: Box::new(new_input),
+                        expressions,
+                        column_names,
+                    };
+                }
+
+                // 检查：expressions[i].column == column_names[i]（projection 输出列名一致性）
+                // 由于 planner 保证 column_indices 顺序与 SELECT 列表一致，
+                // 所以 scan_column_names[i] == column_names[i] == expressions[i].column
+                let matches = expressions.iter().enumerate().all(|(i, expr)| {
+                    if let Expression::ColumnRef { column, .. } = expr {
+                        column_names.get(i).map(|n| n == column).unwrap_or(false)
+                    } else {
+                        false
+                    }
+                });
+
+                if !matches {
+                    return PhysicalPlan::Projection {
+                        input: Box::new(new_input),
+                        expressions,
+                        column_names,
+                    };
+                }
+
+                // 所有条件满足：恒等投影，直接消除
+                trace!("IdentityProjection eliminated for table '{}'", table_name);
+                return new_input;
+            }
+
+            // 非 TableScan 输入：保留 Projection 节点
+            PhysicalPlan::Projection {
+                input: Box::new(new_input),
+                expressions,
+                column_names,
+            }
+        }
+        PhysicalPlan::Filter { input, condition } => PhysicalPlan::Filter {
+            input: Box::new(identity_projection_elimination(*input)),
+            condition,
+        },
+        PhysicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
+            input: Box::new(identity_projection_elimination(*input)),
+            limit,
+        },
+        PhysicalPlan::Sort { input, sort_keys, limit } => PhysicalPlan::Sort {
+            input: Box::new(identity_projection_elimination(*input)),
+            sort_keys,
+            limit,
+        },
+        PhysicalPlan::Aggregate { input, group_by, aggregates } => PhysicalPlan::Aggregate {
+            input: Box::new(identity_projection_elimination(*input)),
+            group_by,
+            aggregates,
+        },
+        PhysicalPlan::Distinct { input } => PhysicalPlan::Distinct {
+            input: Box::new(identity_projection_elimination(*input)),
+        },
+        other => other,
     }
 }
 

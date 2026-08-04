@@ -246,8 +246,17 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::TableScan { table_name, column_indices } => {
-            let chunks = operators::table_scan::execute(db, &table_name, &column_indices)?;
-            let (columns, rows) = collect_result(&chunks, db, &table_name, &column_indices)?;
+            // 性能优化：直传路径（最常见场景 SELECT * / 简单 SELECT）
+            // 跳过 DataChunk 中间层，直接产出行 Vec，避免 chunks_to_rows 的二次克隆
+            let (columns, rows) = {
+                let table = db.get_table_mut(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                let columns: Vec<String> = column_indices.iter()
+                    .map(|&i| table.def.columns[i].name.clone())
+                    .collect();
+                let rows = table.scan_to_rows_direct(&column_indices)?;
+                (columns, rows)
+            };
             Ok(QueryResult {
                 columns,
                 rows,
@@ -320,7 +329,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_columns = input_result.columns.clone();
 
             let projected = operators::projection::execute(
-                &input_chunks, &expressions, &input_columns
+                &input_chunks, &expressions, &input_columns, &column_names
             )?;
             let rows = chunks_to_rows(&projected);
 

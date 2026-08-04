@@ -651,6 +651,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     }
 
     // 确定扫描的列（所有被引用的列）
+    // 注意：collect_referenced_columns 现在返回列名（Vec 而非 HashSet），保持 SELECT/WHERE 中出现的顺序
     let all_referenced_cols = collect_referenced_columns(&stmt, &table.def.columns);
     let mut scan_column_indices: Vec<usize> = all_referenced_cols.iter()
         .filter_map(|name| table.def.column_index(name))
@@ -1081,43 +1082,112 @@ fn find_scan_plan(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
 
 /// 收集 SELECT 语句中所有被引用的列名
 fn collect_referenced_columns(stmt: &SelectStmt, table_cols: &[crate::common::types::ColumnDef]) -> Vec<String> {
-    let mut cols = std::collections::HashSet::new();
+    // 性能优化 + 确定性：用 Vec + 末尾检查代替 HashSet
+    // - 保证列顺序：先出现在 SELECT 中的列排在前面，WHERE/GROUP BY 等引用的列追加在末尾
+    // - 避免 HashSet 的非确定性迭代顺序（影响 IdentityProjection 消除的正确性）
+    let mut cols: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push_if_new = |name: &str, cols: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+        if !seen.contains(name) {
+            seen.insert(name.to_string());
+            cols.push(name.to_string());
+        }
+    };
 
     // SELECT 列表
     for item in &stmt.select_list {
         match item {
             SelectItem::Wildcard => {
+                // Wildcard：按 schema 顺序展开所有列
                 for col in table_cols {
-                    cols.insert(col.name.clone());
+                    if !seen.contains(&col.name) {
+                        seen.insert(col.name.clone());
+                        cols.push(col.name.clone());
+                    }
                 }
             }
             SelectItem::Expression(expr, _) => {
-                collect_expr_columns(expr, &mut cols);
+                collect_expr_columns_ordered(expr, &mut cols, &mut seen);
             }
         }
     }
 
     // WHERE
     if let Some(expr) = &stmt.where_clause {
-        collect_expr_columns(expr, &mut cols);
+        collect_expr_columns_ordered(expr, &mut cols, &mut seen);
     }
 
     // GROUP BY
     for expr in &stmt.group_by {
-        collect_expr_columns(expr, &mut cols);
+        collect_expr_columns_ordered(expr, &mut cols, &mut seen);
     }
 
     // HAVING
     if let Some(expr) = &stmt.having {
-        collect_expr_columns(expr, &mut cols);
+        collect_expr_columns_ordered(expr, &mut cols, &mut seen);
     }
 
     // ORDER BY
     for item in &stmt.order_by {
-        collect_expr_columns(&item.expr, &mut cols);
+        collect_expr_columns_ordered(&item.expr, &mut cols, &mut seen);
     }
 
-    cols.into_iter().collect()
+    let _ = push_if_new; // 抑制未使用警告（用闭包风格保留接口一致性）
+    cols
+}
+
+/// 收集表达式中的列引用，保持出现顺序 + 去重
+fn collect_expr_columns_ordered(
+    expr: &Expression,
+    cols: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Expression::ColumnRef { column, .. } => {
+            if !seen.contains(column) {
+                seen.insert(column.clone());
+                cols.push(column.clone());
+            }
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            collect_expr_columns_ordered(left, cols, seen);
+            collect_expr_columns_ordered(right, cols, seen);
+        }
+        Expression::UnaryOp { expr, .. } => {
+            collect_expr_columns_ordered(expr, cols, seen);
+        }
+        Expression::Function { args, .. } => {
+            for arg in args {
+                collect_expr_columns_ordered(arg, cols, seen);
+            }
+        }
+        Expression::Cast { expr, .. } => {
+            collect_expr_columns_ordered(expr, cols, seen);
+        }
+        Expression::InList { expr, list, .. } => {
+            collect_expr_columns_ordered(expr, cols, seen);
+            for e in list {
+                collect_expr_columns_ordered(e, cols, seen);
+            }
+        }
+        Expression::Like { expr, pattern, .. } => {
+            collect_expr_columns_ordered(expr, cols, seen);
+            collect_expr_columns_ordered(pattern, cols, seen);
+        }
+        Expression::Case { when_then, else_expr, .. } => {
+            for (w, t) in when_then {
+                collect_expr_columns_ordered(w, cols, seen);
+                collect_expr_columns_ordered(t, cols, seen);
+            }
+            if let Some(e) = else_expr {
+                collect_expr_columns_ordered(e, cols, seen);
+            }
+        }
+        Expression::IsNull(e) | Expression::IsNotNull(e) => {
+            collect_expr_columns_ordered(e, cols, seen);
+        }
+        _ => {} // Literal, Placeholder, Subquery, Wildcard: 无列引用
+    }
 }
 
 /// 递归收集表达式中的列引用

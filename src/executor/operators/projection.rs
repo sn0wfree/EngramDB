@@ -12,21 +12,23 @@ use super::super::expression::eval_vectorized;
 /// 执行投影（支持表达式计算）
 ///
 /// 对每个表达式向量化求值，结果组成新的 DataChunk。
-/// 输入列名用于解析 ColumnRef，输出列名由调用方指定。
+/// `input_columns` 是输入 chunk 的列名（用于 ColumnRef 解析）；
+/// `column_names` 是输出列名（当前 DataChunk 不存储，仅保留接口一致）。
 pub fn execute(
     input: &[DataChunk],
     expressions: &[Expression],
+    input_columns: &[String],
     column_names: &[String],
 ) -> Result<Vec<DataChunk>> {
     let mut result = Vec::new();
 
     for chunk in input {
-        let projected = project_chunk(chunk, expressions, column_names)?;
+        let projected = project_chunk(chunk, expressions, input_columns)?;
         if !projected.is_empty() {
             result.push(projected);
         }
     }
-
+    let _ = column_names;
     Ok(result)
 }
 
@@ -34,12 +36,12 @@ pub fn execute(
 fn project_chunk(
     chunk: &DataChunk,
     expressions: &[Expression],
-    column_names: &[String],
+    input_columns: &[String],
 ) -> Result<DataChunk> {
     let mut columns = Vec::with_capacity(expressions.len());
 
     for expr in expressions {
-        let vec = eval_vectorized(expr, chunk, column_names)?;
+        let vec = eval_vectorized(expr, chunk, input_columns)?;
         columns.push(vec);
     }
 
