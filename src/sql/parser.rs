@@ -952,6 +952,10 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
             // 先用 dim=0 占位，建表时再从列定义中获取
             Ok(DataType::Vector { dim: 0 })
         }
+        // INT8 量化向量类型 VECTOR_INT8(dim)（v0.15.0 新增）
+        sqlast::DataType::Custom(name, _) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR_INT8" => {
+            Ok(DataType::VectorInt8 { dim: 0 })
+        }
         _ => Err(EngramDbError::Parse(format!(
             "Unsupported data type: {:?}",
             dt

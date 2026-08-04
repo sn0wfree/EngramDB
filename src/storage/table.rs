@@ -413,6 +413,7 @@ impl Table {
         let col_def = &self.def.columns[col_idx];
         let dim = match &col_def.data_type {
             DataType::Vector { dim } => *dim,
+            DataType::VectorInt8 { dim } => *dim,
             _ => return Err(EngramDbError::InvalidFormat(
                 format!("column '{}' is not a vector type", col_def.name)
             )),
@@ -424,6 +425,9 @@ impl Table {
             ));
         }
 
+        // VectorInt8 列自动启用量化存储
+        let is_vector_int8 = matches!(col_def.data_type, DataType::VectorInt8 { .. });
+
         let config = HnswConfig {
             dim,
             m,
@@ -431,6 +435,7 @@ impl Table {
             ef_construction,
             ef_search: 50,
             metric,
+            quantize: is_vector_int8,
         };
         let mut hnsw = HnswIndex::new(config);
         let mut id_mapping = Vec::new();
@@ -448,6 +453,13 @@ impl Table {
                         id_mapping.resize(hnsw_id as usize + 1, 0);
                     }
                     id_mapping[hnsw_id as usize] = current_row_id;
+                } else if let Value::VectorInt8(v) = val {
+                    let f32_vec: Vec<f32> = v.iter().map(|x| *x as f32).collect();
+                    let hnsw_id = hnsw.insert(f32_vec)?;
+                    if hnsw_id as usize >= id_mapping.len() {
+                        id_mapping.resize(hnsw_id as usize + 1, 0);
+                    }
+                    id_mapping[hnsw_id as usize] = current_row_id;
                 }
                 current_row_id += 1;
             }
@@ -458,6 +470,13 @@ impl Table {
         for (_rowid, row) in &delta_data {
             if let Value::Vector(v) = &row[col_idx] {
                 let hnsw_id = hnsw.insert(v.clone())?;
+                if hnsw_id as usize >= id_mapping.len() {
+                    id_mapping.resize(hnsw_id as usize + 1, 0);
+                }
+                id_mapping[hnsw_id as usize] = current_row_id;
+            } else if let Value::VectorInt8(v) = &row[col_idx] {
+                let f32_vec: Vec<f32> = v.iter().map(|x| *x as f32).collect();
+                let hnsw_id = hnsw.insert(f32_vec)?;
                 if hnsw_id as usize >= id_mapping.len() {
                     id_mapping.resize(hnsw_id as usize + 1, 0);
                 }
@@ -1061,6 +1080,10 @@ impl Table {
                     // TODO: 将分配的 ID 与 row_id 关联存储
                     let _ = hnsw_idx.insert(vec.clone());
                     break; // 只处理第一个向量列
+                } else if let Value::VectorInt8(ref vec) = val {
+                    let f32_vec: Vec<f32> = vec.iter().map(|x| *x as f32).collect();
+                    let _ = hnsw_idx.insert(f32_vec);
+                    break;
                 }
             }
         }
@@ -1104,6 +1127,14 @@ impl Table {
                         let row_id = base_row_id + row_idx as u32;
                         if let Value::Vector(v) = &row[col_idx] {
                             if let Ok(hnsw_id) = hnsw.insert(v.clone()) {
+                                if hnsw_id as usize >= id_mapping.len() {
+                                    id_mapping.resize(hnsw_id as usize + 1, 0);
+                                }
+                                id_mapping[hnsw_id as usize] = row_id;
+                            }
+                        } else if let Value::VectorInt8(v) = &row[col_idx] {
+                            let f32_vec: Vec<f32> = v.iter().map(|x| *x as f32).collect();
+                            if let Ok(hnsw_id) = hnsw.insert(f32_vec) {
                                 if hnsw_id as usize >= id_mapping.len() {
                                     id_mapping.resize(hnsw_id as usize + 1, 0);
                                 }
@@ -1423,6 +1454,14 @@ impl Table {
                             let row_id = row_ids[i];
                             if let Value::Vector(v) = &new_row[col_idx] {
                                 if let Ok(hnsw_id) = hnsw.insert(v.clone()) {
+                                    if hnsw_id as usize >= id_mapping.len() {
+                                        id_mapping.resize(hnsw_id as usize + 1, 0);
+                                    }
+                                    id_mapping[hnsw_id as usize] = row_id;
+                                }
+                            } else if let Value::VectorInt8(v) = &new_row[col_idx] {
+                                let f32_vec: Vec<f32> = v.iter().map(|x| *x as f32).collect();
+                                if let Ok(hnsw_id) = hnsw.insert(f32_vec) {
                                     if hnsw_id as usize >= id_mapping.len() {
                                         id_mapping.resize(hnsw_id as usize + 1, 0);
                                     }

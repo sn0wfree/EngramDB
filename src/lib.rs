@@ -438,6 +438,10 @@ pub enum Value {
     Varchar(String),
     Json(String),
     Vector(Vec<f32>),
+    /// INT8 量化向量（v0.15.0 新增）
+    ///
+    /// 存储空间减少 75%（4x 压缩），每个向量附带独立的 scale/offset。
+    VectorInt8(Vec<i8>),
     Blob(Vec<u8>),
     /// Unix 毫秒时间戳（UTC，v0.14.0 新增）
     Timestamp(i64),
@@ -475,8 +479,9 @@ impl Ord for Value {
                 Value::Varchar(_) => 6,
                 Value::Json(_) => 7,
                 Value::Vector(_) => 8,
-                Value::Blob(_) => 9,
-                Value::Timestamp(_) => 10,
+                Value::VectorInt8(_) => 9,
+                Value::Blob(_) => 10,
+                Value::Timestamp(_) => 11,
             }
         }
         let ord = variant_rank(self).cmp(&variant_rank(other));
@@ -506,6 +511,19 @@ impl Ord for Value {
                 }
                 std::cmp::Ordering::Equal
             }
+            (Value::VectorInt8(a), Value::VectorInt8(b)) => {
+                let len_ord = a.len().cmp(&b.len());
+                if len_ord != std::cmp::Ordering::Equal {
+                    return len_ord;
+                }
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let ord = x.cmp(y);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            }
             (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
             _ => std::cmp::Ordering::Equal,
         }
@@ -529,6 +547,12 @@ impl std::hash::Hash for Value {
                 v.len().hash(state);
                 for x in v {
                     x.to_bits().hash(state);
+                }
+            }
+            Value::VectorInt8(v) => {
+                v.len().hash(state);
+                for x in v {
+                    x.hash(state);
                 }
             }
             Value::Blob(b) => b.hash(state),
@@ -584,6 +608,14 @@ impl Value {
             _ => None,
         }
     }
+
+    /// 获取 INT8 量化向量引用
+    pub fn as_vector_int8(&self) -> Option<&[i8]> {
+        match self {
+            Value::VectorInt8(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Value {
@@ -598,6 +630,7 @@ impl std::fmt::Display for Value {
             Value::Varchar(v) => write!(f, "\"{}\"", v),
             Value::Json(v) => write!(f, "'{}'", v),
             Value::Vector(v) => write!(f, "vector[{}]", v.len()),
+            Value::VectorInt8(v) => write!(f, "vector_int8[{}]", v.len()),
             Value::Blob(b) => write!(f, "blob[{}]", b.len()),
             Value::Timestamp(t) => write!(f, "ts({})", t),
         }

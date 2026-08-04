@@ -421,6 +421,7 @@ mod value_tag {
     pub const VARCHAR: u8 = 5;
     pub const JSON: u8 = 6;
     pub const VECTOR: u8 = 7;
+    pub const VECTOR_INT8: u8 = 11;
     pub const BLOB: u8 = 8;
     pub const FLOAT32: u8 = 9;
     pub const TIMESTAMP: u8 = 10;
@@ -472,6 +473,13 @@ fn encode_value(v: &Value) -> Vec<u8> {
             buf.extend_from_slice(&(vec.len() as u32).to_le_bytes());
             for f in vec {
                 buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        Value::VectorInt8(vec) => {
+            buf.push(value_tag::VECTOR_INT8);
+            buf.extend_from_slice(&(vec.len() as u32).to_le_bytes());
+            for byte in vec {
+                buf.push(*byte as u8);
             }
         }
         Value::Blob(b) => {
@@ -579,6 +587,22 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             }
             offset += byte_len;
             Value::Vector(vec)
+        }
+        value_tag::VECTOR_INT8 => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated vector_int8 dim".into()));
+            }
+            let dim = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + dim > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated vector_int8 data".into()));
+            }
+            let mut vec = Vec::with_capacity(dim);
+            for i in 0..dim {
+                vec.push(data[offset + i] as i8);
+            }
+            offset += dim;
+            Value::VectorInt8(vec)
         }
         value_tag::BLOB => {
             if offset + 4 > data.len() {

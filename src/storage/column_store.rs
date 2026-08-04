@@ -348,6 +348,7 @@ impl ColumnStore {
                         DataType::Vector { .. } => col.uncompressed_count as usize * 64, // 估算
                         DataType::Blob => col.uncompressed_count as usize * 64, // 估算
                         DataType::Timestamp => col.uncompressed_count as usize * 8,
+                        DataType::VectorInt8 { .. } => col.uncompressed_count as usize * 16, // 估算
                     };
                     stats.total_original += est_original;
                 } else {
@@ -757,6 +758,19 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
                 }
             }
         }
+        DataType::VectorInt8 { .. } => {
+            for v in values {
+                if let Value::VectorInt8(vec) = v {
+                    let byte_len = vec.len();
+                    buf.extend_from_slice(&(byte_len as u32).to_le_bytes());
+                    for b in vec {
+                        buf.push(*b as u8);
+                    }
+                } else {
+                    buf.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
         DataType::Blob => {
             for v in values {
                 if let Value::Blob(b) = v {
@@ -901,6 +915,27 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
                 }
             }
         }
+        DataType::VectorInt8 { .. } => {
+            for _ in 0..count {
+                if offset + 4 <= data.len() {
+                    let dim = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    let byte_len = dim;
+                    if offset + byte_len <= data.len() {
+                        let mut vec = Vec::with_capacity(dim);
+                        for _ in 0..dim {
+                            vec.push(data[offset] as i8);
+                            offset += 1;
+                        }
+                        values.push(Value::VectorInt8(vec));
+                    } else {
+                        values.push(Value::Null);
+                    }
+                } else {
+                    values.push(Value::Null);
+                }
+            }
+        }
         DataType::Blob => {
             for _ in 0..count {
                 if offset + 4 <= data.len() {
@@ -1015,6 +1050,17 @@ fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
             }
             size
         }
+        DataType::VectorInt8 { .. } => {
+            let mut size = 0;
+            for v in values {
+                if let Value::VectorInt8(vec) = v {
+                    size += 4 + vec.len();
+                } else {
+                    size += 4;
+                }
+            }
+            size
+        }
         DataType::Blob => {
             let mut size = 0;
             for v in values {
@@ -1046,6 +1092,7 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Vector { .. } => 6,
         DataType::Blob => 7,
         DataType::Timestamp => 9,
+        DataType::VectorInt8 { .. } => 10,
     }
 }
 
@@ -1061,6 +1108,7 @@ fn u8_to_data_type(b: u8) -> DataType {
         6 => DataType::Vector { dim: 0 },
         7 => DataType::Blob,
         9 => DataType::Timestamp,
+        10 => DataType::VectorInt8 { dim: 0 },
         _ => DataType::Varchar,
     }
 }

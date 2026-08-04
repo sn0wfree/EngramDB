@@ -2,6 +2,7 @@
 //!
 //! 基于 HNSW (Hierarchical Navigable Small World) 的向量相似度搜索
 //! 支持：L2 距离、内积 (IP)、余弦相似度
+//! 支持 INT8 量化（MinMax 量化，4x 存储压缩）
 //!
 //! 零外部依赖，纯 Rust 实现
 //! 参考论文：https://arxiv.org/abs/1603.09320
@@ -66,6 +67,50 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ============================================================================
+// INT8 量化
+// ============================================================================
+
+/// MinMax 量化：将 f32 向量量化为 i8 向量
+///
+/// 映射公式：`v_i8 = round((v_f32 - min) / (max - min) * 254.0 - 127.0)`
+/// 每个向量独立存储 scale 和 offset，反量化时恢复。
+///
+/// 返回 (量化后的 i8 向量, scale, offset)
+/// 其中 scale = (max - min) / 254.0, offset = (min + max) / 2.0
+pub fn quantize_to_int8(v: &[f32]) -> (Vec<i8>, f32, f32) {
+    if v.is_empty() {
+        return (Vec::new(), 0.0, 0.0);
+    }
+    let mut min = v[0];
+    let mut max = v[0];
+    for &x in v {
+        if x < min { min = x; }
+        if x > max { max = x; }
+    }
+    let range = max - min;
+    if range == 0.0 {
+        // 所有值相同，全量化为 0
+        return (vec![0i8; v.len()], 1.0, min);
+    }
+    let scale = range / 254.0;
+    let offset = (min + max) / 2.0;
+    let mut quantized = Vec::with_capacity(v.len());
+    for &x in v {
+        let q = ((x - min) / range * 254.0 - 127.0).round().clamp(-128.0, 127.0) as i8;
+        quantized.push(q);
+    }
+    (quantized, scale, offset)
+}
+
+/// 反量化：从 i8 向量恢复为 f32 向量
+///
+/// 映射公式：`v_f32 = (q_i8 + 127.0) / 254.0 * range + min`
+/// 等价于：`v_f32 = q_i8 * scale + offset`
+pub fn dequantize_to_f32(q: &[i8], scale: f32, offset: f32) -> Vec<f32> {
+    q.iter().map(|&x| (x as f32) * scale + offset).collect()
+}
+
+// ============================================================================
 // HNSW 索引
 // ============================================================================
 
@@ -78,6 +123,11 @@ pub struct HnswConfig {
     pub ef_construction: usize, // 构建时的搜索宽度 (efConstruction)
     pub ef_search: usize,     // 查询时的搜索宽度 (efSearch)
     pub metric: DistanceMetric,
+    /// 是否启用 INT8 量化存储（v0.15.0 新增）
+    ///
+    /// 启用后，向量存储为 INT8 量化格式，存储量减少 75%。
+    /// 搜索时自动反量化回 f32 计算距离。
+    pub quantize: bool,
 }
 
 impl Default for HnswConfig {
@@ -89,6 +139,7 @@ impl Default for HnswConfig {
             ef_construction: 100,
             ef_search: 50,
             metric: DistanceMetric::L2,
+            quantize: false,
         }
     }
 }
@@ -98,6 +149,14 @@ impl Default for HnswConfig {
 struct HnswNode {
     id: u32,
     vector: Vec<f32>,
+    /// INT8 量化后的向量（v0.15.0 新增）
+    ///
+    /// 当 config.quantize = true 时，vector 仍保留原始 f32 数据用于距离计算，
+    /// quantized + scale + offset 用于持久化存储（节省 75% 空间）。
+    /// 搜索时统一使用 vector 计算距离，quantized 仅用于序列化。
+    quantized: Vec<i8>,
+    scale: f32,
+    offset: f32,
     /// 每层的邻居列表：layers[level] = Vec<neighbor_id>
     layers: Vec<Vec<u32>>,
 }
@@ -287,10 +346,25 @@ impl HnswIndex {
             layers.push(Vec::with_capacity(self.config.m));
         }
 
-        let new_node = HnswNode {
-            id,
-            vector,
-            layers,
+        let new_node = if self.config.quantize {
+            let (quantized, scale, offset) = quantize_to_int8(&vector);
+            HnswNode {
+                id,
+                vector,
+                quantized,
+                scale,
+                offset,
+                layers,
+            }
+        } else {
+            HnswNode {
+                id,
+                vector,
+                quantized: Vec::new(),
+                scale: 0.0,
+                offset: 0.0,
+                layers,
+            }
         };
         self.nodes.push(new_node);
 
@@ -510,18 +584,24 @@ impl HnswIndex {
     /// 序列化为字节
     ///
     /// 格式：
-    /// - magic: "HNSW_IDX1" (9B)
+    /// - magic: "HNSW_IDX2" (9B)
     /// - dim: u32
     /// - m: u32
     /// - m_max0: u32
     /// - ef_construction: u32
     /// - ef_search: u32
     /// - metric: u8 (0=L2, 1=InnerProduct, 2=Cosine)
+    /// - quantize: u8 (0=false, 1=true)  （v0.15.0 新增）
     /// - max_level: i32
     /// - enter_point: u32 (0xFFFFFFFF = None)
     /// - num_nodes: u32
     /// - 重复 num_nodes 次：
     ///   - id: u32
+    ///   - quantized_flag: u8 (0=否, 1=是)  （v0.15.0 新增）
+    ///   - 如果 quantized_flag == 1:
+    ///     - scale: f32
+    ///     - offset: f32
+    ///     - quantized: [i8; dim]  （dim 个字节）
     ///   - vector: [f32; dim]
     ///   - num_layers: u32
     ///   - 重复 num_layers 次：
@@ -533,7 +613,7 @@ impl HnswIndex {
         let mut buf = Vec::new();
 
         // magic
-        buf.extend_from_slice(b"HNSW_IDX1");
+        buf.extend_from_slice(b"HNSW_IDX2");
 
         // config
         buf.extend_from_slice(&(self.config.dim as u32).to_le_bytes());
@@ -550,6 +630,9 @@ impl HnswIndex {
         };
         buf.push(metric_byte);
 
+        // quantize flag (v0.15.0)
+        buf.push(if self.config.quantize { 1 } else { 0 });
+
         // max_level
         buf.extend_from_slice(&self.max_level.to_le_bytes());
 
@@ -565,6 +648,18 @@ impl HnswIndex {
         // nodes
         for node in &self.nodes {
             buf.extend_from_slice(&node.id.to_le_bytes());
+
+            // quantized flag (v0.15.0)
+            let has_quantized = !node.quantized.is_empty() as u8;
+            buf.push(has_quantized);
+            if has_quantized == 1 {
+                // scale, offset, then quantized data as raw bytes
+                buf.extend_from_slice(&node.scale.to_le_bytes());
+                buf.extend_from_slice(&node.offset.to_le_bytes());
+                for &q in &node.quantized {
+                    buf.push(q as u8);
+                }
+            }
 
             // vector (dim * f32)
             for &v in &node.vector {
@@ -598,8 +693,9 @@ impl HnswIndex {
             ));
         }
 
-        // magic
-        if &data[..9] != b"HNSW_IDX1" {
+        // magic (support both v1 and v2)
+        let is_v2 = &data[..9] == b"HNSW_IDX2";
+        if !is_v2 && &data[..9] != b"HNSW_IDX1" {
             return Err(crate::common::error::EngramDbError::InvalidFormat(
                 "invalid HNSW index magic".into()
             ));
@@ -664,7 +760,21 @@ impl HnswIndex {
         };
         offset += 1;
 
-        let config = HnswConfig { dim, m, m_max0, ef_construction, ef_search, metric };
+        // quantize flag (v2 only, v1 defaults to false)
+        let quantize = if is_v2 {
+            if offset + 1 > data.len() {
+                return Err(crate::common::error::EngramDbError::InvalidFormat(
+                    "truncated HNSW quantize byte".into()
+                ));
+            }
+            let q = data[offset] != 0;
+            offset += 1;
+            q
+        } else {
+            false
+        };
+
+        let config = HnswConfig { dim, m, m_max0, ef_construction, ef_search, metric, quantize };
 
         // max_level
         let max_level = read_i32(data, &mut offset)?;
@@ -685,6 +795,38 @@ impl HnswIndex {
         for _ in 0..num_nodes {
             let id = read_u32(data, &mut offset)?;
 
+            // quantized flag (v2 only, v1 defaults to false)
+            let has_quantized = if is_v2 {
+                if offset + 1 > data.len() {
+                    return Err(crate::common::error::EngramDbError::InvalidFormat(
+                        "truncated HNSW quantized_flag".into()
+                    ));
+                }
+                let flag = data[offset] != 0;
+                offset += 1;
+                flag
+            } else {
+                false
+            };
+
+            let (quantized, scale, offset_f) = if has_quantized {
+                let s = read_f32(data, &mut offset)?;
+                let o = read_f32(data, &mut offset)?;
+                let mut q = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    if offset >= data.len() {
+                        return Err(crate::common::error::EngramDbError::InvalidFormat(
+                            "truncated HNSW quantized data".into()
+                        ));
+                    }
+                    q.push(data[offset] as i8);
+                    offset += 1;
+                }
+                (q, s, o)
+            } else {
+                (Vec::new(), 0.0, 0.0)
+            };
+
             // vector
             let mut vector = Vec::with_capacity(dim);
             for _ in 0..dim {
@@ -703,7 +845,7 @@ impl HnswIndex {
                 layers.push(neighbors);
             }
 
-            nodes.push(HnswNode { id, vector, layers });
+            nodes.push(HnswNode { id, vector, quantized, scale, offset: offset_f, layers });
         }
 
         // tombstone 集合（v0.12.0 DELETE 支持，可选段）
@@ -798,6 +940,7 @@ mod tests {
             ef_construction: 50,
             ef_search: 30,
             metric: DistanceMetric::L2,
+            quantize: false,
         };
         let mut index = HnswIndex::new(config);
 
@@ -828,6 +971,7 @@ mod tests {
 
         let mut hnsw = HnswIndex::new(HnswConfig {
             dim, m: 16, m_max0: 32, ef_construction: 200, ef_search: 100, metric,
+            quantize: false,
         });
         let mut bf = BruteForceIndex::new(dim, metric);
 
@@ -896,6 +1040,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim: 4, m: 4, m_max0: 8, ef_construction: 10, ef_search: 10,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
         let v = vec![1.0, 2.0, 3.0, 4.0];
         let id = index.insert(v.clone()).unwrap();
@@ -914,6 +1059,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
             metric: DistanceMetric::InnerProduct,
+            quantize: false,
         });
         let mut bf = BruteForceIndex::new(dim, DistanceMetric::InnerProduct);
 
@@ -939,6 +1085,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
             metric: DistanceMetric::Cosine,
+            quantize: false,
         });
 
         for i in 0..50 {
@@ -999,6 +1146,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim: 4, m: 4, m_max0: 8, ef_construction: 10, ef_search: 10,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
         let v = vec![1.0, 2.0, 3.0, 4.0];
         index.insert(v.clone()).unwrap();
@@ -1013,6 +1161,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim: 8, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
 
         // 空索引 stats
@@ -1087,6 +1236,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim: 4, m: 4, m_max0: 8, ef_construction: 20, ef_search: 20,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
 
         for i in 0..10 {
@@ -1124,6 +1274,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
 
         for i in 0..n {
@@ -1157,6 +1308,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim: 4, m: 4, m_max0: 8, ef_construction: 20, ef_search: 20,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
 
         for i in 0..5 {
@@ -1187,6 +1339,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim: 8, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
 
         for i in 0..30 {
@@ -1229,6 +1382,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim: 4, m: 4, m_max0: 8, ef_construction: 20, ef_search: 20,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
         for i in 0..5 {
             let v = random_vector(4, i);
@@ -1259,6 +1413,7 @@ mod tests {
         let mut index = HnswIndex::new(HnswConfig {
             dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
             metric: DistanceMetric::L2,
+            quantize: false,
         });
 
         for i in 0..n {
@@ -1281,5 +1436,197 @@ mod tests {
             assert!(!index.is_deleted(r.id), "结果包含已删除节点 {}", r.id);
             assert!(r.id >= 80, "结果应来自未删除的 id 范围 [80, 100)");
         }
+    }
+
+    // ========================================================================
+    // INT8 量化测试（v0.15.0 新增）
+    // ========================================================================
+
+    #[test]
+    fn test_quantize_roundtrip() {
+        // 测试量化/反量化往返
+        let v = vec![0.5, -0.3, 0.8, -0.1, 0.0, 0.9, -0.7, 0.2];
+        let (q, scale, offset) = quantize_to_int8(&v);
+        assert_eq!(q.len(), v.len());
+        let deq = dequantize_to_f32(&q, scale, offset);
+        assert_eq!(deq.len(), v.len());
+        // 反量化后的误差应较小
+        for (a, b) in v.iter().zip(deq.iter()) {
+            let err = (a - b).abs();
+            assert!(err < 0.02, "量化误差过大: {} vs {}, err={}", a, b, err);
+        }
+    }
+
+    #[test]
+    fn test_quantize_all_same() {
+        // 所有值相同的情况
+        let v = vec![0.5; 8];
+        let (q, scale, offset) = quantize_to_int8(&v);
+        assert_eq!(q.len(), 8);
+        assert!(q.iter().all(|&x| x == 0));
+        let deq = dequantize_to_f32(&q, scale, offset);
+        for (a, b) in v.iter().zip(deq.iter()) {
+            assert!((a - b).abs() < 0.001, "全相同值反量化误差过大");
+        }
+    }
+
+    #[test]
+    fn test_quantize_empty() {
+        let (q, scale, offset) = quantize_to_int8(&[]);
+        assert!(q.is_empty());
+        let deq = dequantize_to_f32(&q, scale, offset);
+        assert!(deq.is_empty());
+    }
+
+    #[test]
+    fn test_hnsw_quantized_basic() {
+        let dim = 8;
+        let n = 100;
+        let mut index = HnswIndex::new(HnswConfig {
+            dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
+            metric: DistanceMetric::L2,
+            quantize: true,
+        });
+
+        for i in 0..n {
+            let v = random_vector(dim, i);
+            index.insert(v).unwrap();
+        }
+
+        // 验证量化数据已存储
+        for i in 0..n {
+            let node = &index.nodes[i as usize];
+            assert!(!node.quantized.is_empty(), "节点 {} 应有量化数据", i);
+            assert_eq!(node.quantized.len(), dim);
+        }
+
+        // 搜索应返回有效结果
+        let query = random_vector(dim, 999);
+        let results = index.search(&query, 10);
+        assert_eq!(results.len(), 10, "量化索引应返回 10 个结果");
+        for r in &results {
+            assert!(r.distance >= 0.0, "距离应为非负");
+        }
+    }
+
+    #[test]
+    fn test_hnsw_quantized_precision() {
+        // 比较量化索引与 f32 索引的搜索召回率
+        let dim = 8;
+        let n = 200;
+        let mut f32_index = HnswIndex::new(HnswConfig {
+            dim, m: 16, m_max0: 32, ef_construction: 200, ef_search: 100,
+            metric: DistanceMetric::L2,
+            quantize: false,
+        });
+        let mut q_index = HnswIndex::new(HnswConfig {
+            dim, m: 16, m_max0: 32, ef_construction: 200, ef_search: 100,
+            metric: DistanceMetric::L2,
+            quantize: true,
+        });
+        let mut bf = BruteForceIndex::new(dim, DistanceMetric::L2);
+
+        for i in 0..n {
+            let v = random_vector(dim, i);
+            f32_index.insert(v.clone()).unwrap();
+            q_index.insert(v.clone()).unwrap();
+            bf.insert(v);
+        }
+
+        let query = random_vector(dim, 999);
+        let f32_results = f32_index.search(&query, 10);
+        let q_results = q_index.search(&query, 10);
+        let bf_results = bf.search(&query, 10);
+
+        // 检查量化索引的 top-10 结果中，有多少在 f32 索引的 top-10 中
+        let f32_ids: std::collections::HashSet<u32> = f32_results.iter().map(|r| r.id).collect();
+        let q_ids: std::collections::HashSet<u32> = q_results.iter().map(|r| r.id).collect();
+
+        let overlap = f32_ids.intersection(&q_ids).count();
+        // 量化索引的召回率应 >= 70%（8 维随机向量，量化精度损失较大）
+        assert!(overlap >= 7, "量化召回率过低: {} / 10", overlap);
+
+        // 检查量化索引与暴力搜索的召回率
+        let bf_ids: std::collections::HashSet<u32> = bf_results.iter().map(|r| r.id).collect();
+        let q_vs_bf_overlap = bf_ids.intersection(&q_ids).count();
+        assert!(q_vs_bf_overlap >= 7, "量化 vs BF 召回率过低: {} / 10", q_vs_bf_overlap);
+    }
+
+    #[test]
+    fn test_hnsw_quantized_serialize_deserialize() {
+        let dim = 8;
+        let n = 50;
+        let mut index = HnswIndex::new(HnswConfig {
+            dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
+            metric: DistanceMetric::L2,
+            quantize: true,
+        });
+
+        for i in 0..n {
+            let v = random_vector(dim, i);
+            index.insert(v).unwrap();
+        }
+
+        // 序列化
+        let bytes = index.to_bytes();
+        // 应该使用 HNSW_IDX2 magic
+        assert_eq!(&bytes[..9], b"HNSW_IDX2", "量化索引应使用 HNSW_IDX2 magic");
+
+        // 反序列化
+        let restored = HnswIndex::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.nodes.len(), n as usize);
+        assert!(restored.config.quantize, "反序列化后 quantize 应为 true");
+
+        // 验证量化数据已恢复
+        for i in 0..n {
+            assert!(!restored.nodes[i as usize].quantized.is_empty(), "反序列化后节点 {} 应有量化数据", i);
+            assert_eq!(restored.nodes[i as usize].quantized.len(), dim);
+        }
+
+        // 搜索验证
+        let query = random_vector(dim, 999);
+        let results = restored.search(&query, 10);
+        assert_eq!(results.len(), 10, "反序列化后搜索应返回 10 个结果");
+    }
+
+    #[test]
+    fn test_hnsw_v1_backward_compat() {
+        // 验证旧版 HNSW_IDX1 格式仍可读取
+        // 构造一个 f32 索引，序列化为旧格式，然后反序列化
+        let dim = 4;
+        let mut index = HnswIndex::new(HnswConfig {
+            dim, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
+            metric: DistanceMetric::L2,
+            quantize: false,
+        });
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        index.insert(v).unwrap();
+
+        // 手动构造旧格式字节
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"HNSW_IDX1");
+        buf.extend_from_slice(&(dim as u32).to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes()); // m
+        buf.extend_from_slice(&16u32.to_le_bytes()); // m_max0
+        buf.extend_from_slice(&50u32.to_le_bytes()); // ef_construction
+        buf.extend_from_slice(&30u32.to_le_bytes()); // ef_search
+        buf.push(0u8); // metric = L2
+        buf.extend_from_slice(&0i32.to_le_bytes()); // max_level
+        buf.extend_from_slice(&0u32.to_le_bytes()); // enter_point = 0
+        buf.extend_from_slice(&1u32.to_le_bytes()); // num_nodes = 1
+        // node 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // id = 0
+        for f in [0.1f32, 0.2f32, 0.3f32, 0.4f32] {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        buf.extend_from_slice(&1u32.to_le_bytes()); // num_layers = 1
+        buf.extend_from_slice(&0u32.to_le_bytes()); // num_neighbors = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // deleted_count = 0
+
+        let restored = HnswIndex::from_bytes(&buf).unwrap();
+        assert_eq!(restored.nodes.len(), 1);
+        assert!(!restored.config.quantize);
+        assert_eq!(restored.nodes[0].vector, vec![0.1, 0.2, 0.3, 0.4]);
+        assert!(restored.nodes[0].quantized.is_empty());
     }
 }

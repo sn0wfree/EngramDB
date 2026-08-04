@@ -269,6 +269,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
                         Value::Vector(_) => 8,
                         Value::Blob(_) => 9,
                         Value::Timestamp(_) => 10,
+                        Value::VectorInt8(_) => 11,
                     }
                 }
                 value_tag(a).cmp(&value_tag(b))
@@ -1849,12 +1850,14 @@ fn eval_vector_distance(v1: &Vector, v2: &Vector) -> Result<Vector> {
 
 fn vector_l2_distance(a: &Value, b: &Value) -> Value {
     let va = match a {
-        Value::Vector(v) => v,
+        Value::Vector(v) => v.clone(),
+        Value::VectorInt8(v) => v.iter().map(|x| *x as f32).collect(),
         Value::Null => return Value::Null,
         _ => return Value::Null,
     };
     let vb = match b {
-        Value::Vector(v) => v,
+        Value::Vector(v) => v.clone(),
+        Value::VectorInt8(v) => v.iter().map(|x| *x as f32).collect(),
         Value::Null => return Value::Null,
         _ => return Value::Null,
     };
@@ -1890,12 +1893,14 @@ fn eval_vector_cosine_similarity(v1: &Vector, v2: &Vector) -> Result<Vector> {
 
 fn vector_cosine_sim(a: &Value, b: &Value) -> Value {
     let va = match a {
-        Value::Vector(v) => v,
+        Value::Vector(v) => v.clone(),
+        Value::VectorInt8(v) => v.iter().map(|x| *x as f32).collect(),
         Value::Null => return Value::Null,
         _ => return Value::Null,
     };
     let vb = match b {
-        Value::Vector(v) => v,
+        Value::Vector(v) => v.clone(),
+        Value::VectorInt8(v) => v.iter().map(|x| *x as f32).collect(),
         Value::Null => return Value::Null,
         _ => return Value::Null,
     };
@@ -1931,6 +1936,14 @@ fn eval_vector_norm(v: &Vector) -> Result<Vector> {
 fn vector_norm_value(v: &Value) -> Value {
     match v {
         Value::Vector(vec) => {
+            let mut sum_sq = 0.0f64;
+            for x in vec {
+                let f = *x as f64;
+                sum_sq += f * f;
+            }
+            Value::Float64(sum_sq.sqrt())
+        }
+        Value::VectorInt8(vec) => {
             let mut sum_sq = 0.0f64;
             for x in vec {
                 let f = *x as f64;

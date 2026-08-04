@@ -341,6 +341,13 @@ fn serialize_value(val: &Value, buf: &mut Vec<u8>) {
             buf.push(10);
             buf.extend_from_slice(&t.to_le_bytes());
         }
+        Value::VectorInt8(v) => {
+            buf.push(11);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for b in v {
+                buf.push(*b as u8);
+            }
+        }
     }
 }
 
@@ -380,6 +387,17 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
             if data.len() < 9 { return None; }
             let v = i64::from_le_bytes(data[1..9].try_into().unwrap());
             Some((Value::Timestamp(v), 9))
+        }
+        11 => {
+            if data.len() < 5 { return None; }
+            let dim = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            let byte_len = dim;
+            if 5 + byte_len > data.len() { return None; }
+            let mut vec = Vec::with_capacity(dim);
+            for i in 0..dim {
+                vec.push(data[5 + i] as i8);
+            }
+            Some((Value::VectorInt8(vec), 5 + byte_len))
         }
         5 => {
             if data.len() < 5 { return None; }

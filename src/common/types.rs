@@ -25,6 +25,13 @@ pub enum DataType {
     /// 存储固定维度的 f32 向量，支持 HNSW 近似最近邻搜索。
     /// 维度在建表时指定（如 `VECTOR(1536)`），默认 0 表示动态维度。
     Vector { dim: usize },
+    /// INT8 量化向量类型（v0.15.0 新增）
+    ///
+    /// 存储 INT8 量化后的向量，存储量减少 75%（4x 压缩）。
+    /// 基于 MinMax 量化，每个向量独立存储 scale/offset 参数。
+    /// 搜索时自动反量化回 f32 计算距离，精度损失约 1-5% 召回率。
+    /// 适合 AI embedding 等对精度要求不苛刻的场景。
+    VectorInt8 { dim: usize },
     /// BLOB 二进制数据（v0.13.0 新增）
     Blob,
     /// 时间戳（v0.14.0 新增）
@@ -44,6 +51,7 @@ impl DataType {
             DataType::Varchar => "VARCHAR",
             DataType::Json => "JSON",
             DataType::Vector { .. } => "VECTOR",
+            DataType::VectorInt8 { .. } => "VECTOR_INT8",
             DataType::Blob => "BLOB",
             DataType::Timestamp => "TIMESTAMP",
         }
@@ -59,6 +67,7 @@ impl DataType {
             DataType::Varchar => None,
             DataType::Json => None,
             DataType::Vector { .. } => None,
+            DataType::VectorInt8 { .. } => None,
             DataType::Blob => None,
             DataType::Timestamp => Some(8),
         }

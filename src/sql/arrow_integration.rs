@@ -161,6 +161,7 @@ pub fn value_type_to_arrow(value: &Value) -> ArrowDataType {
         Value::Varchar(_) => ArrowDataType::Utf8,
         Value::Json(_) => ArrowDataType::Utf8,
         Value::Vector(_) => ArrowDataType::Utf8, // 序列化为字符串表示
+        Value::VectorInt8(_) => ArrowDataType::Utf8, // 序列化为字符串表示
         Value::Blob(_) => ArrowDataType::Binary,
     }
 }
