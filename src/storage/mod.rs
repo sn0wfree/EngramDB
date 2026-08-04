@@ -8,6 +8,7 @@ pub mod compression;
 pub mod table;
 pub mod sparse_index;
 pub mod vector_index;
+pub mod cache;
 pub mod index;
 pub mod catalog;
 
@@ -34,6 +35,8 @@ pub struct Database {
     txn_manager: TransactionManager,
     /// 查询计划缓存（Perf02 Prepared Statement）
     plan_cache: std::collections::HashMap<String, (crate::executor::physical_plan::PhysicalPlan, Vec<String>)>,
+    /// KV 缓存引擎（v0.15.0 新增）
+    pub kv_cache: crate::storage::cache::KVCache,
 }
 
 impl Database {
@@ -102,6 +105,7 @@ impl Database {
             file,
             txn_manager,
             plan_cache: std::collections::HashMap::new(),
+            kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024), // 默认 64MB
         })
     }
 
@@ -133,6 +137,7 @@ impl Database {
             file,
             txn_manager,
             plan_cache: std::collections::HashMap::new(),
+            kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024),
         };
 
         // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
@@ -210,6 +215,11 @@ impl Database {
     /// 获取配置
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 获取 KV 缓存引擎的可变引用
+    pub fn cache(&mut self) -> &mut crate::storage::cache::KVCache {
+        &mut self.kv_cache
     }
 
     /// 获取数据库路径

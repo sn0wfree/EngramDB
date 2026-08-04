@@ -333,8 +333,28 @@ impl Connection {
     /// - `CompactStrategy::full(threshold)` — 全量合并，达到阈值一次性合并
     /// - `CompactStrategy::incremental(threshold, batch_size)` — 增量式，分批合并
     /// - `CompactStrategy::default_adaptive(row_group_size)` — 自适应分桶（默认）
-    pub fn set_compact_strategy(&mut self, strategy: crate::common::config::CompactStrategy) {
+pub fn set_compact_strategy(&mut self, strategy: crate::common::config::CompactStrategy) {
         self.db.set_default_compact_strategy(strategy);
+    }
+
+    /// 设置 KV 缓存预算（字节）
+    pub fn set_cache_size(&mut self, bytes: usize) {
+        self.db.kv_cache.set_max_memory(bytes);
+    }
+
+    /// 获取 KV 缓存统计
+    pub fn cache_stats(&self) -> crate::storage::cache::CacheStats {
+        self.db.kv_cache.stats().clone()
+    }
+
+    /// 清除 KV 缓存
+    pub fn clear_cache(&mut self) {
+        self.db.kv_cache.clear();
+    }
+
+    /// 获取 KV 缓存引擎的可变引用（用于高级操作）
+    pub fn cache(&mut self) -> &mut crate::storage::cache::KVCache {
+        &mut self.db.kv_cache
     }
 
     /// 设置指定表的 Delta 合并策略（运行时动态切换）
