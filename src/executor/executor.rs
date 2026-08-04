@@ -493,7 +493,6 @@ fn execute_upsert(
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
     let table_def = table.def.clone();
 
-    // 找到冲突列的索引
     let conflict_col_indices: Vec<usize> = conflict_clause.conflict_columns.iter()
         .filter_map(|col_name| table_def.column_index(col_name))
         .collect();
@@ -501,45 +500,23 @@ fn execute_upsert(
     let mut rows_affected: u64 = 0;
     let mut result_rows = Vec::new();
 
-    // 逐行处理
     for row in &rows {
-        // 查找冲突行
         let mut conflicting_row_id: Option<u32> = None;
+
         if !conflict_col_indices.is_empty() {
-            // 通过扫描查找冲突行（简化实现）
             let table = db.get_table_mut(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
-            let row_count = table.def.row_count;
-            'scan: for rid in 0..row_count as u32 {
-                if let Some(existing_row) = table.get_row_by_id(rid)? {
-                    let mut conflict = true;
-                    for &col_idx in &conflict_col_indices {
-                        if col_idx >= existing_row.len() || col_idx >= row.len() {
-                            conflict = false;
-                            break;
-                        }
-                        if existing_row[col_idx] != row[col_idx] {
-                            conflict = false;
-                            break;
-                        }
-                    }
-                    if conflict {
-                        conflicting_row_id = Some(rid);
-                        break 'scan;
-                    }
-                }
-            }
+
+            conflicting_row_id = find_conflicting_row(
+                table, &table_def, &conflict_col_indices, row,
+            )?;
         }
 
         match conflicting_row_id {
             Some(rid) => {
-                // 冲突发生
                 match &conflict_clause.action {
-                    OnConflictAction::DoNothing => {
-                        // 不做任何事
-                    }
+                    OnConflictAction::DoNothing => {}
                     OnConflictAction::DoUpdate { assignments } => {
-                        // 更新冲突行
                         let table = db.get_table_mut(table_name)
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
                         let mut existing_row = table.get_row_by_id(rid)?
@@ -547,7 +524,6 @@ fn execute_upsert(
                                 format!("Row {} not found during UPSERT update", rid)
                             ))?;
 
-                        // 应用赋值
                         for (col_name, expr) in assignments {
                             let col_idx = table_def.column_index(col_name)
                                 .ok_or_else(|| EngramDbError::Internal(
@@ -558,14 +534,12 @@ fn execute_upsert(
                             }
                         }
 
-                        // 更新行
                         table.update_row(rid, &existing_row)?;
                         rows_affected += 1;
                     }
                 }
             }
             None => {
-                // 无冲突，正常插入
                 let table = db.get_table_mut(table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
                 table.insert(vec![row.clone()])?;
@@ -573,7 +547,6 @@ fn execute_upsert(
             }
         }
 
-        // 收集 RETURNING 结果
         if let Some(ref returning_items) = returning {
             let table = db.get_table_mut(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
@@ -598,7 +571,6 @@ fn execute_upsert(
         }
     }
 
-    // 返回结果
     if returning.is_some() {
         let returning_items = returning.unwrap();
         let columns: Vec<String> = returning_items.iter().enumerate().map(|(i, item)| {
@@ -621,6 +593,70 @@ fn execute_upsert(
             rows_affected,
         })
     }
+}
+
+/// 通过索引查找冲突行，避免全表扫描
+///
+/// 查找优先级：
+/// 1. 主键索引（BTreeMap, O(log n)）— 单列冲突 + 该列是 PK
+/// 2. 唯一二级索引（SkipList, O(log n)）— 单列冲突 + 存在唯一索引
+/// 3. 全表扫描（O(n)）— 兜底
+fn find_conflicting_row(
+    table: &mut crate::storage::table::Table,
+    table_def: &crate::common::types::TableDef,
+    conflict_col_indices: &[usize],
+    row: &[crate::Value],
+) -> Result<Option<u32>> {
+    let conflict_key = &row[conflict_col_indices[0]];
+
+    // 1. 主键索引查找（单列冲突 + 该列是 PK）
+    if conflict_col_indices.len() == 1 {
+        if table_def.primary_key_index() == Some(conflict_col_indices[0]) {
+            if let Some(rid) = table.lookup_primary_key(conflict_key) {
+                return Ok(Some(rid));
+            }
+            return Ok(None);
+        }
+    }
+
+    // 2. 唯一二级索引查找（单列冲突 + 匹配唯一索引）
+    if conflict_col_indices.len() == 1 {
+        for idx_def in &table_def.indexes {
+            if idx_def.unique && idx_def.key_columns == *conflict_col_indices {
+                if let Some(index) = table.get_index(&idx_def.name) {
+                    if let Some(row_ids) = index.get(conflict_key) {
+                        if let Some(&rid) = row_ids.first() {
+                            return Ok(Some(rid));
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    // 3. 兜底：全表扫描
+    let row_count = table.def.row_count;
+    'scan: for rid in 0..row_count as u32 {
+        if let Some(existing_row) = table.get_row_by_id(rid)? {
+            let mut conflict = true;
+            for &col_idx in conflict_col_indices {
+                if col_idx >= existing_row.len() || col_idx >= row.len() {
+                    conflict = false;
+                    break;
+                }
+                if existing_row[col_idx] != row[col_idx] {
+                    conflict = false;
+                    break;
+                }
+            }
+            if conflict {
+                return Ok(Some(rid));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 
