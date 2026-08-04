@@ -440,6 +440,10 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
+        PhysicalPlan::SubqueryScan { plan } => {
+            let result = execute(*plan, db)?;
+            Ok(result)
+        }
     }
 }
 
@@ -496,6 +500,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Distinct { .. } => "Distinct",
         PhysicalPlan::Explain { .. } => "Explain",
         PhysicalPlan::Window { .. } => "Window",
+        PhysicalPlan::SubqueryScan { .. } => "SubqueryScan",
     }
 }
 
@@ -561,6 +566,9 @@ fn format_plan_tree(plan: &PhysicalPlan, indent: usize) -> String {
         }
         PhysicalPlan::Window { input, .. } => {
             result.push_str(&format_plan_tree(input, indent + 1));
+        }
+        PhysicalPlan::SubqueryScan { plan } => {
+            result.push_str(&format_plan_tree(plan, indent + 1));
         }
         _ => {}
     }

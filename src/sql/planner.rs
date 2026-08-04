@@ -55,6 +55,42 @@ fn plan_explain(stmt: ExplainStmt, db: &Database) -> Result<PhysicalPlan> {
     })
 }
 
+/// CTE 内联：将 WITH 子句中的 CTE 定义递归内联到查询中
+fn inline_ctes(stmt: SelectStmt, _db: &Database) -> SelectStmt {
+    if stmt.ctes.is_empty() {
+        return stmt;
+    }
+
+    // 构建 CTE 名 → 查询的映射
+    let cte_map: std::collections::HashMap<String, SelectStmt> = stmt.ctes.iter()
+        .map(|cte| (cte.alias.clone(), *cte.query.clone()))
+        .collect();
+
+    // 递归替换查询中的 CTE 表引用为内联的子查询
+    fn replace_cte_refs(select: SelectStmt, cte_map: &std::collections::HashMap<String, SelectStmt>) -> SelectStmt {
+        let from = select.from.map(|tr| match tr {
+            TableRef::Table { table_name, alias } => {
+                if let Some(cte_query) = cte_map.get(&table_name) {
+                    TableRef::Derived {
+                        query: Box::new(replace_cte_refs(cte_query.clone(), cte_map)),
+                        alias: alias.unwrap_or_else(|| table_name.clone()),
+                    }
+                } else {
+                    TableRef::Table { table_name, alias }
+                }
+            }
+            other => other,
+        });
+        SelectStmt {
+            from,
+            ctes: vec![],
+            ..select
+        }
+    }
+
+    replace_cte_refs(stmt, &cte_map)
+}
+
 /// 检查表达式中是否包含窗口函数
 fn expr_has_window(expr: &Expression) -> bool {
     match expr {
@@ -298,6 +334,9 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
 }
 
 fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
+    // CTE 内联：将 WITH 子句中的 CTE 定义内联到查询中
+    let stmt = inline_ctes(stmt, db);
+
     // ===== Perf01：COUNT(*) 元数据级短路 =====
     // 条件：单表、无 WHERE、无 GROUP BY、无 HAVING、无 ORDER BY、无 LIMIT
     // 且 SELECT 列表唯一一项为 COUNT(*) 或 COUNT(1) 等常量输入
@@ -777,6 +816,7 @@ fn find_scan_plan(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
         PhysicalPlan::Sort { input, .. } => find_scan_plan(input),
         PhysicalPlan::Limit { input, .. } => find_scan_plan(input),
         PhysicalPlan::Window { input, .. } => find_scan_plan(input),
+        PhysicalPlan::SubqueryScan { plan } => find_scan_plan(plan),
         _ => None,
     }
 }
@@ -1101,6 +1141,7 @@ fn extract_column_names(plan: &PhysicalPlan) -> Vec<String> {
             }
             names
         }
+        PhysicalPlan::SubqueryScan { plan } => extract_column_names(plan),
         _ => vec![],
     }
 }

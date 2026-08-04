@@ -340,6 +340,8 @@ fn estimate_merged_props(
         JoinType::Left => left.row_count,
         JoinType::Right => right.row_count,
         JoinType::Full => left.row_count.max(right.row_count),
+        JoinType::Semi => left.row_count,
+        JoinType::Anti => left.row_count,
     };
 
     PlanProperties {
@@ -364,6 +366,8 @@ fn estimate_join_rows(
         JoinType::Left => inner_rows.max(left.row_count),
         JoinType::Right => inner_rows.max(right.row_count),
         JoinType::Full => inner_rows.max(left.row_count).max(right.row_count),
+        JoinType::Semi => left.row_count,
+        JoinType::Anti => left.row_count,
     }
 }
 

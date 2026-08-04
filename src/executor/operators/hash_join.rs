@@ -90,6 +90,20 @@ pub fn execute(
                 left_cols, right_cols,
             )
         }
+        JoinType::Semi => {
+            hash_join_semi(
+                left_chunks, right_chunks,
+                left_keys, right_keys,
+                left_cols,
+            )
+        }
+        JoinType::Anti => {
+            hash_join_anti(
+                left_chunks, right_chunks,
+                left_keys, right_keys,
+                left_cols,
+            )
+        }
     }
 }
 
@@ -341,6 +355,98 @@ fn hash_join_full(
 }
 
 // ============================================================================
+// Semi Join / Anti Join（子查询去相关）
+// ============================================================================
+
+/// SEMI JOIN：返回左表中在右表有匹配的行（只输出左表列）
+fn hash_join_semi(
+    left_chunks: &[DataChunk],
+    right_chunks: &[DataChunk],
+    left_keys: &[usize],
+    right_keys: &[usize],
+    left_cols: usize,
+) -> Result<Vec<DataChunk>> {
+    // Build 阶段：右表哈希表
+    let right_rows = extract_rows(right_chunks);
+    let mut hash_table: FxHashMap<Vec<Value>, bool> = FxHashMap::default();
+    for row in &right_rows {
+        let key = extract_key_from_row(row, right_keys);
+        hash_table.insert(key, true);
+    }
+
+    // Probe 阶段：扫描左表，只保留有匹配的行
+    let left_rows = extract_rows(left_chunks);
+    let mut matched = Vec::with_capacity(left_rows.len());
+    for row in &left_rows {
+        let key = extract_key_from_row(row, left_keys);
+        if hash_table.contains_key(&key) {
+            matched.push(row.clone());
+        }
+    }
+
+    Ok(rows_to_chunks(&matched, left_cols))
+}
+
+/// ANTI JOIN：返回左表中在右表没有匹配的行（只输出左表列）
+fn hash_join_anti(
+    left_chunks: &[DataChunk],
+    right_chunks: &[DataChunk],
+    left_keys: &[usize],
+    right_keys: &[usize],
+    left_cols: usize,
+) -> Result<Vec<DataChunk>> {
+    let right_rows = extract_rows(right_chunks);
+    let mut hash_table: FxHashMap<Vec<Value>, bool> = FxHashMap::default();
+    for row in &right_rows {
+        let key = extract_key_from_row(row, right_keys);
+        hash_table.insert(key, true);
+    }
+
+    let left_rows = extract_rows(left_chunks);
+    let mut matched = Vec::with_capacity(left_rows.len());
+    for row in &left_rows {
+        let key = extract_key_from_row(row, left_keys);
+        if !hash_table.contains_key(&key) {
+            matched.push(row.clone());
+        }
+    }
+
+    Ok(rows_to_chunks(&matched, left_cols))
+}
+
+/// 从 DataChunk 中提取所有行
+fn extract_rows(chunks: &[DataChunk]) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for chunk in chunks {
+        rows.extend(chunk.to_rows());
+    }
+    rows
+}
+
+/// 从行中提取连接键（用于 Semi/Anti Join）
+fn extract_key_from_row(row: &[Value], keys: &[usize]) -> Vec<Value> {
+    keys.iter().map(|&i| row.get(i).cloned().unwrap_or(Value::Null)).collect()
+}
+
+/// 将行列表转换为 DataChunk（只保留前 num_cols 列）
+fn rows_to_chunks(rows: &[Vec<Value>], num_cols: usize) -> Vec<DataChunk> {
+    const BATCH_SIZE: usize = 1024;
+    let mut chunks = Vec::new();
+    for batch in rows.chunks(BATCH_SIZE) {
+        let mut columns: Vec<Vec<Value>> = (0..num_cols).map(|_| Vec::with_capacity(batch.len())).collect();
+        for row in batch {
+            for (col_idx, col) in columns.iter_mut().enumerate() {
+                col.push(row.get(col_idx).cloned().unwrap_or(Value::Null));
+            }
+        }
+        let count = batch.len();
+        let cols: Vec<Vector> = columns.into_iter().map(Vector::Flat).collect();
+        chunks.push(DataChunk { columns: cols, count });
+    }
+    chunks
+}
+
+// ============================================================================
 // 辅助函数
 // ============================================================================
 
@@ -388,6 +494,13 @@ fn handle_empty_input(
             } else {
                 handle_empty_input(left, right, JoinType::Left)
             }
+        }
+        JoinType::Semi | JoinType::Anti => {
+            // Semi/Anti Join 只返回左表列
+            if left.is_empty() {
+                return Ok(vec![]);
+            }
+            Ok(left.to_vec())
         }
     }
 }

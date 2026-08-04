@@ -127,7 +127,8 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::Pragma(_)
             | PhysicalPlan::Distinct { .. }
             | PhysicalPlan::Explain { .. }
-            | PhysicalPlan::Window { .. } => {
+            | PhysicalPlan::Window { .. }
+            | PhysicalPlan::SubqueryScan { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
         }
@@ -477,6 +478,8 @@ fn estimate_join_output_rows(
         JoinType::Left => inner_rows.max(left.row_count),
         JoinType::Right => inner_rows.max(right.row_count),
         JoinType::Full => inner_rows.max(left.row_count).max(right.row_count),
+        JoinType::Semi => left.row_count,
+        JoinType::Anti => left.row_count,
     }
 }
 

@@ -164,6 +164,9 @@ fn collect_joins_and_tables(plan: &PhysicalPlan, joins: &mut Vec<()>, tables: &m
         PhysicalPlan::Window { input, .. } => {
             collect_joins_and_tables(input, joins, tables);
         }
+        PhysicalPlan::SubqueryScan { plan } => {
+            collect_joins_and_tables(plan, joins, tables);
+        }
         _ => {}
     }
 }
@@ -255,6 +258,10 @@ fn optimize_build_sides(plan: PhysicalPlan) -> Result<PhysicalPlan> {
                 column_names,
             })
         }
+        PhysicalPlan::SubqueryScan { plan } => {
+            let opt_plan = optimize_build_sides(*plan)?;
+            Ok(PhysicalPlan::SubqueryScan { plan: Box::new(opt_plan) })
+        }
         other => Ok(other),
     }
 }
@@ -277,6 +284,7 @@ fn estimate_rows(plan: &PhysicalPlan) -> u64 {
             // 连接输出行数：笛卡尔积 × 选择率（默认 0.1）
             (((estimate_rows(left) as f64) * (estimate_rows(right) as f64) * 0.1) as u64).max(1)
         }
+        PhysicalPlan::SubqueryScan { plan } => estimate_rows(plan),
         _ => 1000,
     }
 }

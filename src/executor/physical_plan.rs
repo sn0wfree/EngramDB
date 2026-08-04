@@ -173,6 +173,10 @@ pub enum PhysicalPlan {
         window_functions: Vec<WindowFunctionExpr>,
         column_names: Vec<String>,
     },
+    /// 子查询扫描（执行子查询计划，返回结果）
+    SubqueryScan {
+        plan: Box<PhysicalPlan>,
+    },
 }
 
 /// 聚合表达式
@@ -196,14 +200,12 @@ pub enum AggregateFunc {
 /// 连接类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
-    /// 内连接：只返回匹配的行
     Inner,
-    /// 左连接：返回左表所有行 + 右表匹配行（不匹配为 NULL）
     Left,
-    /// 右连接：返回右表所有行 + 左表匹配行（不匹配为 NULL）
     Right,
-    /// 全外连接：返回左右表所有行（不匹配为 NULL）
     Full,
+    Semi,
+    Anti,
 }
 
 /// 排序方向
