@@ -285,6 +285,19 @@ impl SkipListIndex {
         self.unique
     }
 
+    /// 清空所有索引数据（v0.15.0 TRUNCATE TABLE 支持）
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        let head = Node {
+            key: Value::Null,
+            entries: Vec::new(),
+            forward: vec![None; MAX_LEVEL as usize],
+        };
+        self.nodes.push(head);
+        self.level = 0;
+        self.len = 0;
+    }
+
     /// 删除指定 key 和 row_id 的索引条目（v0.12.0 新增，DELETE/UPDATE 索引维护）
     ///
     /// 返回 true 表示成功删除，false 表示未找到。

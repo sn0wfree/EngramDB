@@ -36,6 +36,7 @@ pub fn plan(stmt: Statement, db: &Database) -> Result<PhysicalPlan> {
         Statement::AlterTable(s) => plan_alter_table(s),
         Statement::Pragma(s) => plan_pragma(s),
         Statement::Explain(s) => plan_explain(s, db),
+        Statement::TruncateTable { table_name } => Ok(PhysicalPlan::TruncateTable { table_name }),
     }
 }
 

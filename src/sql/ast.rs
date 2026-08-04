@@ -22,6 +22,10 @@ pub enum Statement {
     AlterTable(AlterTableStmt),
     Pragma(PragmaStmt),
     Explain(ExplainStmt),
+    /// TRUNCATE TABLE（v0.15.0 新增）
+    TruncateTable {
+        table_name: String,
+    },
 }
 
 #[derive(Debug, Clone)]

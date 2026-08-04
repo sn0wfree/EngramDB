@@ -1338,6 +1338,34 @@ impl Table {
         self.def.row_count
     }
 
+    /// TRUNCATE TABLE：清空所有数据（v0.15.0 新增）
+    ///
+    /// 清空 ColumnStore 和 DeltaStore，重置 row_count 为 0。
+    /// 保留表结构、索引定义、HNSW 索引定义。
+    pub fn truncate(&mut self) -> Result<()> {
+        self.column_store.clear();
+        self.delta_store.clear();
+        self.def.row_count = 0;
+        // 清空主键索引
+        if let Some(idx) = &mut self.primary_index {
+            idx.clear();
+        }
+        // 清空二级索引
+        for index in self.indexes.values_mut() {
+            index.clear();
+        }
+        // HNSW 索引：清空节点（保留配置）
+        for (_, (hnsw, id_mapping)) in self.vector_indexes.iter_mut() {
+            hnsw.clear();
+            id_mapping.clear();
+        }
+        // 清空 FTS 索引
+        for fts in self.fts_indexes.values_mut() {
+            fts.clear();
+        }
+        Ok(())
+    }
+
     /// 删除行（v0.12.0 新增，DELETE 支持）
     ///
     /// 当前实现：只支持删除 Delta 层的行（通过行索引定位）。

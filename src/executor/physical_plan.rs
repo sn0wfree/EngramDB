@@ -196,6 +196,10 @@ pub enum PhysicalPlan {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
     },
+    /// TRUNCATE TABLE（v0.15.0 新增）
+    TruncateTable {
+        table_name: String,
+    },
 }
 
 /// 集合操作类型（v0.15.0 新增）

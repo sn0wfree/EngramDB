@@ -387,6 +387,16 @@ impl TransactionManager {
         self.mvcc.get(&table_id)
     }
 
+    /// 清空指定表的 MVCC 版本（v0.15.0 TRUNCATE TABLE 支持）
+    ///
+    /// TRUNCATE 后，表的旧版本数据不应再影响事务的 Insert/Update 判定。
+    pub fn clear_table_mvcc(&mut self, table_id: u32) {
+        if let Some(store) = self.mvcc.get_mut(&table_id) {
+            // 重新创建空 store（保留类型）
+            *store = MvccStore::new();
+        }
+    }
+
     // --- 内部方法 ---
 
     fn ensure_active(&self, txn_id: TxnId) -> Result<()> {

@@ -54,6 +54,11 @@ impl ColumnStore {
         }
     }
 
+    /// 清空所有数据（v0.15.0 TRUNCATE TABLE 支持）
+    pub fn clear(&mut self) {
+        self.row_groups.clear();
+    }
+
     /// 追加行数据
     pub fn append_rows(&mut self, rows: &[Vec<Value>]) -> Result<()> {
         if rows.is_empty() {

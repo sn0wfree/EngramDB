@@ -478,6 +478,23 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         PhysicalPlan::AlterTable(stmt) => {
             crate::executor::operators::alter_table::execute(db, stmt)
         }
+        PhysicalPlan::TruncateTable { table_name } => {
+            // TRUNCATE TABLE：清空表数据，保留表结构
+            let table_id = db.table_names().get(&table_name).copied()
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+            {
+                let table = db.get_table_mut(&table_name)
+                    .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+                table.truncate()?;
+            }
+            // 清空 MVCC 版本（避免后续 INSERT 被误判为 UPDATE）
+            db.txn_manager_mut().clear_table_mvcc(table_id);
+            Ok(QueryResult {
+                columns: vec!["status".to_string()],
+                rows: vec![vec![crate::Value::Varchar(format!("TRUNCATE {}", table_name))]],
+                rows_affected: 0,
+            })
+        }
         PhysicalPlan::Pragma(stmt) => {
             crate::executor::operators::pragma::execute(db, stmt)
         }
@@ -581,6 +598,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Window { .. } => "Window",
         PhysicalPlan::SubqueryScan { .. } => "SubqueryScan",
         PhysicalPlan::SetUnion { .. } => "SetUnion",
+        PhysicalPlan::TruncateTable { .. } => "TruncateTable",
     }
 }
 

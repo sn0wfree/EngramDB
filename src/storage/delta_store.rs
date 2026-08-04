@@ -334,6 +334,7 @@ impl DeltaStore {
             col.clear();
         }
         self.row_count = 0;
+        self.next_rowid = 1;
         self.row_id_to_idx.clear();
         self.deleted_ids.clear();
     }

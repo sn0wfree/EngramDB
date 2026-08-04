@@ -295,6 +295,13 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
         sqlast::Statement::Commit { .. } => Ok(Statement::Commit),
         sqlast::Statement::Rollback { .. } => Ok(Statement::Rollback),
 
+        // TRUNCATE TABLE（v0.15.0 新增）
+        sqlast::Statement::Truncate { table_name, .. } => {
+            Ok(Statement::TruncateTable {
+                table_name: table_name.to_string(),
+            })
+        }
+
         // ANALYZE：收集统计信息
         sqlast::Statement::Analyze { table_name, .. } => {
             let table = table_name.to_string();

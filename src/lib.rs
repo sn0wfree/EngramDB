@@ -1890,9 +1890,32 @@ mod value_tests {
         // 指定列插入（重排列）
         conn.execute("INSERT INTO dst (x, y) SELECT c, a FROM src").unwrap();
 
-        let result = conn.execute("SELECT * FROM dst ORDER BY x").unwrap();
+        let result = conn.execute("SELECT x, y FROM dst ORDER BY x").unwrap();
         assert_eq!(result.rows.len(), 2);
+        // ORDER BY x ASC: smallest x first
         assert_eq!(result.rows[0], vec![Value::Int64(100), Value::Int64(1)]);
         assert_eq!(result.rows[1], vec![Value::Int64(200), Value::Int64(2)]);
+    }
+
+    #[test]
+    fn test_truncate_table() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64, name VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3));
+
+        // TRUNCATE
+        conn.execute("TRUNCATE TABLE t").unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(0), "TRUNCATE 后表应为空");
+
+        // 表结构仍可用：可以继续插入
+        conn.execute("INSERT INTO t VALUES (10, 'x')").unwrap();
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(1));
     }
 }

@@ -238,6 +238,14 @@ impl HnswIndex {
         self.nodes.is_empty()
     }
 
+    /// 清空所有节点（v0.15.0 TRUNCATE TABLE 支持）
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.deleted.clear();
+        self.enter_point = None;
+        self.max_level = -1;
+    }
+
     /// 计算两个向量的距离（根据 metric）
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         match self.config.metric {

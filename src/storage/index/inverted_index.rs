@@ -27,6 +27,11 @@ impl InvertedIndex {
         }
     }
 
+    /// 清空索引（v0.15.0 TRUNCATE TABLE 支持）
+    pub fn clear(&mut self) {
+        self.postings.clear();
+    }
+
     pub fn column_name(&self) -> &str {
         &self.column_name
     }
