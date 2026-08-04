@@ -160,6 +160,18 @@ impl Database {
         self.tables.insert(table_id, table);
         self.table_names.insert(table_def.name.clone(), table_id);
 
+        // v0.14.0: 为表上的 Unique 索引自动构建（来自列级 UNIQUE 约束）
+        let unique_index_specs: Vec<(String, Vec<usize>, Vec<usize>, bool)> = table_def.indexes
+            .iter()
+            .filter(|idx| idx.unique)
+            .map(|idx| (idx.name.clone(), idx.key_columns.clone(), idx.included_columns.clone(), idx.unique))
+            .collect();
+        if let Some(table_mut) = self.tables.get_mut(&table_id) {
+            for (idx_name, key_cols, included_cols, unique) in &unique_index_specs {
+                table_mut.create_index(idx_name, key_cols, included_cols, *unique)?;
+            }
+        }
+
         // v0.12.1: 持久化 catalog 到文件
         let _ = self.save_catalog();
 

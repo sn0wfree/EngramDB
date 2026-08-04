@@ -134,6 +134,10 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                     let primary_key = col_def.options.iter().any(|o| {
                         matches!(o.option, sqlast::ColumnOption::Unique { is_primary: true, .. })
                     });
+                    // 列级 UNIQUE 约束（非 PRIMARY KEY 的 UNIQUE 列）
+                    let unique = col_def.options.iter().any(|o| {
+                        matches!(o.option, sqlast::ColumnOption::Unique { is_primary: false, .. })
+                    });
                     // 检测 AUTO_INCREMENT 关键字
                     // sqlparser 把它解析为 ColumnOption::DialectSpecific([Token::AUTO_INCREMENT])
                     let auto_increment = col_def.options.iter().any(|o| {
@@ -152,6 +156,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                         nullable,
                         primary_key,
                         auto_increment,
+                        unique,
                     });
                 }
             }

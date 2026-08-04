@@ -65,11 +65,28 @@ fn plan_create_table(stmt: CreateTableStmt) -> Result<PhysicalPlan> {
             if c.auto_increment {
                 col = col.auto_inc();
             }
+            if c.unique && !c.primary_key {
+                // 列级 UNIQUE（除 PRIMARY KEY 外）需要后续建索引
+            }
             col
         })
         .collect();
 
-    let table_def = TableDef::new(0, &stmt.table_name, columns);
+    let mut table_def = TableDef::new(0, &stmt.table_name, columns);
+
+    // v0.14.0：为列级 UNIQUE 列自动创建 UniqueIndex
+    for (i, c) in stmt.columns.iter().enumerate() {
+        if c.unique && !c.primary_key {
+            let idx_name = format!("uniq_{}_{}", stmt.table_name, c.name);
+            table_def.indexes.push(crate::common::types::IndexDef {
+                name: idx_name,
+                key_columns: vec![i],
+                included_columns: vec![],
+                unique: true,
+                index_type: "skiplist".to_string(),
+            });
+        }
+    }
 
     Ok(PhysicalPlan::CreateTable { table_def })
 }

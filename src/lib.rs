@@ -1363,4 +1363,32 @@ mod value_tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // --- C04 列级 UNIQUE 约束测试（v0.14.0 新增）---
+
+    #[test]
+    fn test_unique_column_constraint() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT UNIQUE, name VARCHAR)").unwrap();
+
+        // 唯一 id=1
+        let r = conn.execute("INSERT INTO t VALUES (1, 'a')");
+        eprintln!("[test] first insert: {:?}", r);
+        match r {
+            Ok(_) => {}
+            Err(e) => panic!("first insert failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_unique_column_with_pk() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        // PRIMARY KEY + UNIQUE 不冲突
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR UNIQUE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        // 重复 name 应该报错
+        let err = conn.execute("INSERT INTO t VALUES (3, 'a')").unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
+    }
 }

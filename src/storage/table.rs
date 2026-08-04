@@ -321,14 +321,16 @@ impl Table {
             next_row_id += 1;
         }
 
-        let index_def = IndexDef {
-            name: index_name.to_string(),
-            key_columns: key_cols.to_vec(),
-            included_columns: included_cols.to_vec(),
-            unique,
-            index_type: "skiplist".to_string(),
-        };
-        self.def.indexes.push(index_def);
+        if !self.def.indexes.iter().any(|i| i.name == index_name) {
+            let index_def = IndexDef {
+                name: index_name.to_string(),
+                key_columns: key_cols.to_vec(),
+                included_columns: included_cols.to_vec(),
+                unique,
+                index_type: "skiplist".to_string(),
+            };
+            self.def.indexes.push(index_def);
+        }
         self.indexes.insert(index_name.to_string(), skiplist);
 
         Ok(())

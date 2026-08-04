@@ -72,6 +72,8 @@ pub struct ColumnDef {
     pub primary_key: bool,
     /// AUTO_INCREMENT 自增主键（v0.14.0 新增）
     pub auto_increment: bool,
+    /// 列级 UNIQUE 约束（v0.14.0 新增）
+    pub unique: bool,
 }
 
 /// INSERT 语句
