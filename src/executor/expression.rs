@@ -765,6 +765,107 @@ fn eval_function(
             let arg_vecs = arg_vecs?;
             eval_coalesce(&arg_vecs)
         }
+        "NULLIF" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("NULLIF requires 2 arguments".into()));
+            }
+            let a_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let b_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            eval_nullif(&a_vec, &b_vec)
+        }
+        "IF" => {
+            // IF(cond, true_val, false_val)：条件表达式
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("IF requires 3 arguments".into()));
+            }
+            let cond_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let true_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let false_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            eval_if(&cond_vec, &true_vec, &false_vec)
+        }
+        "TRIM" => {
+            // TRIM(str [, chars]): 去除两端指定字符（默认空白）
+            if args.is_empty() || args.len() > 2 {
+                return Err(EngramDbError::Parse("TRIM requires 1 or 2 arguments".into()));
+            }
+            let str_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let chars_vec = if args.len() == 2 {
+                Some(eval_vectorized(&args[1], chunk, column_names)?)
+            } else {
+                None
+            };
+            eval_trim(&str_vec, chars_vec.as_ref(), TrimMode::Both)
+        }
+        "LTRIM" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EngramDbError::Parse("LTRIM requires 1 or 2 arguments".into()));
+            }
+            let str_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let chars_vec = if args.len() == 2 {
+                Some(eval_vectorized(&args[1], chunk, column_names)?)
+            } else {
+                None
+            };
+            eval_trim(&str_vec, chars_vec.as_ref(), TrimMode::Left)
+        }
+        "RTRIM" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EngramDbError::Parse("RTRIM requires 1 or 2 arguments".into()));
+            }
+            let str_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let chars_vec = if args.len() == 2 {
+                Some(eval_vectorized(&args[1], chunk, column_names)?)
+            } else {
+                None
+            };
+            eval_trim(&str_vec, chars_vec.as_ref(), TrimMode::Right)
+        }
+        "INSTR" | "POSITION" => {
+            // INSTR(haystack, needle): 返回 needle 在 haystack 中第一次出现的位置（1-based），未找到返回 0
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("INSTR requires 2 arguments".into()));
+            }
+            let haystack_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let needle_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            eval_instr(&haystack_vec, &needle_vec)
+        }
+        "CEIL" | "CEILING" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("CEIL requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_unary_numeric(&vec, |x| x.ceil())
+        }
+        "FLOOR" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("FLOOR requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_unary_numeric(&vec, |x| x.floor())
+        }
+        "TRUNC" | "TRUNCATE" => {
+            // TRUNC(x): 向 0 取整（截断小数部分）
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("TRUNC requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_unary_numeric(&vec, |x| x.trunc())
+        }
+        "POWER" | "POW" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("POWER requires 2 arguments".into()));
+            }
+            let base_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let exp_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            eval_binary_numeric(&base_vec, &exp_vec, |a, b| a.powf(b))
+        }
+        "SQRT" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("SQRT requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_unary_numeric(&vec, |x| x.sqrt())
+        }
         "REPLACE" => {
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("REPLACE requires 3 arguments".into()));
@@ -1503,6 +1604,226 @@ fn eval_substring(str_vec: &Vector, start_vec: &Vector, len_vec: Option<&Vector>
         result.push(Value::Varchar(substr));
     }
 
+    Ok(Vector::Flat(result))
+}
+
+fn eval_nullif(a_vec: &Vector, b_vec: &Vector) -> Result<Vector> {
+    let len = a_vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let a = a_vec.get(i);
+        let b = b_vec.get(i);
+        // NULLIF(a, b): a == b 时返回 NULL，否则返回 a
+        // NULL 与任何值比较都为 NULL（三值逻辑）
+        if a.is_null() || b.is_null() {
+            result.push(a.clone());
+        } else if a == b {
+            result.push(Value::Null);
+        } else {
+            result.push(a.clone());
+        }
+    }
+    Ok(Vector::Flat(result))
+}
+
+fn eval_if(cond_vec: &Vector, true_vec: &Vector, false_vec: &Vector) -> Result<Vector> {
+    let len = cond_vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let cond = cond_vec.get(i);
+        // IF(cond, a, b): cond 为 TRUE 时返回 a，否则返回 b
+        // 任何与 NULL 的判断都为 NULL（结果取决于实现，这里返回 false_val）
+        if matches!(cond, Value::Boolean(true)) {
+            result.push(true_vec.get(i).clone());
+        } else {
+            result.push(false_vec.get(i).clone());
+        }
+    }
+    Ok(Vector::Flat(result))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrimMode { Both, Left, Right }
+
+fn eval_trim(str_vec: &Vector, chars_vec: Option<&Vector>, mode: TrimMode) -> Result<Vector> {
+    let len = str_vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let s = str_vec.get(i);
+        if s.is_null() {
+            result.push(Value::Null);
+            continue;
+        }
+        let s_str = match s.as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        // 字符集：默认空白
+        let chars: Option<String> = if let Some(cv) = chars_vec {
+            let c = cv.get(i);
+            if c.is_null() {
+                result.push(Value::Null);
+                continue;
+            }
+            c.as_str().map(|x| x.to_string())
+        } else {
+            None
+        };
+
+        let trimmed = match chars {
+            None => {
+                // 默认去除空白
+                let s_trimmed = match mode {
+                    TrimMode::Both => s_str.trim().to_string(),
+                    TrimMode::Left => s_str.trim_start().to_string(),
+                    TrimMode::Right => s_str.trim_end().to_string(),
+                };
+                s_trimmed
+            }
+            Some(chars_str) => {
+                let chars: Vec<char> = chars_str.chars().collect();
+                let s_chars: Vec<char> = s_str.chars().collect();
+                let (start, end) = match mode {
+                    TrimMode::Both => {
+                        let mut lo = 0usize;
+                        let mut hi = s_chars.len();
+                        while lo < hi && chars.contains(&s_chars[lo]) { lo += 1; }
+                        while hi > lo && chars.contains(&s_chars[hi - 1]) { hi -= 1; }
+                        (lo, hi)
+                    }
+                    TrimMode::Left => {
+                        let mut lo = 0usize;
+                        while lo < s_chars.len() && chars.contains(&s_chars[lo]) { lo += 1; }
+                        (lo, s_chars.len())
+                    }
+                    TrimMode::Right => {
+                        let mut hi = s_chars.len();
+                        while hi > 0 && chars.contains(&s_chars[hi - 1]) { hi -= 1; }
+                        (0, hi)
+                    }
+                };
+                s_chars[start..end].iter().collect()
+            }
+        };
+        result.push(Value::Varchar(trimmed));
+    }
+    Ok(Vector::Flat(result))
+}
+
+fn eval_instr(haystack_vec: &Vector, needle_vec: &Vector) -> Result<Vector> {
+    let len = haystack_vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let h = haystack_vec.get(i);
+        let n = needle_vec.get(i);
+        if h.is_null() || n.is_null() {
+            result.push(Value::Null);
+            continue;
+        }
+        let h_str = match h.as_str() {
+            Some(s) => s,
+            None => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let n_str = match n.as_str() {
+            Some(s) => s,
+            None => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        // 1-based position; 0 if not found
+        let pos = h_str.find(&n_str)
+            .map(|idx| {
+                // 计算 1-based 字符位置（而不是字节位置）
+                let prefix = &h_str[..idx];
+                let prefix_chars = prefix.chars().count();
+                (prefix_chars + 1) as i64
+            })
+            .unwrap_or(0);
+        result.push(Value::Int64(pos));
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// 一元数值函数辅助：将 Value 转为 f64，应用函数 f，再转回 Value
+fn eval_unary_numeric<F: Fn(f64) -> f64>(vec: &Vector, f: F) -> Result<Vector> {
+    let len = vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let v = vec.get(i);
+        let n = match v {
+            Value::Null => {
+                result.push(Value::Null);
+                continue;
+            }
+            Value::Int32(x) => *x as f64,
+            Value::Int64(x) => *x as f64,
+            Value::Float32(x) => *x as f64,
+            Value::Float64(x) => *x,
+            _ => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let r = f(n);
+        // 保留整数（如果结果是整数）
+        if r.fract() == 0.0 && r.is_finite() && r >= i64::MIN as f64 && r <= i64::MAX as f64 {
+            result.push(Value::Int64(r as i64));
+        } else {
+            result.push(Value::Float64(r));
+        }
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// 二元数值函数辅助：两个 Value 转为 f64，应用函数 f
+fn eval_binary_numeric<F: Fn(f64, f64) -> f64>(
+    a_vec: &Vector,
+    b_vec: &Vector,
+    f: F,
+) -> Result<Vector> {
+    let len = a_vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let a = a_vec.get(i);
+        let b = b_vec.get(i);
+        if a.is_null() || b.is_null() {
+            result.push(Value::Null);
+            continue;
+        }
+        let x = match a {
+            Value::Int32(x) => *x as f64,
+            Value::Int64(x) => *x as f64,
+            Value::Float32(x) => *x as f64,
+            Value::Float64(x) => *x,
+            _ => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let y = match b {
+            Value::Int32(y) => *y as f64,
+            Value::Int64(y) => *y as f64,
+            Value::Float32(y) => *y as f64,
+            Value::Float64(y) => *y,
+            _ => {
+                result.push(Value::Null);
+                continue;
+            }
+        };
+        let r = f(x, y);
+        if r.fract() == 0.0 && r.is_finite() && r >= i64::MIN as f64 && r <= i64::MAX as f64 {
+            result.push(Value::Int64(r as i64));
+        } else {
+            result.push(Value::Float64(r));
+        }
+    }
     Ok(Vector::Flat(result))
 }
 

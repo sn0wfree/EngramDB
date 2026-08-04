@@ -26,6 +26,32 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        PhysicalPlan::CreateTableAs { table_def, source } => {
+            // 1. 创建表
+            let name = table_def.name.clone();
+            db.create_table(table_def)?;
+
+            // 2. 执行 SELECT 子查询，将结果插入新表
+            let source_result = execute(*source, db)?;
+            let num_cols = source_result.rows.first().map(|r| r.len()).unwrap_or(0);
+            let rows: Vec<Vec<crate::Value>> = source_result.rows.iter()
+                .map(|r| {
+                    let mut row = r.clone();
+                    row.resize(num_cols.max(0), crate::Value::Null);
+                    row
+                })
+                .collect();
+            let count = crate::executor::operators::insert::execute(db, &name, rows)?;
+
+            Ok(QueryResult {
+                columns: vec!["status".to_string()],
+                rows: vec![vec![crate::Value::Varchar(format!(
+                    "Table '{}' created with {} rows", name, count
+                ))]],
+                rows_affected: count,
+            })
+        }
+
         PhysicalPlan::CreateIndex { table_name, index_name, key_columns, included_columns, unique } => {
             db.create_index(&table_name, &index_name, &key_columns, &included_columns, unique)?;
             Ok(QueryResult {
@@ -599,6 +625,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::SubqueryScan { .. } => "SubqueryScan",
         PhysicalPlan::SetUnion { .. } => "SetUnion",
         PhysicalPlan::TruncateTable { .. } => "TruncateTable",
+        PhysicalPlan::CreateTableAs { .. } => "CreateTableAs",
     }
 }
 
@@ -771,9 +798,16 @@ fn execute_upsert(
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
     let table_def = table.def.clone();
 
-    let conflict_col_indices: Vec<usize> = conflict_clause.conflict_columns.iter()
+    let mut conflict_col_indices: Vec<usize> = conflict_clause.conflict_columns.iter()
         .filter_map(|col_name| table_def.column_index(col_name))
         .collect();
+
+    // INSERT OR IGNORE / DO NOTHING：未指定冲突列时默认使用 PRIMARY KEY
+    if conflict_col_indices.is_empty() {
+        if let Some(pk_idx) = table_def.primary_key_index() {
+            conflict_col_indices.push(pk_idx);
+        }
+    }
 
     let mut rows_affected: u64 = 0;
     let mut result_rows = Vec::new();

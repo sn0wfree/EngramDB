@@ -131,7 +131,8 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::SubqueryScan { .. }
             | PhysicalPlan::SetUnion { .. }
             | PhysicalPlan::InsertSelect { .. }
-            | PhysicalPlan::TruncateTable { .. } => {
+            | PhysicalPlan::TruncateTable { .. }
+            | PhysicalPlan::CreateTableAs { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
         }

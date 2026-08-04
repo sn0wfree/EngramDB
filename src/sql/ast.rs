@@ -72,6 +72,8 @@ pub struct CreateIndexStmt {
 pub struct CreateTableStmt {
     pub table_name: String,
     pub columns: Vec<ColumnDef>,
+    /// CREATE TABLE AS SELECT 子查询（v0.15.0 新增）
+    pub as_select: Option<Box<SelectStmt>>,
 }
 
 /// 列定义

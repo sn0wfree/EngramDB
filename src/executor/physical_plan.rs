@@ -200,6 +200,13 @@ pub enum PhysicalPlan {
     TruncateTable {
         table_name: String,
     },
+    /// CREATE TABLE AS SELECT（v0.15.0 新增）
+    ///
+    /// 创建表并填充 SELECT 查询结果。
+    CreateTableAs {
+        table_def: TableDef,
+        source: Box<PhysicalPlan>,
+    },
 }
 
 /// 集合操作类型（v0.15.0 新增）

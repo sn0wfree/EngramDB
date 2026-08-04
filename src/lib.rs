@@ -1946,4 +1946,155 @@ mod value_tests {
         let result = conn.execute("SELECT id FROM t WHERE val IN (10, 30, 50)").unwrap();
         assert_eq!(result.rows.len(), 3, "val IN (10, 30, 50) 应返回 3 行");
     }
+
+    #[test]
+    fn test_create_table_as_select() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        // 源表
+        conn.execute("CREATE TABLE src (id INT64, name VARCHAR, score INT64)").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alice', 90), (2, 'bob', 85), (3, 'charlie', 95)").unwrap();
+
+        // CREATE TABLE AS SELECT：创建高分学生表
+        conn.execute("CREATE TABLE high_scores AS SELECT id, name, score FROM src WHERE score >= 90").unwrap();
+
+        let result = conn.execute("SELECT id FROM high_scores ORDER BY id").unwrap();
+        assert_eq!(result.rows.len(), 2, "高分学生应有 2 人（alice 和 charlie）");
+    }
+
+    #[test]
+    fn test_create_table_as_select_with_columns() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE src (a INT64, b INT64)").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 10), (2, 20)").unwrap();
+
+        // CREATE TABLE col1 TYPE, col2 TYPE AS SELECT ... — 显式列定义
+        conn.execute("CREATE TABLE dst (x INT64, y VARCHAR) AS SELECT a, 'tag' FROM src").unwrap();
+
+        let result = conn.execute("SELECT x FROM dst").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_or_ignore() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 100), (2, 200)").unwrap();
+
+        // INSERT OR IGNORE：尝试插入重复的 id，应该被忽略
+        conn.execute("INSERT OR IGNORE INTO t VALUES (1, 999), (3, 300)").unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3), "应保留 3 行（2 原有 + 1 新增）");
+
+        // 验证 val=100 (id=1) 的行还在
+        let result = conn.execute("SELECT id, val FROM t WHERE val = 100").unwrap();
+        assert_eq!(result.rows.len(), 1, "val=100 的行应存在");
+        assert_eq!(result.rows[0][1], Value::Int64(100));
+
+        // 验证 val=300 (id=3) 的行被插入
+        let result = conn.execute("SELECT id FROM t WHERE val = 300").unwrap();
+        assert_eq!(result.rows.len(), 1, "val=300 的行应被插入");
+        assert_eq!(result.rows[0][0], Value::Int64(3));
+    }
+
+    #[test]
+    fn test_between() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64, val INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)").unwrap();
+
+        // BETWEEN 范围查询
+        let result = conn.execute("SELECT id FROM t WHERE val BETWEEN 20 AND 40").unwrap();
+        assert_eq!(result.rows.len(), 3, "20-40 范围内应有 3 行 (20, 30, 40)");
+
+        // NOT BETWEEN
+        let result = conn.execute("SELECT id FROM t WHERE val NOT BETWEEN 20 AND 40").unwrap();
+        assert_eq!(result.rows.len(), 2, "20-40 范围外应有 2 行 (10, 50)");
+
+        // BETWEEN with strings
+        conn.execute("CREATE TABLE words (w VARCHAR)").unwrap();
+        conn.execute("INSERT INTO words VALUES ('apple'), ('banana'), ('cherry'), ('date')").unwrap();
+        let result = conn.execute("SELECT w FROM words WHERE w BETWEEN 'banana' AND 'date'").unwrap();
+        assert_eq!(result.rows.len(), 3, "banana-date 范围内应有 banana, cherry, date");
+    }
+
+    #[test]
+    fn test_nullif() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INT64, b INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1), (1, 2), (2, 1)").unwrap();
+
+        // NULLIF(a, b): a == b 时返回 NULL，否则返回 a
+        let result = conn.execute("SELECT NULLIF(a, b) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Null, "1 == 1 → NULL");
+        assert_eq!(result.rows[1][0], Value::Int64(1), "1 != 2 → 1");
+        assert_eq!(result.rows[2][0], Value::Int64(2), "2 != 1 → 2");
+    }
+
+    #[test]
+    fn test_if_func() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+        // IF(cond, true_val, false_val)
+        let result = conn.execute("SELECT IF(x > 1, 'big', 'small') FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("small".to_string()));
+        assert_eq!(result.rows[1][0], Value::Varchar("big".to_string()));
+        assert_eq!(result.rows[2][0], Value::Varchar("big".to_string()));
+    }
+
+    #[test]
+    fn test_trim() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (s VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('  hello  '), ('xxxhelloxxx'), ('  world')").unwrap();
+
+        // TRIM 默认去除两端空白
+        let result = conn.execute("SELECT TRIM(s) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("hello".to_string()));
+        assert_eq!(result.rows[1][0], Value::Varchar("xxxhelloxxx".to_string())); // 无空白不变
+        assert_eq!(result.rows[2][0], Value::Varchar("world".to_string()));
+
+        // LTRIM / RTRIM
+        let result = conn.execute("SELECT LTRIM(s), RTRIM(s) FROM t WHERE s = '  hello  '").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("hello  ".to_string()));
+        assert_eq!(result.rows[0][1], Value::Varchar("  hello".to_string()));
+    }
+
+    #[test]
+    fn test_instr() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (s VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('hello world'), ('hello')").unwrap();
+
+        // INSTR(haystack, needle): 1-based position, 0 if not found
+        let result = conn.execute("SELECT INSTR(s, 'world') FROM t WHERE s = 'hello world'").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(7));
+
+        let result = conn.execute("SELECT INSTR(s, 'xyz') FROM t WHERE s = 'hello'").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(0), "未找到应返回 0");
+    }
+
+    #[test]
+    fn test_numeric_functions() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x DOUBLE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1.5), (-1.5), (16.0)").unwrap();
+
+        // CEIL / FLOOR / TRUNC
+        let result = conn.execute("SELECT CEIL(x), FLOOR(x), TRUNC(x) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(2));
+        assert_eq!(result.rows[0][1], Value::Int64(1));
+        assert_eq!(result.rows[0][2], Value::Int64(1));
+
+        // POWER / SQRT
+        let result = conn.execute("SELECT POWER(x, 2), SQRT(x) FROM t").unwrap();
+        assert_eq!(result.rows[2][0], Value::Int64(256)); // 16^2 = 256 (整数)
+        assert_eq!(result.rows[2][1], Value::Int64(4)); // sqrt(16) = 4 (整数)
+    }
 }

@@ -27,9 +27,13 @@ pub fn parse(sql: &str) -> Result<Statement> {
         return Ok(stmt);
     }
 
+    // 处理 INSERT OR IGNORE / INSERT OR REPLACE（v0.15.0 M05 新增）
+    // sqlparser 不原生支持，转换为 ON CONFLICT 子句
+    let normalized_sql = normalize_insert_or(sql);
+
     // 处理 CREATE INDEX ... INCLUDE (...) 语法（v0.12.0 覆盖索引）
     // sqlparser 0.47 不原生支持 INCLUDE 子句，需要预处理
-    if let Some((base_sql, included_cols)) = extract_include_clause(sql) {
+    if let Some((base_sql, included_cols)) = extract_include_clause(&normalized_sql) {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, &base_sql).map_err(|e| {
             EngramDbError::Parse(format!("SQL parse error: {}", e))
@@ -46,7 +50,7 @@ pub fn parse(sql: &str) -> Result<Statement> {
     }
 
     let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
+    let stmts = Parser::parse_sql(&dialect, &normalized_sql).map_err(|e| {
         EngramDbError::Parse(format!("SQL parse error: {}", e))
     })?;
 
@@ -117,10 +121,34 @@ fn extract_include_clause(sql: &str) -> Option<(String, Vec<String>)> {
     Some((base_sql, columns))
 }
 
+/// 预处理 INSERT OR IGNORE / INSERT OR REPLACE 语法（v0.15.0 M05 新增）
+///
+/// sqlparser 不原生支持 SQLite 的 `INSERT OR REPLACE/IGNORE` 语法。
+/// 将其转换为等价的 `INSERT ... ON CONFLICT DO NOTHING` 形式（在语句末尾追加）。
+///
+/// 注意：OR REPLACE 暂不支持（需要显式 SET 子句指定列）。
+fn normalize_insert_or(sql: &str) -> String {
+    let upper = sql.to_uppercase();
+
+    if upper.starts_with("INSERT OR IGNORE ") || upper.starts_with("INSERT OR IGNORE\t")
+        || upper.starts_with("INSERT OR IGNORE\n") || upper.starts_with("INSERT OR IGNORE\r")
+    {
+        // 去掉 "INSERT OR IGNORE" 前缀
+        let after = &sql["INSERT OR IGNORE".len()..];
+        let stripped = after.trim_start();
+        // 在末尾追加 ON CONFLICT DO NOTHING
+        if !upper.contains("ON CONFLICT") {
+            return format!("INSERT {} ON CONFLICT DO NOTHING", stripped);
+        }
+    }
+
+    sql.to_string()
+}
+
 /// sqlparser AST → EngramDB 内部 AST
 fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
     match stmt {
-        sqlast::Statement::CreateTable { name, columns, .. } => {
+        sqlast::Statement::CreateTable { name, columns, query, .. } => {
             let table_name = name.to_string();
             let mut cols = Vec::new();
             for col_def in columns {
@@ -160,9 +188,16 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                     });
                 }
             }
+            // CREATE TABLE AS SELECT：query 字段非空
+            let as_select = if let Some(q) = query {
+                Some(Box::new(convert_query(q)?))
+            } else {
+                None
+            };
             Ok(Statement::CreateTable(CreateTableStmt {
                 table_name,
                 columns: cols,
+                as_select,
             }))
         }
 
@@ -775,8 +810,58 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
 
         sqlast::Expr::IsNull(expr) => Ok(Expression::IsNull(Box::new(convert_expression(expr)?))),
 
+        // TRIM(expr [, chars]) / LTRIM / RTRIM：转换为函数调用（v0.15.0 S05）
+        sqlast::Expr::Trim { expr, trim_where, trim_what, .. } => {
+            let inner = convert_expression(expr)?;
+            // trim_what 是要去除的字符（仅第一个元素）
+            let what = if let Some(what_box) = trim_what {
+                Some(convert_expression(what_box)?)
+            } else {
+                None
+            };
+            // 根据 trim_where 选择函数名
+            let fname = match trim_where {
+                Some(sqlast::TrimWhereField::Leading) => "LTRIM",
+                Some(sqlast::TrimWhereField::Trailing) => "RTRIM",
+                _ => "TRIM",
+            };
+            let mut fn_args = vec![inner];
+            if let Some(w) = what {
+                fn_args.push(w);
+            }
+            Ok(Expression::Function {
+                name: fname.to_string(),
+                args: fn_args,
+                distinct: false,
+                count_star: false,
+                over: None,
+            })
+        }
+
         sqlast::Expr::IsNotNull(expr) => {
             Ok(Expression::IsNotNull(Box::new(convert_expression(expr)?)))
+        }
+
+        // CEIL/FLOOR 表达式：转换为函数调用（v0.15.0 N03-N04）
+        sqlast::Expr::Ceil { expr, .. } => {
+            let inner = convert_expression(expr)?;
+            Ok(Expression::Function {
+                name: "CEIL".to_string(),
+                args: vec![inner],
+                distinct: false,
+                count_star: false,
+                over: None,
+            })
+        }
+        sqlast::Expr::Floor { expr, .. } => {
+            let inner = convert_expression(expr)?;
+            Ok(Expression::Function {
+                name: "FLOOR".to_string(),
+                args: vec![inner],
+                distinct: false,
+                count_star: false,
+                over: None,
+            })
         }
 
         sqlast::Expr::InList { expr, list, negated } => {
