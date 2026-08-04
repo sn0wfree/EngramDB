@@ -82,6 +82,10 @@ pub enum PhysicalPlan {
         key_columns: Vec<usize>,
         included_columns: Vec<usize>,
         unique: bool,
+        /// 索引类型（如 hnsw），None 表示普通 B-tree 索引
+        using: Option<String>,
+        /// 向量索引 WITH 选项
+        with_options: Vec<(String, String)>,
     },
     /// 删除（v0.12.0 新增，DELETE）
     Delete {
@@ -213,6 +217,13 @@ pub enum PhysicalPlan {
     ReleaseSavepoint { name: String },
     /// ROLLBACK TO SAVEPOINT name（v0.15.0 Txn05 新增）
     RollbackToSavepoint { name: String },
+    /// 向量搜索表值函数（v0.15.0 V16 新增）
+    VectorSearch {
+        table_name: String,
+        index_name: String,
+        query_vector: Vec<f32>,
+        k: usize,
+    },
 }
 
 /// 集合操作类型（v0.15.0 新增）

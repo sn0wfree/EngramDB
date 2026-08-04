@@ -159,7 +159,7 @@ fn test_persistence_after_compact() {
         conn.execute_prepared_batch(&stmt, &batch).unwrap();
 
         // 手动 compact
-        conn.compact_table("big").unwrap();
+        conn.compact("big").unwrap();
 
         conn.close().unwrap();
     }

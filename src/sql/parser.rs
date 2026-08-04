@@ -31,9 +31,13 @@ pub fn parse(sql: &str) -> Result<Statement> {
     // sqlparser 不原生支持，转换为 ON CONFLICT 子句
     let normalized_sql = normalize_insert_or(sql);
 
+    // 处理 CREATE VECTOR INDEX ... WITH (...) 语法（v0.15.0 V16 新增）
+    // 转换为 CREATE INDEX ... USING hnsw，并提取 WITH 选项
+    let (sql_for_parse, with_options) = normalize_vector_index(&normalized_sql);
+
     // 处理 CREATE INDEX ... INCLUDE (...) 语法（v0.12.0 覆盖索引）
     // sqlparser 0.47 不原生支持 INCLUDE 子句，需要预处理
-    if let Some((base_sql, included_cols)) = extract_include_clause(&normalized_sql) {
+    if let Some((base_sql, included_cols)) = extract_include_clause(&sql_for_parse) {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, &base_sql).map_err(|e| {
             EngramDbError::Parse(format!("SQL parse error: {}", e))
@@ -45,12 +49,13 @@ pub fn parse(sql: &str) -> Result<Statement> {
         // 注入 INCLUDE 列
         if let Statement::CreateIndex(ref mut idx_stmt) = stmt {
             idx_stmt.included_columns = included_cols;
+            idx_stmt.with_options = with_options;
         }
         return Ok(stmt);
     }
 
     let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, &normalized_sql).map_err(|e| {
+    let stmts = Parser::parse_sql(&dialect, &sql_for_parse).map_err(|e| {
         EngramDbError::Parse(format!("SQL parse error: {}", e))
     })?;
 
@@ -59,7 +64,14 @@ pub fn parse(sql: &str) -> Result<Statement> {
     }
 
     // 只处理第一条语句
-    convert_statement(&stmts[0])
+    let mut stmt = convert_statement(&stmts[0])?;
+    // 注入 WITH 选项（向量索引）
+    if !with_options.is_empty() {
+        if let Statement::CreateIndex(ref mut idx_stmt) = stmt {
+            idx_stmt.with_options = with_options;
+        }
+    }
+    Ok(stmt)
 }
 
 /// 从 CREATE INDEX 语句中提取 INCLUDE 子句（v0.12.0 覆盖索引）
@@ -143,6 +155,91 @@ fn normalize_insert_or(sql: &str) -> String {
     }
 
     sql.to_string()
+}
+
+/// 预处理 CREATE VECTOR INDEX ... WITH (...) 语法（v0.15.0 V16 新增）
+///
+/// 将 `CREATE VECTOR INDEX idx ON t (col) USING hnsw WITH (metric = cosine, m = 16)`
+/// 转换为 `CREATE INDEX idx ON t (col) USING hnsw`
+/// 并提取 WITH 选项。
+fn normalize_vector_index(sql: &str) -> (String, Vec<(String, String)>) {
+    let upper = sql.to_uppercase();
+    if !upper.starts_with("CREATE VECTOR INDEX") {
+        // 即使没有 CREATE VECTOR INDEX，也可能有 WITH 子句
+        // 但只有 CREATE INDEX 才可能有 WITH
+        if upper.contains("CREATE INDEX") && upper.contains(" WITH ") {
+            return extract_with_options(sql);
+        }
+        return (sql.to_string(), Vec::new());
+    }
+
+    // 去掉 "VECTOR" 关键字：CREATE VECTOR INDEX → CREATE INDEX
+    let after_vector = &sql["CREATE VECTOR".len()..];
+    let base = format!("CREATE{}", after_vector);
+
+    // 提取 WITH 选项
+    if upper.contains(" WITH ") {
+        extract_with_options(&base)
+    } else {
+        (base, Vec::new())
+    }
+}
+
+/// 从 CREATE INDEX 语句中提取 WITH 选项
+fn extract_with_options(sql: &str) -> (String, Vec<(String, String)>) {
+    let upper = sql.to_uppercase();
+    let with_pos = match upper.find(" WITH ") {
+        Some(p) => p,
+        None => return (sql.to_string(), Vec::new()),
+    };
+
+    let after_with = &sql[with_pos + " WITH ".len()..];
+    let bytes = after_with.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return (sql.to_string(), Vec::new());
+    }
+
+    // 解析括号内的选项
+    let paren_start = i + 1;
+    let mut depth = 1;
+    let mut j = paren_start;
+    while j < bytes.len() && depth > 0 {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    if depth != 0 {
+        return (sql.to_string(), Vec::new());
+    }
+    let paren_end = j - 1;
+
+    let opts_str = &after_with[paren_start..paren_end];
+    let options: Vec<(String, String)> = opts_str
+        .split(',')
+        .filter_map(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            // 按 = 分割
+            let eq_pos = trimmed.find('=')?;
+            let key = trimmed[..eq_pos].trim().to_lowercase();
+            let val = trimmed[eq_pos + 1..].trim().trim_matches('\'').to_string();
+            Some((key, val))
+        })
+        .collect();
+
+    // 构造去掉 WITH 子句的基础 SQL
+    let base_sql = format!("{}{}", &sql[..with_pos], &after_with[j..]);
+
+    (base_sql, options)
 }
 
 /// sqlparser AST → EngramDB 内部 AST
@@ -347,6 +444,21 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
             name: name.value.clone(),
         }),
 
+        // PRAGMA（v0.15.0 新增 P03-P06）
+        sqlast::Statement::Pragma { name, value, .. } => {
+            let pragma_name = name.to_string();
+            let arg = value.as_ref().map(|v| match v {
+                sqlast::Value::SingleQuotedString(s) => s.clone(),
+                sqlast::Value::Number(s, _) => s.clone(),
+                sqlast::Value::Boolean(b) => b.to_string(),
+                _ => v.to_string(),
+            });
+            Ok(Statement::Pragma(PragmaStmt {
+                name: pragma_name,
+                arg,
+            }))
+        }
+
         // TRUNCATE TABLE（v0.15.0 新增）
         sqlast::Statement::Truncate { table_name, .. } => {
             Ok(Statement::TruncateTable {
@@ -406,6 +518,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
             table_name,
             columns,
             unique,
+            using,
             ..
         } => {
             let index_name = name.as_ref()
@@ -426,6 +539,8 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 key_columns: key_cols,
                 included_columns: included_cols,
                 unique: *unique,
+                using: using.clone().map(|u| u.value.to_string()),
+                with_options: Vec::new(),
             }))
         }
 
@@ -695,6 +810,28 @@ fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>>
             } else {
                 Err(EngramDbError::Parse("Unsupported subquery type in FROM".into()))
             }
+        }
+        sqlast::TableFactor::TableFunction { expr, alias } => {
+            let (name, args) = if let sqlast::Expr::Function(func) = &expr {
+                let name = func.name.to_string();
+                let args = match &func.args {
+                    sqlast::FunctionArguments::List(arg_list) => {
+                        arg_list.args.iter().filter_map(|arg| {
+                            if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) = arg {
+                                convert_expression(e).ok()
+                            } else {
+                                None
+                            }
+                        }).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                (name, args)
+            } else {
+                (expr.to_string(), Vec::new())
+            };
+            let alias = alias.as_ref().map(|a| a.name.value.clone());
+            Ok(Some(TableRef::TableFunction { name, args, alias }))
         }
         _ => Ok(None),
     }
@@ -1378,6 +1515,38 @@ mod tests {
                 assert_eq!(s.columns[0].data_type, DataType::Int32);
             }
             _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pragma() {
+        let stmt = parse("PRAGMA table_info('t')").unwrap();
+        match stmt {
+            Statement::Pragma(s) => {
+                assert_eq!(s.name, "table_info");
+                assert_eq!(s.arg, Some("t".to_string()));
+            }
+            _ => panic!("Expected Pragma"),
+        }
+
+        // sqlparser 的 PRAGMA value 要求是字面量，WAL 须加引号
+        let stmt = parse("PRAGMA journal_mode = 'WAL'").unwrap();
+        match stmt {
+            Statement::Pragma(s) => {
+                assert_eq!(s.name, "journal_mode");
+                assert_eq!(s.arg, Some("WAL".to_string()));
+            }
+            _ => panic!("Expected Pragma"),
+        }
+
+        // 无参数 PRAGMA
+        let stmt = parse("PRAGMA database_list").unwrap();
+        match stmt {
+            Statement::Pragma(s) => {
+                assert_eq!(s.name, "database_list");
+                assert!(s.arg.is_none());
+            }
+            _ => panic!("Expected Pragma"),
         }
     }
 }

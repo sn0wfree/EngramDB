@@ -279,6 +279,7 @@ impl Database {
 
     /// 设置 WAL 刷盘策略
     pub fn set_wal_flush_mode(&mut self, mode: crate::common::config::WalFlushMode) {
+        self.config.wal_flush_mode = mode;
         self.txn_manager.set_wal_flush_mode(mode);
     }
 

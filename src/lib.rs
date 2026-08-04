@@ -2348,4 +2348,161 @@ mod value_tests {
         assert_eq!(parsed["a"], 1);
         assert!(parsed.get("b").is_none(), "JSON_REPLACE 在路径不存在时不应创建");
     }
+
+    #[test]
+    fn test_is_null() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64, val INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)").unwrap();
+
+        // IS NULL
+        let result = conn.execute("SELECT id FROM t WHERE val IS NULL").unwrap();
+        assert_eq!(result.rows.len(), 1, "val IS NULL 应有 1 行 (id=2)");
+        assert_eq!(result.rows[0][0], Value::Int64(2));
+
+        // IS NOT NULL
+        let result = conn.execute("SELECT id FROM t WHERE val IS NOT NULL").unwrap();
+        assert_eq!(result.rows.len(), 2, "val IS NOT NULL 应有 2 行 (id=1,3)");
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+        assert_eq!(result.rows[1][0], Value::Int64(3));
+
+        // IS NULL 在 SELECT 列表中
+        let result = conn.execute("SELECT val IS NULL FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Boolean(false));
+        assert_eq!(result.rows[1][0], Value::Boolean(true));
+        assert_eq!(result.rows[2][0], Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_is_not_null() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (name VARCHAR, age INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('alice', 30), (NULL, 25), ('bob', NULL)").unwrap();
+
+        // VARCHAR IS NOT NULL
+        let result = conn.execute("SELECT name FROM t WHERE name IS NOT NULL").unwrap();
+        assert_eq!(result.rows.len(), 2, "name IS NOT NULL 应有 2 行 (alice, bob)");
+        assert_eq!(result.rows[0][0], Value::Varchar("alice".to_string()));
+        assert_eq!(result.rows[1][0], Value::Varchar("bob".to_string()));
+
+        // IS NOT NULL 对两种列
+        let result = conn.execute("SELECT name FROM t WHERE age IS NOT NULL AND name IS NOT NULL").unwrap();
+        assert_eq!(result.rows.len(), 1, "age AND name IS NOT NULL 应有 1 行 (alice)");
+    }
+
+    #[test]
+    fn test_pragma_index_info() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, name VARCHAR, age INT64)").unwrap();
+        conn.execute("CREATE INDEX idx_name ON t (name)").unwrap();
+        conn.execute("CREATE INDEX idx_age ON t (age)").unwrap();
+
+        let result = conn.execute("PRAGMA index_info('t')").unwrap();
+        // 至少应有 2 条索引列记录
+        assert!(result.rows.len() >= 2, "index_info should have at least 2 rows");
+        // 列名和索引名应非空
+        for row in &result.rows {
+            assert!(matches!(row[1], Value::Varchar(_)));
+            assert!(matches!(row[2], Value::Varchar(_)));
+        }
+    }
+
+    #[test]
+    fn test_pragma_index_list() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, name VARCHAR)").unwrap();
+        conn.execute("CREATE INDEX idx_name ON t (name)").unwrap();
+
+        let result = conn.execute("PRAGMA index_list('t')").unwrap();
+        assert!(result.rows.len() >= 1, "index_list should have at least 1 row");
+        // 验证有索引名列
+        let has_name_idx = result.rows.iter().any(|r| {
+            matches!(&r[1], Value::Varchar(n) if n == "idx_name")
+        });
+        assert!(has_name_idx, "index_list should contain idx_name");
+    }
+
+    #[test]
+    fn test_pragma_journal_mode() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        // 查询当前 mode（默认 Sync → "wal"）
+        let result = conn.execute("PRAGMA journal_mode").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("wal".to_string()));
+
+        // 切换 mode 并返回值
+        let result = conn.execute("PRAGMA journal_mode = 'memory'").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("MEMORY".to_string()));
+
+        // 查询当前 mode（"memory" 映射到 BufferFull，返回 "off"）
+        let result = conn.execute("PRAGMA journal_mode").unwrap();
+        // 实际存储为 BufferFull，对应 "off"
+        assert_eq!(result.rows[0][0], Value::Varchar("off".to_string()));
+    }
+
+    #[test]
+    fn test_pragma_synchronous() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        // 查询当前同步级别（默认 Sync → "2"）
+        let result = conn.execute("PRAGMA synchronous").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("2".to_string()));
+
+        // 切换级别
+        let result = conn.execute("PRAGMA synchronous = 0").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("0".to_string()));
+
+        let result = conn.execute("PRAGMA synchronous").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("0".to_string()));
+    }
+
+    #[test]
+    fn test_pragma_cache_size() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        // 查询当前缓存大小（默认 64MB = 65536 KB）
+        let result = conn.execute("PRAGMA cache_size").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(65536));
+
+        // 设置缓存大小（KB）
+        let result = conn.execute("PRAGMA cache_size = 8192").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(8192));
+
+        let result = conn.execute("PRAGMA cache_size").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(8192));
+    }
+
+    #[test]
+    fn test_create_vector_index() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, embedding VECTOR(4))").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '[1.0, 0.0, 0.0, 0.0]'), (2, '[0.0, 1.0, 0.0, 0.0]'), (3, '[0.0, 0.0, 1.0, 0.0]')").unwrap();
+
+        // 创建向量索引（使用 CREATE VECTOR INDEX 语法）
+        let result = conn.execute("CREATE VECTOR INDEX idx_emb ON t (embedding) WITH (metric = cosine, m = 8, ef_construction = 50)").unwrap();
+        assert!(result.rows[0][0].to_string().contains("Vector index"));
+
+        // 使用标准 CREATE INDEX ... USING hnsw 语法
+        let result = conn.execute("CREATE INDEX idx_emb2 ON t (embedding) USING hnsw WITH (metric = l2, m = 8, ef_construction = 50)").unwrap();
+        assert!(result.rows[0][0].to_string().contains("Vector index"));
+    }
+
+    #[test]
+    fn test_vector_search() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, embedding VECTOR(4))").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '[1.0, 0.0, 0.0, 0.0]'), (2, '[0.0, 1.0, 0.0, 0.0]'), (3, '[0.0, 0.0, 1.0, 0.0]')").unwrap();
+
+        // 创建向量索引
+        conn.execute("CREATE VECTOR INDEX idx_emb ON t (embedding) WITH (metric = cosine, m = 8, ef_construction = 50)").unwrap();
+
+        // 使用 vector_search 表值函数
+        let result = conn.execute("SELECT * FROM vector_search('t', 'idx_emb', '[1.0, 0.0, 0.0, 0.0]', 3)").unwrap();
+        assert_eq!(result.rows.len(), 3, "vector_search should return 3 neighbors");
+        // 第一行应是 id=1（自己，距离 0）
+        assert_eq!(result.rows[0][0], Value::Int32(1));
+        assert_eq!(result.rows[0][1], Value::Float64(0.0));
+    }
 }

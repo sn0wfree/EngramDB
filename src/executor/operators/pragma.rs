@@ -1,3 +1,4 @@
+use crate::common::config::WalFlushMode;
 use crate::common::error::Result;
 use crate::storage::Database;
 use crate::sql::ast::PragmaStmt;
@@ -118,6 +119,135 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
+
+        // P03: PRAGMA index_info / index_list — 索引详细信息
+        "index_info" => {
+            if let Some(table_name) = stmt.arg {
+                let table = db.get_table(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                let mut rows = Vec::new();
+                for idx in &table.def.indexes {
+                    for (seq, &col_idx) in idx.key_columns.iter().enumerate() {
+                        let col_name = table.def.columns.get(col_idx).map(|c| c.name.clone()).unwrap_or_default();
+                        rows.push(vec![
+                            Value::Int32(seq as i32),
+                            Value::Varchar(col_name),
+                            Value::Varchar(idx.name.clone()),
+                        ]);
+                    }
+                }
+                Ok(QueryResult {
+                    columns: vec!["seqno".into(), "name".into(), "index_name".into()],
+                    rows,
+                    rows_affected: 0,
+                })
+            } else {
+                Err(crate::common::error::EngramDbError::Parse("PRAGMA index_info requires table name".into()))
+            }
+        }
+        "index_list" => {
+            if let Some(table_name) = stmt.arg {
+                let table = db.get_table(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                let mut rows = Vec::new();
+                for (seq, idx) in table.def.indexes.iter().enumerate() {
+                    let key_cols: Vec<String> = idx.key_columns.iter()
+                        .map(|&i| table.def.columns.get(i).map(|c| c.name.clone()).unwrap_or_default())
+                        .collect();
+                    rows.push(vec![
+                        Value::Int32(seq as i32),
+                        Value::Varchar(idx.name.clone()),
+                        Value::Varchar(key_cols.join(", ")),
+                        Value::Boolean(idx.unique),
+                        Value::Varchar(idx.index_type.clone()),
+                    ]);
+                }
+                Ok(QueryResult {
+                    columns: vec!["seq".into(), "name".into(), "key_columns".into(), "unique".into(), "type".into()],
+                    rows,
+                    rows_affected: 0,
+                })
+            } else {
+                Err(crate::common::error::EngramDbError::Parse("PRAGMA index_list requires table name".into()))
+            }
+        }
+
+        // P04: PRAGMA journal_mode — WAL / 普通模式切换
+        "journal_mode" => {
+            let mode = if let Some(arg) = stmt.arg {
+                let new_mode = match arg.to_lowercase().as_str() {
+                    "wal" => WalFlushMode::Sync,
+                    "delete" | "truncate" | "persist" => WalFlushMode::Periodic,
+                    "memory" | "off" => WalFlushMode::BufferFull,
+                    _ => { return Err(crate::common::error::EngramDbError::Parse(format!("unknown journal_mode: {}", arg))); }
+                };
+                db.set_wal_flush_mode(new_mode);
+                arg.to_uppercase()
+            } else {
+                match db.config().wal_flush_mode {
+                    WalFlushMode::Sync => "wal",
+                    WalFlushMode::Periodic => "delete",
+                    WalFlushMode::BufferFull => "off",
+                }.to_string()
+            };
+            Ok(QueryResult {
+                columns: vec!["journal_mode".into()],
+                rows: vec![vec![Value::Varchar(mode)]],
+                rows_affected: 0,
+            })
+        }
+
+        // P05: PRAGMA synchronous — 同步级别设置
+        "synchronous" => {
+            let level = if let Some(arg) = stmt.arg {
+                match arg.to_lowercase().as_str() {
+                    "0" | "off" => {
+                        db.set_wal_flush_mode(WalFlushMode::BufferFull);
+                        "0".to_string()
+                    }
+                    "1" | "normal" => {
+                        db.set_wal_flush_mode(WalFlushMode::Periodic);
+                        "1".to_string()
+                    }
+                    "2" | "full" => {
+                        db.set_wal_flush_mode(WalFlushMode::Sync);
+                        "2".to_string()
+                    }
+                    _ => { return Err(crate::common::error::EngramDbError::Parse(format!("unknown synchronous level: {}", arg))); }
+                }
+            } else {
+                match db.config().wal_flush_mode {
+                    WalFlushMode::Sync => "2",
+                    WalFlushMode::Periodic => "1",
+                    WalFlushMode::BufferFull => "0",
+                }.to_string()
+            };
+            Ok(QueryResult {
+                columns: vec!["synchronous".into()],
+                rows: vec![vec![Value::Varchar(level)]],
+                rows_affected: 0,
+            })
+        }
+
+        // P06: PRAGMA cache_size — 缓存大小设置
+        "cache_size" => {
+            let size = if let Some(arg) = stmt.arg {
+                let kb: i64 = arg.parse().map_err(|_| {
+                    crate::common::error::EngramDbError::Parse(format!("invalid cache_size: {}", arg))
+                })?;
+                let bytes = if kb >= 0 { kb as usize * 1024 } else { ((-kb) as usize) * 1024 };
+                db.cache().set_max_memory(bytes);
+                kb
+            } else {
+                (db.cache().max_memory() / 1024) as i64
+            };
+            Ok(QueryResult {
+                columns: vec!["cache_size".into()],
+                rows: vec![vec![Value::Int64(size)]],
+                rows_affected: 0,
+            })
+        }
+
         _ => Ok(QueryResult {
             columns: vec!["status".to_string()],
             rows: vec![vec![Value::Varchar(format!("PRAGMA {} ok", stmt.name))]],

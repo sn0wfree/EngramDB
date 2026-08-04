@@ -71,6 +71,10 @@ pub struct CreateIndexStmt {
     pub included_columns: Vec<String>,
     /// 是否唯一索引
     pub unique: bool,
+    /// 向量索引：USING 子句（如 hnsw）
+    pub using: Option<String>,
+    /// 向量索引：WITH 选项（如 metric, m, ef_construction）
+    pub with_options: Vec<(String, String)>,
 }
 
 /// CREATE TABLE 语句
@@ -210,6 +214,8 @@ pub enum TableRef {
     Table { table_name: String, alias: Option<String> },
     /// 派生表（子查询）
     Derived { query: Box<SelectStmt>, alias: String },
+    /// 表值函数（v0.15.0 V16 新增，如 vector_search(...)）
+    TableFunction { name: String, args: Vec<Expression>, alias: Option<String> },
 }
 
 /// ORDER BY 项

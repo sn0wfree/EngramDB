@@ -332,6 +332,53 @@ fn plan_create_index(stmt: CreateIndexStmt, db: &Database) -> Result<PhysicalPla
         key_columns: key_cols,
         included_columns: included_cols,
         unique: stmt.unique,
+        using: stmt.using,
+        with_options: stmt.with_options,
+    })
+}
+
+/// 规划 vector_search 表值函数（v0.15.0 V16 新增）
+fn plan_vector_search(args: &[Expression], db: &Database) -> Result<PhysicalPlan> {
+    if args.len() < 4 {
+        return Err(EngramDbError::Parse(
+            "vector_search requires 4 arguments: table_name, index_name, query_vector, k".into()
+        ));
+    }
+
+    // 所有参数必须是字面量
+    let table_name = match &args[0] {
+        Expression::Literal(Value::Varchar(s)) => s.clone(),
+        _ => return Err(EngramDbError::Parse("vector_search: table_name must be a string literal".into())),
+    };
+    let index_name = match &args[1] {
+        Expression::Literal(Value::Varchar(s)) => s.clone(),
+        _ => return Err(EngramDbError::Parse("vector_search: index_name must be a string literal".into())),
+    };
+    let query_vector = match &args[2] {
+        Expression::Literal(Value::Varchar(s)) => {
+            // Parse JSON array of floats
+            let v: Vec<f64> = serde_json::from_str(s)
+                .map_err(|e| EngramDbError::Parse(format!("vector_search: invalid query vector JSON: {}", e)))?;
+            v.into_iter().map(|x| x as f32).collect()
+        }
+        Expression::Literal(Value::Vector(v)) => v.clone(),
+        _ => return Err(EngramDbError::Parse("vector_search: query_vector must be a string or vector literal".into())),
+    };
+    let k = match &args[3] {
+        Expression::Literal(Value::Int64(n)) => *n as usize,
+        Expression::Literal(Value::Int32(n)) => *n as usize,
+        _ => return Err(EngramDbError::Parse("vector_search: k must be an integer literal".into())),
+    };
+
+    // 验证表存在
+    db.get_table(&table_name)
+        .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+
+    Ok(PhysicalPlan::VectorSearch {
+        table_name,
+        index_name,
+        query_vector,
+        k,
     })
 }
 
@@ -467,6 +514,13 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                     return Ok(PhysicalPlan::CountStar { output_name, count });
                 }
             }
+        }
+    }
+
+    // ===== V16：表值函数 vector_search(...) =====
+    if let Some(TableRef::TableFunction { name, args, .. }) = &stmt.from {
+        if name.eq_ignore_ascii_case("vector_search") {
+            return plan_vector_search(args, db);
         }
     }
 

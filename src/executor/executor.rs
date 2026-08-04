@@ -52,16 +52,60 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::CreateIndex { table_name, index_name, key_columns, included_columns, unique } => {
-            db.create_index(&table_name, &index_name, &key_columns, &included_columns, unique)?;
-            Ok(QueryResult {
-                columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar(format!(
-                    "Index '{}' created on '{}' ({} key, {} included)",
-                    index_name, table_name, key_columns.len(), included_columns.len()
-                ))]],
-                rows_affected: 0,
-            })
+        PhysicalPlan::CreateIndex { table_name, index_name, key_columns, included_columns, unique, using, with_options } => {
+            if let Some(using_type) = using {
+                if using_type.to_lowercase() == "hnsw" {
+                    // 向量索引：解析 WITH 选项
+                    let mut metric = crate::storage::vector_index::DistanceMetric::L2;
+                    let mut m: usize = 16;
+                    let mut ef_construction: usize = 100;
+                    for (key, val) in with_options {
+                        match key.as_str() {
+                            "metric" => {
+                                metric = match val.to_lowercase().as_str() {
+                                    "l2" | "l2_distance" => crate::storage::vector_index::DistanceMetric::L2,
+                                    "cosine" | "cosine_similarity" => crate::storage::vector_index::DistanceMetric::Cosine,
+                                    "ip" | "inner_product" => crate::storage::vector_index::DistanceMetric::InnerProduct,
+                                    _ => return Err(EngramDbError::Parse(format!("unknown metric: {}", val))),
+                                };
+                            }
+                            "m" => {
+                                m = val.parse().map_err(|_| EngramDbError::Parse(format!("invalid m: {}", val)))?;
+                            }
+                            "ef_construction" => {
+                                ef_construction = val.parse().map_err(|_| EngramDbError::Parse(format!("invalid ef_construction: {}", val)))?;
+                            }
+                            _ => { /* ignore unknown options */ }
+                        }
+                    }
+                    let col_name_str = {
+                        let table = db.get_table(table_name.as_str())
+                            .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+                        table.def.columns[key_columns[0]].name.clone()
+                    };
+                    db.create_vector_index(&table_name, &index_name, &col_name_str, metric, m, ef_construction)?;
+                    Ok(QueryResult {
+                        columns: vec!["status".to_string()],
+                        rows: vec![vec![crate::Value::Varchar(format!(
+                            "Vector index '{}' created on '{}' (metric={:?}, m={}, ef_construction={})",
+                            index_name, table_name, metric, m, ef_construction
+                        ))]],
+                        rows_affected: 0,
+                    })
+                } else {
+                    Err(EngramDbError::Parse(format!("unsupported index type: {}", using_type)))
+                }
+            } else {
+                db.create_index(&table_name, &index_name, &key_columns, &included_columns, unique)?;
+                Ok(QueryResult {
+                    columns: vec!["status".to_string()],
+                    rows: vec![vec![crate::Value::Varchar(format!(
+                        "Index '{}' created on '{}' ({} key, {} included)",
+                        index_name, table_name, key_columns.len(), included_columns.len()
+                    ))]],
+                    rows_affected: 0,
+                })
+            }
         }
 
         PhysicalPlan::Delete { table_name, condition } => {
@@ -513,6 +557,23 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        // V16: vector_search 表值函数
+        PhysicalPlan::VectorSearch { table_name, index_name, query_vector, k } => {
+            let neighbors = db.vector_search(&table_name, &index_name, query_vector.as_slice(), k)?;
+            let mut rows = Vec::with_capacity(neighbors.len());
+            for n in &neighbors {
+                rows.push(vec![
+                    crate::Value::Int32(n.id as i32),
+                    crate::Value::Float64(n.distance as f64),
+                ]);
+            }
+            Ok(QueryResult {
+                columns: vec!["row_id".into(), "distance".into()],
+                rows,
+                rows_affected: 0,
+            })
+        }
+
         // Perf01：COUNT(*) 元数据级短路
         PhysicalPlan::CountStar { output_name, count } => {
             Ok(QueryResult {
@@ -706,6 +767,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Savepoint { .. } => "Savepoint",
         PhysicalPlan::ReleaseSavepoint { .. } => "ReleaseSavepoint",
         PhysicalPlan::RollbackToSavepoint { .. } => "RollbackToSavepoint",
+        PhysicalPlan::VectorSearch { .. } => "VectorSearch",
     }
 }
 
