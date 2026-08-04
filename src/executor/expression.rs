@@ -96,6 +96,12 @@ pub fn eval_vectorized(
                 "Placeholder should be resolved before execution".into()
             ))
         }
+
+        Expression::Subquery(_) | Expression::Exists { .. } | Expression::InSubquery { .. } => {
+            Err(EngramDbError::Internal(
+                "Subquery should be resolved before expression evaluation".into()
+            ))
+        }
     }
 }
 
@@ -841,9 +847,481 @@ fn eval_function(
             let v = eval_vectorized(&args[0], chunk, column_names)?;
             eval_vector_norm(&v)
         }
+        "NOW" | "CURRENT_TIMESTAMP" => {
+            if !args.is_empty() {
+                return Err(EngramDbError::Parse("NOW/CURRENT_TIMESTAMP takes 0 arguments".into()));
+            }
+            let now = now_ms();
+            Ok(Vector::Constant(Value::Timestamp(now), chunk.count))
+        }
+        "DATE" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("DATE requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            match &vec {
+                Vector::Constant(v, n) => {
+                    let val = date_value(v);
+                    Ok(Vector::Constant(val, *n))
+                }
+                Vector::Flat(values) => {
+                    let result: Vec<Value> = values.iter().map(date_value).collect();
+                    Ok(Vector::Flat(result))
+                }
+            }
+        }
+        "STRFTIME" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("STRFTIME requires 2 arguments (format, timestamp)".into()));
+            }
+            let fmt_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let ts_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let fmt = match &fmt_vec {
+                Vector::Constant(Value::Varchar(s), _) => s.clone(),
+                _ => return Err(EngramDbError::Parse("STRFTIME format must be a constant string".into())),
+            };
+            match &ts_vec {
+                Vector::Constant(v, n) => {
+                    let val = strftime_value(&fmt, v);
+                    Ok(Vector::Constant(val, *n))
+                }
+                Vector::Flat(values) => {
+                    let result: Vec<Value> = values.iter().map(|v| strftime_value(&fmt, v)).collect();
+                    Ok(Vector::Flat(result))
+                }
+            }
+        }
+        "TIME" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("TIME requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            match &vec {
+                Vector::Constant(v, n) => {
+                    let val = time_value(v);
+                    Ok(Vector::Constant(val, *n))
+                }
+                Vector::Flat(values) => {
+                    let result: Vec<Value> = values.iter().map(time_value).collect();
+                    Ok(Vector::Flat(result))
+                }
+            }
+        }
+        "DATETIME" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("DATETIME requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            match &vec {
+                Vector::Constant(v, n) => {
+                    let val = datetime_value(v);
+                    Ok(Vector::Constant(val, *n))
+                }
+                Vector::Flat(values) => {
+                    let result: Vec<Value> = values.iter().map(datetime_value).collect();
+                    Ok(Vector::Flat(result))
+                }
+            }
+        }
+        "DATE_ADD" => {
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("DATE_ADD requires 3 arguments (timestamp, number, unit)".into()));
+            }
+            let ts_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let n_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let unit_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            let unit = match &unit_vec {
+                Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
+                _ => return Err(EngramDbError::Parse("DATE_ADD unit must be a constant string".into())),
+            };
+            match (&ts_vec, &n_vec) {
+                (Vector::Constant(ts, n), Vector::Constant(num, _)) => {
+                    let val = date_add_value(ts, num, &unit);
+                    Ok(Vector::Constant(val, *n))
+                }
+                (Vector::Flat(ts), Vector::Flat(num)) => {
+                    let result: Vec<Value> = ts.iter().zip(num.iter()).map(|(t, n)| date_add_value(t, n, &unit)).collect();
+                    Ok(Vector::Flat(result))
+                }
+                _ => Ok(Vector::Flat(vec![Value::Null; chunk.count])),
+            }
+        }
+        "DATE_SUB" => {
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("DATE_SUB requires 3 arguments (timestamp, number, unit)".into()));
+            }
+            let ts_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let n_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let unit_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            let unit = match &unit_vec {
+                Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
+                _ => return Err(EngramDbError::Parse("DATE_SUB unit must be a constant string".into())),
+            };
+            match (&ts_vec, &n_vec) {
+                (Vector::Constant(ts, n), Vector::Constant(num, _)) => {
+                    let val = date_sub_value(ts, num, &unit);
+                    Ok(Vector::Constant(val, *n))
+                }
+                (Vector::Flat(ts), Vector::Flat(num)) => {
+                    let result: Vec<Value> = ts.iter().zip(num.iter()).map(|(t, n)| date_sub_value(t, n, &unit)).collect();
+                    Ok(Vector::Flat(result))
+                }
+                _ => Ok(Vector::Flat(vec![Value::Null; chunk.count])),
+            }
+        }
+        "DATE_DIFF" => {
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("DATE_DIFF requires 3 arguments (timestamp1, timestamp2, unit)".into()));
+            }
+            let ts1_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let ts2_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let unit_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            let unit = match &unit_vec {
+                Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
+                _ => return Err(EngramDbError::Parse("DATE_DIFF unit must be a constant string".into())),
+            };
+            match (&ts1_vec, &ts2_vec) {
+                (Vector::Constant(ts1, n), Vector::Constant(ts2, _)) => {
+                    let val = date_diff_value(ts1, ts2, &unit);
+                    Ok(Vector::Constant(val, *n))
+                }
+                (Vector::Flat(ts1), Vector::Flat(ts2)) => {
+                    let result: Vec<Value> = ts1.iter().zip(ts2.iter()).map(|(a, b)| date_diff_value(a, b, &unit)).collect();
+                    Ok(Vector::Flat(result))
+                }
+                _ => Ok(Vector::Flat(vec![Value::Null; chunk.count])),
+            }
+        }
+        "MATCH" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("MATCH requires 2 arguments (column, query)".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let query_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let query = match &query_vec {
+                Vector::Constant(Value::Varchar(s), _) => s.clone(),
+                _ => return Err(EngramDbError::Parse("MATCH query must be a string literal".into())),
+            };
+            Ok(eval_match(&vec, &query))
+        }
         _ => {
             Err(EngramDbError::Parse(format!("Unknown function: {}", name)))
         }
+    }
+}
+
+/// 对文本列执行全文检索匹配（MATCH 函数）
+/// 第一个参数为列引用，第二个参数为查询字符串
+fn eval_match(vec: &Vector, query: &str) -> Vector {
+    let tokens: Vec<String> = query.split_whitespace()
+        .map(|t| t.to_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return Vector::Flat(vec![Value::Boolean(false); vec.len()]);
+    }
+    match vec {
+        Vector::Constant(v, n) => {
+            let matches = match v {
+                Value::Varchar(s) => {
+                    let s_lower = s.to_lowercase();
+                    tokens.iter().all(|t| s_lower.contains(t))
+                }
+                _ => false,
+            };
+            Vector::Constant(Value::Boolean(matches), *n)
+        }
+        Vector::Flat(values) => {
+            let result: Vec<Value> = values.iter().map(|v| {
+                match v {
+                    Value::Varchar(s) => {
+                        let s_lower = s.to_lowercase();
+                        Value::Boolean(tokens.iter().all(|t| s_lower.contains(t)))
+                    }
+                    _ => Value::Boolean(false),
+                }
+            }).collect();
+            Vector::Flat(result)
+        }
+    }
+}
+
+/// 计算当前时间戳（Unix 毫秒）
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// 将 Unix 毫秒时间戳格式化为 YYYY-MM-DD
+fn format_date(ts_ms: i64) -> String {
+    let secs = ts_ms / 1000;
+    // 处理负时间戳：Rust 整数除法向零截断，需要调整
+    let (days, rem) = if secs >= 0 {
+        (secs / 86400, secs % 86400)
+    } else {
+        // 对负数向下取整
+        ((secs - 86399) / 86400, (secs % 86400 + 86400) % 86400)
+    };
+    let _ = rem; // 不需要
+    // 从 Unix epoch (1970-01-01) 开始计算
+    let mut y = 1970i64;
+    let mut remaining_days = days;
+    if remaining_days < 0 {
+        loop {
+            y -= 1;
+            let days_in_year = if is_leap_year(y) { 366 } else { 365 };
+            remaining_days += days_in_year;
+            if remaining_days >= 0 {
+                break;
+            }
+        }
+    } else {
+        loop {
+            let days_in_year = if is_leap_year(y) { 366 } else { 365 };
+            if remaining_days < days_in_year {
+                break;
+            }
+            remaining_days -= days_in_year;
+            y += 1;
+        }
+    }
+    let month_days = if is_leap_year(y) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut m = 0usize;
+    for (i, &md) in month_days.iter().enumerate() {
+        if remaining_days < md as i64 {
+            m = i;
+            break;
+        }
+        remaining_days -= md as i64;
+    }
+    let d = remaining_days + 1;
+    format!("{:04}-{:02}-{:02}", y, m + 1, d)
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// 使用 STRFTIME 格式格式化时间戳
+fn format_strftime(fmt: &str, ts_ms: i64) -> String {
+    let secs = ts_ms / 1000;
+    // 处理负时间戳
+    let (days, day_secs) = if secs >= 0 {
+        (secs / 86400, secs % 86400)
+    } else {
+        ((secs - 86399) / 86400, (secs % 86400 + 86400) % 86400)
+    };
+    let hours = day_secs / 3600;
+    let minutes = (day_secs % 3600) / 60;
+    let seconds = day_secs % 60;
+
+    // 计算年月日
+    let mut y = 1970i64;
+    let mut remaining_days = days;
+    if remaining_days < 0 {
+        loop {
+            y -= 1;
+            let days_in_year = if is_leap_year(y) { 366 } else { 365 };
+            remaining_days += days_in_year;
+            if remaining_days >= 0 {
+                break;
+            }
+        }
+    } else {
+        loop {
+            let days_in_year = if is_leap_year(y) { 366 } else { 365 };
+            if remaining_days < days_in_year {
+                break;
+            }
+            remaining_days -= days_in_year;
+            y += 1;
+        }
+    }
+    let month_days = if is_leap_year(y) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut m = 0usize;
+    for (i, &md) in month_days.iter().enumerate() {
+        if remaining_days < md as i64 {
+            m = i;
+            break;
+        }
+        remaining_days -= md as i64;
+    }
+    let d = remaining_days + 1;
+    let wday = (days + 4) % 7; // 1970-01-01 是星期四 (4)
+
+    let mut result = String::new();
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                'Y' => result.push_str(&format!("{:04}", y)),
+                'y' => result.push_str(&format!("{:02}", y % 100)),
+                'm' => result.push_str(&format!("{:02}", m + 1)),
+                'd' => result.push_str(&format!("{:02}", d)),
+                'H' => result.push_str(&format!("{:02}", hours)),
+                'M' => result.push_str(&format!("{:02}", minutes)),
+                'S' => result.push_str(&format!("{:02}", seconds)),
+                'w' => result.push_str(&format!("{}", wday)),
+                'j' => result.push_str(&format!("{:03}", remaining_days + 1)),
+                'U' => result.push_str(&format!("{:02}", (days + 7 - wday) / 7)),
+                '%' => result.push('%'),
+                _ => {
+                    result.push('%');
+                    result.push(chars[i + 1]);
+                }
+            }
+            i += 2;
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// 提取日期字符串（YYYY-MM-DD）
+fn date_value(v: &Value) -> Value {
+    if v.is_null() {
+        return Value::Null;
+    }
+    if let Some(ts) = v.as_i64() {
+        Value::Varchar(format_date(ts))
+    } else if let Value::Varchar(s) = v {
+        // 传入 YYYY-MM-DD 格式字符串，直接返回
+        if s.len() == 10 && s.chars().filter(|&c| c == '-').count() == 2 {
+            return Value::Varchar(s.clone());
+        }
+        Value::Null
+    } else {
+        Value::Null
+    }
+}
+
+/// STRFTIME 格式化
+fn strftime_value(fmt: &str, v: &Value) -> Value {
+    if v.is_null() {
+        return Value::Null;
+    }
+    if let Some(ts) = v.as_i64() {
+        Value::Varchar(format_strftime(fmt, ts))
+    } else {
+        Value::Null
+    }
+}
+
+/// 提取时间部分（HH:MM:SS）
+fn time_value(v: &Value) -> Value {
+    if v.is_null() {
+        return Value::Null;
+    }
+    if let Some(ts) = v.as_i64() {
+        let secs = ts / 1000;
+        let day_secs = if secs >= 0 { secs % 86400 } else { (secs % 86400 + 86400) % 86400 };
+        let h = day_secs / 3600;
+        let m = (day_secs % 3600) / 60;
+        let s = day_secs % 60;
+        Value::Varchar(format!("{:02}:{:02}:{:02}", h, m, s))
+    } else {
+        Value::Null
+    }
+}
+
+/// 提取日期时间字符串（YYYY-MM-DD HH:MM:SS）
+fn datetime_value(v: &Value) -> Value {
+    if v.is_null() {
+        return Value::Null;
+    }
+    if let Some(ts) = v.as_i64() {
+        let date = format_date(ts);
+        let secs = ts / 1000;
+        let day_secs = if secs >= 0 { secs % 86400 } else { (secs % 86400 + 86400) % 86400 };
+        let h = day_secs / 3600;
+        let m = (day_secs % 3600) / 60;
+        let s = day_secs % 60;
+        Value::Varchar(format!("{} {:02}:{:02}:{:02}", date, h, m, s))
+    } else {
+        Value::Null
+    }
+}
+
+/// DATE_ADD(ts, n, unit) — 给时间戳加 n 个单位
+fn date_add_value(ts: &Value, n: &Value, unit: &str) -> Value {
+    if ts.is_null() || n.is_null() {
+        return Value::Null;
+    }
+    let ts_ms = match ts.as_i64() {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    let num = match n.as_i64() {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    Value::Timestamp(apply_date_arithmetic(ts_ms, num, unit))
+}
+
+/// DATE_SUB(ts, n, unit) — 给时间戳减 n 个单位
+fn date_sub_value(ts: &Value, n: &Value, unit: &str) -> Value {
+    if ts.is_null() || n.is_null() {
+        return Value::Null;
+    }
+    let ts_ms = match ts.as_i64() {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    let num = match n.as_i64() {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    Value::Timestamp(apply_date_arithmetic(ts_ms, -num, unit))
+}
+
+/// DATE_DIFF(ts1, ts2, unit) — 计算两个时间戳的差值
+fn date_diff_value(ts1: &Value, ts2: &Value, unit: &str) -> Value {
+    if ts1.is_null() || ts2.is_null() {
+        return Value::Null;
+    }
+    let a = match ts1.as_i64() {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    let b = match ts2.as_i64() {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    let diff_ms = a - b;
+    let result = match unit {
+        "millisecond" | "milliseconds" | "ms" => diff_ms,
+        "second" | "seconds" | "sec" | "s" => diff_ms / 1000,
+        "minute" | "minutes" | "min" => diff_ms / 60000,
+        "hour" | "hours" | "h" => diff_ms / 3600000,
+        "day" | "days" | "d" => diff_ms / 86400000,
+        "week" | "weeks" | "w" => diff_ms / 604800000,
+        _ => return Value::Null,
+    };
+    Value::Int64(result)
+}
+
+/// 日期算术运算（内部辅助）
+fn apply_date_arithmetic(ts_ms: i64, delta: i64, unit: &str) -> i64 {
+    match unit {
+        "millisecond" | "milliseconds" | "ms" => ts_ms + delta,
+        "second" | "seconds" | "sec" | "s" => ts_ms + delta * 1000,
+        "minute" | "minutes" | "min" => ts_ms + delta * 60000,
+        "hour" | "hours" | "h" => ts_ms + delta * 3600000,
+        "day" | "days" | "d" => ts_ms + delta * 86400000,
+        "week" | "weeks" | "w" => ts_ms + delta * 604800000,
+        _ => ts_ms, // 未知单位，返回原值
     }
 }
 
@@ -1758,6 +2236,7 @@ mod tests {
             args,
             distinct: false,
             count_star: false,
+            over: None,
         }
     }
 
@@ -1833,5 +2312,193 @@ mod tests {
         let flat = r.to_flat();
         assert_eq!(flat[0], Value::Null);
         assert_eq!(flat[1], Value::Null);
+    }
+
+    #[test]
+    fn test_now() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        let expr = func_expr("NOW", vec![]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        // 应该是 Timestamp 且接近当前时间
+        if let Value::Timestamp(ts) = flat[0] {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            assert!((ts - now).abs() < 2000, "NOW should be within 2 seconds of actual time");
+        } else {
+            panic!("NOW should return Timestamp");
+        }
+    }
+
+    #[test]
+    fn test_current_timestamp_alias() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        let expr = func_expr("CURRENT_TIMESTAMP", vec![]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert!(matches!(flat[0], Value::Timestamp(_)));
+    }
+
+    #[test]
+    fn test_date() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![
+                Value::Timestamp(0),                           // 1970-01-01
+                Value::Timestamp(86400000),                    // 1970-01-02
+                Value::Timestamp(1735689600000),               // 2025-01-01
+                Value::Timestamp(1759536000000),               // 2025-10-04
+                Value::Timestamp(-86400000),                   // 1969-12-31
+            ])],
+            count: 5,
+        };
+        let expr = func_expr("DATE", vec![Expression::ColumnRef { table: None, column: "c".to_string() }]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Varchar("1970-01-01".to_string()));
+        assert_eq!(flat[1], Value::Varchar("1970-01-02".to_string()));
+        assert_eq!(flat[2], Value::Varchar("2025-01-01".to_string()));
+        assert_eq!(flat[3], Value::Varchar("2025-10-04".to_string()));
+        assert_eq!(flat[4], Value::Varchar("1969-12-31".to_string()));
+    }
+
+    #[test]
+    fn test_strftime() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![
+                Value::Timestamp(0),
+                Value::Timestamp(1735689600000),
+                Value::Timestamp(1759536000000),
+            ])],
+            count: 3,
+        };
+        let expr = func_expr("STRFTIME", vec![
+            Expression::Literal(Value::Varchar("%Y-%m-%d %H:%M:%S".to_string())),
+            Expression::ColumnRef { table: None, column: "c".to_string() },
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Varchar("1970-01-01 00:00:00".to_string()));
+        assert_eq!(flat[2], Value::Varchar("2025-10-04 00:00:00".to_string()));
+    }
+
+    #[test]
+    fn test_strftime_format_codes() {
+        // 1735689600000 = 2025-01-01 00:00:00 UTC (星期三, wday=3)
+        let ts = 1735689600000i64;
+        let chunk = DataChunk {
+            columns: vec![Vector::Constant(Value::Timestamp(ts), 1)],
+            count: 1,
+        };
+        let test_cases = vec![
+            ("%Y", "2025"),
+            ("%y", "25"),
+            ("%m", "01"),
+            ("%d", "01"),
+            ("%H", "00"),
+            ("%M", "00"),
+            ("%S", "00"),
+        ];
+        for (fmt, expected) in test_cases {
+            let expr = func_expr("STRFTIME", vec![
+                Expression::Literal(Value::Varchar(fmt.to_string())),
+                Expression::ColumnRef { table: None, column: "c".to_string() },
+            ]);
+            let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+            let flat = r.to_flat();
+            assert_eq!(flat[0], Value::Varchar(expected.to_string()), "fmt={}", fmt);
+        }
+    }
+
+    #[test]
+    fn test_time() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![
+                Value::Timestamp(0),                           // 00:00:00
+                Value::Timestamp(3723000),                     // 01:02:03
+                Value::Timestamp(86399000),                    // 23:59:59
+            ])],
+            count: 3,
+        };
+        let expr = func_expr("TIME", vec![Expression::ColumnRef { table: None, column: "c".to_string() }]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Varchar("00:00:00".to_string()));
+        assert_eq!(flat[1], Value::Varchar("01:02:03".to_string()));
+        assert_eq!(flat[2], Value::Varchar("23:59:59".to_string()));
+    }
+
+    #[test]
+    fn test_datetime() {
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(vec![
+                Value::Timestamp(0),
+                Value::Timestamp(1735689600000),
+                Value::Timestamp(1759536000000),
+            ])],
+            count: 3,
+        };
+        let expr = func_expr("DATETIME", vec![Expression::ColumnRef { table: None, column: "c".to_string() }]);
+        let r = eval_vectorized(&expr, &chunk, &["c".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Varchar("1970-01-01 00:00:00".to_string()));
+        assert_eq!(flat[1], Value::Varchar("2025-01-01 00:00:00".to_string()));
+        assert_eq!(flat[2], Value::Varchar("2025-10-04 00:00:00".to_string()));
+    }
+
+    #[test]
+    fn test_date_add() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        let ts = Value::Timestamp(0);
+        let expr = func_expr("DATE_ADD", vec![
+            Expression::Literal(ts),
+            Expression::Literal(Value::Int64(7)),
+            Expression::Literal(Value::Varchar("day".to_string())),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Timestamp(7 * 86400000));
+    }
+
+    #[test]
+    fn test_date_sub() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        let ts = Value::Timestamp(10 * 86400000);
+        let expr = func_expr("DATE_SUB", vec![
+            Expression::Literal(ts),
+            Expression::Literal(Value::Int64(3)),
+            Expression::Literal(Value::Varchar("day".to_string())),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Timestamp(7 * 86400000));
+    }
+
+    #[test]
+    fn test_date_diff() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        let expr = func_expr("DATE_DIFF", vec![
+            Expression::Literal(Value::Timestamp(10 * 86400000)),
+            Expression::Literal(Value::Timestamp(0)),
+            Expression::Literal(Value::Varchar("day".to_string())),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Int64(10));
+    }
+
+    #[test]
+    fn test_date_add_hours() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        let ts = Value::Timestamp(0);
+        let expr = func_expr("DATE_ADD", vec![
+            Expression::Literal(ts),
+            Expression::Literal(Value::Int64(48)),
+            Expression::Literal(Value::Varchar("hour".to_string())),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Timestamp(2 * 86400000));
     }
 }

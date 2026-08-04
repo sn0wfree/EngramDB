@@ -3,7 +3,7 @@
 use crate::common::types::TableDef;
 use crate::Value;
 use crate::sql::ast::Expression;
-use crate::sql::ast::{AlterTableStmt, PragmaStmt};
+use crate::sql::ast::{AlterTableStmt, PragmaStmt, WindowSpec};
 
 /// 物理计划节点
 #[derive(Debug, Clone)]
@@ -162,6 +162,17 @@ pub enum PhysicalPlan {
     Distinct {
         input: Box<PhysicalPlan>,
     },
+    /// EXPLAIN / EXPLAIN ANALYZE
+    Explain {
+        analyze: bool,
+        plan: Box<PhysicalPlan>,
+    },
+    /// 窗口函数
+    Window {
+        input: Box<PhysicalPlan>,
+        window_functions: Vec<WindowFunctionExpr>,
+        column_names: Vec<String>,
+    },
 }
 
 /// 聚合表达式
@@ -207,4 +218,51 @@ pub enum SortDirection {
 pub struct SortKey {
     pub column_index: usize,
     pub direction: SortDirection,
+}
+
+/// 窗口函数表达式
+#[derive(Debug, Clone)]
+pub struct WindowFunctionExpr {
+    pub func: WindowFuncType,
+    pub input_column: Option<usize>,
+    pub window_spec: WindowSpec,
+    pub output_name: String,
+}
+
+/// 窗口函数类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFuncType {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lag(usize),
+    Lead(usize),
+    FirstValue,
+    LastValue,
+    NthValue(usize),
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl WindowFuncType {
+    pub fn name(&self) -> &'static str {
+        match self {
+            WindowFuncType::RowNumber => "ROW_NUMBER",
+            WindowFuncType::Rank => "RANK",
+            WindowFuncType::DenseRank => "DENSE_RANK",
+            WindowFuncType::Lag(_) => "LAG",
+            WindowFuncType::Lead(_) => "LEAD",
+            WindowFuncType::FirstValue => "FIRST_VALUE",
+            WindowFuncType::LastValue => "LAST_VALUE",
+            WindowFuncType::NthValue(_) => "NTH_VALUE",
+            WindowFuncType::Count => "COUNT",
+            WindowFuncType::Sum => "SUM",
+            WindowFuncType::Avg => "AVG",
+            WindowFuncType::Min => "MIN",
+            WindowFuncType::Max => "MAX",
+        }
+    }
 }

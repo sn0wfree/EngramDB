@@ -15,6 +15,7 @@ pub mod dictionary;
 pub mod for_encoding;
 pub mod delta;
 pub mod gorilla;
+pub mod double_delta;
 
 use crate::common::config::CompressionType;
 use crate::common::error::Result;
@@ -39,7 +40,7 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
         DataType::Int64 => compress_integer::<i64>(data),
         DataType::Float32 => compress_float32(data),
         DataType::Float64 => compress_float64(data),
-        DataType::Timestamp => compress_integer::<i64>(data),
+        DataType::Timestamp => compress_timestamp(data),
         DataType::Varchar => compress_varchar(data),
         // JSON 和 Vector 暂不压缩，直接存储
         DataType::Json | DataType::Vector { .. } | DataType::Blob => {
@@ -72,6 +73,7 @@ pub fn decompress(data: &[u8], compression_type: CompressionType, data_type: &Da
         CompressionType::Gorilla => decompress_gorilla(data),
         CompressionType::ForBitPack => decompress_for_bitpack(data, data_type),
         CompressionType::BooleanPack => decompress_boolean_pack(data),
+        CompressionType::DoubleDelta => decompress_double_delta(data, data_type),
     }
 }
 
@@ -247,6 +249,31 @@ fn compress_integer<T: IntegerCodec>(data: &[u8]) -> Result<(CompressionType, Ve
     }
 
     Ok(best)
+}
+
+/// Timestamp 专用压缩：先试 DoubleDelta，再回退到通用整数压缩
+fn compress_timestamp(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
+    if let Some(values) = bytes_to_i64(data) {
+        if let Some((ctype, encoded)) = double_delta::encode_i64(&values) {
+            if encoded.len() < data.len() {
+                return Ok((ctype, encoded));
+            }
+        }
+    }
+    compress_integer::<i64>(data)
+}
+
+fn decompress_double_delta(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> {
+    match data_type {
+        DataType::Timestamp | DataType::Int64 => {
+            let max_count = data.len() + 2;
+            let values = double_delta::decode_i64(data, max_count)
+                .ok_or_else(|| crate::common::error::EngramDbError::Parse("DoubleDelta decompress failed".into()))?;
+            let result: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            Ok(result)
+        }
+        _ => Ok(data.to_vec()),
+    }
 }
 
 fn bytes_to_i32(data: &[u8]) -> Option<Vec<i32>> {

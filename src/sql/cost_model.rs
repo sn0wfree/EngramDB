@@ -125,7 +125,9 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::DropMaterializedView { .. }
             | PhysicalPlan::AlterTable(_)
             | PhysicalPlan::Pragma(_)
-            | PhysicalPlan::Distinct { .. } => {
+            | PhysicalPlan::Distinct { .. }
+            | PhysicalPlan::Explain { .. }
+            | PhysicalPlan::Window { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
         }
@@ -388,6 +390,9 @@ fn estimate_expression_complexity(expr: &Expression) -> usize {
             2 + when_cost + else_cost
         }
         Expression::Placeholder(_) => 1,
+        Expression::Subquery(_) => 10,
+        Expression::Exists { .. } => 5,
+        Expression::InSubquery { .. } => 8,
     }
 }
 

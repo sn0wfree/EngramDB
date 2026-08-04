@@ -418,6 +418,28 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
+        PhysicalPlan::Explain { analyze, plan } => {
+            if analyze {
+                execute_explain_analyze(*plan, db)
+            } else {
+                execute_explain(*plan, db)
+            }
+        }
+        PhysicalPlan::Window { input, window_functions, column_names } => {
+            let input_result = execute(*input, db)?;
+            let input_chunks = rows_to_chunks(&input_result.rows);
+            let result = operators::window::execute(&input_chunks, &window_functions, &column_names)?;
+            let mut columns = input_result.columns.clone();
+            for wf in &window_functions {
+                columns.push(wf.output_name.clone());
+            }
+            let rows = chunks_to_rows(&result);
+            Ok(QueryResult {
+                columns,
+                rows,
+                rows_affected: 0,
+            })
+        }
     }
 }
 
@@ -438,6 +460,149 @@ fn collect_result(
     let rows = chunks_to_rows(chunks);
 
     Ok((column_names, rows))
+}
+
+// ============================================================================
+// EXPLAIN / EXPLAIN ANALYZE 实现
+// ============================================================================
+
+fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
+    match plan {
+        PhysicalPlan::TableScan { .. } => "TableScan",
+        PhysicalPlan::IndexOnlyScan { .. } => "IndexOnlyScan",
+        PhysicalPlan::Filter { .. } => "Filter",
+        PhysicalPlan::Projection { .. } => "Projection",
+        PhysicalPlan::Aggregate { .. } => "Aggregate",
+        PhysicalPlan::Insert { .. } => "Insert",
+        PhysicalPlan::InsertColumns { .. } => "InsertColumns",
+        PhysicalPlan::CreateTable { .. } => "CreateTable",
+        PhysicalPlan::CreateIndex { .. } => "CreateIndex",
+        PhysicalPlan::Delete { .. } => "Delete",
+        PhysicalPlan::Update { .. } => "Update",
+        PhysicalPlan::Sort { .. } => "Sort",
+        PhysicalPlan::HashJoin { .. } => "HashJoin",
+        PhysicalPlan::Limit { .. } => "Limit",
+        PhysicalPlan::Analyze { .. } => "Analyze",
+        PhysicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
+        PhysicalPlan::RefreshMaterializedView { .. } => "RefreshMaterializedView",
+        PhysicalPlan::DropMaterializedView { .. } => "DropMaterializedView",
+        PhysicalPlan::CountStar { .. } => "CountStar",
+        PhysicalPlan::PrimaryKeyLookup { .. } => "PrimaryKeyLookup",
+        PhysicalPlan::BeginTransaction => "BeginTransaction",
+        PhysicalPlan::Commit => "Commit",
+        PhysicalPlan::Rollback => "Rollback",
+        PhysicalPlan::AlterTable(_) => "AlterTable",
+        PhysicalPlan::Pragma(_) => "Pragma",
+        PhysicalPlan::Distinct { .. } => "Distinct",
+        PhysicalPlan::Explain { .. } => "Explain",
+        PhysicalPlan::Window { .. } => "Window",
+    }
+}
+
+/// 构建计划树的可视化文本（缩进格式）
+fn format_plan_tree(plan: &PhysicalPlan, indent: usize) -> String {
+    let prefix = "  ".repeat(indent);
+    let name = plan_node_name(plan);
+    let detail = match plan {
+        PhysicalPlan::TableScan { table_name, column_indices } => {
+            format!(" [{}.{} cols]", table_name, column_indices.len())
+        }
+        PhysicalPlan::Filter { .. } => String::new(),
+        PhysicalPlan::Projection { column_names, .. } => {
+            format!(" [{}]", column_names.join(", "))
+        }
+        PhysicalPlan::Aggregate { group_by, aggregates, .. } => {
+            let gb: Vec<String> = group_by.iter().map(|i| format!("col{}", i)).collect();
+            let agg: Vec<String> = aggregates.iter().map(|a| format!("{:?}", a.func)).collect();
+            format!(" [group_by: {}, agg: {}]", gb.join(","), agg.join(","))
+        }
+        PhysicalPlan::Sort { sort_keys, .. } => {
+            let sk: Vec<String> = sort_keys.iter().map(|k| format!("col{}", k.column_index)).collect();
+            format!(" [sort: {}]", sk.join(","))
+        }
+        PhysicalPlan::HashJoin { join_type, .. } => {
+            format!(" [{:?}]", join_type)
+        }
+        PhysicalPlan::Limit { limit, .. } => {
+            format!(" [limit: {}]", limit)
+        }
+        PhysicalPlan::Insert { table_name, .. } => {
+            format!(" [table: {}]", table_name)
+        }
+        PhysicalPlan::Delete { table_name, .. } => {
+            format!(" [table: {}]", table_name)
+        }
+        PhysicalPlan::Update { table_name, .. } => {
+            format!(" [table: {}]", table_name)
+        }
+        PhysicalPlan::PrimaryKeyLookup { table_name, .. } => {
+            format!(" [table: {}]", table_name)
+        }
+        PhysicalPlan::CountStar { output_name, count } => {
+            format!(" [{}: {}]", output_name, count)
+        }
+        _ => String::new(),
+    };
+    let mut result = format!("{}{}{}\n", prefix, name, detail);
+
+    // 递归处理子节点
+    match plan {
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Projection { input, .. }
+        | PhysicalPlan::Aggregate { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Distinct { input, .. } => {
+            result.push_str(&format_plan_tree(input, indent + 1));
+        }
+        PhysicalPlan::HashJoin { left, right, .. } => {
+            result.push_str(&format_plan_tree(left, indent + 1));
+            result.push_str(&format_plan_tree(right, indent + 1));
+        }
+        PhysicalPlan::Window { input, .. } => {
+            result.push_str(&format_plan_tree(input, indent + 1));
+        }
+        _ => {}
+    }
+
+    result
+}
+
+/// EXPLAIN（不执行，只显示计划树）
+fn execute_explain(plan: PhysicalPlan, _db: &mut Database) -> Result<QueryResult> {
+    let plan_tree = format_plan_tree(&plan, 0);
+    Ok(QueryResult {
+        columns: vec!["QUERY PLAN".to_string()],
+        rows: vec![vec![crate::Value::Varchar(plan_tree)]],
+        rows_affected: 0,
+    })
+}
+
+/// EXPLAIN ANALYZE（执行并收集统计信息）
+fn execute_explain_analyze(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
+    use std::time::Instant;
+
+    let total_start = Instant::now();
+
+    // 先执行一次获取实际结果
+    let result = execute(plan.clone(), db)?;
+    let total_elapsed = total_start.elapsed().as_micros();
+
+    // 构建计划树文本
+    let plan_tree = format_plan_tree(&plan, 0);
+
+    let output = format!(
+        "Execution Time: {} us\nTotal Rows: {}\n\nPlan:\n{}",
+        total_elapsed,
+        result.rows.len(),
+        plan_tree,
+    );
+
+    Ok(QueryResult {
+        columns: vec!["QUERY PLAN".to_string()],
+        rows: vec![vec![crate::Value::Varchar(output)]],
+        rows_affected: 0,
+    })
 }
 
 fn chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {

@@ -9,6 +9,7 @@ use crate::Value;
 
 use super::column_store::ColumnStore;
 use super::delta_store::DeltaStore;
+use super::index::inverted_index::InvertedIndex;
 use super::index::skiplist::SkipListIndex;
 use super::vector_index::{HnswIndex, HnswConfig, DistanceMetric, Neighbor};
 use crate::common::error::EngramDbError;
@@ -92,6 +93,11 @@ pub struct Table {
     /// key 为索引名，value 为 (HNSW 索引, hnsw_id -> row_id 映射)。
     /// 用于向量列的近似最近邻搜索，支持 L2/内积/余弦距离。
     vector_indexes: std::collections::HashMap<String, (HnswIndex, Vec<u32>)>,
+    /// 全文检索倒排索引（v0.15.0 新增）
+    ///
+    /// key 为列名，value 为对应列的倒排索引。
+    /// 通过 CREATE INDEX ... USING fts(column) 创建。
+    fts_indexes: std::collections::HashMap<String, InvertedIndex>,
     /// Perf03：主键索引（BTreeMap<主键值, row_id>）
     ///
     /// 第一阶段用 `std::collections::BTreeMap` 快速接线（O(log n) 点查），
@@ -118,6 +124,7 @@ impl Table {
             compact_strategy: strategy,
             indexes: std::collections::HashMap::new(),
             vector_indexes: std::collections::HashMap::new(),
+            fts_indexes: std::collections::HashMap::new(),
             primary_index: if has_pk { Some(std::collections::BTreeMap::new()) } else { None },
         }
     }
@@ -908,6 +915,11 @@ impl Table {
             self.update_vector_indexes_for_row(row_id, row);
         }
         
+        // 更新所有全文索引
+        if !self.fts_indexes.is_empty() {
+            self.update_fts_indexes_for_row(row_id, row);
+        }
+        
         Ok(())
     }
     
@@ -946,6 +958,11 @@ impl Table {
             // 标记向量索引中的删除
             if !self.vector_indexes.is_empty() {
                 self.remove_vector_indexes_for_rows(&[row_id]);
+            }
+            
+            // 删除全文索引
+            if !self.fts_indexes.is_empty() {
+                self.remove_fts_indexes_for_row(row_id, row);
             }
         }
         
@@ -1459,5 +1476,71 @@ impl Table {
                 }
             }
         }
+    }
+
+    /// 添加全文检索索引
+    pub fn add_fts_index(&mut self, column_name: &str) -> Result<()> {
+        // 检查列是否存在
+        if self.def.column_index(column_name).is_none() {
+            return Err(EngramDbError::Parse(format!("Column '{}' not found", column_name)));
+        }
+        // 检查列类型是否为 Varchar
+        let col_idx = self.def.column_index(column_name).unwrap();
+        if self.def.columns[col_idx].data_type != crate::common::types::DataType::Varchar {
+            return Err(EngramDbError::Parse(format!("FTS index requires VARCHAR column, got {:?}", self.def.columns[col_idx].data_type)));
+        }
+        self.fts_indexes.insert(column_name.to_string(), InvertedIndex::new(column_name));
+        Ok(())
+    }
+
+    /// 全文检索搜索
+    pub fn search_fts(&self, column_name: &str, query: &str) -> Vec<u32> {
+        if let Some(idx) = self.fts_indexes.get(column_name) {
+            idx.search(query)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 更新全文索引（单行插入时）
+    fn update_fts_indexes_for_row(&mut self, row_id: u32, row: &[Value]) {
+        let col_names: Vec<String> = self.fts_indexes.keys().cloned().collect();
+        for col_name in col_names {
+            if let Some(col_idx) = self.def.column_index(&col_name) {
+                if col_idx < row.len() {
+                    if let Value::Varchar(text) = &row[col_idx] {
+                        if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
+                            idx.add_document(row_id, text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 删除全文索引条目（单行删除时）
+    fn remove_fts_indexes_for_row(&mut self, row_id: u32, row: &[Value]) {
+        let col_names: Vec<String> = self.fts_indexes.keys().cloned().collect();
+        for col_name in col_names {
+            if let Some(col_idx) = self.def.column_index(&col_name) {
+                if col_idx < row.len() {
+                    if let Value::Varchar(text) = &row[col_idx] {
+                        if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
+                            idx.remove_document(row_id, text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 获取 FTS 索引列表
+    pub fn fts_indexes(&self) -> &std::collections::HashMap<String, InvertedIndex> {
+        &self.fts_indexes
+    }
+
+    /// 获取 FTS 索引的可变引用
+    pub fn fts_indexes_mut(&mut self) -> &mut std::collections::HashMap<String, InvertedIndex> {
+        &mut self.fts_indexes
     }
 }

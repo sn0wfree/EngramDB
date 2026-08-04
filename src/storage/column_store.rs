@@ -1077,6 +1077,7 @@ fn compression_type_from_u8(b: u8) -> CompressionType {
         7 => CompressionType::Gorilla,
         8 => CompressionType::ForBitPack,
         9 => CompressionType::BooleanPack,
+        10 => CompressionType::DoubleDelta,
         _ => CompressionType::Uncompressed,
     }
 }

@@ -21,6 +21,13 @@ pub enum Statement {
     DropMaterializedView(DropMaterializedViewStmt),
     AlterTable(AlterTableStmt),
     Pragma(PragmaStmt),
+    Explain(ExplainStmt),
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplainStmt {
+    pub analyze: bool,
+    pub statement: Box<Statement>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +131,8 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<usize>,
     pub distinct: bool,
+    /// CTE (WITH 子句)
+    pub ctes: Vec<Cte>,
 }
 
 /// ANALYZE 语句：收集表的统计信息
@@ -168,9 +177,11 @@ pub enum SelectItem {
 
 /// 表引用
 #[derive(Debug, Clone)]
-pub struct TableRef {
-    pub table_name: String,
-    pub alias: Option<String>,
+pub enum TableRef {
+    /// 物理表
+    Table { table_name: String, alias: Option<String> },
+    /// 派生表（子查询）
+    Derived { query: Box<SelectStmt>, alias: String },
 }
 
 /// ORDER BY 项
@@ -205,6 +216,8 @@ pub enum Expression {
         args: Vec<Expression>,
         distinct: bool,
         count_star: bool,
+        /// OVER 子句（窗口函数）
+        over: Option<WindowSpec>,
     },
     /// CAST(expr AS type)
     Cast {
@@ -229,6 +242,19 @@ pub enum Expression {
     Case {
         when_then: Vec<(Expression, Expression)>,
         else_expr: Option<Box<Expression>>,
+    },
+    /// 标量子查询 (SELECT ...)
+    Subquery(Box<SelectStmt>),
+    /// EXISTS (SELECT ...)
+    Exists {
+        subquery: Box<SelectStmt>,
+        negated: bool,
+    },
+    /// expr IN (SELECT ...)
+    InSubquery {
+        expr: Box<Expression>,
+        subquery: Box<SelectStmt>,
+        negated: bool,
     },
 }
 
@@ -256,4 +282,44 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Not,
     Negate,
+}
+
+/// CTE（WITH 子句）
+#[derive(Debug, Clone)]
+pub struct Cte {
+    pub alias: String,
+    pub query: Box<SelectStmt>,
+    pub columns: Vec<String>,
+}
+
+/// 窗口规范（OVER 子句）
+#[derive(Debug, Clone)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expression>,
+    pub order_by: Vec<OrderByItem>,
+    pub window_frame: Option<WindowFrame>,
+}
+
+/// 窗口帧
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: Option<WindowFrameBound>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Debug, Clone)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    NPreceding(usize),
+    CurrentRow,
+    NFollowing(usize),
+    UnboundedFollowing,
 }

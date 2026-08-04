@@ -11,3 +11,4 @@ pub mod update;
 pub mod sort;
 pub mod alter_table;
 pub mod pragma;
+pub mod window;

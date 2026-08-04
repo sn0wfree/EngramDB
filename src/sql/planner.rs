@@ -11,6 +11,12 @@ use log::trace;
 use super::ast::*;
 use crate::executor::physical_plan::*;
 
+/// 窗口函数名列表
+const WINDOW_FUNCTIONS: &[&str] = &[
+    "ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD",
+    "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
+];
+
 /// 规划查询
 pub fn plan(stmt: Statement, db: &Database) -> Result<PhysicalPlan> {
     match stmt {
@@ -29,6 +35,7 @@ pub fn plan(stmt: Statement, db: &Database) -> Result<PhysicalPlan> {
         Statement::DropMaterializedView(s) => plan_drop_mv(s),
         Statement::AlterTable(s) => plan_alter_table(s),
         Statement::Pragma(s) => plan_pragma(s),
+        Statement::Explain(s) => plan_explain(s, db),
     }
 }
 
@@ -38,6 +45,77 @@ fn plan_alter_table(stmt: AlterTableStmt) -> Result<PhysicalPlan> {
 
 fn plan_pragma(stmt: PragmaStmt) -> Result<PhysicalPlan> {
     Ok(PhysicalPlan::Pragma(stmt))
+}
+
+fn plan_explain(stmt: ExplainStmt, db: &Database) -> Result<PhysicalPlan> {
+    let inner_plan = plan(*stmt.statement, db)?;
+    Ok(PhysicalPlan::Explain {
+        analyze: stmt.analyze,
+        plan: Box::new(inner_plan),
+    })
+}
+
+/// 检查表达式中是否包含窗口函数
+fn expr_has_window(expr: &Expression) -> bool {
+    match expr {
+        Expression::Function { over, .. } => over.is_some(),
+        _ => false,
+    }
+}
+
+/// 提取窗口函数信息
+fn extract_window_functions(
+    expr: &Expression,
+    alias: &Option<String>,
+    column_names: &[String],
+    table_columns: &[crate::common::types::ColumnDef],
+    funcs: &mut Vec<WindowFunctionExpr>,
+) {
+    match expr {
+        Expression::Function { name, args, over: Some(ws), .. } => {
+            let func_name = name.to_uppercase();
+            let func_type = match func_name.as_str() {
+                "ROW_NUMBER" => Some(WindowFuncType::RowNumber),
+                "RANK" => Some(WindowFuncType::Rank),
+                "DENSE_RANK" => Some(WindowFuncType::DenseRank),
+                "LAG" => Some(WindowFuncType::Lag(1)),
+                "LEAD" => Some(WindowFuncType::Lead(1)),
+                "FIRST_VALUE" => Some(WindowFuncType::FirstValue),
+                "LAST_VALUE" => Some(WindowFuncType::LastValue),
+                "NTH_VALUE" => Some(WindowFuncType::NthValue(1)),
+                "COUNT" => Some(WindowFuncType::Count),
+                "SUM" => Some(WindowFuncType::Sum),
+                "AVG" => Some(WindowFuncType::Avg),
+                "MIN" => Some(WindowFuncType::Min),
+                "MAX" => Some(WindowFuncType::Max),
+                _ => None,
+            };
+            if let Some(ft) = func_type {
+                let input_column = if !args.is_empty() {
+                    if let Some(arg) = args.first() {
+                        if let Expression::ColumnRef { column, .. } = arg {
+                            column_names.iter().position(|c| c == column)
+                                .or_else(|| table_columns.iter().position(|c| c.name == *column))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let output_name = alias.clone().unwrap_or_else(|| func_name.to_lowercase());
+                funcs.push(WindowFunctionExpr {
+                    func: ft,
+                    input_column,
+                    window_spec: ws.clone(),
+                    output_name,
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 带参数绑定的规划（用于 prepared statement）
@@ -231,7 +309,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         && stmt.select_list.len() == 1
     {
         if let SelectItem::Expression(expr, alias) = &stmt.select_list[0] {
-            if let Expression::Function { name, args, distinct: false, count_star } = expr {
+            if let Expression::Function { name, args, distinct: false, count_star, .. } = expr {
                 let is_count_star = *count_star
                     || (name.eq_ignore_ascii_case("COUNT")
                         && (args.is_empty()
@@ -239,7 +317,10 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                 if name.eq_ignore_ascii_case("COUNT") && is_count_star {
                     let table_name = stmt.from
                         .as_ref()
-                        .map(|t| t.table_name.clone())
+                        .and_then(|t| match t {
+                            TableRef::Table { table_name, .. } => Some(table_name.clone()),
+                            _ => None,
+                        })
                         .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
                     let table = db.get_table(&table_name)
                         .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
@@ -254,7 +335,10 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
 
     let table_name = stmt.from
         .as_ref()
-        .map(|t| t.table_name.clone())
+        .and_then(|t| match t {
+            TableRef::Table { table_name, .. } => Some(table_name.clone()),
+            _ => None,
+        })
         .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
 
     let table = db.get_table(&table_name)
@@ -415,6 +499,37 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             input: Box::new(plan),
             group_by: group_by_indices.clone(),
             aggregates: aggregates.clone(),
+        };
+    }
+
+    // 检测窗口函数
+    let has_window = stmt.select_list.iter().any(|item| {
+        if let SelectItem::Expression(expr, _) = item {
+            expr_has_window(expr)
+        } else {
+            false
+        }
+    });
+
+    // 提取窗口函数信息
+    let window_funcs = if has_window {
+        let mut funcs = Vec::new();
+        for item in &stmt.select_list {
+            if let SelectItem::Expression(expr, alias) = item {
+                extract_window_functions(expr, alias, &scan_column_names, &table.def.columns, &mut funcs);
+            }
+        }
+        funcs
+    } else {
+        Vec::new()
+    };
+
+    // 如果有窗口函数，插入 Window 节点
+    if !window_funcs.is_empty() {
+        plan = PhysicalPlan::Window {
+            input: Box::new(plan),
+            window_functions: window_funcs.clone(),
+            column_names: scan_column_names.clone(),
         };
     }
 
@@ -661,6 +776,7 @@ fn find_scan_plan(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
         PhysicalPlan::Aggregate { input, .. } => find_scan_plan(input),
         PhysicalPlan::Sort { input, .. } => find_scan_plan(input),
         PhysicalPlan::Limit { input, .. } => find_scan_plan(input),
+        PhysicalPlan::Window { input, .. } => find_scan_plan(input),
         _ => None,
     }
 }
@@ -749,8 +865,14 @@ fn collect_expr_columns(expr: &Expression, cols: &mut std::collections::HashSet<
                 collect_expr_columns(e, cols);
             }
         }
-        Expression::Literal(_) => {}
-        Expression::Placeholder(_) => {}
+        Expression::Literal(_) | Expression::Placeholder(_) | Expression::Subquery(_) => {}
+        Expression::Exists { subquery, .. } | Expression::InSubquery { subquery, .. } => {
+            if let Some(ref from) = subquery.from {
+                if let TableRef::Table { table_name, .. } = from {
+                    // 子查询列引用，暂时忽略
+                }
+            }
+        }
     }
 }
 
@@ -972,6 +1094,13 @@ fn extract_column_names(plan: &PhysicalPlan) -> Vec<String> {
             left_names
         }
         PhysicalPlan::Limit { input, .. } => extract_column_names(input),
+        PhysicalPlan::Window { input, window_functions, column_names } => {
+            let mut names = column_names.clone();
+            for wf in window_functions {
+                names.push(wf.output_name.clone());
+            }
+            names
+        }
         _ => vec![],
     }
 }

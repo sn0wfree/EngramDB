@@ -13,6 +13,7 @@
 pub mod skiplist;
 pub mod bitmap;
 pub mod bloom;
+pub mod inverted_index;
 
 pub use skiplist::SkipListIndex;
 pub use bitmap::BitmapIndex;

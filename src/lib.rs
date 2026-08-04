@@ -546,6 +546,7 @@ impl Value {
         match self {
             Value::Int32(v) => Some(*v as i64),
             Value::Int64(v) => Some(*v),
+            Value::Timestamp(v) => Some(*v),
             _ => None,
         }
     }

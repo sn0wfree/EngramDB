@@ -278,6 +278,14 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
             Ok(Statement::Select(select))
         }
 
+        sqlast::Statement::Explain { statement, analyze, .. } => {
+            let inner = convert_statement(statement)?;
+            Ok(Statement::Explain(ExplainStmt {
+                analyze: *analyze,
+                statement: Box::new(inner),
+            }))
+        }
+
         // 事务语句
         sqlast::Statement::StartTransaction { .. } => Ok(Statement::BeginTransaction),
         sqlast::Statement::Commit { .. } => Ok(Statement::Commit),
@@ -446,14 +454,8 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
                 None
             } else {
                 let table = &select.from[0];
-                match &table.relation {
-                    sqlast::TableFactor::Table { name, alias, .. } => {
-                        let alias = alias.as_ref().map(|a| a.name.value.clone());
-                        Some(TableRef {
-                            table_name: name.to_string(),
-                            alias,
-                        })
-                    }
+                match convert_table_ref(table) {
+                    Ok(Some(tr)) => Some(tr),
                     _ => None,
                 }
             };
@@ -529,7 +531,48 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
         order_by,
         limit,
         distinct,
+        ctes: extract_ctes(query),
     })
+}
+
+/// 从 sqlparser Query 中提取 CTE
+fn extract_ctes(query: &sqlast::Query) -> Vec<Cte> {
+    let mut ctes = Vec::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            if let Ok(inner) = convert_query(&cte.query) {
+                let cols: Vec<String> = cte.alias.columns.iter().map(|c| c.value.clone()).collect();
+                ctes.push(Cte {
+                    alias: cte.alias.name.value.clone(),
+                    query: Box::new(inner),
+                    columns: cols,
+                });
+            }
+        }
+    }
+    ctes
+}
+
+/// 转换 sqlparser 的 TableRef 为 EngramDB TableRef
+fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>> {
+    match &table.relation {
+        sqlast::TableFactor::Table { name, alias, .. } => {
+            let alias = alias.as_ref().map(|a| a.name.value.clone());
+            Ok(Some(TableRef::Table { table_name: name.to_string(), alias }))
+        }
+        sqlast::TableFactor::Derived { subquery, alias, .. } => {
+            if let sqlast::SetExpr::Select(_) = subquery.body.as_ref() {
+                let inner = convert_query(subquery)?;
+                Ok(Some(TableRef::Derived {
+                    query: Box::new(inner),
+                    alias: alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_default(),
+                }))
+            } else {
+                Err(EngramDbError::Parse("Unsupported subquery type in FROM".into()))
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /// sqlparser Expr → EngramDB Expression
@@ -636,6 +679,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
                     args: vec![Expression::Literal(Value::Int64(1))],
                     distinct: false,
                     count_star: true,
+                    over: None,
                 });
             }
 
@@ -644,6 +688,13 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
                 args,
                 distinct,
                 count_star: false,
+                over: func.over.as_ref().and_then(|wt| {
+                    if let sqlast::WindowType::WindowSpec(ws) = wt {
+                        Some(convert_window_spec(ws))
+                    } else {
+                        None
+                    }
+                }),
             })
         }
 
@@ -775,6 +826,29 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
         // where JsonPath is a struct, not an Expr, so we skip it and fall through
         // to the unsupported expression error below.
 
+        sqlast::Expr::Subquery(subquery) => {
+            let inner = convert_query(subquery)?;
+            Ok(Expression::Subquery(Box::new(inner)))
+        }
+
+        sqlast::Expr::Exists { subquery, negated } => {
+            let inner = convert_query(subquery)?;
+            Ok(Expression::Exists {
+                subquery: Box::new(inner),
+                negated: *negated,
+            })
+        }
+
+        sqlast::Expr::InSubquery { expr, subquery, negated } => {
+            let inner_expr = convert_expression(expr)?;
+            let inner_sub = convert_query(subquery)?;
+            Ok(Expression::InSubquery {
+                expr: Box::new(inner_expr),
+                subquery: Box::new(inner_sub),
+                negated: *negated,
+            })
+        }
+
         _ => Err(EngramDbError::Parse(format!(
             "Unsupported expression: {}",
             expr
@@ -800,6 +874,49 @@ fn convert_value(v: &sqlast::Value) -> Result<Value> {
         sqlast::Value::Null => Ok(Value::Null),
         _ => Err(EngramDbError::Parse(format!("Unsupported value type: {:?}", v))),
     }
+}
+
+/// 转换窗口规范
+fn convert_window_spec(ws: &sqlast::WindowSpec) -> WindowSpec {
+    let partition_by: Result<Vec<Expression>> = ws.partition_by.iter()
+        .map(|e| convert_expression(e))
+        .collect();
+    let partition_by = partition_by.unwrap_or_default();
+    let order_by: Vec<OrderByItem> = ws.order_by.iter().map(|item| {
+        let expr = convert_expression(&item.expr).unwrap_or(Expression::Literal(Value::Null));
+        let ascending = item.asc.unwrap_or(true);
+        OrderByItem { expr, ascending }
+    }).collect();
+    let window_frame = ws.window_frame.as_ref().map(|wf| WindowFrame {
+        units: match wf.units {
+            sqlast::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+            sqlast::WindowFrameUnits::Range => WindowFrameUnits::Range,
+            sqlast::WindowFrameUnits::Groups => WindowFrameUnits::Groups,
+        },
+        start: match &wf.start_bound {
+            sqlast::WindowFrameBound::Preceding(None) => WindowFrameBound::UnboundedPreceding,
+            sqlast::WindowFrameBound::Preceding(Some(n)) => {
+                WindowFrameBound::NPreceding(n.to_string().parse().unwrap_or(0))
+            }
+            sqlast::WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+            sqlast::WindowFrameBound::Following(Some(n)) => {
+                WindowFrameBound::NFollowing(n.to_string().parse().unwrap_or(0))
+            }
+            sqlast::WindowFrameBound::Following(None) => WindowFrameBound::UnboundedFollowing,
+        },
+        end: wf.end_bound.as_ref().map(|end| match end {
+            sqlast::WindowFrameBound::Preceding(None) => WindowFrameBound::UnboundedPreceding,
+            sqlast::WindowFrameBound::Preceding(Some(n)) => {
+                WindowFrameBound::NPreceding(n.to_string().parse().unwrap_or(0))
+            }
+            sqlast::WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+            sqlast::WindowFrameBound::Following(Some(n)) => {
+                WindowFrameBound::NFollowing(n.to_string().parse().unwrap_or(0))
+            }
+            sqlast::WindowFrameBound::Following(None) => WindowFrameBound::UnboundedFollowing,
+        }),
+    });
+    WindowSpec { partition_by, order_by, window_frame }
 }
 
 fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {

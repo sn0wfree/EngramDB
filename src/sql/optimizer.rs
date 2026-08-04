@@ -161,6 +161,9 @@ fn collect_joins_and_tables(plan: &PhysicalPlan, joins: &mut Vec<()>, tables: &m
         PhysicalPlan::Limit { input, .. } => {
             collect_joins_and_tables(input, joins, tables);
         }
+        PhysicalPlan::Window { input, .. } => {
+            collect_joins_and_tables(input, joins, tables);
+        }
         _ => {}
     }
 }
@@ -242,6 +245,14 @@ fn optimize_build_sides(plan: PhysicalPlan) -> Result<PhysicalPlan> {
             Ok(PhysicalPlan::Limit {
                 input: Box::new(opt_input),
                 limit,
+            })
+        }
+        PhysicalPlan::Window { input, window_functions, column_names } => {
+            let opt_input = optimize_build_sides(*input)?;
+            Ok(PhysicalPlan::Window {
+                input: Box::new(opt_input),
+                window_functions,
+                column_names,
             })
         }
         other => Ok(other),
@@ -797,8 +808,8 @@ fn collect_columns_recursive(expr: &Expression, cols: &mut Vec<String>) {
             collect_columns_recursive(expr, cols);
             collect_columns_recursive(pattern, cols);
         }
-        Expression::Literal(_) => {}
-        Expression::Placeholder(_) => {}
+        Expression::Literal(_) | Expression::Placeholder(_) => {}
+        Expression::Subquery(_) | Expression::Exists { .. } | Expression::InSubquery { .. } => {}
     }
 }
 

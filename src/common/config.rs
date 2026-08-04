@@ -219,6 +219,7 @@ pub enum CompressionType {
     Gorilla = 7,
     ForBitPack = 8,
     BooleanPack = 9,
+    DoubleDelta = 10,
 }
 
 impl Default for Config {
