@@ -15,6 +15,12 @@ pub enum Statement {
     BeginTransaction,
     Commit,
     Rollback,
+    /// SAVEPOINT name（v0.15.0 Txn05 新增）
+    Savepoint { name: String },
+    /// RELEASE SAVEPOINT name（v0.15.0 Txn05 新增）
+    ReleaseSavepoint { name: String },
+    /// ROLLBACK TO SAVEPOINT name（v0.15.0 Txn05 新增）
+    RollbackToSavepoint { name: String },
     Analyze(AnalyzeStmt),
     CreateMaterializedView(CreateMaterializedViewStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),

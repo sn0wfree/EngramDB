@@ -207,6 +207,12 @@ pub enum PhysicalPlan {
         table_def: TableDef,
         source: Box<PhysicalPlan>,
     },
+    /// SAVEPOINT name（v0.15.0 Txn05 新增）
+    Savepoint { name: String },
+    /// RELEASE SAVEPOINT name（v0.15.0 Txn05 新增）
+    ReleaseSavepoint { name: String },
+    /// ROLLBACK TO SAVEPOINT name（v0.15.0 Txn05 新增）
+    RollbackToSavepoint { name: String },
 }
 
 /// 集合操作类型（v0.15.0 新增）

@@ -38,6 +38,11 @@ pub struct Database {
     plan_cache: std::collections::HashMap<String, (crate::executor::physical_plan::PhysicalPlan, Vec<String>)>,
     /// KV 缓存引擎（v0.15.0 新增）
     pub kv_cache: crate::storage::cache::KVCache,
+    /// 当前活跃事务 ID（v0.15.0 Txn05 新增）
+    ///
+    /// 由 BEGIN TRANSACTION 设置，COMMIT/ROLLBACK 后清除。
+    /// SAVEPOINT/RELEASE/ROLLBACK TO SAVEPOINT 基于此事务 ID。
+    current_txn_id: Option<u32>,
 }
 
 impl Database {
@@ -107,6 +112,7 @@ impl Database {
             txn_manager,
             plan_cache: std::collections::HashMap::new(),
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024), // 默认 64MB
+            current_txn_id: None,
         })
     }
 
@@ -139,6 +145,7 @@ impl Database {
             txn_manager,
             plan_cache: std::collections::HashMap::new(),
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024),
+            current_txn_id: None,
         };
 
         // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
@@ -236,6 +243,16 @@ impl Database {
     /// 获取事务管理器（可变）
     pub fn txn_manager_mut(&mut self) -> &mut TransactionManager {
         &mut self.txn_manager
+    }
+
+    /// 获取当前活跃事务 ID（v0.15.0 Txn05 新增）
+    pub fn current_txn_id(&self) -> Option<u32> {
+        self.current_txn_id
+    }
+
+    /// 设置当前活跃事务 ID（v0.15.0 Txn05 新增）
+    pub fn set_current_txn_id(&mut self, txn_id: Option<u32>) {
+        self.current_txn_id = txn_id;
     }
 
     /// 手动触发 WAL fsync（用于 Periodic 刷盘模式）

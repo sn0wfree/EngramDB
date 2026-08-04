@@ -132,7 +132,10 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::SetUnion { .. }
             | PhysicalPlan::InsertSelect { .. }
             | PhysicalPlan::TruncateTable { .. }
-            | PhysicalPlan::CreateTableAs { .. } => {
+            | PhysicalPlan::CreateTableAs { .. }
+            | PhysicalPlan::Savepoint { .. }
+            | PhysicalPlan::ReleaseSavepoint { .. }
+            | PhysicalPlan::RollbackToSavepoint { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
         }

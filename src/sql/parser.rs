@@ -328,7 +328,24 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
         // 事务语句
         sqlast::Statement::StartTransaction { .. } => Ok(Statement::BeginTransaction),
         sqlast::Statement::Commit { .. } => Ok(Statement::Commit),
-        sqlast::Statement::Rollback { .. } => Ok(Statement::Rollback),
+        sqlast::Statement::Rollback { savepoint, .. } => {
+            if let Some(name) = savepoint {
+                // ROLLBACK TO SAVEPOINT <name>
+                Ok(Statement::RollbackToSavepoint {
+                    name: name.value.clone(),
+                })
+            } else {
+                Ok(Statement::Rollback)
+            }
+        }
+
+        // SAVEPOINT / RELEASE SAVEPOINT（v0.15.0 Txn05 新增）
+        sqlast::Statement::Savepoint { name } => Ok(Statement::Savepoint {
+            name: name.value.clone(),
+        }),
+        sqlast::Statement::ReleaseSavepoint { name } => Ok(Statement::ReleaseSavepoint {
+            name: name.value.clone(),
+        }),
 
         // TRUNCATE TABLE（v0.15.0 新增）
         sqlast::Statement::Truncate { table_name, .. } => {

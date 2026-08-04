@@ -413,15 +413,31 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::BeginTransaction => {
+            // 实际开启事务（v0.15.0 Txn05 新增）
+            // 设置默认隔离级别为 SnapshotIsolation
+            let txn_id = db.txn_manager_mut().begin(
+                crate::common::config::IsolationLevel::SnapshotIsolation
+            )?;
+            db.set_current_txn_id(Some(txn_id));
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar("BEGIN".to_string())]],
+                rows: vec![vec![crate::Value::Varchar(format!("BEGIN (txn={})", txn_id))]],
                 rows_affected: 0,
             })
         }
 
         PhysicalPlan::Commit => {
-            Ok(QueryResult {
+            // 实际提交事务（v0.15.0 Txn05 新增）
+            let result = if let Some(txn_id) = db.current_txn_id() {
+                let r = db.txn_manager_mut().commit(txn_id)?;
+                db.set_current_txn_id(None);
+                Ok(r)
+            } else {
+                Err(crate::common::error::EngramDbError::Internal(
+                    "No active transaction to COMMIT".into()
+                ))
+            };
+            result.map(|_| QueryResult {
                 columns: vec!["status".to_string()],
                 rows: vec![vec![crate::Value::Varchar("COMMIT".to_string())]],
                 rows_affected: 0,
@@ -429,9 +445,70 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::Rollback => {
-            Ok(QueryResult {
+            // 实际回滚事务（v0.15.0 Txn05 新增）
+            let result = if let Some(txn_id) = db.current_txn_id() {
+                db.txn_manager_mut().rollback(txn_id)?;
+                db.set_current_txn_id(None);
+                Ok(())
+            } else {
+                Err(crate::common::error::EngramDbError::Internal(
+                    "No active transaction to ROLLBACK".into()
+                ))
+            };
+            result.map(|_| QueryResult {
                 columns: vec!["status".to_string()],
                 rows: vec![vec![crate::Value::Varchar("ROLLBACK".to_string())]],
+                rows_affected: 0,
+            })
+        }
+
+        PhysicalPlan::Savepoint { name } => {
+            // SAVEPOINT name（v0.15.0 Txn05 新增）
+            let result = if let Some(txn_id) = db.current_txn_id() {
+                db.txn_manager_mut().savepoint(txn_id, name.as_str())?;
+                Ok(())
+            } else {
+                Err(crate::common::error::EngramDbError::Internal(
+                    "No active transaction for SAVEPOINT".into()
+                ))
+            };
+            result.map(|_| QueryResult {
+                columns: vec!["status".to_string()],
+                rows: vec![vec![crate::Value::Varchar(format!("SAVEPOINT {}", name))]],
+                rows_affected: 0,
+            })
+        }
+
+        PhysicalPlan::ReleaseSavepoint { name } => {
+            // RELEASE SAVEPOINT name（v0.15.0 Txn05 新增）
+            let result = if let Some(txn_id) = db.current_txn_id() {
+                db.txn_manager_mut().release_savepoint(txn_id, name.as_str())?;
+                Ok(())
+            } else {
+                Err(crate::common::error::EngramDbError::Internal(
+                    "No active transaction for RELEASE SAVEPOINT".into()
+                ))
+            };
+            result.map(|_| QueryResult {
+                columns: vec!["status".to_string()],
+                rows: vec![vec![crate::Value::Varchar(format!("RELEASE SAVEPOINT {}", name))]],
+                rows_affected: 0,
+            })
+        }
+
+        PhysicalPlan::RollbackToSavepoint { name } => {
+            // ROLLBACK TO SAVEPOINT name（v0.15.0 Txn05 新增）
+            let result = if let Some(txn_id) = db.current_txn_id() {
+                db.txn_manager_mut().rollback_to_savepoint(txn_id, name.as_str())?;
+                Ok(())
+            } else {
+                Err(crate::common::error::EngramDbError::Internal(
+                    "No active transaction for ROLLBACK TO SAVEPOINT".into()
+                ))
+            };
+            result.map(|_| QueryResult {
+                columns: vec!["status".to_string()],
+                rows: vec![vec![crate::Value::Varchar(format!("ROLLBACK TO SAVEPOINT {}", name))]],
                 rows_affected: 0,
             })
         }
@@ -626,6 +703,9 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::SetUnion { .. } => "SetUnion",
         PhysicalPlan::TruncateTable { .. } => "TruncateTable",
         PhysicalPlan::CreateTableAs { .. } => "CreateTableAs",
+        PhysicalPlan::Savepoint { .. } => "Savepoint",
+        PhysicalPlan::ReleaseSavepoint { .. } => "ReleaseSavepoint",
+        PhysicalPlan::RollbackToSavepoint { .. } => "RollbackToSavepoint",
     }
 }
 
