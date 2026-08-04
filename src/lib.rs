@@ -1570,4 +1570,69 @@ mod value_tests {
         ).unwrap();
         assert_eq!(results.len(), 0, "没有类别 Z 的数据");
     }
+
+    #[test]
+    fn test_ttl_expiration() {
+        use crate::common::types::{TableDef, ColumnDef, DataType};
+
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        // 创建有 TTL 的表：60 秒过期
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int64).primary_key(),
+            ColumnDef::new("data", DataType::Varchar),
+            ColumnDef::new("created_at", DataType::Timestamp),
+        ];
+        let mut table_def = TableDef::new(0, "ttl_test", columns);
+        table_def.ttl_seconds = Some(60); // 60 秒过期
+        table_def.ttl_column = Some(2);   // created_at 列是 TTL 参考列
+
+        let db = conn.database_mut();
+        db.create_table(table_def).unwrap();
+
+        // 插入数据（TTL 会自动填充 created_at 为当前时间）
+        let rows = vec![
+            vec![Value::Int64(1), Value::Varchar("alive".into()), Value::Null],
+        ];
+        let table = db.get_table_mut("ttl_test").unwrap();
+        table.insert(rows).unwrap();
+
+        // 验证刚插入的数据可以被查询到（未过期）
+        let row = table.get_row_by_id(1).unwrap();  // 注意：delta store 使用 1-based row_id
+        assert!(row.is_some(), "刚插入的数据应该可查询");
+
+        // 验证 scan 也能查到
+        let all = table.scan(&[0, 1]).unwrap();
+        assert_eq!(all.len(), 1, "scan 应该返回 1 行");
+
+        // 模拟过期：手动设置 created_at 为 120 秒前
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64 - 120_000;
+        let table = db.get_table_mut("ttl_test").unwrap();
+        // 直接修改 Delta 层的数据（row_id=1）
+        let old_row = table.delta_store().get(1).unwrap();
+        let mut modified_row = old_row.clone();
+        modified_row[2] = Value::Timestamp(past);
+        table.delta_store_mut().update_row_by_id(1, modified_row).unwrap();
+
+        // 验证过期行不再被查询到
+        let row = table.get_row_by_id(1).unwrap();
+        assert!(row.is_none(), "过期行应该不可查询");
+
+        // 验证 scan 也看不到过期行
+        let all = table.scan(&[0, 1]).unwrap();
+        assert_eq!(all.len(), 0, "scan 应该看不到过期行");
+
+        // 验证 compaction 后物理删除
+        table.compact_delta().unwrap();
+        // 重新插入一条新数据验证 compaction 后索引正常
+        let rows = vec![
+            vec![Value::Int64(2), Value::Varchar("new".into()), Value::Null],
+        ];
+        table.insert(rows).unwrap();
+        let all = table.scan(&[0, 1]).unwrap();
+        assert_eq!(all.len(), 1, "compaction 后只有新数据");
+    }
 }

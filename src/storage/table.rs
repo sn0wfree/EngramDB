@@ -57,6 +57,25 @@ fn cluster_columns(columns: &[Vec<Value>], cluster_col_idx: usize) -> Vec<Vec<Va
     result
 }
 
+/// 将行列表转置为列格式（行 -> 列式存储）
+fn transpose_rows(rows: &[Vec<Value>], num_cols: usize) -> Vec<Vec<Value>> {
+    let num_rows = rows.len();
+    if num_rows == 0 {
+        return vec![vec![]; num_cols];
+    }
+    let mut columns = vec![Vec::with_capacity(num_rows); num_cols];
+    for row in rows {
+        for col_idx in 0..num_cols {
+            if col_idx < row.len() {
+                columns[col_idx].push(row[col_idx].clone());
+            } else {
+                columns[col_idx].push(Value::Null);
+            }
+        }
+    }
+    columns
+}
+
 /// 表（整合列存 + Delta）
 pub struct Table {
     pub def: TableDef,
@@ -146,10 +165,23 @@ impl Table {
                     row.push(crate::Value::Null);
                 }
             }
+            // TTL 过滤：过期行视为不存在
+            if self.def.is_expired(&row) {
+                return Ok(None);
+            }
             Ok(Some(row))
         } else {
             // 位于 Delta 层：使用绝对 row_id 读取
-            Ok(self.delta_store.get(row_id_u).map(|r| r.to_vec()))
+            let delta_row = self.delta_store.get(row_id_u);
+            if let Some(r) = delta_row {
+                // TTL 过滤：过期行视为不存在
+                if self.def.is_expired(&r) {
+                    return Ok(None);
+                }
+                Ok(Some(r.to_vec()))
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -732,6 +764,23 @@ impl Table {
             }
         }
 
+        // TTL 时间戳自动填充（v0.15.0）
+        // 当表有 TTL 且指定了 ttl_column 时，如果该列的值为 Null 或空，自动填充当前时间
+        if let Some(ttl_col) = self.def.ttl_column {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            for row in rows.iter_mut() {
+                if ttl_col >= row.len() || row[ttl_col].is_null() {
+                    if ttl_col >= row.len() {
+                        row.resize(ttl_col + 1, Value::Null);
+                    }
+                    row[ttl_col] = Value::Timestamp(now_ms);
+                }
+            }
+        }
+
         // NOT NULL 约束检查
         for (col_idx, col_def) in self.def.columns.iter().enumerate() {
             if !col_def.nullable {
@@ -812,15 +861,29 @@ impl Table {
                             self.def.next_auto_increment_id += 1;
                         } else if (*n as u64) >= self.def.next_auto_increment_id {
                             self.def.next_auto_increment_id = (*n as u64) + 1;
-                        }
-                    }
-                    _ => {}
-                }
+}
             }
-            if !col_def.nullable && col_idx < owned_row.len() && owned_row[col_idx].is_null() {
+            _ => {}
+        }
+    }
+    if !col_def.nullable && col_idx < owned_row.len() && owned_row[col_idx].is_null() {
                 return Err(EngramDbError::ConstraintViolation(
                     format!("NOT NULL constraint failed: column '{}'", col_def.name)
                 ));
+            }
+        }
+
+        // TTL 时间戳自动填充（v0.15.0）
+        if let Some(ttl_col) = self.def.ttl_column {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            if ttl_col >= owned_row.len() || owned_row[ttl_col].is_null() {
+                if ttl_col >= owned_row.len() {
+                    owned_row.resize(ttl_col + 1, Value::Null);
+                }
+                owned_row[ttl_col] = Value::Timestamp(now_ms);
             }
         }
 
@@ -1096,10 +1159,24 @@ impl Table {
             // 按行组装
             if !columns_data.is_empty() {
                 let row_count = columns_data[0].len();
+                // 如果 TTL 启用，需要完整的行来判断过期
+                let full_row_for_ttl = self.def.has_ttl();
                 for row_idx in 0..row_count {
                     let mut row = Vec::with_capacity(column_indices.len());
                     for col in &columns_data {
                         row.push(col[row_idx].clone());
+                    }
+                    // TTL 过滤：跳过过期行
+                    if full_row_for_ttl {
+                        // 重建完整行用于 TTL 判断
+                        let mut full_row: Vec<Value> = Vec::new();
+                        for ci in 0..self.def.columns.len() {
+                            let col_data = self.column_store.read_column(rg_idx, ci)?;
+                            full_row.push(if row_idx < col_data.len() { col_data[row_idx].clone() } else { Value::Null });
+                        }
+                        if self.def.is_expired(&full_row) {
+                            continue;
+                        }
                     }
                     result.push(row);
                 }
@@ -1108,6 +1185,10 @@ impl Table {
 
         // 从 Delta 层读取
         for (_, row) in self.delta_store.all_rows() {
+            // TTL 过滤：跳过过期行
+            if self.def.is_expired(&row) {
+                continue;
+            }
             let mut projected = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
                 if col_idx < row.len() {
@@ -1135,6 +1216,27 @@ impl Table {
         }
 
         let row_count = self.delta_store.len() as u64;
+
+        // 如果有 TTL，过滤掉过期行
+        if self.def.has_ttl() {
+            let all_rows = self.delta_store.all_rows();
+            let mut alive_rows: Vec<Vec<Value>> = Vec::new();
+            for (_, row) in all_rows {
+                if !self.def.is_expired(&row) {
+                    alive_rows.push(row);
+                }
+            }
+            // 清空 Delta 并用存活行重建
+            self.delta_store.clear();
+            // 重新插入未过期的行作为列式数据
+            let alive_count = alive_rows.len();
+            if alive_count > 0 {
+                let columns = transpose_rows(&alive_rows, self.def.columns.len());
+                self.column_store.append_columns(&columns)?;
+            }
+            self.def.row_count += alive_count as u64;
+            return Ok(());
+        }
 
         // 根据是否有聚簇键选择写入方式
         let columns_to_write: Vec<Vec<Value>> = match self.def.cluster_key {

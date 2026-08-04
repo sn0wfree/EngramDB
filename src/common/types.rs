@@ -141,6 +141,17 @@ pub struct TableDef {
     /// 下一个待分配的自增 ID。每次 INSERT 自增列时从该值分配并 +1。
     /// 持久化到 TableDef，自动通过 serde 处理。
     pub next_auto_increment_id: u64,
+    /// TTL（秒），None 表示永不过期（v0.15.0 新增）
+    ///
+    /// 设置了 TTL 的表，写入时自动填充 `_created_at` 时间戳列，
+    /// 读取时检查 `created_at + ttl < now()` 自动过滤过期行，
+    /// compaction 时物理删除过期行。
+    pub ttl_seconds: Option<u64>,
+    /// TTL 参考列索引（v0.15.0 新增）
+    ///
+    /// 该列必须是 Timestamp 类型，用于判断 TTL 是否过期。
+    /// 建表时由 `ttl_seconds` 自动指定，用户也可以显式设置。
+    pub ttl_column: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -172,6 +183,8 @@ impl TableDef {
             cluster_key: None,
             foreign_keys: Vec::new(),
             next_auto_increment_id: 1,
+            ttl_seconds: None,
+            ttl_column: None,
         }
     }
 
@@ -191,6 +204,37 @@ impl TableDef {
                 Ok(())
             }
             None => Err(format!("column '{}' not found", column_name)),
+        }
+    }
+
+    /// 检查表是否有 TTL 配置
+    pub fn has_ttl(&self) -> bool {
+        self.ttl_seconds.is_some()
+    }
+
+    /// 获取 TTL 秒数
+    pub fn ttl(&self) -> Option<u64> {
+        self.ttl_seconds
+    }
+
+    /// 判断指定行是否已过期（相对于当前时间）
+    pub fn is_expired(&self, row: &[crate::Value]) -> bool {
+        match self.ttl_seconds {
+            Some(ttl) => {
+                if let Some(ttl_col) = self.ttl_column {
+                    if ttl_col < row.len() {
+                        if let crate::Value::Timestamp(created_ms) = &row[ttl_col] {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as i64;
+                            return now_ms - created_ms > (ttl as i64) * 1000;
+                        }
+                    }
+                }
+                false
+            }
+            None => false,
         }
     }
 }
