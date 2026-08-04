@@ -11,3 +11,4 @@ pub mod join_order;
 pub mod materialized_view;
 pub mod udf;
 pub mod arrow_integration;
+pub mod ingestion;
