@@ -1731,4 +1731,55 @@ mod value_tests {
         let result = conn.execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) > 1").unwrap();
         assert_eq!(result.rows.len(), 2, "Alice(3) 和 Bob(2) 应有多个订单");
     }
+
+    #[test]
+    fn test_case_when_basic() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE scores (id INT64, score INT64)").unwrap();
+        conn.execute("INSERT INTO scores VALUES (1, 95)").unwrap();
+        conn.execute("INSERT INTO scores VALUES (2, 85)").unwrap();
+        conn.execute("INSERT INTO scores VALUES (3, 70)").unwrap();
+        conn.execute("INSERT INTO scores VALUES (4, 55)").unwrap();
+
+        // CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END
+        let result = conn.execute("SELECT id, CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END FROM scores").unwrap();
+        assert_eq!(result.rows.len(), 4);
+        assert_eq!(result.rows[0][1], Value::Varchar("A".to_string())); // 95 -> A
+        assert_eq!(result.rows[1][1], Value::Varchar("B".to_string())); // 85 -> B
+        assert_eq!(result.rows[2][1], Value::Varchar("C".to_string())); // 70 -> C
+        assert_eq!(result.rows[3][1], Value::Varchar("C".to_string())); // 55 -> C
+    }
+
+    #[test]
+    fn test_case_when_no_else() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64, x INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+        // CASE WHEN x > 15 THEN 'big' END — 无 ELSE，未匹配返回 NULL
+        let result = conn.execute("SELECT id, CASE WHEN x > 15 THEN 'big' END FROM t").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][1], Value::Null); // 10 -> NULL
+        assert_eq!(result.rows[1][1], Value::Varchar("big".to_string()));
+        assert_eq!(result.rows[2][1], Value::Varchar("big".to_string()));
+    }
+
+    #[test]
+    fn test_case_when_in_where() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE products (id INT64, price INT64)").unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 50)").unwrap();
+        conn.execute("INSERT INTO products VALUES (2, 150)").unwrap();
+        conn.execute("INSERT INTO products VALUES (3, 500)").unwrap();
+        conn.execute("INSERT INTO products VALUES (4, 1000)").unwrap();
+
+        // 在 WHERE 中使用 CASE WHEN
+        let result = conn.execute("SELECT id, CASE WHEN price < 100 THEN 'cheap' WHEN price < 500 THEN 'mid' ELSE 'expensive' END AS tier FROM products WHERE (CASE WHEN price < 500 THEN 1 ELSE 0 END) = 1").unwrap();
+        assert_eq!(result.rows.len(), 2, "price < 500 的产品有 2 个（50 和 150，500 不算）");
+    }
 }
