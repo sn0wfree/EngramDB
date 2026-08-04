@@ -197,11 +197,35 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 ));
             };
 
+            // 解析 RETURNING 子句
+            let returning = if let Some(returning_items) = &insert.returning {
+                let mut items = Vec::new();
+                for item in returning_items {
+                    match item {
+                        sqlast::SelectItem::Wildcard(_) => {
+                            items.push(SelectItem::Wildcard);
+                        }
+                        sqlast::SelectItem::UnnamedExpr(expr) => {
+                            let e = convert_expression(expr)?;
+                            items.push(SelectItem::Expression(e, None));
+                        }
+                        sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                            let e = convert_expression(expr)?;
+                            items.push(SelectItem::Expression(e, Some(alias.value.clone())));
+                        }
+                        _ => {}
+                    }
+                }
+                Some(items)
+            } else {
+                None
+            };
+
             Ok(Statement::Insert(InsertStmt {
                 table_name: tbl_name,
                 columns: col_names,
                 values,
-                returning: None,
+                returning,
                 on_conflict: None,
             }))
         }

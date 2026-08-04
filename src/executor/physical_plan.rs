@@ -51,6 +51,7 @@ pub enum PhysicalPlan {
     Insert {
         table_name: String,
         rows: Vec<Vec<Value>>,
+        returning: Option<Vec<crate::sql::ast::SelectItem>>,
     },
     /// 列式插入（向量化写入路径）
     ///

@@ -3,7 +3,7 @@
 //! 遍历物理计划树，执行每个算子。
 //! 向量化执行：算子间以 DataChunk 为单位传递数据，整批计算。
 
-use crate::common::error::Result;
+use crate::common::error::{Result, EngramDbError};
 use crate::storage::Database;
 use crate::QueryResult;
 
@@ -56,8 +56,61 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Insert { table_name, rows } => {
+        PhysicalPlan::Insert { table_name, rows, returning } => {
+            // 记录插入前的 row_count，用于 RETURNING 读取实际行
+            let base_row_id = if returning.is_some() {
+                let t = db.get_table(&table_name)
+                    .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+                t.def.row_count as u32
+            } else {
+                0
+            };
+            let num_rows = rows.len();
             let count = operators::insert::execute(db, &table_name, rows)?;
+
+            // INSERT...RETURNING: 从表中读取实际插入的行（含 AUTO_INCREMENT 值）
+            if let Some(returning_items) = returning {
+                let table = db.get_table_mut(&table_name)
+                    .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+
+                let mut result_rows = Vec::with_capacity(num_rows);
+                for rid in base_row_id..base_row_id + num_rows as u32 {
+                    let row = table.get_row_by_id(rid)?
+                        .ok_or_else(|| EngramDbError::Internal(
+                            format!("RETURNING: row_id {} not found after insert", rid)
+                        ))?;
+                    let mut result_row = Vec::with_capacity(returning_items.len());
+                    for item in &returning_items {
+                        match item {
+                            crate::sql::ast::SelectItem::Wildcard => {
+                                result_row.extend(row.iter().cloned());
+                            }
+                            crate::sql::ast::SelectItem::Expression(expr, _alias) => {
+                                let val = evaluate_returning_expr(expr, &row, &table.def)?;
+                                result_row.push(val);
+                            }
+                        }
+                    }
+                    result_rows.push(result_row);
+                }
+
+                // 构造列名
+                let columns: Vec<String> = returning_items.iter().enumerate().map(|(i, item)| {
+                    match item {
+                        crate::sql::ast::SelectItem::Wildcard => format!("*"),
+                        crate::sql::ast::SelectItem::Expression(_expr, alias) => {
+                            alias.clone().unwrap_or_else(|| format!("col_{}", i))
+                        }
+                    }
+                }).collect();
+
+                return Ok(QueryResult {
+                    columns,
+                    rows: result_rows,
+                    rows_affected: count,
+                });
+            }
+
             Ok(QueryResult {
                 columns: vec!["rows_inserted".to_string()],
                 rows: vec![vec![crate::Value::Int64(count as i64)]],
@@ -397,6 +450,28 @@ fn rows_to_chunks(rows: &[Vec<crate::Value>]) -> Vec<DataChunk> {
         chunks.push(DataChunk::from_rows(batch));
     }
     chunks
+}
+
+/// 评估 INSERT...RETURNING 表达式
+fn evaluate_returning_expr(
+    expr: &crate::sql::ast::Expression,
+    row: &[crate::Value],
+    table_def: &crate::common::types::TableDef,
+) -> Result<crate::Value> {
+    use crate::sql::ast::Expression;
+    match expr {
+        Expression::ColumnRef { column, .. } => {
+            let idx = table_def.column_index(column)
+                .ok_or_else(|| EngramDbError::Internal(
+                    format!("RETURNING column '{}' not found", column)
+                ))?;
+            Ok(row[idx].clone())
+        }
+        Expression::Literal(v) => Ok(v.clone()),
+        _ => Err(EngramDbError::Parse(
+            format!("Unsupported RETURNING expression: {:?}", expr)
+        )),
+    }
 }
 
 

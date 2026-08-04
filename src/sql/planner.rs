@@ -214,6 +214,7 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
     Ok(PhysicalPlan::Insert {
         table_name: stmt.table_name,
         rows,
+        returning: stmt.returning,
     })
 }
 

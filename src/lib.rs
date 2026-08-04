@@ -1391,4 +1391,31 @@ mod value_tests {
         let err = conn.execute("INSERT INTO t VALUES (3, 'a')").unwrap_err();
         assert!(err.to_string().contains("UNIQUE"), "got: {}", err);
     }
+
+    #[test]
+    fn test_insert_returning() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR, score INT)").unwrap();
+
+        // INSERT...RETURNING 单列
+        let result = conn.execute("INSERT INTO t (name, score) VALUES ('alice', 100) RETURNING id").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+
+        // INSERT...RETURNING 多列
+        let result = conn.execute("INSERT INTO t (name, score) VALUES ('bob', 200) RETURNING id, name, score").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(2));
+        assert_eq!(result.rows[0][1], Value::Varchar("bob".into()));
+        assert_eq!(result.rows[0][2], Value::Int64(200));
+
+        // INSERT...RETURNING *
+        let result = conn.execute("INSERT INTO t (name, score) VALUES ('carol', 300) RETURNING *").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].len(), 3); // id, name, score
+
+        // 验证数据正确写入
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3));
+    }
 }
