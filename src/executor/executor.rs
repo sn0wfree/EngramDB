@@ -56,7 +56,12 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Insert { table_name, rows, returning } => {
+        PhysicalPlan::Insert { table_name, rows, returning, on_conflict } => {
+            // UPSERT 路径：INSERT...ON CONFLICT DO UPDATE/NOTHING
+            if let Some(conflict_clause) = on_conflict {
+                return execute_upsert(db, &table_name, rows, conflict_clause, returning);
+            }
+
             // 记录插入前的 row_count，用于 RETURNING 读取实际行
             let base_row_id = if returning.is_some() {
                 let t = db.get_table(&table_name)
@@ -471,6 +476,150 @@ fn evaluate_returning_expr(
         _ => Err(EngramDbError::Parse(
             format!("Unsupported RETURNING expression: {:?}", expr)
         )),
+    }
+}
+
+/// 执行 INSERT...ON CONFLICT DO UPDATE/NOTHING（UPSERT）
+fn execute_upsert(
+    db: &mut Database,
+    table_name: &str,
+    rows: Vec<Vec<crate::Value>>,
+    conflict_clause: crate::sql::ast::OnConflictClause,
+    returning: Option<Vec<crate::sql::ast::SelectItem>>,
+) -> Result<QueryResult> {
+    use crate::sql::ast::OnConflictAction;
+
+    let table = db.get_table(table_name)
+        .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
+    let table_def = table.def.clone();
+
+    // 找到冲突列的索引
+    let conflict_col_indices: Vec<usize> = conflict_clause.conflict_columns.iter()
+        .filter_map(|col_name| table_def.column_index(col_name))
+        .collect();
+
+    let mut rows_affected: u64 = 0;
+    let mut result_rows = Vec::new();
+
+    // 逐行处理
+    for row in &rows {
+        // 查找冲突行
+        let mut conflicting_row_id: Option<u32> = None;
+        if !conflict_col_indices.is_empty() {
+            // 通过扫描查找冲突行（简化实现）
+            let table = db.get_table_mut(table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
+            let row_count = table.def.row_count;
+            'scan: for rid in 0..row_count as u32 {
+                if let Some(existing_row) = table.get_row_by_id(rid)? {
+                    let mut conflict = true;
+                    for &col_idx in &conflict_col_indices {
+                        if col_idx >= existing_row.len() || col_idx >= row.len() {
+                            conflict = false;
+                            break;
+                        }
+                        if existing_row[col_idx] != row[col_idx] {
+                            conflict = false;
+                            break;
+                        }
+                    }
+                    if conflict {
+                        conflicting_row_id = Some(rid);
+                        break 'scan;
+                    }
+                }
+            }
+        }
+
+        match conflicting_row_id {
+            Some(rid) => {
+                // 冲突发生
+                match &conflict_clause.action {
+                    OnConflictAction::DoNothing => {
+                        // 不做任何事
+                    }
+                    OnConflictAction::DoUpdate { assignments } => {
+                        // 更新冲突行
+                        let table = db.get_table_mut(table_name)
+                            .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
+                        let mut existing_row = table.get_row_by_id(rid)?
+                            .ok_or_else(|| EngramDbError::Internal(
+                                format!("Row {} not found during UPSERT update", rid)
+                            ))?;
+
+                        // 应用赋值
+                        for (col_name, expr) in assignments {
+                            let col_idx = table_def.column_index(col_name)
+                                .ok_or_else(|| EngramDbError::Internal(
+                                    format!("Column '{}' not found in UPDATE assignments", col_name)
+                                ))?;
+                            if col_idx < existing_row.len() {
+                                existing_row[col_idx] = evaluate_returning_expr(expr, &row, &table_def)?;
+                            }
+                        }
+
+                        // 更新行
+                        table.update_row(rid, &existing_row)?;
+                        rows_affected += 1;
+                    }
+                }
+            }
+            None => {
+                // 无冲突，正常插入
+                let table = db.get_table_mut(table_name)
+                    .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
+                table.insert(vec![row.clone()])?;
+                rows_affected += 1;
+            }
+        }
+
+        // 收集 RETURNING 结果
+        if let Some(ref returning_items) = returning {
+            let table = db.get_table_mut(table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
+            let rid = conflicting_row_id.unwrap_or(table.def.row_count as u32 - 1);
+            let actual_row = table.get_row_by_id(rid)?
+                .ok_or_else(|| EngramDbError::Internal(
+                    format!("Row {} not found for RETURNING", rid)
+                ))?;
+            let mut result_row = Vec::new();
+            for item in returning_items {
+                match item {
+                    crate::sql::ast::SelectItem::Wildcard => {
+                        result_row.extend(actual_row.iter().cloned());
+                    }
+                    crate::sql::ast::SelectItem::Expression(expr, _alias) => {
+                        let val = evaluate_returning_expr(expr, &actual_row, &table.def)?;
+                        result_row.push(val);
+                    }
+                }
+            }
+            result_rows.push(result_row);
+        }
+    }
+
+    // 返回结果
+    if returning.is_some() {
+        let returning_items = returning.unwrap();
+        let columns: Vec<String> = returning_items.iter().enumerate().map(|(i, item)| {
+            match item {
+                crate::sql::ast::SelectItem::Wildcard => format!("*"),
+                crate::sql::ast::SelectItem::Expression(_expr, alias) => {
+                    alias.clone().unwrap_or_else(|| format!("col_{}", i))
+                }
+            }
+        }).collect();
+        Ok(QueryResult {
+            columns,
+            rows: result_rows,
+            rows_affected,
+        })
+    } else {
+        Ok(QueryResult {
+            columns: vec!["rows_affected".to_string()],
+            rows: vec![vec![crate::Value::Int64(rows_affected as i64)]],
+            rows_affected,
+        })
     }
 }
 

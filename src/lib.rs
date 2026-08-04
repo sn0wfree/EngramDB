@@ -1418,4 +1418,45 @@ mod value_tests {
         let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(result.rows[0][0], Value::Int64(3));
     }
+
+    #[test]
+    fn test_upsert_do_update() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR, score INT)").unwrap();
+
+        // 首次插入
+        conn.execute("INSERT INTO t VALUES (1, 'alice', 100)").unwrap();
+
+        // UPSERT：冲突时更新
+        conn.execute("INSERT INTO t VALUES (1, 'alice_updated', 200) ON CONFLICT (id) DO UPDATE SET name = excluded.name, score = excluded.score").unwrap();
+
+        // 验证更新后的值
+        let result = conn.execute("SELECT name, score FROM t WHERE id = 1").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("alice_updated".into()));
+        assert_eq!(result.rows[0][1], Value::Int64(200));
+
+        // 验证只有一行
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+    }
+
+    #[test]
+    fn test_upsert_do_nothing() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR)").unwrap();
+
+        // 首次插入
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+
+        // UPSERT：冲突时不做任何事
+        conn.execute("INSERT INTO t VALUES (1, 'bob') ON CONFLICT (id) DO NOTHING").unwrap();
+
+        // 验证原始值未变
+        let result = conn.execute("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("alice".into()));
+
+        // 验证只有一行
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+    }
 }

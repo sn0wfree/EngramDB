@@ -215,6 +215,7 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
         table_name: stmt.table_name,
         rows,
         returning: stmt.returning,
+        on_conflict: stmt.on_conflict,
     })
 }
 

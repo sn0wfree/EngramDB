@@ -221,12 +221,55 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 None
             };
 
+            // 解析 ON CONFLICT 子句（UPSERT）
+            let on_conflict = if let Some(on_insert) = &insert.on {
+                match on_insert {
+                    sqlast::OnInsert::OnConflict(on_conflict) => {
+                        // 提取冲突目标列
+                        let conflict_columns = if let Some(target) = &on_conflict.conflict_target {
+                            match target {
+                                sqlast::ConflictTarget::Columns(cols) => {
+                                    cols.iter().map(|c| c.value.clone()).collect()
+                                }
+                                _ => vec![],
+                            }
+                        } else {
+                            vec![]
+                        };
+
+                        // 提取冲突动作
+                        let action = match &on_conflict.action {
+                            sqlast::OnConflictAction::DoNothing => {
+                                OnConflictAction::DoNothing
+                            }
+                            sqlast::OnConflictAction::DoUpdate(do_update) => {
+                                let mut assignments = Vec::new();
+                                for assignment in &do_update.assignments {
+                                    let col_name = assignment.id[0].value.clone();
+                                    let expr = convert_expression(&assignment.value)?;
+                                    assignments.push((col_name, expr));
+                                }
+                                OnConflictAction::DoUpdate { assignments }
+                            }
+                        };
+
+                        Some(OnConflictClause {
+                            conflict_columns,
+                            action,
+                        })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             Ok(Statement::Insert(InsertStmt {
                 table_name: tbl_name,
                 columns: col_names,
                 values,
                 returning,
-                on_conflict: None,
+                on_conflict,
             }))
         }
 
