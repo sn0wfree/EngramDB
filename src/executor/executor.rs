@@ -7,7 +7,7 @@ use crate::common::error::{Result, EngramDbError};
 use crate::storage::Database;
 use crate::QueryResult;
 
-use super::physical_plan::{PhysicalPlan, JoinType};
+use super::physical_plan::{PhysicalPlan, JoinType, SetUnionOp};
 use super::vector::DataChunk;
 use super::operators;
 use crate::sql::ast::Expression;
@@ -308,6 +308,41 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        PhysicalPlan::SetUnion { op, left, right } => {
+            // UNION / UNION ALL：合并两个子计划的行
+            let left_result = execute(*left, db)?;
+            let right_result = execute(*right, db)?;
+
+            // 列名必须一致（否则无法合并）
+            if left_result.columns != right_result.columns {
+                return Err(EngramDbError::Parse(format!(
+                    "UNION columns mismatch: {:?} vs {:?}",
+                    left_result.columns, right_result.columns
+                )));
+            }
+
+            let columns = left_result.columns.clone();
+            let mut rows = left_result.rows;
+
+            match op {
+                SetUnionOp::UnionAll => {
+                    // UNION ALL：直接拼接
+                    rows.extend(right_result.rows);
+                }
+                SetUnionOp::Union => {
+                    // UNION：拼接后去重（基于行内容比较）
+                    rows.extend(right_result.rows);
+                    rows.dedup();
+                }
+            }
+
+            Ok(QueryResult {
+                columns,
+                rows,
+                rows_affected: 0,
+            })
+        }
+
         PhysicalPlan::BeginTransaction => {
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
@@ -501,6 +536,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Explain { .. } => "Explain",
         PhysicalPlan::Window { .. } => "Window",
         PhysicalPlan::SubqueryScan { .. } => "SubqueryScan",
+        PhysicalPlan::SetUnion { .. } => "SetUnion",
     }
 }
 
@@ -569,6 +605,10 @@ fn format_plan_tree(plan: &PhysicalPlan, indent: usize) -> String {
         }
         PhysicalPlan::SubqueryScan { plan } => {
             result.push_str(&format_plan_tree(plan, indent + 1));
+        }
+        PhysicalPlan::SetUnion { left, right, .. } => {
+            result.push_str(&format_plan_tree(left, indent + 1));
+            result.push_str(&format_plan_tree(right, indent + 1));
         }
         _ => {}
     }

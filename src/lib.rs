@@ -1782,4 +1782,63 @@ mod value_tests {
         let result = conn.execute("SELECT id, CASE WHEN price < 100 THEN 'cheap' WHEN price < 500 THEN 'mid' ELSE 'expensive' END AS tier FROM products WHERE (CASE WHEN price < 500 THEN 1 ELSE 0 END) = 1").unwrap();
         assert_eq!(result.rows.len(), 2, "price < 500 的产品有 2 个（50 和 150，500 不算）");
     }
+
+    #[test]
+    fn test_union_all() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64, name VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64, name VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3, 'c'), (4, 'd'), (5, 'e')").unwrap();
+
+        // UNION ALL：不去重，6 行
+        let result = conn.execute("SELECT id, name FROM t1 UNION ALL SELECT id, name FROM t2").unwrap();
+        assert_eq!(result.rows.len(), 6, "UNION ALL 应返回 6 行（不去重）");
+    }
+
+    #[test]
+    fn test_union_dedup() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64, name VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64, name VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3, 'c'), (4, 'd'), (5, 'e')").unwrap();
+
+        // UNION：去重，5 行
+        let result = conn.execute("SELECT id, name FROM t1 UNION SELECT id, name FROM t2").unwrap();
+        assert_eq!(result.rows.len(), 5, "UNION 应返回 5 行（去重 1 行：id=3,name='c'）");
+    }
+
+    #[test]
+    fn test_union_no_overlap() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (4), (5), (6)").unwrap();
+
+        // UNION：完全无重叠，UNION 和 UNION ALL 结果相同
+        let result = conn.execute("SELECT id FROM t1 UNION SELECT id FROM t2").unwrap();
+        assert_eq!(result.rows.len(), 6);
+
+        let result = conn.execute("SELECT id FROM t1 UNION ALL SELECT id FROM t2").unwrap();
+        assert_eq!(result.rows.len(), 6);
+    }
+
+    #[test]
+    fn test_union_with_where() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64, val INT64)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64, val INT64)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3, 30), (4, 40), (5, 50)").unwrap();
+
+        // 带 WHERE 过滤的 UNION
+        let result = conn.execute("SELECT id FROM t1 WHERE val > 15 UNION ALL SELECT id FROM t2 WHERE val > 35").unwrap();
+        assert_eq!(result.rows.len(), 4, "t1(val>15): 2 行, t2(val>35): 2 行");
+    }
 }

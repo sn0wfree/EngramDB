@@ -128,7 +128,8 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::Distinct { .. }
             | PhysicalPlan::Explain { .. }
             | PhysicalPlan::Window { .. }
-            | PhysicalPlan::SubqueryScan { .. } => {
+            | PhysicalPlan::SubqueryScan { .. }
+            | PhysicalPlan::SetUnion { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
         }

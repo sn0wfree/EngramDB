@@ -177,6 +177,25 @@ pub enum PhysicalPlan {
     SubqueryScan {
         plan: Box<PhysicalPlan>,
     },
+    /// 集合操作：UNION / UNION ALL（v0.15.0 新增）
+    ///
+    /// 合并 left 和 right 两个子计划的行：
+    /// - UnionAll：直接拼接所有行
+    /// - Union：拼接后按行去重（基于多列比较）
+    SetUnion {
+        op: SetUnionOp,
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+    },
+}
+
+/// 集合操作类型（v0.15.0 新增）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetUnionOp {
+    /// UNION：合并并去重
+    Union,
+    /// UNION ALL：合并不去重
+    UnionAll,
 }
 
 /// 聚合表达式

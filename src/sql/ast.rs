@@ -133,6 +133,19 @@ pub struct SelectStmt {
     pub distinct: bool,
     /// CTE (WITH 子句)
     pub ctes: Vec<Cte>,
+    /// 集合操作（v0.15.0 新增）：UNION / UNION ALL
+    ///
+    /// `set_op = Some((Union, right))` 表示 `self UNION right`
+    pub set_op: Option<(SetOpType, Box<SelectStmt>)>,
+}
+
+/// 集合操作类型（v0.15.0 新增）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpType {
+    /// UNION：合并两个结果集并去重
+    Union,
+    /// UNION ALL：合并两个结果集不去重
+    UnionAll,
 }
 
 /// ANALYZE 语句：收集表的统计信息

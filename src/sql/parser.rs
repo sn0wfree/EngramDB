@@ -428,7 +428,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
         _ => false,
     };
     // 处理 body (SELECT 主体)
-    let (select_list, from, where_clause, group_by, having) = match query.body.as_ref() {
+    let (select_list, from, where_clause, group_by, having, set_op) = match query.body.as_ref() {
         sqlast::SetExpr::Select(select) => {
             // SELECT 列表
             let mut items = Vec::new();
@@ -484,7 +484,68 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
                 None => None,
             };
 
-            (items, from, where_clause, group_by, having)
+            (items, from, where_clause, group_by, having, None)
+        }
+        sqlast::SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            // UNION / UNION ALL：将右侧 SELECT 嵌套到左侧的 set_op 字段中
+            // 注意：只支持 UNION/UNION ALL，INTERSECT/EXCEPT 暂不支持
+            match op {
+                sqlast::SetOperator::Union => {
+                    // 解析右侧 SELECT
+                    let right_query = sqlast::Query {
+                        with: None,
+                        body: right.clone(),
+                        order_by: vec![],
+                        limit: None,
+                        limit_by: vec![],
+                        offset: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                    };
+                    let right_select = convert_query(&right_query)?;
+
+                    // UNION ALL vs UNION
+                    let set_op_type = match set_quantifier {
+                        sqlast::SetQuantifier::All => SetOpType::UnionAll,
+                        _ => SetOpType::Union,
+                    };
+
+                    // 解析左侧（必须也是 SELECT）
+                    let left_query = sqlast::Query {
+                        with: None,
+                        body: left.clone(),
+                        order_by: vec![],
+                        limit: None,
+                        limit_by: vec![],
+                        offset: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                    };
+                    let left_select = convert_query(&left_query)?;
+
+                    // 使用左侧的 select_list、from 等，set_op 指向右侧
+                    let (l_items, l_from, l_where, l_group_by, l_having) = match left_select {
+                        s if s.set_op.is_none() => (
+                            s.select_list, s.from, s.where_clause, s.group_by, s.having,
+                        ),
+                        _ => {
+                            return Err(EngramDbError::Parse(
+                                "Nested UNION/UNION ALL not supported".into(),
+                            ));
+                        }
+                    };
+
+                    (l_items, l_from, l_where, l_group_by, l_having, Some((set_op_type, Box::new(right_select))))
+                }
+                _ => {
+                    return Err(EngramDbError::Parse(format!(
+                        "Unsupported set operator: {} (only UNION/UNION ALL supported)",
+                        op
+                    )));
+                }
+            }
         }
         _ => {
             return Err(EngramDbError::Parse(
@@ -532,6 +593,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
         limit,
         distinct,
         ctes: extract_ctes(query),
+        set_op,
     })
 }
 

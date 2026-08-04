@@ -689,6 +689,20 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         };
     }
 
+    // 集合操作 UNION / UNION ALL（v0.15.0 新增）
+    if let Some((op, right_stmt)) = stmt.set_op {
+        let right_plan = plan_select(*right_stmt, db)?;
+        let set_union_op = match op {
+            SetOpType::Union => SetUnionOp::Union,
+            SetOpType::UnionAll => SetUnionOp::UnionAll,
+        };
+        plan = PhysicalPlan::SetUnion {
+            op: set_union_op,
+            left: Box::new(plan),
+            right: Box::new(right_plan),
+        };
+    }
+
     Ok(plan)
 }
 
