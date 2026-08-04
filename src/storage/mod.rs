@@ -301,6 +301,82 @@ impl Database {
         table.vector_search(index_name, query, k)
     }
 
+    /// 混合搜索（向量近似搜索 + 标量条件过滤）
+    ///
+    /// 流程：
+    /// 1. 用 HNSW 搜索 `top_k * ef_mult` 个候选（扩大 ef 提高召回率）
+    /// 2. 对每个候选行，通过 `filter_fn` 判断是否满足标量条件
+    /// 3. 返回过滤后的前 `top_k` 个结果，附带行数据
+    ///
+    /// `ef_mult` 控制候选集扩大倍数（默认 3），越大召回率越高但性能越低。
+    /// `filter_fn` 接收行数据，返回 true 表示保留。
+    pub fn hybrid_search(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        query: &[f32],
+        top_k: usize,
+        ef_mult: usize,
+        column_indices: &[usize],
+        filter_fn: &dyn Fn(&[crate::Value]) -> bool,
+    ) -> Result<Vec<crate::HybridSearchResult>> {
+        let table = self.get_table_mut(table_name)
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
+
+        // 1. 获取 HNSW 索引，读取 id_mapping 和 ef_search 配置
+        let (hnsw_index, id_mapping) = table.vector_indexes()
+            .get(index_name)
+            .ok_or_else(|| crate::common::error::EngramDbError::IndexNotFound(index_name.into()))?;
+
+        // 2. 扩大候选集：搜索 top_k * ef_mult 个候选
+        let ef_search = hnsw_index.config().ef_search;
+        let candidate_k = (top_k * ef_mult).max(ef_search);
+        let neighbors = hnsw_index.search(query, candidate_k);
+
+        // 3. 构建 row_id -> distance 映射（释放对 table 的不可变借用）
+        let mut candidates: Vec<(u32, f32)> = neighbors.iter()
+            .map(|n| {
+                let row_id = if n.id < id_mapping.len() as u32 {
+                    id_mapping[n.id as usize]
+                } else {
+                    n.id
+                };
+                (row_id, n.distance)
+            })
+            .collect();
+
+        // 4. 释放 table 借用，重新获取可变借用
+        drop(hnsw_index);
+        drop(id_mapping);
+
+        // 5. 遍历候选集，读取行数据并应用标量过滤
+        let table = self.get_table_mut(table_name)
+            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
+
+        let mut results = Vec::with_capacity(candidates.len());
+        for (row_id, distance) in &candidates {
+            if let Some(row) = table.get_row_by_id(*row_id)? {
+                if filter_fn(&row) {
+                    let projected: Vec<crate::Value> = column_indices.iter()
+                        .map(|&ci| {
+                            if ci < row.len() { row[ci].clone() } else { crate::Value::Null }
+                        })
+                        .collect();
+                    results.push(crate::HybridSearchResult {
+                        row_id: *row_id,
+                        distance: *distance,
+                        row: projected,
+                    });
+                }
+            }
+        }
+
+        // 6. 按距离升序取 top_k
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_k);
+        Ok(results)
+    }
+
     /// 设置全局默认合并策略（新建表生效，已有表不受影响）
     pub fn set_default_compact_strategy(&mut self, strategy: crate::common::config::CompactStrategy) {
         self.config.compact_strategy = strategy;

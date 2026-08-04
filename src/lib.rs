@@ -221,6 +221,11 @@ impl Connection {
         result
     }
 
+    /// 获取底层 Database 的可变引用（用于高级 API 操作）
+    pub fn database_mut(&mut self) -> &mut Database {
+        &mut self.db
+    }
+
     // -----------------------------------------------------------------------
     // 向量化写入 & 零拷贝导入（v0.11.2 新增）
     // -----------------------------------------------------------------------
@@ -416,6 +421,14 @@ pub enum Value {
     Blob(Vec<u8>),
     /// Unix 毫秒时间戳（UTC，v0.14.0 新增）
     Timestamp(i64),
+}
+
+/// 混合搜索结果（向量相似度 + 标量过滤后的行数据）
+#[derive(Debug, Clone)]
+pub struct HybridSearchResult {
+    pub row_id: u32,
+    pub distance: f32,
+    pub row: Vec<Value>,
 }
 
 // 手动实现 Eq：Float64 按位模式比较（含 NaN 自等）
@@ -1458,5 +1471,103 @@ mod value_tests {
         // 验证只有一行
         let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(result.rows[0][0], Value::Int64(1));
+    }
+
+    #[test]
+    fn test_hybrid_search() {
+        use crate::storage::vector_index::DistanceMetric;
+        use crate::common::types::{TableDef, ColumnDef, DataType};
+
+        // 通过 API 直接创建表（避免 SQL 解析器 VECTOR 维度问题）
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        let columns = vec![
+            ColumnDef::new("id", DataType::Int64).primary_key(),
+            ColumnDef::new("name", DataType::Varchar),
+            ColumnDef::new("category", DataType::Varchar),
+            ColumnDef::new("vec", DataType::Vector { dim: 4 }),
+        ];
+        let table_def = TableDef::new(0, "items", columns);
+        let db = conn.database_mut();
+        db.create_table(table_def).unwrap();
+
+        // 写入数据
+        let ids = vec![Value::Int64(1), Value::Int64(2), Value::Int64(3), Value::Int64(4), Value::Int64(5), Value::Int64(6)];
+        let names = vec![
+            Value::Varchar("item1".into()), Value::Varchar("item2".into()),
+            Value::Varchar("item3".into()), Value::Varchar("item4".into()),
+            Value::Varchar("item5".into()), Value::Varchar("item6".into()),
+        ];
+        let categories = vec![
+            Value::Varchar("A".into()), Value::Varchar("A".into()),
+            Value::Varchar("B".into()), Value::Varchar("B".into()),
+            Value::Varchar("C".into()), Value::Varchar("C".into()),
+        ];
+        let vectors = vec![
+            Value::Vector(vec![0.1, 0.2, 0.3, 0.4]),
+            Value::Vector(vec![0.2, 0.3, 0.4, 0.5]),
+            Value::Vector(vec![0.9, 0.8, 0.7, 0.6]),
+            Value::Vector(vec![0.8, 0.7, 0.6, 0.5]),
+            Value::Vector(vec![0.5, 0.5, 0.5, 0.5]),
+            Value::Vector(vec![0.4, 0.4, 0.4, 0.4]),
+        ];
+        // 使用 table.insert 直接写入行数据
+        let rows: Vec<Vec<Value>> = (0..6).map(|i| {
+            vec![ids[i].clone(), names[i].clone(), categories[i].clone(), vectors[i].clone()]
+        }).collect();
+        let table = db.get_table_mut("items").unwrap();
+        table.insert(rows).unwrap();
+
+        // 创建 HNSW 向量索引
+        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50).unwrap();
+
+        // 查询向量：接近类别 A 的向量
+        let query = vec![0.15, 0.25, 0.35, 0.45];
+
+        // 无过滤的向量搜索
+        let results = db.vector_search("items", "idx_vec", &query, 3).unwrap();
+        assert_eq!(results.len(), 3);
+
+        // 混合搜索：只保留类别 A 的结果
+        let results = db.hybrid_search(
+            "items", "idx_vec", &query, 3, 3, &[0, 1, 2],
+            &|row: &[Value]| {
+                if let Value::Varchar(cat) = &row[2] {
+                    cat == "A"
+                } else {
+                    false
+                }
+            },
+        ).unwrap();
+        assert_eq!(results.len(), 2, "应该只返回类别 A 的 2 个结果");
+        for r in &results {
+            assert_eq!(r.row.len(), 3, "应该返回 id, name, category 三列");
+        }
+
+        // 混合搜索：保留类别 B 的结果
+        let results = db.hybrid_search(
+            "items", "idx_vec", &query, 3, 3, &[0, 1, 2],
+            &|row: &[Value]| {
+                if let Value::Varchar(cat) = &row[2] {
+                    cat == "B"
+                } else {
+                    false
+                }
+            },
+        ).unwrap();
+        assert_eq!(results.len(), 2, "应该只返回类别 B 的 2 个结果");
+
+        // 混合搜索：无匹配类别
+        let results = db.hybrid_search(
+            "items", "idx_vec", &query, 3, 3, &[0, 1, 2],
+            &|row: &[Value]| {
+                if let Value::Varchar(cat) = &row[2] {
+                    cat == "Z"
+                } else {
+                    false
+                }
+            },
+        ).unwrap();
+        assert_eq!(results.len(), 0, "没有类别 Z 的数据");
     }
 }

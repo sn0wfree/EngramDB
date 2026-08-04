@@ -395,6 +395,11 @@ impl HnswIndex {
         Ok(id)
     }
 
+    /// 获取索引配置
+    pub fn config(&self) -> &HnswConfig {
+        &self.config
+    }
+
     /// K 近邻搜索
     ///
     /// 自动过滤已逻辑删除（tombstone）的节点。
