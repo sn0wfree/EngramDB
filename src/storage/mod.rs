@@ -9,6 +9,7 @@ pub mod table;
 pub mod sparse_index;
 pub mod vector_index;
 pub mod cache;
+pub mod rate_limiter;
 pub mod index;
 pub mod catalog;
 
