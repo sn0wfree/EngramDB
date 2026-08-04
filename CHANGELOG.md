@@ -3,6 +3,16 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [0.14.0] - 2026-08-04
+
+### 新增功能
+- **FLOAT32 类型**：DataType::Float32 + Value::Float32(f32)，完整读写路径（列存/SkipList/WAL/压缩）
+- **TIMESTAMP 类型**：DataType::Timestamp + Value::Timestamp(i64)，支持 Timestamp/Datetime 关键字
+- **AUTO_INCREMENT 自增**：列级 AUTO_INCREMENT/AUTOINCREMENT，INSERT 时自动分配递增 ID
+- **列级 UNIQUE 约束**：`col_name TYPE UNIQUE` 语法，自动创建唯一索引
+- **INSERT...RETURNING**：INSERT 后返回插入行的值，支持单列/多列/通配符
+- **UPSERT**：INSERT...ON CONFLICT DO UPDATE/NOTHING，冲突时更新或跳过
+
 ## [0.13.0] - 2026-08-04
 
 ### 性能优化
