@@ -1918,4 +1918,32 @@ mod value_tests {
         let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(result.rows[0][0], Value::Int64(1));
     }
+
+    #[test]
+    fn test_in_list_basic() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE products (id INT64, name VARCHAR)").unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'date')").unwrap();
+
+        // IN 列表基本查询
+        let result = conn.execute("SELECT id FROM products WHERE name IN ('apple', 'cherry')").unwrap();
+        assert_eq!(result.rows.len(), 2, "应返回 apple 和 cherry");
+
+        // NOT IN
+        let result = conn.execute("SELECT id FROM products WHERE name NOT IN ('apple', 'cherry')").unwrap();
+        assert_eq!(result.rows.len(), 2, "应返回 banana 和 date");
+    }
+
+    #[test]
+    fn test_in_list_with_int() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64, val INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)").unwrap();
+
+        // 数值 IN 列表
+        let result = conn.execute("SELECT id FROM t WHERE val IN (10, 30, 50)").unwrap();
+        assert_eq!(result.rows.len(), 3, "val IN (10, 30, 50) 应返回 3 行");
+    }
 }
