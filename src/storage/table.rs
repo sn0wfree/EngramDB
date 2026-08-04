@@ -192,6 +192,73 @@ impl Table {
         }
     }
 
+    /// 按列索引裁剪读取一行（Perf03 列裁剪加速）
+    ///
+    /// 只读取 `col_indices` 指定的列，避免无关注列的全行拷贝。
+    /// 返回的 `Vec<Vec<Value>>` 是单行（按 `col_indices` 顺序排列）。
+    /// 若 row 不存在返回 Ok(vec![])。
+    pub fn get_row_by_id_columns(&mut self, row_id: u32, col_indices: &[usize]) -> Result<Vec<Vec<crate::Value>>> {
+        let cs_rows = self.column_store.total_rows();
+        let row_id_u = row_id as u64;
+        let row_opt: Option<Vec<crate::Value>> = if row_id_u < cs_rows {
+            // 位于列存主存储：定位 row_group 和 row_idx
+            let mut remaining = row_id_u;
+            let mut located_rg: Option<usize> = None;
+            let mut located_row_in_rg: Option<usize> = None;
+            for (rg_idx, rg) in self.column_store.row_groups().iter().enumerate() {
+                let rc = rg.row_count as u64;
+                if remaining < rc {
+                    located_rg = Some(rg_idx);
+                    located_row_in_rg = Some(remaining as usize);
+                    break;
+                }
+                remaining -= rc;
+            }
+            match located_rg {
+                Some(rg_idx) => {
+                    let row_in_rg = located_row_in_rg.unwrap();
+                    let mut row: Vec<crate::Value> = Vec::with_capacity(col_indices.len());
+                    for &col_idx in col_indices {
+                        let col_data = self.column_store.read_column(rg_idx, col_idx)?;
+                        let v = if row_in_rg < col_data.len() {
+                            col_data[row_in_rg].clone()
+                        } else {
+                            crate::Value::Null
+                        };
+                        row.push(v);
+                    }
+                    Some(row)
+                }
+                None => None,
+            }
+        } else {
+            // 位于 Delta 层
+            match self.delta_store.get(row_id_u) {
+                Some(r) => {
+                    let row: Vec<crate::Value> = col_indices.iter().map(|&i| r[i].clone()).collect();
+                    Some(row)
+                }
+                None => None,
+            }
+        };
+
+        match row_opt {
+            Some(row) => {
+                // TTL 检查需要全列视图，将未读到的列填 Null
+                let mut full_row = vec![crate::Value::Null; self.def.columns.len()];
+                for (i, &ci) in col_indices.iter().enumerate() {
+                    full_row[ci] = row[i].clone();
+                }
+                if self.def.is_expired(&full_row) {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![row])
+                }
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// 通过主键值查找 row_id（O(log n)）
     pub fn lookup_primary_key(&self, key: &crate::Value) -> Option<u32> {
         self.primary_index.as_ref().and_then(|idx| idx.get(key).copied())

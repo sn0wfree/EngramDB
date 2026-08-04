@@ -160,6 +160,8 @@ pub enum PhysicalPlan {
     PrimaryKeyLookup {
         table_name: String,
         pk_value: crate::Value,
+        /// 要返回的列索引（空表示全列）
+        output_column_indices: Vec<usize>,
     },
     /// 开始事务
     BeginTransaction,

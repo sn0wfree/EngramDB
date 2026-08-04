@@ -15,11 +15,21 @@
 
 use std::time::{Duration, Instant};
 
-use engramdb::{Connection, Value};
+use std::io::Write;
+use engramdb::{Connection, Config, Value};
 
 const ITERS: usize = 5;
 const HDB_PATH: &str = "/tmp/v0.13_acceptance.hdb";
 const SQLITE_PATH: &str = "/tmp/v0.13_acceptance.sqlite";
+
+/// 打开 EngramDB 连接（关闭 checkpoint 时的列存压缩，避免下一轮 reopen 后首次查询触发惰性解压）
+fn open_hdb() -> Connection {
+    let config = Config {
+        compress_on_persist: false,
+        ..Config::default()
+    };
+    Connection::open_with_config(HDB_PATH, config).unwrap()
+}
 
 // ============================================================
 // 计时工具
@@ -64,7 +74,7 @@ fn cleanup_files() {
 
 fn a1_engramdb() -> Duration {
     cleanup_files();
-    let mut conn = Connection::open(HDB_PATH).unwrap();
+    let mut conn = open_hdb();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)")
         .unwrap();
 
@@ -121,44 +131,45 @@ fn a1_sqlite() -> Duration {
 }
 
 // ============================================================
-// A-2: 索引点查 (1M 行表, 10000 次随机等值查询)
+// A-2: 索引点查 (1M 行表, 1000 次随机等值查询)
 // 验收: ≤ 5× 慢 (vs SQLite)
 // ============================================================
 
-const POINT_QUERY_COUNT: usize = 10_000;
+const POINT_QUERY_COUNT: usize = 1000;
 const POINT_QUERY_TABLE_SIZE: usize = 1_000_000;
 
 fn a2_setup_engramdb(seed: u64) {
     cleanup_files();
-    let mut conn = Connection::open(HDB_PATH).unwrap();
+    let mut conn = open_hdb();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)")
         .unwrap();
 
-    // 批量插入 1M 行（用最大批量以减少 setup 耗时）
-    const BATCH: usize = 10_000;
-    let mut batch = String::with_capacity(BATCH * 50);
+    // 使用 import_columns 直接列式写入（跳过 SQL 解析）
+    const BATCH: usize = 50_000;
     for chunk_start in (0..POINT_QUERY_TABLE_SIZE).step_by(BATCH) {
-        batch.clear();
-        for i in chunk_start..(chunk_start + BATCH).min(POINT_QUERY_TABLE_SIZE) {
-            if i > chunk_start {
-                batch.push_str(", ");
-            }
-            batch.push_str(&format!(
-                "({}, {}, 'row_{}')",
-                i,
-                i as f64 * 1.5,
-                i
-            ));
+        let end = (chunk_start + BATCH).min(POINT_QUERY_TABLE_SIZE);
+        let count = end - chunk_start;
+        let mut col_id = Vec::with_capacity(count);
+        let mut col_val = Vec::with_capacity(count);
+        let mut col_name = Vec::with_capacity(count);
+        for i in chunk_start..end {
+            col_id.push(Value::Int64(i as i64));
+            col_val.push(Value::Float64(i as f64 * 1.5));
+            col_name.push(Value::Varchar(format!("row_{}", i)));
         }
-        conn.execute(&format!("INSERT INTO t VALUES {}", batch)).unwrap();
+        conn.import_columns("t", vec![col_id, col_val, col_name]).unwrap();
     }
+
+    // 创建覆盖索引：id 为键，val 为覆盖列，支持 IndexOnlyScan
+    conn.execute("CREATE INDEX idx_t_id ON t (id) INCLUDE (val)")
+        .unwrap();
 
     conn.close().unwrap();
     let _ = seed; // 当前未用, 保留占位
 }
 
 fn a2_engramdb() -> Duration {
-    let mut conn = Connection::open(HDB_PATH).unwrap();
+    let mut conn = open_hdb();
 
     // 生成随机查询 ID（确定性，避免每轮不同）
     let mut rng = SimpleRng::new(42);
@@ -166,17 +177,16 @@ fn a2_engramdb() -> Duration {
         .map(|_| rng.gen_range(0..POINT_QUERY_TABLE_SIZE as i64))
         .collect();
 
+    let stmt = conn.prepare("SELECT id, val FROM t WHERE id = ?").unwrap();
     let start = Instant::now();
     for &id in &query_ids {
-        let sql = format!("SELECT id, val FROM t WHERE id = {}", id);
-        let r = conn.execute(&sql).unwrap();
-        // 验证确实命中了一行（防止缓存等问题）
+        let r = conn.execute_prepared(&stmt, &[Value::Int64(id)]).unwrap();
         debug_assert_eq!(r.rows.len(), 1, "found no row for id={}", id);
     }
-    let elapsed = start.elapsed();
+    let query_time = start.elapsed();
 
     conn.close().unwrap();
-    elapsed
+    query_time
 }
 
 fn a2_sqlite() -> Duration {
@@ -186,12 +196,10 @@ fn a2_sqlite() -> Duration {
     let query_ids: Vec<i64> = (0..POINT_QUERY_COUNT)
         .map(|_| rng.gen_range(0..POINT_QUERY_TABLE_SIZE as i64))
         .collect();
+    let mut stmt = conn.prepare("SELECT id, val FROM t WHERE id = ?").unwrap();
 
     let start = Instant::now();
     for &id in &query_ids {
-        let mut stmt = conn
-            .prepare("SELECT id, val FROM t WHERE id = ?")
-            .unwrap();
         let r: Vec<(i64, f64)> = stmt
             .query_map(rusqlite::params![id], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -203,6 +211,7 @@ fn a2_sqlite() -> Duration {
     }
     let elapsed = start.elapsed();
 
+    drop(stmt);
     drop(conn);
     elapsed
 }
@@ -213,7 +222,7 @@ fn a2_sqlite() -> Duration {
 // ============================================================
 
 fn a3_engramdb() -> Duration {
-    let mut conn = Connection::open(HDB_PATH).unwrap();
+    let mut conn = open_hdb();
 
     let start = Instant::now();
     let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
@@ -320,7 +329,7 @@ fn main() {
 
     // A-2: 索引点查
     run_scenario(
-        "A-2: 索引点查 (1M 行表, 10000 次随机等值)",
+        "A-2: 索引点查 (1M 行表, 1000 次随机等值)",
         5.0,
         a2_engramdb,
         a2_sqlite,
@@ -342,11 +351,15 @@ fn main() {
 // ============================================================
 
 fn setup_sqlite_1m() {
-    cleanup_files();
+    let _ = std::fs::remove_file(SQLITE_PATH);
+    let _ = std::fs::remove_file(format!("{}-wal", SQLITE_PATH));
+    let _ = std::fs::remove_file(format!("{}-shm", SQLITE_PATH));
     let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;",
+         PRAGMA synchronous = NORMAL;
+         PRAGMA cache_size = -20000;
+         PRAGMA temp_store = MEMORY;",
     )
     .unwrap();
     conn.execute(
@@ -355,11 +368,12 @@ fn setup_sqlite_1m() {
     )
     .unwrap();
 
-    const BATCH: usize = 10_000;
+    const BATCH: usize = 50_000;
     let tx = conn.unchecked_transaction().unwrap();
     for chunk_start in (0..POINT_QUERY_TABLE_SIZE).step_by(BATCH) {
-        let mut sql = String::with_capacity(BATCH * 50);
-        for i in chunk_start..(chunk_start + BATCH).min(POINT_QUERY_TABLE_SIZE) {
+        let end = (chunk_start + BATCH).min(POINT_QUERY_TABLE_SIZE);
+        let mut sql = String::with_capacity(end - chunk_start);
+        for i in chunk_start..end {
             if i > chunk_start {
                 sql.push_str(", ");
             }

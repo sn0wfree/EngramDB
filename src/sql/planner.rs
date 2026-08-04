@@ -160,10 +160,87 @@ fn extract_window_functions(
 
 /// 带参数绑定的规划（用于 prepared statement）
 pub fn plan_with_params(stmt: Statement, db: &Database, params: &[Value]) -> Result<PhysicalPlan> {
+    if params.is_empty() {
+        return plan(stmt, db);
+    }
     match stmt {
         Statement::Insert(s) => plan_insert(s, db, params),
-        // 其他语句暂不支持参数，走普通路径
+        Statement::Select(s) => plan(substitute_params_stmt(Statement::Select(s), params), db),
+        Statement::Delete(s) => plan(substitute_params_stmt(Statement::Delete(s), params), db),
+        Statement::Update(s) => plan(substitute_params_stmt(Statement::Update(s), params), db),
         other => plan(other, db),
+    }
+}
+
+fn substitute_params_expr(expr: &Expression, params: &[Value]) -> Expression {
+    match expr {
+        Expression::Placeholder(idx) => {
+            params.get(*idx)
+                .map(|v| Expression::Literal(v.clone()))
+                .unwrap_or_else(|| Expression::Placeholder(*idx))
+        }
+        Expression::BinaryOp { left, op, right } => Expression::BinaryOp {
+            left: Box::new(substitute_params_expr(left, params)),
+            op: *op,
+            right: Box::new(substitute_params_expr(right, params)),
+        },
+        Expression::UnaryOp { op, expr } => Expression::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_params_expr(expr, params)),
+        },
+        Expression::Function { name, args, distinct, count_star, over } => Expression::Function {
+            name: name.clone(),
+            args: args.iter().map(|a| substitute_params_expr(a, params)).collect(),
+            distinct: *distinct,
+            count_star: *count_star,
+            over: over.clone(),
+        },
+        Expression::Cast { expr, data_type } => Expression::Cast {
+            expr: Box::new(substitute_params_expr(expr, params)),
+            data_type: data_type.clone(),
+        },
+        Expression::InList { expr, list } => Expression::InList {
+            expr: Box::new(substitute_params_expr(expr, params)),
+            list: list.iter().map(|e| substitute_params_expr(e, params)).collect(),
+        },
+        Expression::Like { expr, pattern } => Expression::Like {
+            expr: Box::new(substitute_params_expr(expr, params)),
+            pattern: Box::new(substitute_params_expr(pattern, params)),
+        },
+        Expression::Case { when_then, else_expr } => Expression::Case {
+            when_then: when_then.iter().map(|(w, t)| {
+                (substitute_params_expr(w, params), substitute_params_expr(t, params))
+            }).collect(),
+            else_expr: else_expr.as_ref().map(|e| Box::new(substitute_params_expr(e, params))),
+        },
+        Expression::IsNull(expr) => Expression::IsNull(Box::new(substitute_params_expr(expr, params))),
+        other => other.clone(),
+    }
+}
+
+fn substitute_params_stmt(stmt: Statement, params: &[Value]) -> Statement {
+    match stmt {
+        Statement::Select(mut s) => {
+            s.where_clause = s.where_clause.map(|w| substitute_params_expr(&w, params));
+            s.group_by = s.group_by.iter().map(|e| substitute_params_expr(e, params)).collect();
+            s.having = s.having.map(|h| substitute_params_expr(&h, params));
+            for item in &mut s.select_list {
+                if let SelectItem::Expression(ref mut expr, _) = item {
+                    *expr = substitute_params_expr(expr, params);
+                }
+            }
+            for item in &mut s.order_by {
+                item.expr = substitute_params_expr(&item.expr, params);
+            }
+            if let Some((_, ref mut right)) = s.set_op {
+                let right_sub = substitute_params_stmt(Statement::Select(*right.clone()), params);
+                if let Statement::Select(new_right) = right_sub {
+                    *right = Box::new(new_right);
+                }
+            }
+            Statement::Select(s)
+        }
+        other => other,
     }
 }
 
@@ -585,11 +662,6 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         scan_column_indices.push(0);
     }
 
-    // ===== Perf03：主键短路时输出全列（Projection 裁剪列，避免列映射错乱）=====
-    if pk_short_circuit.is_some() {
-        scan_column_indices = (0..table.def.columns.len()).collect();
-    }
-
     // 扫描阶段的列名映射（扫描输出的列名）
     let scan_column_names: Vec<String> = scan_column_indices.iter()
         .map(|&i| table.def.columns[i].name.clone())
@@ -614,6 +686,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         PhysicalPlan::PrimaryKeyLookup {
             table_name: table_name.clone(),
             pk_value: pk_val,
+            output_column_indices: scan_column_indices.clone(),
         }
     } else if can_use_index_only {
         try_index_only_scan(&stmt, db, &table_name, &scan_column_indices)
