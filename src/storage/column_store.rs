@@ -797,6 +797,52 @@ pub fn matches_predicate(val: &Value, op: PredicateOp, target: &Value) -> bool {
     }
 }
 
+/// S2-M3：Typed 列标量谓词求值（PREWHERE 用，直接类型数组比较，零 Value 构造）
+///
+/// 语义与 `matches_predicate` 完全一致（跨类型数值比较、NULL 三值逻辑）。
+/// 不支持的列/目标类型组合 → 回退 Value 级比较（正确性兜底）。
+pub fn matches_predicate_typed(data: &ColumnData, row: usize, op: PredicateOp, target: &Value) -> bool {
+    use crate::common::column_data::ColumnValue;
+    use Value::*;
+
+    let is_null = data.nulls.as_ref().map_or(false, |n| n.test(row));
+    if is_null {
+        return matches!(target, Null) && matches!(op, PredicateOp::Eq);
+    }
+    if matches!(target, Null) {
+        return false;
+    }
+
+    // 列值类型（i64 / f64 / &str / bool）与 target 组合比较
+    // 直接按 (列, target) 组合 match
+    let cmp = |ord: std::cmp::Ordering| match op {
+        PredicateOp::Eq => ord == std::cmp::Ordering::Equal,
+        PredicateOp::Lt => ord == std::cmp::Ordering::Less,
+        PredicateOp::LtEq => ord != std::cmp::Ordering::Greater,
+        PredicateOp::Gt => ord == std::cmp::Ordering::Greater,
+        PredicateOp::GtEq => ord != std::cmp::Ordering::Less,
+    };
+    let cmp_f = |a: f64, b: f64| cmp(a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
+
+    match (&data.values, target) {
+        // Int64 / Timestamp 列 vs 整数 / 浮点目标
+        (ColumnValue::Int64(v), Int32(t)) => cmp(v[row].cmp(&(*t as i64))),
+        (ColumnValue::Int64(v), Int64(t)) => cmp(v[row].cmp(t)),
+        (ColumnValue::Int64(v), Float64(t)) => cmp_f(v[row] as f64, *t),
+        (ColumnValue::Timestamp(v), Int32(t)) => cmp(v[row].cmp(&(*t as i64))),
+        (ColumnValue::Timestamp(v), Int64(t)) => cmp(v[row].cmp(t)),
+        (ColumnValue::Timestamp(v), Float64(t)) => cmp_f(v[row] as f64, *t),
+        // Float64 列 vs 数值目标
+        (ColumnValue::Float64(v), Float64(t)) => cmp_f(v[row], *t),
+        (ColumnValue::Float64(v), Int32(t)) => cmp_f(v[row], *t as f64),
+        (ColumnValue::Float64(v), Int64(t)) => cmp_f(v[row], *t as f64),
+        // Varchar / Boolean 同类型
+        (ColumnValue::Varchar(v), Varchar(t)) => cmp(v[row].as_str().cmp(t.as_str())),
+        (ColumnValue::Boolean(v), Boolean(t)) => cmp(v[row].cmp(t)),
+        _ => matches_predicate(&data.get(row), op, target),
+    }
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
@@ -1456,5 +1502,56 @@ mod tests {
         assert!(!matches_predicate(&Value::Null, PredicateOp::Gt, &Value::Int64(0)));
         // Null == Null
         assert!(matches_predicate(&Value::Null, PredicateOp::Eq, &Value::Null));
+    }
+
+    /// S2-M3：Typed 谓词与 Value 级等价性（随机数据 + 全 op + 混合 target 类型）
+    #[test]
+    fn test_matches_predicate_typed_equals_value() {
+        use crate::common::column_data::ColumnData;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let ops = [PredicateOp::Eq, PredicateOp::Lt, PredicateOp::LtEq, PredicateOp::Gt, PredicateOp::GtEq];
+        for trial in 0..200 {
+            let n = 1 + rng.gen_range(0..30);
+            let kind = rng.gen_range(0..3); // Int64 / Float64 / Varchar
+            let values: Vec<Value> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(0.2) {
+                        return Value::Null;
+                    }
+                    match kind {
+                        0 => Value::Int64(rng.gen_range(-1000..1000)),
+                        1 => Value::Float64(rng.gen_range(-1000.0..1000.0)),
+                        _ => Value::Varchar(format!("s{}", rng.gen_range(0..30))),
+                    }
+                })
+                .collect();
+            let Some(data) = ColumnData::try_from_values(&values) else { continue };
+            let target = match kind {
+                0 => {
+                    let t = rng.gen_range(0..3);
+                    match t {
+                        0 => Value::Int32(rng.gen_range(-1000..1000)),
+                        1 => Value::Int64(rng.gen_range(-1000..1000)),
+                        _ => Value::Float64(rng.gen_range(-1000.0..1000.0)),
+                    }
+                }
+                1 => {
+                    if rng.gen_bool(0.5) {
+                        Value::Float64(rng.gen_range(-1000.0..1000.0))
+                    } else {
+                        Value::Int64(rng.gen_range(-1000..1000))
+                    }
+                }
+                _ => Value::Varchar(format!("s{}", rng.gen_range(0..30))),
+            };
+            let op = ops[rng.gen_range(0..ops.len())];
+            for i in 0..n {
+                let typed = matches_predicate_typed(&data, i, op, &target);
+                let value = matches_predicate(&data.get(i), op, &target);
+                assert_eq!(typed, value, "trial {} i {} op {:?} col={:?} target={:?}",
+                    trial, i, op, data.get(i), target);
+            }
+        }
     }
 }

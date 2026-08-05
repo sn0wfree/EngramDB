@@ -1717,7 +1717,7 @@ impl Table {
         column_indices: &[usize],
         skip_pred: Option<(usize, PredicateOp, Value)>,
     ) -> Result<Vec<Vec<Value>>> {
-        use super::column_store::matches_predicate;
+        use super::column_store::{matches_predicate, matches_predicate_typed};
 
         // P-W1 PREWHERE：按 batch 处理，过滤在前、物化在后。
         // 1% 选择性场景：未 MinMax 跳过的 row group 中，1% 行被物化 → 节省 99% cell 克隆
@@ -1741,11 +1741,11 @@ impl Table {
                 }
             }
 
-            // 一次性克隆整个列到 owned Vec（断开借用链）
-            let mut col_owned: Vec<Vec<Value>> = Vec::with_capacity(column_indices.len());
+            // S2-M3：克隆类型化列（比 to_values 便宜 4x；谓词列直扫）
+            let mut col_owned: Vec<ColumnData> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.to_values());
+                col_owned.push(col_data.clone());
             }
             if col_owned.is_empty() {
                 continue;
@@ -1757,12 +1757,12 @@ impl Table {
             for batch_start in (0..row_count).step_by(BATCH_SIZE) {
                 let batch_end = std::cmp::min(batch_start + BATCH_SIZE, row_count);
 
-                // 1. 找出 batch 内通过谓词的行索引
+                // 1. 找出 batch 内通过谓词的行索引（Typed 谓词列直扫，零 Value 构造）
                 let survivors: Vec<usize> = match (pred_col_pos_in_output, &skip_pred) {
                     (Some(pos), Some((_, op, val))) => {
                         let col = &col_owned[pos];
                         (batch_start..batch_end)
-                            .filter(|&i| i < col.len() && matches_predicate(&col[i], *op, val))
+                            .filter(|&i| i < col.len() && matches_predicate_typed(col, i, *op, val))
                             .collect()
                     }
                     _ => (batch_start..batch_end).collect(),
@@ -1784,7 +1784,7 @@ impl Table {
 
                     let mut row: Vec<Value> = Vec::with_capacity(column_indices.len());
                     for col in &col_owned {
-                        row.push(if row_idx < col.len() { col[row_idx].clone() } else { Value::Null });
+                        row.push(if row_idx < col.len() { col.get(row_idx) } else { Value::Null });
                     }
                     rows.push(row);
                 }
