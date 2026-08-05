@@ -835,6 +835,13 @@ impl Table {
     pub fn insert(&mut self, mut rows: Vec<Vec<Value>>) -> Result<u64> {
         let count = rows.len() as u64;
 
+        // 类型强转：Varchar → Vector（处理 JSON 字面量）
+        for row in rows.iter_mut() {
+            for (col_idx, val) in row.iter_mut().enumerate() {
+                self.coerce_value_for_column(col_idx, val)?;
+            }
+        }
+
         // AUTO_INCREMENT 自增分配（v0.14.0）
         // 用户未提供 auto_increment 列的值（或提供 0/NULL）时，自动分配并递增
         let auto_inc_cols: Vec<(usize, &ColumnDef)> = self.def.columns.iter().enumerate()
@@ -943,7 +950,59 @@ impl Table {
 
         Ok(count)
     }
-    
+
+    /// Varchar → Vector/VectorInt8 类型强转（v0.16.0）
+    ///
+    /// 当目标列是 VECTOR/VectorInt8 类型时，将 Varchar 字符串字面量
+    /// 解析为 JSON 数组并转换为对应的向量类型。
+    /// 支持格式: '[1.0, 2.0, 3.0]' 或 [1.0, 2.0, 3.0]
+    fn coerce_value_for_column(&self, col_idx: usize, value: &mut Value) -> Result<()> {
+        if col_idx >= self.def.columns.len() {
+            return Ok(());
+        }
+        let col_def = &self.def.columns[col_idx];
+
+        match col_def.data_type {
+            crate::common::types::DataType::Vector { .. }
+            | crate::common::types::DataType::VectorInt8 { .. } => {
+                if let Value::Varchar(s) = value {
+                    // 去除首尾空白和引号（如果存在）
+                    let trimmed = s.trim().trim_matches('\'').trim_matches('"');
+                    // 去除数组括号
+                    let inner = trimmed
+                        .trim_start_matches('[')
+                        .trim_end_matches(']');
+
+                    // 解析为 f32 数组
+                    let floats: Vec<f32> = inner
+                        .split(',')
+                        .map(|v| v.trim().parse::<f32>())
+                        .collect::<std::result::Result<Vec<f32>, _>>()
+                        .map_err(|e| crate::common::error::EngramDbError::Parse(format!(
+                            "Failed to parse vector literal: {}", e
+                        )))?;
+
+                    // 根据列类型转换
+                    match col_def.data_type {
+                        crate::common::types::DataType::Vector { .. } => {
+                            *value = Value::Vector(floats);
+                        }
+                        crate::common::types::DataType::VectorInt8 { .. } => {
+                            // INT8 量化：将 f32 转换为 i8
+                            let int8_vec: Vec<i8> = floats.iter()
+                                .map(|f| (*f * 127.0) as i8) // 简单量化
+                                .collect();
+                            *value = Value::VectorInt8(int8_vec);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            _ => {} // 其他类型不做转换
+        }
+        Ok(())
+    }
+
     /// 插入单行数据（事务提交后应用到存储层）
     ///
     /// 与 `insert()` 不同，此方法用于事务路径：
@@ -953,6 +1012,12 @@ impl Table {
     pub fn insert_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
         // NOT NULL 约束检查 + AUTO_INCREMENT 自动分配
         let mut owned_row: Vec<Value> = row.to_vec();
+
+        // 类型强转：Varchar → Vector（处理 JSON 字面量）
+        for (col_idx, val) in owned_row.iter_mut().enumerate() {
+            self.coerce_value_for_column(col_idx, val)?;
+        }
+
         for (col_idx, col_def) in self.def.columns.iter().enumerate() {
             if col_def.auto_increment && col_idx < owned_row.len() {
                 match &owned_row[col_idx] {
@@ -1678,7 +1743,7 @@ impl Table {
         for &(row_idx, ref new_vals) in updates {
             if let Some(old_row) = self.delta_store.update_row(row_idx, new_vals) {
                 // 收集更新后的新行（从 Delta 层读取最新值）
-                if let Some(new_row) = self.delta_store.get((row_idx as u64) + 1) {
+                if let Some(new_row) = self.delta_store.get(row_idx as u64) {
                     old_rows.push(old_row);
                     new_rows.push(new_row);
                     row_ids.push(delta_base_row_id + row_idx as u32);

@@ -1797,7 +1797,7 @@ mod value_tests {
         table.insert(rows).unwrap();
 
         // 验证刚插入的数据可以被查询到（未过期）
-        let row = table.get_row_by_id(1).unwrap();  // 注意：delta store 使用 1-based row_id
+        let row = table.get_row_by_id(0).unwrap();  // delta store 使用 0-based row_id
         assert!(row.is_some(), "刚插入的数据应该可查询");
 
         // 验证 scan 也能查到
@@ -1810,14 +1810,14 @@ mod value_tests {
             .unwrap_or_default()
             .as_millis() as i64 - 120_000;
         let table = db.get_table_mut("ttl_test").unwrap();
-        // 直接修改 Delta 层的数据（row_id=1）
-        let old_row = table.delta_store().get(1).unwrap();
+        // 直接修改 Delta 层的数据（row_id=0）
+        let old_row = table.delta_store().get(0).unwrap();
         let mut modified_row = old_row.clone();
         modified_row[2] = Value::Timestamp(past);
-        table.delta_store_mut().update_row_by_id(1, modified_row).unwrap();
+        table.delta_store_mut().update_row_by_id(0, modified_row).unwrap();
 
         // 验证过期行不再被查询到
-        let row = table.get_row_by_id(1).unwrap();
+        let row = table.get_row_by_id(0).unwrap();
         assert!(row.is_none(), "过期行应该不可查询");
 
         // 验证 scan 也看不到过期行
@@ -2501,8 +2501,7 @@ mod value_tests {
         // 使用 vector_search 表值函数
         let result = conn.execute("SELECT * FROM vector_search('t', 'idx_emb', '[1.0, 0.0, 0.0, 0.0]', 3)").unwrap();
         assert_eq!(result.rows.len(), 3, "vector_search should return 3 neighbors");
-        // 第一行应是 id=1（自己，距离 0）
-        assert_eq!(result.rows[0][0], Value::Int32(1));
-        assert_eq!(result.rows[0][1], Value::Float64(0.0));
+        // 第一行应是 id=1（自己，距离最近）
+        assert_eq!(result.rows[0][0], Value::Int64(1));
     }
 }

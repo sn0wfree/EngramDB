@@ -30,7 +30,7 @@ impl DeltaStore {
             table_def,
             columns,
             row_count: 0,
-            next_rowid: 1,
+            next_rowid: 0,
             row_id_to_idx: HashMap::new(),
             deleted_ids: std::collections::HashSet::new(),
         }

@@ -569,12 +569,27 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         // V16: vector_search 表值函数
         PhysicalPlan::VectorSearch { table_name, index_name, query_vector, k } => {
             let neighbors = db.vector_search(&table_name, &index_name, query_vector.as_slice(), k)?;
+            // 返回 (primary_key_value, distance) 格式
             let mut rows = Vec::with_capacity(neighbors.len());
             for n in &neighbors {
-                rows.push(vec![
-                    crate::Value::Int32(n.id as i32),
-                    crate::Value::Float64(n.distance as f64),
-                ]);
+                let table = db.get_table_mut(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                match table.get_row_by_id(n.id)? {
+                    Some(row) => {
+                        // 找到 PRIMARY KEY 列（第一列）的值
+                        let pk_value = row.first().cloned().unwrap_or(crate::Value::Int32(n.id as i32));
+                        rows.push(vec![
+                            pk_value,
+                            crate::Value::Float64(n.distance as f64),
+                        ]);
+                    }
+                    None => {
+                        rows.push(vec![
+                            crate::Value::Int32(n.id as i32),
+                            crate::Value::Float64(n.distance as f64),
+                        ]);
+                    }
+                }
             }
             Ok(QueryResult {
                 columns: vec!["row_id".into(), "distance".into()],

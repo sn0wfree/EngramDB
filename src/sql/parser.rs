@@ -33,7 +33,7 @@ pub fn parse(sql: &str) -> Result<Statement> {
 
     // 处理 CREATE VECTOR INDEX ... WITH (...) 语法（v0.15.0 V16 新增）
     // 转换为 CREATE INDEX ... USING hnsw，并提取 WITH 选项
-    let (sql_for_parse, with_options) = normalize_vector_index(&normalized_sql);
+    let (sql_for_parse, with_options, has_using_hnsw) = normalize_vector_index(&normalized_sql);
 
     // 处理 CREATE INDEX ... INCLUDE (...) 语法（v0.12.0 覆盖索引）
     // sqlparser 0.47 不原生支持 INCLUDE 子句，需要预处理
@@ -50,6 +50,10 @@ pub fn parse(sql: &str) -> Result<Statement> {
         if let Statement::CreateIndex(ref mut idx_stmt) = stmt {
             idx_stmt.included_columns = included_cols;
             idx_stmt.with_options = with_options;
+            // 恢复 USING hnsw 标记（供 executor 识别向量索引）
+            if has_using_hnsw && idx_stmt.using.is_none() {
+                idx_stmt.using = Some("hnsw".to_string());
+            }
         }
         return Ok(stmt);
     }
@@ -65,13 +69,100 @@ pub fn parse(sql: &str) -> Result<Statement> {
 
     // 只处理第一条语句
     let mut stmt = convert_statement(&stmts[0])?;
-    // 注入 WITH 选项（向量索引）
-    if !with_options.is_empty() {
-        if let Statement::CreateIndex(ref mut idx_stmt) = stmt {
+    // 注入 WITH 选项和 USING hnsw 标记（向量索引）
+    if let Statement::CreateIndex(ref mut idx_stmt) = stmt {
+        if !with_options.is_empty() {
             idx_stmt.with_options = with_options;
         }
+        // 恢复 USING hnsw 标记（供 executor 识别向量索引）
+        if has_using_hnsw && idx_stmt.using.is_none() {
+            idx_stmt.using = Some("hnsw".to_string());
+        }
     }
+    // 占位符索引修正：按出现顺序重新编号 `?` 占位符
+    // （sqlparser 把所有无编号 `?` 都赋 idx=0，需要后处理）
+    renumber_placeholders(&mut stmt);
     Ok(stmt)
+}
+
+/// 按出现顺序重新编号 `?` 占位符
+///
+/// sqlparser 0.47 把所有无编号 `?` 占位符都映射为 idx=0，
+/// 我们递归遍历 AST，按首次出现顺序分配 0, 1, 2, ... 的 idx。
+/// 同一个 `?`（同一 sqlparser id）出现多次时复用首次分配的 idx。
+fn renumber_placeholders(stmt: &mut Statement) {
+    let mut counter: usize = 0;
+    match stmt {
+        Statement::Insert(s) => {
+            for row in s.values.iter_mut() {
+                for expr in row.iter_mut() {
+                    renumber_expr(expr, &mut counter);
+                }
+            }
+        }
+        Statement::Select(s) => {
+            for item in s.select_list.iter_mut() {
+                renumber_select_item(item, &mut counter);
+            }
+            if let Some(ref mut where_expr) = s.where_clause {
+                renumber_expr(where_expr, &mut counter);
+            }
+        }
+        _ => {} // 其他语句暂不涉及占位符
+    }
+}
+
+fn renumber_select_item(item: &mut SelectItem, counter: &mut usize) {
+    match item {
+        SelectItem::Expression(expr, _) => renumber_expr(expr, counter),
+        _ => {}
+    }
+}
+
+fn renumber_expr(expr: &mut Expression, counter: &mut usize) {
+    match expr {
+        Expression::Placeholder(idx) => {
+            // sqlparser 把所有无编号 ? 都映射为 0，这里把它们替换为递增 idx
+            if *idx == 0 {
+                let new_idx = *counter;
+                *counter += 1;
+                *idx = new_idx;
+            }
+            // 已是 >0 的 idx 通常来自 ?1, ?2 等（sqlparser 已经处理好），保留原值
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            renumber_expr(left, counter);
+            renumber_expr(right, counter);
+        }
+        Expression::UnaryOp { expr, .. } => renumber_expr(expr, counter),
+        Expression::Function { args, .. } => {
+            for arg in args.iter_mut() {
+                renumber_expr(arg, counter);
+            }
+        }
+        Expression::Cast { expr, .. } => renumber_expr(expr, counter),
+        Expression::InList { expr, list, .. } => {
+            renumber_expr(expr, counter);
+            for e in list.iter_mut() {
+                renumber_expr(e, counter);
+            }
+        }
+        Expression::Like { expr, pattern, .. } => {
+            renumber_expr(expr, counter);
+            renumber_expr(pattern, counter);
+        }
+        Expression::Case { when_then, else_expr, .. } => {
+            for (w, t) in when_then.iter_mut() {
+                renumber_expr(w, counter);
+                renumber_expr(t, counter);
+            }
+            if let Some(ref mut e) = else_expr {
+                renumber_expr(e, counter);
+            }
+        }
+        Expression::IsNull(e) | Expression::IsNotNull(e) => renumber_expr(e, counter),
+        _ => {}
+    }
 }
 
 /// 从 CREATE INDEX 语句中提取 INCLUDE 子句（v0.12.0 覆盖索引）
@@ -159,29 +250,58 @@ fn normalize_insert_or(sql: &str) -> String {
 
 /// 预处理 CREATE VECTOR INDEX ... WITH (...) 语法（v0.15.0 V16 新增）
 ///
-/// 将 `CREATE VECTOR INDEX idx ON t (col) USING hnsw WITH (metric = cosine, m = 16)`
+/// 将 `CREATE VECTOR INDEX idx ON t (col) WITH (metric = cosine, m = 16)`
 /// 转换为 `CREATE INDEX idx ON t (col) USING hnsw`
 /// 并提取 WITH 选项。
-fn normalize_vector_index(sql: &str) -> (String, Vec<(String, String)>) {
+///
+/// 返回 (处理后的SQL, WITH选项列表, 是否包含USING hnsw)。
+/// 注意：必须去除 `USING hnsw`，否则 sqlparser 0.47 会报错。
+/// 但需要保留 USING hnsw 标记，以便后续识别为向量索引。
+fn normalize_vector_index(sql: &str) -> (String, Vec<(String, String)>, bool) {
     let upper = sql.to_uppercase();
     if !upper.starts_with("CREATE VECTOR INDEX") {
         // 即使没有 CREATE VECTOR INDEX，也可能有 WITH 子句
         // 但只有 CREATE INDEX 才可能有 WITH
-        if upper.contains("CREATE INDEX") && upper.contains(" WITH ") {
-            return extract_with_options(sql);
+        if upper.contains("CREATE INDEX") {
+            // 检测是否包含 USING hnsw（在去除之前）
+            let has_hnsw = upper.contains(" USING HNSW");
+            // 先提取 WITH 选项（如果有）
+            let (mut base, options) = if upper.contains(" WITH ") {
+                extract_with_options(sql)
+            } else {
+                (sql.to_string(), Vec::new())
+            };
+            // 同时去除 USING hnsw（sqlparser 0.47 不支持 hnsw 作为 USING 值）
+            base = strip_using_hnsw(&base);
+            return (base, options, has_hnsw);
         }
-        return (sql.to_string(), Vec::new());
+        return (sql.to_string(), Vec::new(), false);
     }
 
     // 去掉 "VECTOR" 关键字：CREATE VECTOR INDEX → CREATE INDEX
+    // 若 SQL 原本没有 USING 子句（用户写了 `CREATE VECTOR INDEX idx ON t (col) WITH(...)` 没显式指定），
+    // 这里补上 `USING hnsw`，否则 sqlparser 会把 WITH(...) 误解析为 WHERE 谓词。
     let after_vector = &sql["CREATE VECTOR".len()..];
-    let base = format!("CREATE{}", after_vector);
+    let has_using = upper.contains(" USING ");
+    let base = if has_using {
+        format!("CREATE{}", after_vector)
+    } else {
+        // 在 (col) 之前插入 USING hnsw
+        // 找到 '(' 位置
+        if let Some(paren_pos) = after_vector.find('(') {
+            let (before, after) = after_vector.split_at(paren_pos);
+            format!("CREATE{} USING hnsw{}", before, after)
+        } else {
+            format!("CREATE{}", after_vector)
+        }
+    };
 
     // 提取 WITH 选项
     if upper.contains(" WITH ") {
-        extract_with_options(&base)
+        let (sql, options) = extract_with_options(&base);
+        (sql, options, true)
     } else {
-        (base, Vec::new())
+        (base, Vec::new(), true)
     }
 }
 
@@ -240,6 +360,33 @@ fn extract_with_options(sql: &str) -> (String, Vec<(String, String)>) {
     let base_sql = format!("{}{}", &sql[..with_pos], &after_with[j..]);
 
     (base_sql, options)
+}
+
+/// 从 CREATE INDEX 语句中去除 USING hnsw 子句
+///
+/// sqlparser 0.47 不支持 hnsw 作为 USING 值，需要先去除。
+fn strip_using_hnsw(sql: &str) -> String {
+    let upper = sql.to_uppercase();
+    // 查找 USING HNSW（不区分大小写）
+    if let Some(pos) = upper.find(" USING ") {
+        let after_using = &sql[pos + " USING ".len()..];
+        let upper_after = after_using.to_uppercase();
+        if upper_after.starts_with("HNSW") {
+            // 去掉 USING hnsw（包括后面可能的空格）
+            let end = pos + " USING ".len() + "HNSW".len();
+            // 跳过尾部空格
+            let mut end_trimmed = end;
+            let bytes = sql.as_bytes();
+            while end_trimmed < bytes.len() && bytes[end_trimmed] == b' ' {
+                end_trimmed += 1;
+            }
+            format!("{}{}", &sql[..pos], &sql[end_trimmed..])
+        } else {
+            sql.to_string()
+        }
+    } else {
+        sql.to_string()
+    }
 }
 
 /// sqlparser AST → EngramDB 内部 AST
@@ -796,8 +943,27 @@ fn extract_ctes(query: &sqlast::Query) -> Vec<Cte> {
 /// 转换 sqlparser 的 TableRef 为 EngramDB TableRef
 fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>> {
     match &table.relation {
-        sqlast::TableFactor::Table { name, alias, .. } => {
+        sqlast::TableFactor::Table { name, alias, args, .. } => {
             let alias = alias.as_ref().map(|a| a.name.value.clone());
+            // sqlparser 0.47 把裸函数调用（如 `vector_search('t', ...)`）解析成
+            // `Table { name, args: Some([...]) }`。若 args 存在，升级为 TableRef::TableFunction，
+            // 否则按普通表处理。
+            if let Some(arg_list) = args {
+                let name_str = name.to_string();
+                let converted_args: Vec<Expression> = arg_list.iter()
+                    .filter_map(|arg| match arg {
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                            convert_expression(e).ok()
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                return Ok(Some(TableRef::TableFunction {
+                    name: name_str,
+                    args: converted_args,
+                    alias,
+                }));
+            }
             Ok(Some(TableRef::Table { table_name: name.to_string(), alias }))
         }
         sqlast::TableFactor::Derived { subquery, alias, .. } => {
@@ -843,7 +1009,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
         // 参数占位符（? 或 $1 / $2 ...）——必须在 Expr::Value 之前匹配
         sqlast::Expr::Value(sqlast::Value::Placeholder(id)) => {
             let idx = if id.is_empty() {
-                0 // ? 形式（无编号时默认第0个）
+                0 // ? 形式（无编号时默认第0个），renumber_placeholders 会后处理为顺序编号
             } else {
                 // $1, $2 或 ?1, ?2 形式 → 转为 0-based 索引
                 let num_str: String = id.chars().skip_while(|c| !c.is_ascii_digit()).collect();
@@ -1258,21 +1424,27 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
             n == "JSON" || n == "JSONB"
         } => Ok(DataType::Json),
         // 向量类型 VECTOR(dim)（v0.12.0 新增）
-        sqlast::DataType::Custom(name, _) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR" => {
-            // 从类型名的完整字符串中解析维度，如 VECTOR(1536)
-            // sqlparser 0.47 的 Custom 类型参数可能以不同形式出现
-            // 先用 dim=0 占位，建表时再从列定义中获取
-            Ok(DataType::Vector { dim: 0 })
+        sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR" => {
+            // 从 modifiers 中解析维度，如 VECTOR(4) → dim=4
+            let dim = parse_dim_from_modifiers(modifiers).unwrap_or(0);
+            Ok(DataType::Vector { dim })
         }
         // INT8 量化向量类型 VECTOR_INT8(dim)（v0.15.0 新增）
-        sqlast::DataType::Custom(name, _) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR_INT8" => {
-            Ok(DataType::VectorInt8 { dim: 0 })
+        sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR_INT8" => {
+            let dim = parse_dim_from_modifiers(modifiers).unwrap_or(0);
+            Ok(DataType::VectorInt8 { dim })
         }
         _ => Err(EngramDbError::Parse(format!(
             "Unsupported data type: {:?}",
             dt
         ))),
     }
+}
+
+/// 从 sqlparser Custom 类型的 modifiers 中解析向量维度（如 `VECTOR(4)` → 4）
+fn parse_dim_from_modifiers(modifiers: &[String]) -> Option<usize> {
+    // sqlparser 0.47 把 `VECTOR(4)` 解析为 modifiers=["4"]
+    modifiers.first().and_then(|s| s.parse::<usize>().ok())
 }
 
 fn convert_binary_op(op: &sqlast::BinaryOperator) -> Result<BinaryOperator> {
