@@ -3249,4 +3249,34 @@ mod value_tests {
             assert!(val > 5, "val should be > 5, got {}", val);
         }
     }
+
+    #[test]
+    fn test_prepared_batch_multi_col_params() {
+        // 回归：fast_insert fast path 裸 `?` 未重编号曾导致所有列绑定 params[0]
+        // 验证 execute_prepared_batch 多列参数按位绑定（值级验证）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)")
+            .unwrap();
+
+        let stmt = conn.prepare("INSERT INTO t VALUES (?, ?, ?)").unwrap();
+        let mut batch = Vec::with_capacity(10);
+        for i in 0..10 {
+            batch.push(vec![
+                Value::Int32(i),
+                Value::Float64(i as f64 * 1.5),
+                Value::Varchar(format!("row_{}", i)),
+            ]);
+        }
+        conn.execute_prepared_batch(&stmt, &batch).unwrap();
+
+        // 值级验证每列绑定各自参数（而非全部 = params[0]）
+        let result = conn.execute("SELECT id, val, name FROM t WHERE id >= 5").unwrap();
+        assert_eq!(result.rows.len(), 5);
+        for (j, row) in result.rows.iter().enumerate() {
+            let i = (j + 5) as i32;
+            assert_eq!(row[0], Value::Int32(i), "id 列应为 {}", i);
+            assert_eq!(row[1], Value::Float64(i as f64 * 1.5), "val 列应为 id*1.5");
+            assert_eq!(row[2], Value::Varchar(format!("row_{}", i)), "name 列应为 row_{}", i);
+        }
+    }
 }

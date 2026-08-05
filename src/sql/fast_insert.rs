@@ -382,12 +382,13 @@ mod tests {
     #[test]
     fn test_insert_with_placeholders() {
         let sql = "INSERT INTO t VALUES (?, ?)";
-        let result = try_parse_insert(sql);
-        assert!(result.is_some());
-        if let Some(Statement::Insert(stmt)) = result {
+        // 经 parse() 后裸 `?` 应被 renumber 为 0, 1（修复前为 0, 0，导致所有列绑定 params[0]）
+        let result = crate::sql::parser::parse(sql);
+        assert!(result.is_ok());
+        if let Ok(Statement::Insert(stmt)) = result {
             assert_eq!(stmt.values.len(), 1);
             assert!(matches!(stmt.values[0][0], Expression::Placeholder(0)));
-            assert!(matches!(stmt.values[0][1], Expression::Placeholder(0)));
+            assert!(matches!(stmt.values[0][1], Expression::Placeholder(1)));
         } else {
             panic!("Expected Insert");
         }

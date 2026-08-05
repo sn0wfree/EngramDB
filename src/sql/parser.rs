@@ -23,7 +23,10 @@ use sqlparser::parser::Parser;
 pub fn parse(sql: &str) -> Result<Statement> {
     // P3 优化：先尝试轻量级 INSERT 解析器（快 15-25%）
     // 仅对简单 INSERT ... VALUES 有效，失败时回退到完整解析器
-    if let Some(stmt) = crate::sql::fast_insert::try_parse_insert(sql) {
+    if let Some(mut stmt) = crate::sql::fast_insert::try_parse_insert(sql) {
+        // fast path 的裸 `?` 占位符硬编码为 Placeholder(0)，必须重编号，
+        // 否则多列/多行参数全部绑定到 params[0]（与主路径语义一致）
+        renumber_placeholders(&mut stmt);
         return Ok(stmt);
     }
 
