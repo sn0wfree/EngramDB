@@ -40,6 +40,9 @@ pub enum WalRecordType {
     Begin = 7,
     /// 补偿记录（用于回滚时的反向操作）
     Compensation = 8,
+    /// 批量 INSERT（P-W2a）：单条 WAL 记录承载 N 行 INSERT
+    /// payload 格式见 `make_insert_batch_payload`
+    InsertBatch = 9,
 }
 
 impl WalRecordType {
@@ -53,6 +56,7 @@ impl WalRecordType {
             6 => Some(WalRecordType::Checkpoint),
             7 => Some(WalRecordType::Begin),
             8 => Some(WalRecordType::Compensation),
+            9 => Some(WalRecordType::InsertBatch),
             _ => None,
         }
     }
@@ -170,6 +174,51 @@ pub fn make_insert_payload(rowid: u64, row: &[Value]) -> Vec<u8> {
         serialize_value(val, &mut buf);
     }
     buf
+}
+
+/// 批量 INSERT payload（P-W2a）: [base_rowid:8][num_rows:4][num_cols:4][row_0...][row_1...]
+///
+/// 每行数据复用 `make_insert_payload` 的行序列化格式（不含 rowid，rowid = base_rowid + i）。
+/// 单条 WAL 记录承载 N 行，避免 N 条单行 Insert 记录的头开销（19B/条）。
+pub fn make_insert_batch_payload(base_rowid: u64, rows: &[Vec<Value>]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&base_rowid.to_le_bytes());
+    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    // num_cols 从第一行推断；空批量的 num_cols 为 0
+    let num_cols = rows.first().map(|r| r.len()).unwrap_or(0) as u32;
+    buf.extend_from_slice(&num_cols.to_le_bytes());
+    for row in rows {
+        for val in row {
+            serialize_value(val, &mut buf);
+        }
+    }
+    buf
+}
+
+/// 解析批量 INSERT payload
+///
+/// 返回 (base_rowid, rows)，行 i 的 rowid = base_rowid + i。
+pub fn parse_insert_batch_payload(data: &[u8]) -> Option<(u64, Vec<Vec<Value>>)> {
+    if data.len() < 16 {
+        return None;
+    }
+    let base_rowid = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let num_rows = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let num_cols = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+
+    let mut offset = 16;
+    let mut rows = Vec::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        let mut row = Vec::with_capacity(num_cols);
+        for _ in 0..num_cols {
+            let (val, consumed) = deserialize_value(&data[offset..])?;
+            row.push(val);
+            offset += consumed;
+        }
+        rows.push(row);
+    }
+
+    Some((base_rowid, rows))
 }
 
 /// 解析 INSERT payload
@@ -676,6 +725,83 @@ mod tests {
         // 随机垃圾数据应该解析失败
         let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
         assert!(parse_insert_payload(&garbage).is_none());
+    }
+
+    // --- InsertBatch payload (P-W2a) ---
+
+    #[test]
+    fn test_insert_batch_payload_roundtrip() {
+        let rows = vec![
+            vec![Value::Int64(1), Value::Varchar("a".into())],
+            vec![Value::Int64(2), Value::Varchar("b".into())],
+            vec![Value::Int64(3), Value::Varchar("c".into())],
+        ];
+        let payload = make_insert_batch_payload(100, &rows);
+        let (base_rowid, parsed) = parse_insert_batch_payload(&payload).unwrap();
+        assert_eq!(base_rowid, 100);
+        assert_eq!(parsed, rows);
+    }
+
+    #[test]
+    fn test_insert_batch_payload_single_row() {
+        // 单行批量 = 行式插入的等价物（N=1 边界）
+        let rows = vec![vec![Value::Float64(3.14), Value::Boolean(true)]];
+        let payload = make_insert_batch_payload(7, &rows);
+        let (base_rowid, parsed) = parse_insert_batch_payload(&payload).unwrap();
+        assert_eq!(base_rowid, 7);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0][0], Value::Float64(3.14));
+        assert_eq!(parsed[0][1], Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_insert_batch_payload_empty() {
+        // 空批量边界：num_rows=0
+        let payload = make_insert_batch_payload(0, &[]);
+        let (base_rowid, parsed) = parse_insert_batch_payload(&payload).unwrap();
+        assert_eq!(base_rowid, 0);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn test_insert_batch_payload_mixed_types() {
+        let rows = vec![
+            vec![Value::Null, Value::Int32(-5), Value::Vector(vec![1.0, 2.0])],
+            vec![Value::Varchar("x".into()), Value::Timestamp(1700000000000), Value::Blob(vec![1, 2, 3])],
+        ];
+        let payload = make_insert_batch_payload(1, &rows);
+        let (base, parsed) = parse_insert_batch_payload(&payload).unwrap();
+        assert_eq!(base, 1);
+        assert_eq!(parsed, rows);
+    }
+
+    #[test]
+    fn test_insert_batch_payload_invalid_data() {
+        // 垃圾数据应解析失败
+        let garbage = vec![0xFF; 10];
+        assert!(parse_insert_batch_payload(&garbage).is_none());
+    }
+
+    #[test]
+    fn test_wal_record_insert_batch_type_roundtrip() {
+        // 整条 WalRecord 序列化/反序列化（含 InsertBatch 类型）
+        let rows = vec![vec![Value::Int64(1)], vec![Value::Int64(2)]];
+        let payload = make_insert_batch_payload(10, &rows);
+        let record = WalRecord {
+            lsn: 0,
+            record_type: WalRecordType::InsertBatch,
+            txn_id: 42,
+            table_id: 3,
+            payload,
+        };
+        let bytes = record.to_bytes();
+        let parsed = WalRecord::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.record_type, WalRecordType::InsertBatch);
+        assert_eq!(parsed.txn_id, 42);
+        assert_eq!(parsed.table_id, 3);
+        let (base, rows2) = parse_insert_batch_payload(&parsed.payload).unwrap();
+        assert_eq!(base, 10);
+        assert_eq!(rows2.len(), 2);
     }
 
     // --- Update payload ---

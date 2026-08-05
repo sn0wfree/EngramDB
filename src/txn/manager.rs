@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::common::error::Result;
 use crate::common::config::{Config, WalFlushMode};
-use crate::wal::{WalWriter, WalRecordType, make_insert_payload, make_update_payload, make_delete_payload};
+use crate::wal::{WalWriter, WalRecordType, make_insert_payload, make_insert_batch_payload, make_update_payload, make_delete_payload};
 use crate::Value;
 
 use super::{TxnState, IsolationLevel, TxnError, TxnId, Timestamp, MvccStore, ActiveTxnTable, ApplyOp, CommitResult};
@@ -213,6 +213,13 @@ impl TransactionManager {
             }
         }
         
+        // P-W2c：合并连续同表 Insert 段为 InsertBatch
+        // 条件：连续 ≥2 个 Insert、同 table_id、rowid 连续（base + i）
+        // 合并后行数据转置为列式，apply_to_storage 直接走 insert_columns
+        if ops.len() >= 2 {
+            ops = merge_insert_batches(ops);
+        }
+        
         Ok(ops)
     }
 
@@ -377,6 +384,52 @@ impl TransactionManager {
         // 记录到 write_set
         let ctx = self.txns.get_mut(&txn_id).unwrap();
         ctx.write_set.push((table_id, rowid));
+
+        Ok(())
+    }
+
+    /// 事务内批量插入（P-W2a）
+    ///
+    /// 与 N 次 `insert()` 语义完全一致，但：
+    /// - 1 次 WAL `InsertBatch` 记录（替代 N 条 `Insert`，省 N×19B 头）
+    /// - 1 次 MVCC `batch_write`（替代 N 次 hashmap entry lookup）
+    /// - 1 次 write_set 扩展（替代 N 次 push）
+    ///
+    /// 行 i 的 rowid = base_rowid + i。失败（写-写冲突）时整批不写。
+    pub fn batch_insert(
+        &mut self,
+        txn_id: TxnId,
+        table_id: u32,
+        base_rowid: u64,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<()> {
+        self.ensure_active(txn_id)?;
+
+        let num_rows = rows.len() as u64;
+        if num_rows == 0 {
+            return Ok(());
+        }
+
+        let ctx = self.txns.get(&txn_id).unwrap();
+        let write_ts = ctx.start_ts;
+
+        // 1. 写入 WAL（单条 InsertBatch 记录）
+        let payload = make_insert_batch_payload(base_rowid, &rows);
+        self.wal.write_record(WalRecordType::InsertBatch, txn_id, table_id, &payload)?;
+
+        // 2. 写入 MVCC（单次批量写）
+        let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
+        if !store.batch_write(base_rowid, rows, txn_id, write_ts) {
+            return Err(TxnError::WriteConflict(
+                format!("Write conflict on table {} rows {}..{}", table_id, base_rowid, base_rowid + num_rows)
+            ).into());
+        }
+
+        // 3. 记录到 write_set（一次扩展）
+        let ctx = self.txns.get_mut(&txn_id).unwrap();
+        ctx.write_set.extend(
+            (0..num_rows).map(|i| (table_id, base_rowid + i))
+        );
 
         Ok(())
     }
@@ -556,6 +609,93 @@ impl TransactionManager {
     }
 }
 
+// ============================================================================
+// P-W2c：连续同表 Insert 段 → ApplyOp::InsertBatch 合并
+// ============================================================================
+
+/// 合并连续同表 Insert 段为 `ApplyOp::InsertBatch`
+///
+/// 条件：≥2 个连续 Insert、同 table_id、rowid 连续（base_row_id + i）。
+/// 合并后行数据转置为列式（每列一个 Vec），供 `apply_to_storage` 走
+/// `table.insert_columns` 列式落盘（无行→列转置）。
+///
+/// Update/Delete/非连续 Insert 保持原样（顺序不变）。
+fn merge_insert_batches(ops: Vec<ApplyOp>) -> Vec<ApplyOp> {
+    let mut result: Vec<ApplyOp> = Vec::with_capacity(ops.len());
+    let mut i = 0;
+
+    while i < ops.len() {
+        // 找从 i 开始的连续同表 Insert 段
+        let mut run_len = 0usize;
+        let start_table = match &ops[i] {
+            ApplyOp::Insert { table_id, .. } => {
+                run_len = 1;
+                *table_id
+            }
+            _ => {
+                // 非 Insert：原样保留
+                result.push(ops[i].clone());
+                i += 1;
+                continue;
+            }
+        };
+
+        // 收集段内 rowid，检查连续性
+        while i + run_len < ops.len() {
+            match &ops[i + run_len] {
+                ApplyOp::Insert { table_id, .. } if *table_id == start_table => {
+                    run_len += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if run_len >= 2 {
+            // 检查 rowid 连续：base + idx
+            let base_row_id = match &ops[i] {
+                ApplyOp::Insert { row_id, .. } => *row_id,
+                _ => unreachable!(),
+            };
+            let contiguous = (0..run_len).all(|k| {
+                matches!(&ops[i + k], ApplyOp::Insert { row_id, .. } if *row_id == base_row_id + k as u64)
+            });
+
+            if contiguous {
+                // 行 → 列转置（首行列数决定列数）
+                let num_cols = match &ops[i] {
+                    ApplyOp::Insert { row, .. } => row.len(),
+                    _ => 0,
+                };
+                let mut columns: Vec<Vec<crate::Value>> = (0..num_cols).map(|_| Vec::with_capacity(run_len)).collect();
+                for k in 0..run_len {
+                    if let ApplyOp::Insert { row, .. } = &ops[i + k] {
+                        for (c, v) in row.iter().enumerate() {
+                            if c < num_cols {
+                                columns[c].push(v.clone());
+                            }
+                        }
+                    }
+                }
+                result.push(ApplyOp::InsertBatch {
+                    table_id: start_table,
+                    base_row_id,
+                    columns,
+                });
+                i += run_len;
+                continue;
+            }
+        }
+
+        // 非连续或长度 <2：逐个原样保留
+        for k in 0..run_len {
+            result.push(ops[i + k].clone());
+        }
+        i += run_len;
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +784,140 @@ mod tests {
         mgr.rollback(txn2).unwrap();
 
         cleanup(&path);
+    }
+
+    // ========================================================================
+    // P-W2a：batch_insert
+    // ========================================================================
+
+    #[test]
+    fn test_batch_insert_commit_read() {
+        let (mut mgr, path) = setup_manager("batch_insert_commit_read");
+        let table_id = 1;
+
+        // Txn 1: 批量插入 100 行（rowid 10..110）
+        let txn1 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        let rows: Vec<Vec<Value>> = (0..100).map(|i| vec![Value::Int64(i as i64)]).collect();
+        mgr.batch_insert(txn1, table_id, 10, rows).unwrap();
+        mgr.commit(txn1).unwrap();
+
+        // Txn 2: 读取验证
+        let txn2 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        for i in 0..100u64 {
+            let val = mgr.read(txn2, table_id, 10 + i);
+            assert!(val.is_some());
+            assert_eq!(val.unwrap(), &vec![Value::Int64(i as i64)]);
+        }
+        mgr.commit(txn2).unwrap();
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_batch_insert_write_conflict() {
+        let (mut mgr, path) = setup_manager("batch_insert_conflict");
+        let table_id = 1;
+
+        // Txn 1: 写 rowid 12
+        let txn1 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        mgr.insert(txn1, table_id, 12, vec![Value::Int64(100)]).unwrap();
+
+        // Txn 2: 批量写 10..20 — 与 rowid 12 冲突
+        let txn2 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        let rows: Vec<Vec<Value>> = (0..10).map(|i| vec![Value::Int64(i as i64)]).collect();
+        let result = mgr.batch_insert(txn2, table_id, 10, rows);
+        assert!(result.is_err(), "batch insert should conflict");
+
+        // 冲突后 txn2 的 write_set 应为空（整批失败）
+        let ctx = mgr.txns.get(&txn2).unwrap();
+        assert!(ctx.write_set.is_empty(), "conflict batch must leave no write_set");
+
+        mgr.rollback(txn1).unwrap();
+        mgr.rollback(txn2).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_batch_insert_empty() {
+        let (mut mgr, path) = setup_manager("batch_insert_empty");
+        let txn = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
+        // 空批量：无副作用
+        mgr.batch_insert(txn, 1, 0, Vec::new()).unwrap();
+        let ctx = mgr.txns.get(&txn).unwrap();
+        assert!(ctx.write_set.is_empty());
+        mgr.rollback(txn).unwrap();
+        cleanup(&path);
+    }
+
+    // ========================================================================
+    // P-W2c：merge_insert_batches
+    // ========================================================================
+
+    #[test]
+    fn test_merge_insert_batches_contiguous() {
+        let ops = vec![
+            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0), Value::Varchar("a".into())] },
+            ApplyOp::Insert { table_id: 1, row_id: 1, row: vec![Value::Int64(1), Value::Varchar("b".into())] },
+            ApplyOp::Insert { table_id: 1, row_id: 2, row: vec![Value::Int64(2), Value::Varchar("c".into())] },
+        ];
+        let merged = merge_insert_batches(ops);
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            ApplyOp::InsertBatch { table_id, base_row_id, columns } => {
+                assert_eq!(*table_id, 1);
+                assert_eq!(*base_row_id, 0);
+                assert_eq!(columns.len(), 2); // 2 列
+                assert_eq!(columns[0].len(), 3); // 3 行
+                assert_eq!(columns[0][2], Value::Int64(2));
+                assert_eq!(columns[1][1], Value::Varchar("b".into()));
+            }
+            other => panic!("expected InsertBatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_merge_insert_batches_keeps_update() {
+        // Insert + Update 混合：Update 打断合并
+        let ops = vec![
+            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0)] },
+            ApplyOp::Insert { table_id: 1, row_id: 1, row: vec![Value::Int64(1)] },
+            ApplyOp::Update { table_id: 1, row_id: 0, new_row: vec![Value::Int64(99)] },
+            ApplyOp::Insert { table_id: 1, row_id: 2, row: vec![Value::Int64(2)] },
+        ];
+        let merged = merge_insert_batches(ops);
+        // 前 2 个 Insert 合并为 1 个 InsertBatch；Update 保留；最后一个 Insert 单条
+        assert_eq!(merged.len(), 3);
+        assert!(matches!(merged[0], ApplyOp::InsertBatch { .. }));
+        assert!(matches!(merged[1], ApplyOp::Update { .. }));
+        assert!(matches!(merged[2], ApplyOp::Insert { .. }));
+    }
+
+    #[test]
+    fn test_merge_insert_batches_non_contiguous_rowids() {
+        // 同表但 rowid 不连续：不合并
+        let ops = vec![
+            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0)] },
+            ApplyOp::Insert { table_id: 1, row_id: 5, row: vec![Value::Int64(5)] },
+        ];
+        let merged = merge_insert_batches(ops);
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(merged[0], ApplyOp::Insert { .. }));
+        assert!(matches!(merged[1], ApplyOp::Insert { .. }));
+    }
+
+    #[test]
+    fn test_merge_insert_batches_multi_table() {
+        // 跨表交替插入：各表独立合并
+        let ops = vec![
+            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0)] },
+            ApplyOp::Insert { table_id: 1, row_id: 1, row: vec![Value::Int64(1)] },
+            ApplyOp::Insert { table_id: 2, row_id: 0, row: vec![Value::Int64(10)] },
+            ApplyOp::Insert { table_id: 2, row_id: 1, row: vec![Value::Int64(11)] },
+        ];
+        let merged = merge_insert_batches(ops);
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(merged[0], ApplyOp::InsertBatch { table_id: 1, .. }));
+        assert!(matches!(merged[1], ApplyOp::InsertBatch { table_id: 2, .. }));
     }
 
     #[test]

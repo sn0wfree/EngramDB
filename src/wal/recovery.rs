@@ -107,7 +107,7 @@ pub fn recover(wal_path: &str) -> Result<RecoveryResult> {
     let start_idx = last_checkpoint_idx.map(|i| i + 1).unwrap_or(0);
     for rec in &records[start_idx..] {
         match rec.record_type {
-            WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete => {
+            WalRecordType::Insert | WalRecordType::InsertBatch | WalRecordType::Update | WalRecordType::Delete => {
                 result.records_redone += 1;
                 // 实际应用变更由调用方完成
                 // 这里只统计
@@ -122,7 +122,7 @@ pub fn recover(wal_path: &str) -> Result<RecoveryResult> {
     for rec in records[start_idx..].iter().rev() {
         if active.contains(&rec.txn_id) {
             match rec.record_type {
-                WalRecordType::Insert => {
+                WalRecordType::Insert | WalRecordType::InsertBatch => {
                     // INSERT 的补偿 = DELETE
                     result.records_undone += 1;
                 }
@@ -174,7 +174,7 @@ pub fn get_redo_records(wal_path: &str) -> Result<Vec<WalRecord>> {
     let start_idx = last_ckpt_idx.map(|i| i + 1).unwrap_or(0);
     let redo: Vec<WalRecord> = records[start_idx..].iter()
         .filter(|r| {
-            matches!(r.record_type, WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete)
+            matches!(r.record_type, WalRecordType::Insert | WalRecordType::InsertBatch | WalRecordType::Update | WalRecordType::Delete)
                 && committed.contains(&r.txn_id)
         })
         .cloned()
@@ -186,7 +186,7 @@ pub fn get_redo_records(wal_path: &str) -> Result<Vec<WalRecord>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::{WalWriter, WalRecordType, make_insert_payload};
+    use crate::wal::{WalWriter, WalRecordType, make_insert_payload, make_insert_batch_payload};
     use crate::Value;
 
     fn tmp(name: &str) -> String {
@@ -250,6 +250,40 @@ mod tests {
         assert_eq!(result.records_redone, 1); // Redo 阶段重做了
         assert_eq!(result.records_undone, 1);  // Undo 阶段回滚了
         assert!(result.success);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_recover_insert_batch_committed() {
+        // P-W2a：InsertBatch 记录应被 Redo 识别并计入
+        let tmp = tmp("recover_insert_batch");
+        let _ = std::fs::remove_file(&tmp);
+
+        {
+            let mut writer = WalWriter::open(&tmp).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
+            let payload = make_insert_batch_payload(0, &[
+                vec![Value::Int64(1), Value::Varchar("a".into())],
+                vec![Value::Int64(2), Value::Varchar("b".into())],
+                vec![Value::Int64(3), Value::Varchar("c".into())],
+            ]);
+            writer.write_record(WalRecordType::InsertBatch, 1, 1, &payload).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let result = recover(&tmp).unwrap();
+        assert_eq!(result.transactions_committed, 1);
+        assert_eq!(result.transactions_rolled_back, 0);
+        assert_eq!(result.records_redone, 1); // InsertBatch 记录计入 1 条
+        assert_eq!(result.records_undone, 0);
+        assert!(result.success);
+
+        // get_redo_records 也应包含 InsertBatch
+        let redo = get_redo_records(&tmp).unwrap();
+        assert_eq!(redo.len(), 1);
+        assert_eq!(redo[0].record_type, WalRecordType::InsertBatch);
 
         let _ = std::fs::remove_file(&tmp);
     }

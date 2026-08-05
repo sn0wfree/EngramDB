@@ -75,23 +75,14 @@ fn execute_with_txn(
     let txn_id = db.txn_manager_mut().begin(isolation)?;
     info!("Transaction started: txn_id={}, isolation={:?}", txn_id, isolation);
     
-    // 2. 事务内插入每行
+    // 2. 事务内插入行（P-W2a：批量走 batch_insert，单次 WAL + MVCC）
     debug!("Inserting {} rows in transaction {}...", rows.len(), txn_id);
     let table_id = *db.table_names().get(table_name).unwrap();
     let base_row_id = db.get_table(table_name).unwrap().def.row_count as u32;
     let rows_len = rows.len();
-    
-    for (idx, row) in rows.into_iter().enumerate() {
-        let row_id = base_row_id + idx as u32;
-        trace!("Inserting row {} (row_id={}): {:?}", idx, row_id, row);
-        
-        db.txn_manager_mut().insert(txn_id, table_id, row_id as u64, row)?;
-        
-        if idx % 100 == 0 {
-            debug!("Inserted {}/{} rows in transaction {}", idx + 1, rows_len, txn_id);
-        }
-    }
-    debug!("✓ All {} rows inserted in transaction {}", rows_len, txn_id);
+
+    db.txn_manager_mut().batch_insert(txn_id, table_id, base_row_id as u64, rows)?;
+    debug!("✓ All {} rows inserted in transaction {} (batch)", rows_len, txn_id);
     
     // 3. 提交事务（会 fsync WAL）
     debug!("Committing transaction {}...", txn_id);
@@ -133,12 +124,49 @@ fn execute_without_txn(
 ///
 /// M02 优化：将连续的同表 Insert 段打包走 `table.insert(batch_rows)`，
 /// 减少 N 次单条 insert_row 的方法调用与索引维护开销。
+/// P-W2c：`ApplyOp::InsertBatch`（由 collect_apply_ops 合并产出）直接走
+/// `table.insert_columns` 列式落盘（无行→列转置）。
 /// Update/Delete 仍按原顺序逐行应用（保持操作顺序正确性）。
 pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> {
     trace!("apply_to_storage called with {} operations", ops.len());
 
     let mut idx = 0;
     while idx < ops.len() {
+        // P-W2c：InsertBatch 直接列式落盘（优先分支）
+        if let ApplyOp::InsertBatch { table_id, base_row_id, columns } = &ops[idx] {
+            let table = db.tables_mut().get_mut(table_id)
+                .ok_or_else(|| {
+                    error!("Table not found: table_id={}", table_id);
+                    EngramDbError::TableNotFound(format!("id={}", table_id))
+                })?;
+
+            // 仅当 base_row_id 与当前表行数对齐时走 insert_columns（列式批量）
+            // 否则退回逐行 insert_row（保持 rowid 语义）
+            let base = table.def.row_count as u32;
+            if *base_row_id == base as u64 && !columns.is_empty() {
+                let cols = columns.clone();
+                let inserted = table.insert_columns(cols)?;
+                debug!("✓ P-W2c InsertBatch applied: table_id={}, rows={}", table_id, inserted);
+            } else {
+                // 非对齐：按 base_row_id + i 逐行插入
+                let num_rows = columns.first().map(|c| c.len()).unwrap_or(0);
+                for i in 0..num_rows {
+                    let mut row = Vec::with_capacity(columns.len());
+                    for col in columns {
+                        if i < col.len() {
+                            row.push(col[i].clone());
+                        } else {
+                            row.push(Value::Null);
+                        }
+                    }
+                    table.insert_row((*base_row_id + i as u64) as u32, &row)?;
+                }
+                debug!("✓ InsertBatch applied (non-aligned): table_id={}, rows={}", table_id, num_rows);
+            }
+            idx += 1;
+            continue;
+        }
+
         // 检测当前位置开始的「连续同表 Insert」段
         if let ApplyOp::Insert { table_id: start_tid, .. } = ops[idx] {
             // 收集后续与 start_tid 相同的 Insert
@@ -210,6 +238,28 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                     })?;
                 table.insert_row(*row_id as u32, row)?;
                 debug!("✓ Insert applied: table_id={}, row_id={}", table_id, row_id);
+            }
+            ApplyOp::InsertBatch { table_id, base_row_id, columns } => {
+                // 防御分支：正常情况下 InsertBatch 在循环顶部已被处理
+                // （该分支仅当 ops 顺序异常时可达）
+                let table = db.tables_mut().get_mut(table_id)
+                    .ok_or_else(|| {
+                        error!("Table not found: table_id={}", table_id);
+                        EngramDbError::TableNotFound(format!("id={}", table_id))
+                    })?;
+                let num_rows = columns.first().map(|c| c.len()).unwrap_or(0);
+                for i in 0..num_rows {
+                    let mut row = Vec::with_capacity(columns.len());
+                    for col in columns.iter() {
+                        if i < col.len() {
+                            row.push(col[i].clone());
+                        } else {
+                            row.push(Value::Null);
+                        }
+                    }
+                    table.insert_row((*base_row_id + i as u64) as u32, &row)?;
+                }
+                debug!("✓ InsertBatch applied (fallback): table_id={}, rows={}", table_id, num_rows);
             }
             ApplyOp::Update { table_id, row_id, new_row } => {
                 trace!("Update: table_id={}, row_id={}, new_row={:?}", table_id, row_id, new_row);

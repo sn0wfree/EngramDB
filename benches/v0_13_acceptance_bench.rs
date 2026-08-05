@@ -132,6 +132,93 @@ fn a1_sqlite() -> Duration {
 }
 
 // ============================================================
+// A-1b/c/d: 单事务批量写入（P-W2 验收）
+// 验收: A-1b ≤ 1.5× / A-1c ≤ 2.0× / A-1d ≤ 2.5× (vs SQLite)
+// 单事务 N 行 INSERT，验证 batch_insert + InsertBatch WAL/MVCC
+// ============================================================
+
+/// EngramDB：单事务 N 行批量 INSERT（SQL 多行 VALUES → execute_with_txn → batch_insert）
+fn a1b_engramdb(n: usize) -> Duration {
+    cleanup_files();
+    let mut conn = open_hdb();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)")
+        .unwrap();
+
+    // 构造单条多行 VALUES SQL（每批 50K 行，避免 SQL 过长）
+    const SQL_BATCH: usize = 50_000;
+    let start = Instant::now();
+    let mut offset = 0;
+    while offset < n {
+        let end = (offset + SQL_BATCH).min(n);
+        let mut sql = String::with_capacity((end - offset) * 32);
+        sql.push_str("INSERT INTO t VALUES ");
+        for i in offset..end {
+            if i > offset {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({}, {}, 'row_{}')", i, i as f64 * 1.5, i));
+        }
+        conn.execute(&sql).unwrap();
+        offset = end;
+    }
+    let elapsed = start.elapsed();
+
+    // 验证行数
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    debug_assert_eq!(r.rows[0][0], Value::Int64(n as i64), "A-1b expected {} rows", n);
+
+    conn.close().unwrap();
+    cleanup_files();
+    elapsed
+}
+
+/// SQLite：单事务 N 行批量 INSERT
+fn a1b_sqlite(n: usize) -> Duration {
+    cleanup_files();
+    let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)",
+        [],
+    )
+    .unwrap();
+
+    const SQL_BATCH: usize = 50_000;
+    let start = Instant::now();
+    {
+        let tx = conn.unchecked_transaction().unwrap();
+        let mut offset = 0;
+        while offset < n {
+            let end = (offset + SQL_BATCH).min(n);
+            let mut sql = String::with_capacity((end - offset) * 32);
+            sql.push_str("INSERT INTO t VALUES ");
+            for i in offset..end {
+                if i > offset {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("({}, {}, 'row_{}')", i, i as f64 * 1.5, i));
+            }
+            tx.execute(&sql, []).unwrap();
+            offset = end;
+        }
+        tx.commit().unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    // 验证行数
+    let v: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+    debug_eq_i64(v, n as i64);
+
+    drop(conn);
+    cleanup_files();
+    elapsed
+}
+
+// ============================================================
 // A-2: 索引点查 (1M 行表, 1000 次随机等值查询)
 // 验收: ≤ 5× 慢 (vs SQLite)
 // ============================================================
@@ -315,6 +402,26 @@ fn main() {
 
     // A-1: 事务内逐行写入
     run_scenario("A-1: 事务内逐行写入 (1000 事务 × 1 行)", 10.0, a1_engramdb, a1_sqlite);
+
+    // A-1b/c/d: 单事务批量写入（P-W2 验收）
+    run_scenario(
+        "A-1b: 单事务批量 INSERT (1 事务 × 1000 行)",
+        1.5,
+        || a1b_engramdb(1_000),
+        || a1b_sqlite(1_000),
+    );
+    run_scenario(
+        "A-1c: 单事务批量 INSERT (1 事务 × 10000 行)",
+        2.0,
+        || a1b_engramdb(10_000),
+        || a1b_sqlite(10_000),
+    );
+    run_scenario(
+        "A-1d: 单事务批量 INSERT (1 事务 × 100000 行)",
+        2.5,
+        || a1b_engramdb(100_000),
+        || a1b_sqlite(100_000),
+    );
 
     // A-2 & A-3 共享 1M 行数据集 setup
     println!("\n--- 设置 A-2/A-3 测试数据 (1M 行到 EngramDB + SQLite) ---");

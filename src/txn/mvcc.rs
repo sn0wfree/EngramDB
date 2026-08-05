@@ -109,6 +109,54 @@ impl<T: Clone> MvccStore<T> {
         true
     }
 
+    /// 批量写入新版本（P-W2a）
+    ///
+    /// 写入连续的 key 序列 `base_key..base_key+values.len()`，每 key 一个版本。
+    /// 与 N 次 `write()` 语义完全一致，但：
+    /// - 只对每个 key 做 1 次 hashmap entry lookup（`entry().or_insert_with`）
+    /// - 冲突检测一次遍历所有待写 key（任一冲突即整体失败，不写任何 key）
+    /// - 版本节点一次性分配后 push
+    ///
+    /// 返回 true 表示全部写入成功；false 表示存在写-写冲突（整批未写入）。
+    pub fn batch_write(
+        &mut self,
+        base_key: u64,
+        values: Vec<T>,
+        txn_id: TxnId,
+        write_ts: Timestamp,
+    ) -> bool {
+        // 先做整体冲突检测（不写任何 key，失败时保证零副作用）
+        let count = values.len();
+        for i in 0..count {
+            let key = base_key + i as u64;
+            if let Some(chain) = self.versions.get(&key) {
+                for node in chain.iter().rev() {
+                    if !node.committed && node.txn_id != txn_id {
+                        return false;
+                    }
+                    if node.committed {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 无冲突：批量写入
+        for (i, value) in values.into_iter().enumerate() {
+            let key = base_key + i as u64;
+            let chain = self.versions.entry(key).or_insert_with(Vec::new);
+            chain.push(VersionNode {
+                value,
+                begin_ts: write_ts,
+                end_ts: None,
+                txn_id,
+                committed: false,
+            });
+        }
+
+        true
+    }
+
     /// 提交事务的所有写入：标记已提交 + 设置前一版本 end_ts
     pub fn commit_txn(&mut self, txn_id: TxnId, commit_ts: Timestamp) {
         for chain in self.versions.values_mut() {
@@ -445,6 +493,76 @@ mod tests {
 
         // Txn 2 写同一个 key — 应该冲突
         assert!(!store.write(1, 200, txn2, ts2));
+    }
+
+    // --- P-W2a: batch_write ---
+
+    #[test]
+    fn test_mvcc_batch_write_basic() {
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let mut txn_table = ActiveTxnTable::new();
+
+        let (txn1, ts1) = txn_table.begin_txn();
+        // 连续写 key 10..15
+        assert!(store.batch_write(10, vec![1, 2, 3, 4, 5], txn1, ts1));
+
+        for i in 0..5u64 {
+            let key = 10 + i;
+            assert_eq!(store.version_count(key), 1);
+            assert_eq!(store.get_for_txn(key, ts1, txn1), Some(&((i + 1) as i32)));
+        }
+
+        // 提交后可见
+        let c1 = txn_table.commit_txn(txn1);
+        store.commit_txn(txn1, c1);
+        for i in 0..5u64 {
+            let key = 10 + i;
+            assert_eq!(store.get(key, c1), Some(&((i + 1) as i32)));
+        }
+    }
+
+    #[test]
+    fn test_mvcc_batch_write_empty() {
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let (txn, ts) = ActiveTxnTable::new().begin_txn();
+        // 空批量：无副作用
+        assert!(store.batch_write(0, Vec::new(), txn, ts));
+        assert_eq!(store.key_count(), 0);
+    }
+
+    #[test]
+    fn test_mvcc_batch_write_conflict_atomic() {
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let mut txn_table = ActiveTxnTable::new();
+
+        let (txn1, ts1) = txn_table.begin_txn();
+        let (txn2, ts2) = txn_table.begin_txn();
+
+        // Txn1 写 key 12
+        assert!(store.write(12, 100, txn1, ts1));
+
+        // Txn2 批量写 10..15 — key 12 冲突 → 整批失败，且不写任何 key
+        assert!(!store.batch_write(10, vec![1, 2, 3, 4, 5], txn2, ts2));
+
+        // 冲突批未留下任何痕迹
+        assert_eq!(store.version_count(10), 0);
+        assert_eq!(store.version_count(11), 0);
+        assert_eq!(store.version_count(13), 0);
+        assert_eq!(store.version_count(14), 0);
+        // key 12 只有 txn1 的版本
+        assert_eq!(store.version_count(12), 1);
+    }
+
+    #[test]
+    fn test_mvcc_batch_write_same_txn_ok() {
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let (txn, ts) = ActiveTxnTable::new().begin_txn();
+
+        // 同一事务内先写 key 5，再批量写 5..7 不冲突（同 txn_id）
+        assert!(store.write(5, 100, txn, ts));
+        assert!(store.batch_write(5, vec![200, 300], txn, ts));
+        assert_eq!(store.version_count(5), 2);
+        assert_eq!(store.version_count(6), 1);
     }
 
     #[test]

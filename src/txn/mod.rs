@@ -65,6 +65,16 @@ pub enum ApplyOp {
         row_id: u64,
         row: Vec<crate::Value>,
     },
+    /// 批量插入（P-W2c）：连续同表 Insert 段的合并表示
+    ///
+    /// 行 i 的 rowid = base_row_id + i，行数据以列式组织（每列一个 Vec）。
+    /// 由 `collect_apply_ops` 在检测到连续同表 Insert 段时产出，
+    /// `apply_to_storage` 直接走 `table.insert_columns`（列式落盘，无转置）。
+    InsertBatch {
+        table_id: u32,
+        base_row_id: u64,
+        columns: Vec<Vec<crate::Value>>,
+    },
     Update {
         table_id: u32,
         row_id: u64,

@@ -183,4 +183,114 @@ mod tests {
         let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(count.rows[0][0], Value::Int64(0));
     }
+
+    // ========================================================================
+    // P-W2：事务内批量 INSERT 接线
+    // ========================================================================
+
+    #[test]
+    fn test_txn_batch_insert_commit_persists() {
+        // P-W2a：单事务批量 100 行 → commit 后全部持久化
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT, val INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        let mut rows = Vec::with_capacity(100);
+        for i in 0..100 {
+            rows.push(vec![Value::Int64(i), Value::Int64(i * 2)]);
+        }
+        txn.insert("t", rows).unwrap();
+        txn.commit().unwrap();
+        drop(txn);
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(100));
+
+        // 抽查数据
+        let r = conn.execute("SELECT id, val FROM t WHERE id = 50").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Int64(50));
+        assert_eq!(r.rows[0][1], Value::Int64(100));
+    }
+
+    #[test]
+    fn test_txn_batch_insert_rollback_discards() {
+        // P-W2a：单事务批量 100 行 → rollback 后 0 行
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT, val INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        let mut rows = Vec::with_capacity(100);
+        for i in 0..100 {
+            rows.push(vec![Value::Int64(i), Value::Int64(i * 2)]);
+        }
+        txn.insert("t", rows).unwrap();
+        txn.rollback().unwrap();
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(0));
+    }
+
+    #[test]
+    fn test_txn_batch_insert_with_index() {
+        // P-W2a + P-W2c：批量事务 + 二级索引维护正确
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT, score INT)").unwrap();
+        conn.execute("CREATE INDEX idx_score ON t (score)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        let mut rows = Vec::with_capacity(50);
+        for i in 0..50 {
+            rows.push(vec![Value::Int64(i), Value::Int64(100 - i)]);
+        }
+        txn.insert("t", rows).unwrap();
+        txn.commit().unwrap();
+        drop(txn);
+
+        // 通过索引查询
+        let r = conn.execute("SELECT id FROM t WHERE score = 95").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Int64(5));
+
+        // 全量正确
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(50));
+    }
+
+    #[test]
+    fn test_txn_batch_insert_sql_multi_values() {
+        // P-W2a：SQL 多行 VALUES 在事务模式下走批量路径
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT, name VARCHAR)").unwrap();
+
+        // 多行 VALUES（走 Insert 计划 → execute_with_txn → batch_insert）
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')").unwrap();
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(4));
+
+        let r = conn.execute("SELECT name FROM t WHERE id = 3").unwrap();
+        assert_eq!(r.rows[0][0], Value::Varchar("c".into()));
+    }
+
+    #[test]
+    fn test_txn_batch_insert_primary_key() {
+        // P-W2a：批量事务 + 主键索引
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        let mut rows = Vec::with_capacity(20);
+        for i in 0..20 {
+            rows.push(vec![Value::Int64(i), Value::Int64(i * 3)]);
+        }
+        txn.insert("t", rows).unwrap();
+        txn.commit().unwrap();
+        drop(txn);
+
+        // 主键点查
+        let r = conn.execute("SELECT val FROM t WHERE id = 7").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Int64(21));
+    }
 }
