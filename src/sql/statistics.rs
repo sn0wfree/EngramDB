@@ -15,6 +15,8 @@ use crate::executor::vector::{DataChunk, Vector};
 pub struct TableStatistics {
     /// 表名
     pub table_name: String,
+    /// 引擎（M5：JOIN 代价模型按引擎加权扫描成本）
+    pub engine: crate::common::types::EngineType,
     /// 总行数
     pub row_count: u64,
     /// 列统计
@@ -138,6 +140,7 @@ impl TableStatistics {
     /// 从数据块收集统计信息
     pub fn from_chunks(
         table_name: &str,
+        engine: crate::common::types::EngineType,
         column_names: &[String],
         chunks: &[DataChunk],
         with_histogram: bool,
@@ -166,6 +169,7 @@ impl TableStatistics {
 
         TableStatistics {
             table_name: table_name.to_string(),
+            engine,
             row_count: total_rows,
             columns,
         }
@@ -350,7 +354,7 @@ mod tests {
         let chunk = make_test_chunk();
         let cols = vec!["id".to_string(), "name".to_string()];
         let stats = TableStatistics::from_chunks(
-            "test", &cols, &[chunk], false
+            "test", crate::common::types::EngineType::Columnar, &cols, &[chunk], false
         );
 
         assert_eq!(stats.row_count, 10);
@@ -366,7 +370,7 @@ mod tests {
         let chunk = make_test_chunk();
         let cols = vec!["id".to_string(), "name".to_string()];
         let stats = TableStatistics::from_chunks(
-            "test", &cols, &[chunk], false
+            "test", crate::common::types::EngineType::Columnar, &cols, &[chunk], false
         );
 
         // name 列：a,b,c,d,e,f = 6 个不同值

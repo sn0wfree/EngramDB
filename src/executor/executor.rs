@@ -1148,8 +1148,18 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        // DDL/管理语句：简单返回 OK
+        // M5：ANALYZE 真实收集统计（引擎分派全表扫描 → 直方图/NDV 缓存）
         PhysicalPlan::Analyze { table_name, .. } => {
+            use crate::sql::statistics::TableStatistics;
+            let table = db.get_engine_table_mut(&table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+            let engine = table.def().engine;
+            let col_names: Vec<String> = table.def().columns.iter().map(|c| c.name.clone()).collect();
+            let col_indices: Vec<usize> = (0..col_names.len()).collect();
+            let chunks = table.scan_to_chunks(&col_indices, None)?;
+            let stats = TableStatistics::from_chunks(&table_name, engine, &col_names, &chunks, true);
+            drop(table);
+            db.statistics_cache_mut().insert(table_name.clone(), stats);
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
                 rows: vec![vec![crate::Value::Varchar(format!("ANALYZE {} ok", table_name))]],

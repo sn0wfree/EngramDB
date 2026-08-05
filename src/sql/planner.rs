@@ -36,14 +36,29 @@ pub fn plan(stmt: Statement, db: &Database) -> Result<PhysicalPlan> {
         Statement::CreateMaterializedView(s) => plan_create_mv(s, db),
         Statement::RefreshMaterializedView(s) => plan_refresh_mv(s),
         Statement::DropMaterializedView(s) => plan_drop_mv(s),
-        Statement::AlterTable(s) => plan_alter_table(s),
+        Statement::AlterTable(s) => plan_alter_table(s, db),
         Statement::Pragma(s) => plan_pragma(s),
         Statement::Explain(s) => plan_explain(s, db),
         Statement::TruncateTable { table_name } => Ok(PhysicalPlan::TruncateTable { table_name }),
     }
 }
 
-fn plan_alter_table(stmt: AlterTableStmt) -> Result<PhysicalPlan> {
+/// M5：引擎能力校验（planner 提前拦截，执行期不再深挖报错）
+fn ensure_engine_capability(
+    db: &Database,
+    table_name: &str,
+    capability: &str,
+    supported: impl Fn(&crate::storage::capabilities::EngineCapabilities) -> bool,
+) -> Result<()> {
+    let Some(table) = db.get_engine_table(table_name) else {
+        return Ok(()); // 表不存在由上层抛 TableNotFound
+    };
+    let caps = crate::storage::capabilities::EngineCapabilities::for_engine(table.def().engine);
+    caps.ensure(capability, supported(&caps), table_name)
+}
+
+fn plan_alter_table(stmt: AlterTableStmt, db: &Database) -> Result<PhysicalPlan> {
+    ensure_engine_capability(db, &stmt.table_name, "ALTER TABLE", |c| c.supports_alter)?;
     Ok(PhysicalPlan::AlterTable(stmt))
 }
 
@@ -383,6 +398,8 @@ fn infer_columns_from_select(
 
 /// 规划 CREATE INDEX（v0.12.0 新增，覆盖索引）
 fn plan_create_index(stmt: CreateIndexStmt, db: &Database) -> Result<PhysicalPlan> {
+    // M5：非 Columnar 引擎不支持索引（提前清晰报错）
+    ensure_engine_capability(db, &stmt.table_name, "索引", |c| c.supports_index)?;
     // 验证表存在
     let table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
@@ -458,6 +475,8 @@ fn plan_vector_search(args: &[Expression], db: &Database) -> Result<PhysicalPlan
         _ => return Err(EngramDbError::Parse("vector_search: k must be an integer literal".into())),
     };
 
+    // M5：非 Columnar 引擎不支持向量搜索（提前清晰报错）
+    ensure_engine_capability(db, &table_name, "向量索引", |c| c.supports_vector_index)?;
     // 验证表存在
     db.get_engine_table(&table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
@@ -472,6 +491,8 @@ fn plan_vector_search(args: &[Expression], db: &Database) -> Result<PhysicalPlan
 
 /// 规划 DELETE 语句（v0.12.0 新增）
 fn plan_delete(stmt: DeleteStmt, db: &Database) -> Result<PhysicalPlan> {
+    // M5：Log 引擎不支持 DELETE（planner 提前拦截）
+    ensure_engine_capability(db, &stmt.table_name, "DELETE", |c| c.supports_delete)?;
     // 验证表存在
     let _table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
@@ -484,6 +505,8 @@ fn plan_delete(stmt: DeleteStmt, db: &Database) -> Result<PhysicalPlan> {
 
 /// 规划 UPDATE 语句（v0.12.0 新增）
 fn plan_update(stmt: UpdateStmt, db: &Database) -> Result<PhysicalPlan> {
+    // M5：Log 引擎不支持 UPDATE（planner 提前拦截）
+    ensure_engine_capability(db, &stmt.table_name, "UPDATE", |c| c.supports_update)?;
     // 验证表存在
     let table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;

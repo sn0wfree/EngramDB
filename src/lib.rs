@@ -138,7 +138,8 @@ impl Connection {
             | PhysicalPlan::Limit { .. }
         );
         if needs_optimize {
-            let optimized = sql::optimizer::optimize(plan)?;
+            let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+            let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
             executor::execute(optimized, &mut self.db)
         } else {
             executor::execute(plan, &mut self.db)
@@ -149,7 +150,8 @@ impl Connection {
     pub fn explain(&mut self, sql: &str) -> Result<String> {
         let ast = sql::parser::parse(sql)?;
         let plan = sql::planner::plan(ast, &self.db)?;
-        let optimized = sql::optimizer::optimize(plan.clone())?;
+        let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+        let optimized = sql::optimizer::optimize_with_stats(plan.clone(), &stats)?;
         Ok(format!(
             "原始计划:\n{:#?}\n\n优化后:\n{:#?}",
             plan, optimized
@@ -182,7 +184,8 @@ impl Connection {
             | PhysicalPlan::Limit { .. }
         );
         if needs_optimize {
-            let optimized = sql::optimizer::optimize(plan)?;
+            let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+            let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
             executor::execute(optimized, &mut self.db)
         } else {
             executor::execute(plan, &mut self.db)
@@ -3304,6 +3307,7 @@ mod multi_engine_tests {
     include!("log_engine_tests.rs");
     include!("bloom_tests.rs");
     include!("m4_tests.rs");
+    include!("p5_tests.rs");
 
 
     #[test]

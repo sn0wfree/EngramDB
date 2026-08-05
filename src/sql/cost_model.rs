@@ -165,12 +165,19 @@ impl<'a> CostModel<'a> {
         let row_count = stats.map(|s| s.row_count as f64).unwrap_or(1000.0);
         let num_cols = column_indices.len().max(1);
 
+        // M5：引擎扫描代价权重（Memory 内存扫描 / Log 块级跳读便宜，
+        // 无统计信息时默认 1.0）
+        let engine_weight = stats
+            .map(|s| crate::storage::capabilities::EngineCapabilities::for_engine(s.engine).scan_cost_weight)
+            .unwrap_or(1.0);
+
         // 估算每行大小（简化：每列 16 字节 + 一些开销）
         let row_size = num_cols * 16;
 
-        // 顺序扫描代价：行数 × 每行成本
-        let total = row_count * COST_SEQUENTIAL_PAGE * 0.1 // 每页多行，这里简化
-            + row_count * num_cols as f64 * COST_CPU_OP;
+        // 顺序扫描代价：行数 × 每行成本 × 引擎权重
+        let total = (row_count * COST_SEQUENTIAL_PAGE * 0.1 // 每页多行，这里简化
+            + row_count * num_cols as f64 * COST_CPU_OP)
+            * engine_weight;
 
         (
             PlanProperties { row_count, num_columns: num_cols, row_size },

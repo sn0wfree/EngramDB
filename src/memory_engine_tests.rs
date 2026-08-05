@@ -95,7 +95,8 @@ fn test_memory_engine_capability_errors() {
     let mut conn = super::Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT) ENGINE = Memory").unwrap();
     let err = conn.execute("CREATE INDEX idx_v ON t (v)").unwrap_err();
-    assert!(err.to_string().contains("Table not found"), "got: {err}");
+    // M5：planner 提前清晰报错（原为执行期 "Table not found"）
+    assert!(err.to_string().contains("不支持"), "got: {err}");
 }
 
 #[test]

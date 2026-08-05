@@ -83,10 +83,11 @@ fn test_log_engine_no_update_delete() {
     let mut conn = super::Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    // M5：planner 提前拦截（信息含引擎名与操作）
     let err = conn.execute("UPDATE t SET v = 'b' WHERE ts = 1").unwrap_err();
-    assert!(err.to_string().contains("LogEngine"), "got: {err}");
+    assert!(err.to_string().contains("不支持 UPDATE"), "got: {err}");
     let err = conn.execute("DELETE FROM t WHERE ts = 1").unwrap_err();
-    assert!(err.to_string().contains("LogEngine"), "got: {err}");
+    assert!(err.to_string().contains("不支持 DELETE"), "got: {err}");
     // UPSERT 同样拒绝
     let err = conn.execute(
         "INSERT INTO t VALUES (1, 'b') ON CONFLICT (ts) DO UPDATE SET v = 'b'",

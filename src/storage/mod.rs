@@ -14,6 +14,7 @@ pub mod index;
 pub mod catalog;
 pub mod engine;
 pub mod bloom;
+pub mod capabilities;
 mod log_engine;
 mod memory_engine;
 
@@ -41,6 +42,8 @@ pub struct Database {
     txn_manager: TransactionManager,
     /// 查询计划缓存（Perf02 Prepared Statement）
     plan_cache: std::collections::HashMap<String, (crate::executor::physical_plan::PhysicalPlan, Vec<String>)>,
+    /// 统计信息缓存（M5）：ANALYZE 收集，JOIN 代价模型消费
+    statistics_cache: std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
     /// KV 缓存引擎（v0.15.0 新增）
     pub kv_cache: crate::storage::cache::KVCache,
     /// 当前活跃事务 ID（v0.15.0 Txn05 新增）
@@ -116,6 +119,7 @@ impl Database {
             file,
             txn_manager,
             plan_cache: std::collections::HashMap::new(),
+            statistics_cache: std::collections::HashMap::new(),
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024), // 默认 64MB
             current_txn_id: None,
         })
@@ -149,6 +153,7 @@ impl Database {
             file,
             txn_manager,
             plan_cache: std::collections::HashMap::new(),
+            statistics_cache: std::collections::HashMap::new(),
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024),
             current_txn_id: None,
         };
@@ -535,6 +540,15 @@ impl Database {
     /// 设置查询计划缓存（Perf02）
     pub fn set_plan_cache(&mut self, sql: &str, plan: crate::executor::physical_plan::PhysicalPlan, columns: Vec<String>) {
         self.plan_cache.insert(sql.to_string(), (plan, columns));
+    }
+
+    /// 统计信息缓存（M5）：ANALYZE 结果，JOIN 代价模型消费
+    pub fn statistics_cache(&self) -> &std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
+        &self.statistics_cache
+    }
+
+    pub fn statistics_cache_mut(&mut self) -> &mut std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
+        &mut self.statistics_cache
     }
 
     /// 清空查询计划缓存
