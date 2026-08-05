@@ -41,8 +41,10 @@ pub struct Database {
     file: std::fs::File,
     /// 事务管理器
     txn_manager: TransactionManager,
-    /// 查询计划缓存（Perf02 Prepared Statement）
-    plan_cache: std::collections::HashMap<String, (crate::executor::physical_plan::PhysicalPlan, Vec<String>)>,
+    /// 查询计划缓存（Perf02 / v0.18 P0-1）
+    ///
+    /// 值 = (计划, batcher_clean)：命中路径跳过 parse，仍需按攒批语义冲刷
+    plan_cache: std::collections::HashMap<String, (crate::executor::physical_plan::PhysicalPlan, bool)>,
     /// 统计信息缓存（M5）：ANALYZE 收集，JOIN 代价模型消费
     statistics_cache: std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
     /// KV 缓存引擎（v0.15.0 新增）
@@ -566,15 +568,37 @@ impl Database {
         Ok(())
     }
 
-    /// 获取缓存的查询计划（Perf02）
-    pub fn get_plan_cache(&self, sql: &str) -> Option<&(crate::executor::physical_plan::PhysicalPlan, Vec<String>)> {
+    /// 获取缓存的查询计划（Perf02 / v0.18 P0-1 计划缓存接线）
+    pub fn get_plan_cache(
+        &self,
+        sql: &str,
+    ) -> Option<&(crate::executor::physical_plan::PhysicalPlan, bool)> {
         self.plan_cache.get(sql)
     }
 
-    /// 设置查询计划缓存（Perf02）
-    pub fn set_plan_cache(&mut self, sql: &str, plan: crate::executor::physical_plan::PhysicalPlan, columns: Vec<String>) {
-        self.plan_cache.insert(sql.to_string(), (plan, columns));
+    /// 设置查询计划缓存（v0.18 P0-1）
+    ///
+    /// 键 = SQL 原文（无参数语句：相同 SQL = 相同计划）。
+    /// 容量上限：PLAN_CACHE_MAX，满则整体清空（日志场景 SQL 种类少）。
+    pub fn set_plan_cache(
+        &mut self,
+        sql: &str,
+        plan: crate::executor::physical_plan::PhysicalPlan,
+        batcher_clean: bool,
+    ) {
+        if self.plan_cache.len() >= Self::PLAN_CACHE_MAX {
+            self.plan_cache.clear();
+        }
+        self.plan_cache.insert(sql.to_string(), (plan, batcher_clean));
     }
+
+    /// 清空计划缓存（DDL / ANALYZE 后调用：结构或统计变更使缓存计划过期）
+    pub fn clear_plan_cache(&mut self) {
+        self.plan_cache.clear();
+    }
+
+    /// 计划缓存容量上限（超限整体清空）
+    pub const PLAN_CACHE_MAX: usize = 256;
 
     /// 统计信息缓存（M5）：ANALYZE 结果，JOIN 代价模型消费
     pub fn statistics_cache(&self) -> &std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
@@ -583,11 +607,6 @@ impl Database {
 
     pub fn statistics_cache_mut(&mut self) -> &mut std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
         &mut self.statistics_cache
-    }
-
-    /// 清空查询计划缓存
-    pub fn clear_plan_cache(&mut self) {
-        self.plan_cache.clear();
     }
 
     /// 保存所有索引到文件（v0.12.0 索引持久化）

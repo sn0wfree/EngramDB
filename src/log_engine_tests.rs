@@ -263,3 +263,60 @@ fn test_log_block_rows_configurable() {
     let _ = std::fs::remove_file(format!("{}-wal", db_path));
 
 }
+
+// ---------------------------------------------------------------------------
+// v0.18 P0-1 计划缓存测试
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_plan_cache_same_sql() {
+    // 同 SQL 重复执行：缓存命中，结果正确
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    for i in 0..5 {
+        let r = conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        assert_eq!(r.rows_affected, 1);
+    }
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(5));
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_plan_cache_invalidated_on_ddl() {
+    // DDL 后缓存失效：同 SQL 重新规划（表结构已变）
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (id INT64, v TEXT)").unwrap();
+    // 缓存 INSERT + SELECT 计划
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    // CREATE INDEX（DDL）→ 缓存清空；同 INSERT 语句走新计划仍正确
+    conn.execute("CREATE INDEX idx_t_v ON t (v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(3));
+    // TRUNCATE 后计数正确（SELECT 计划缓存失效）
+    conn.execute("TRUNCATE TABLE t").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(1));
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_plan_cache_countstar_not_cached() {
+    // CountStar（行数快照）不缓存：插入后 COUNT 返回实时值
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (id INT64, v TEXT)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(1));
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(2), "CountStar 快照不得被缓存");
+    conn.close().unwrap();
+}

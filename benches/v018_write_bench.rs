@@ -34,6 +34,7 @@ fn new_cfg() -> Config {
 
 fn main() {
     println!("=== v0.18 LogEngine 写入优化基准 ===");
+    main_plan_cache();
 
     // ---- 1. 批量落盘（import_columns 列式直写）----
     {
@@ -107,4 +108,80 @@ fn main() {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path));
     }
+}
+
+// v0.18 P0-1 计划缓存基准：同 SQL 重复场景 parse+plan 占比实测
+// 对比组（均走 Batcher，仅差 parse+plan）：
+//  - 变值 SQL（缓存必然 miss）
+//  - 同值 SQL（execute 缓存命中）
+//  - 参数化 prepared（PreparedStatement 省 parse，但每次重跑 plan）
+fn main_plan_cache() {
+    println!("=== v0.18 P0-1 计划缓存基准（同 SQL 重复 20 万次）===");
+    let n = 200_000usize;
+    let mut miss_times = Vec::new();
+    let mut hit_times = Vec::new();
+    let mut prep_times = Vec::new();
+    for _ in 0..ITERS {
+        // 变值 SQL：缓存 miss
+        {
+            let path = format!("/tmp/v018_pc_miss_{}.hdb", std::process::id());
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path));
+            let mut conn = Connection::open_with_config(&path, new_cfg()).unwrap();
+            conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+            let t0 = Instant::now();
+            for i in 0..n {
+                conn.execute(&format!("INSERT INTO t VALUES ({}, 'e{}')", i, i)).unwrap();
+            }
+            conn.sync_wal().unwrap();
+            miss_times.push(t0.elapsed());
+            println!("  变值 SQL（缓存 miss）: {}", fmt_rate(t0.elapsed(), n));
+            conn.close().unwrap();
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path));
+        }
+        // 同值 SQL：execute 缓存命中
+        {
+            let path = format!("/tmp/v018_pc_hit_{}.hdb", std::process::id());
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path));
+            let mut conn = Connection::open_with_config(&path, new_cfg()).unwrap();
+            conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+            let t0 = Instant::now();
+            for _ in 0..n {
+                conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+            }
+            conn.sync_wal().unwrap();
+            hit_times.push(t0.elapsed());
+            println!("  同值 SQL（缓存命中）: {}", fmt_rate(t0.elapsed(), n));
+            conn.close().unwrap();
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path));
+        }
+        // 参数化 prepared：省 parse，每次重跑 plan
+        {
+            let path = format!("/tmp/v018_pc_prep_{}.hdb", std::process::id());
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path));
+            let mut conn = Connection::open_with_config(&path, new_cfg()).unwrap();
+            conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+            let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+            let t0 = Instant::now();
+            for i in 0..n {
+                conn.execute_prepared(&stmt, &[Value::Int64(i as i64), Value::Varchar(format!("e{}", i))]).unwrap();
+            }
+            conn.sync_wal().unwrap();
+            prep_times.push(t0.elapsed());
+            println!("  参数化 prepared（重跑 plan）: {}", fmt_rate(t0.elapsed(), n));
+            conn.close().unwrap();
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path));
+        }
+    }
+    let miss = median(miss_times);
+    let hit = median(hit_times);
+    let prep = median(prep_times);
+    println!("  [中位数] miss {} / hit {} / prepared {}", fmt_rate(miss, n), fmt_rate(hit, n), fmt_rate(prep, n));
+    println!("  缓存收益: {:.1}x（同 SQL 场景）", miss.as_secs_f64() / hit.as_secs_f64());
+    println!("  prepared 重跑 plan 成本: {:.1}% 相对 miss 全解析", (prep.as_secs_f64() / miss.as_secs_f64()) * 100.0);
 }

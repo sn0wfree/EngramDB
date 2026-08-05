@@ -67,6 +67,10 @@
 //! # Ok::<(), engramdb::common::error::EngramDbError>(())
 //! ```
 
+// v0.18 实验：jemalloc 全局分配器（bench 验证无收益则回退）
+#[global_allocator]
+static GLOBAL_ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 pub mod common;
 pub mod storage;
 pub mod wal;
@@ -133,33 +137,64 @@ impl Connection {
 
     /// 执行 SQL 语句
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
-        use executor::physical_plan::PhysicalPlan;
-        let ast = sql::parser::parse(sql)?;
-        // P0-2：非裸 INSERT 语句前置冲刷攒批
-        let batcher_clean = matches!(&ast, crate::sql::ast::Statement::Insert(stmt)
-            if stmt.on_conflict.is_none() && stmt.returning.is_none() && stmt.select.is_none());
-        if !batcher_clean {
-            self.flush_batches()?;
-        }
-        let plan = sql::planner::plan(ast, &self.db)?;
-        // INSERT / CREATE TABLE 等 DDL/DML 语句不需要查询优化，直接执行
-        // 避免对包含大量数据的计划做无谓的 clone 和优化规则遍历
-        let needs_optimize = matches!(plan,
-            PhysicalPlan::TableScan { .. }
-            | PhysicalPlan::Filter { .. }
-            | PhysicalPlan::Projection { .. }
-            | PhysicalPlan::HashJoin { .. }
-            | PhysicalPlan::Aggregate { .. }
-            | PhysicalPlan::Limit { .. }
-        );
-        if needs_optimize {
-            let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
-            let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
-            executor::execute(optimized, &mut self.db)
-        } else {
-            executor::execute(plan, &mut self.db)
-        }
-    }
+         use executor::physical_plan::PhysicalPlan;
+         // v0.18 P0-1 计划缓存：命中跳过 parse/plan/optimize（同 SQL 重复场景）
+         if let Some((cached, clean)) = self.db.get_plan_cache(sql).cloned() {
+             // 命中路径同样遵守攒批冲刷语义（非裸 INSERT 语句先 flush）
+             if !clean {
+                 self.flush_batches()?;
+             }
+             return executor::execute(cached, &mut self.db);
+         }
+         let ast = sql::parser::parse(sql)?;
+         // P0-2：非裸 INSERT 语句前置冲刷攒批
+         let batcher_clean = matches!(&ast, crate::sql::ast::Statement::Insert(stmt)
+             if stmt.on_conflict.is_none() && stmt.returning.is_none() && stmt.select.is_none());
+         if !batcher_clean {
+             self.flush_batches()?;
+         }
+         // 结构性 DDL / ANALYZE：不缓存，执行后清空缓存（计划依赖表结构与统计）
+         let is_ddl = matches!(&ast,
+             crate::sql::ast::Statement::CreateTable(_)
+             | crate::sql::ast::Statement::CreateIndex(_)
+             | crate::sql::ast::Statement::AlterTable(_)
+             | crate::sql::ast::Statement::TruncateTable { .. }
+             | crate::sql::ast::Statement::Analyze(_)
+             | crate::sql::ast::Statement::CreateMaterializedView(_)
+             | crate::sql::ast::Statement::DropMaterializedView(_)
+             | crate::sql::ast::Statement::RefreshMaterializedView(_));
+         let plan = sql::planner::plan(ast, &self.db)?;
+         // CountStar 是行数快照（Perf01 元数据短路），缓存即过期 → 不缓存
+         let cacheable = !matches!(plan, PhysicalPlan::CountStar { .. });
+         // INSERT / CREATE TABLE 等 DDL/DML 语句不需要查询优化，直接执行
+         // 避免对包含大量数据的计划做无谓的 clone 和优化规则遍历
+         let needs_optimize = matches!(plan,
+             PhysicalPlan::TableScan { .. }
+             | PhysicalPlan::Filter { .. }
+             | PhysicalPlan::Projection { .. }
+             | PhysicalPlan::HashJoin { .. }
+             | PhysicalPlan::Aggregate { .. }
+             | PhysicalPlan::Limit { .. }
+         );
+         let result = if needs_optimize {
+             let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+             let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
+             // 缓存最终（优化后）计划
+             if !is_ddl && cacheable {
+                 self.db.set_plan_cache(sql, optimized.clone(), batcher_clean);
+             }
+             executor::execute(optimized, &mut self.db)
+         } else {
+             if !is_ddl && cacheable {
+                 self.db.set_plan_cache(sql, plan.clone(), batcher_clean);
+             }
+             executor::execute(plan, &mut self.db)
+         }?;
+         if is_ddl {
+             self.db.clear_plan_cache();
+         }
+         Ok(result)
+     }
 
     /// 解释 SQL 执行计划（用于调试和验证优化器）
     pub fn explain(&mut self, sql: &str) -> Result<String> {

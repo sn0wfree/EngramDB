@@ -43,6 +43,9 @@ chrono = "0.4"
 log = "0.4"
 env_logger = "0.11"
 
+# v0.18 实验：jemalloc 全局分配器（小对象分配优势；bench 验证无收益则回退）
+jemallocator = "0.5"
+
 # 哈希
 fxhash = "0.2"
 
@@ -153,7 +156,8 @@ codegen-units = 256
 [profile.release]
 opt-level = 3
 debug = false
-codegen-units = 256
+codegen-units = 16
+lto = "thin"
 
 
 [[bench]]
