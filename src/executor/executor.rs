@@ -9,10 +9,256 @@ use crate::QueryResult;
 use crate::Value;
 
 use super::physical_plan::{PhysicalPlan, JoinType, SetUnionOp};
-use super::vector::DataChunk;
+use super::vector::{DataChunk, Vector};
 use super::operators;
 use crate::sql::ast::Expression;
 use fxhash::FxHashSet;
+
+/// 只读子计划的列式执行：返回 (列名, chunks)，全程保持 Typed 列式，不物化行。
+///
+/// M1-3：跳过「行→列→行」双重转置。表扫描直接产出 Typed chunks，
+/// 过滤/投影/排序/聚合在列式管道内完成，最终结果只物化一次。
+/// 不支持的节点返回 Ok(None)，调用方回退行式路径（行为与改造前一致）。
+fn try_execute_chunks(
+    plan: &PhysicalPlan,
+    db: &mut Database,
+) -> Result<Option<(Vec<String>, Vec<DataChunk>)>> {
+    use crate::common::column_data::ColumnData;
+    use crate::executor::vector::VECTOR_SIZE;
+
+    match plan {
+        PhysicalPlan::TableScan { table_name, column_indices } => {
+            let table = db
+                .get_table_mut(table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+            let columns: Vec<String> = column_indices
+                .iter()
+                .map(|&i| table.def.columns[i].name.clone())
+                .collect();
+            let chunks = table.scan_to_chunks(column_indices)?;
+            Ok(Some((columns, chunks)))
+        }
+        PhysicalPlan::Projection {
+            input,
+            expressions,
+            column_names,
+        } => {
+            // 仅支持纯列引用投影（列子集 / 重排），其余表达式回退行式路径
+            if !expressions
+                .iter()
+                .all(|e| matches!(e, Expression::ColumnRef { .. }))
+            {
+                return Ok(None);
+            }
+            let (cols, chunks) = match try_execute_chunks(input, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            // 表达式列名 → 输入列位置（兼容 "t.col" 前缀形式）
+            let mut indices = Vec::with_capacity(expressions.len());
+            for e in expressions {
+                let Expression::ColumnRef { table, column } = e else {
+                    return Ok(None);
+                };
+                let prefixed = table
+                    .as_ref()
+                    .map(|t| format!("{}.{}", t, column))
+                    .unwrap_or_default();
+                let pos = cols
+                    .iter()
+                    .position(|c| c == column || c == &prefixed)
+                    .ok_or_else(|| {
+                        EngramDbError::Parse(format!("unknown column: {}", column))
+                    })?;
+                indices.push(pos);
+            }
+            let out_chunks = chunks
+                .iter()
+                .map(|ch| {
+                    let columns: Vec<Vector> =
+                        indices.iter().map(|&i| ch.columns[i].clone()).collect();
+                    DataChunk {
+                        columns,
+                        count: ch.count,
+                    }
+                })
+                .collect();
+            Ok(Some((column_names.clone(), out_chunks)))
+        }
+        PhysicalPlan::Filter { input, condition } => {
+            // PREWHERE（M1-6）：TableScan + 简单谓词 → 列式跳读扫描
+            // （row group MinMax 跳过 + batch 内 Typed 谓词直扫，只物化幸存行）
+            if let PhysicalPlan::TableScan { table_name, column_indices } = input.as_ref() {
+                if let Some((pred_col, pred_op, pred_val)) = extract_skip_predicate(condition) {
+                    let (names, chunks, filtered) = {
+                        let table = db
+                            .get_table_mut(table_name)
+                            .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+                        let names: Vec<String> = column_indices
+                            .iter()
+                            .map(|&i| table.def.columns[i].name.clone())
+                            .collect();
+                        let pred_col_idx = table.def.column_index(&pred_col);
+                        // 谓词列是否在输出列：在 → 扫描已精确筛选；不在 → 需 filter 兜底
+                        let pred_pos = pred_col_idx
+                            .and_then(|ci| column_indices.iter().position(|&c| c == ci));
+                        let skip = pred_col_idx.map(|ci| (ci, pred_op, pred_val.clone()));
+                        let chunks = table.scan_to_chunks_with_skip(column_indices, skip)?;
+                        (names, chunks, pred_pos.is_some())
+                    };
+                    if filtered {
+                        return Ok(Some((names, chunks)));
+                    }
+                    // 谓词列不在输出列：扫描只做 row group 级粗裁，需精确过滤
+                    let filtered_chunks = operators::filter::execute(&chunks, condition, &names)?;
+                    return Ok(Some((names, filtered_chunks)));
+                }
+            }
+            // 通用路径：列式向量化过滤
+            let (cols, chunks) = match try_execute_chunks(input, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let filtered = operators::filter::execute(&chunks, condition, &cols)?;
+            Ok(Some((cols, filtered)))
+        }
+        PhysicalPlan::Sort {
+            input,
+            sort_keys,
+            limit,
+        } => {
+            let (cols, chunks) = match try_execute_chunks(input, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let sorted = operators::sort::execute(&chunks, sort_keys, *limit)?;
+            Ok(Some((cols, sorted)))
+        }
+        PhysicalPlan::Limit { input, limit } => {
+            let (cols, chunks) = match try_execute_chunks(input, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let mut remaining = *limit;
+            let mut out = Vec::new();
+            for ch in chunks {
+                if remaining == 0 {
+                    break;
+                }
+                let take = ch.count.min(remaining);
+                let columns: Vec<Vector> = ch
+                    .columns
+                    .iter()
+                    .map(|c| match c {
+                        Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
+                        Vector::Typed(d) => {
+                            let mut d = d.clone();
+                            Vector::Typed(d.take_front(take))
+                        }
+                        Vector::Flat(rows) => {
+                            Vector::Flat(rows.iter().take(take).cloned().collect())
+                        }
+                    })
+                    .collect();
+                out.push(DataChunk {
+                    columns,
+                    count: take,
+                });
+                remaining -= take;
+            }
+            Ok(Some((cols, out)))
+        }
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            let (cols, chunks) = match try_execute_chunks(input, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let agg_funcs: Vec<_> = aggregates
+                .iter()
+                .map(|a| (a.func, a.input, a.distinct))
+                .collect();
+            let result = if group_by.is_empty() {
+                operators::aggregate::execute(&chunks, &agg_funcs)?
+            } else {
+                operators::aggregate::execute_grouped(&chunks, group_by, &agg_funcs)?
+                
+            };
+            let mut columns: Vec<String> = group_by
+                .iter()
+                .map(|&i| {
+                    if i < cols.len() {
+                        cols[i].clone()
+                    } else {
+                        format!("group_{}", i)
+                    }
+                })
+                .collect();
+            let agg_names: Vec<String> = aggregates
+                .iter()
+                .map(|a| format!("{:?}({})", a.func, a.input))
+                .collect();
+            columns.extend(agg_names);
+            Ok(Some((columns, result)))
+        }
+        PhysicalPlan::CountStar { output_name, count } => {
+            let chunk = DataChunk {
+                columns: vec![Vector::Constant(Value::Int64(*count), 1)],
+                count: 1,
+            };
+            Ok(Some((vec![output_name.clone()], vec![chunk])))
+        }
+        PhysicalPlan::SetUnion { op, left, right } => {
+            if matches!(op, SetUnionOp::Union) {
+                // UNION 去重需要行比较，回退行式路径
+                return Ok(None);
+            }
+            let (lcols, mut chunks) = match try_execute_chunks(left, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let (rcols, rchunks) = match try_execute_chunks(right, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            if lcols.len() != rcols.len() {
+                return Err(EngramDbError::Parse(format!(
+                    "UNION columns mismatch: {:?} vs {:?}",
+                    lcols, rcols
+                )));
+            }
+            chunks.extend(rchunks);
+            Ok(Some((lcols, chunks)))
+        }
+        PhysicalPlan::SubqueryScan { plan } => try_execute_chunks(plan, db),
+        _ => Ok(None),
+    }
+}
+
+/// 截断 DataChunk 到前 n 行
+#[allow(dead_code)]
+fn truncate_chunk(chunk: &DataChunk, n: usize) -> DataChunk {
+    let n = n.min(chunk.count);
+    let columns: Vec<Vector> = chunk
+        .columns
+        .iter()
+        .map(|c| match c {
+            Vector::Constant(v, _) => Vector::Constant(v.clone(), n),
+            Vector::Typed(d) => {
+                let mut d = d.clone();
+                Vector::Typed(d.take_front(n))
+            }
+            Vector::Flat(rows) => Vector::Flat(rows.iter().take(n).cloned().collect()),
+        })
+        .collect();
+    DataChunk {
+        columns,
+        count: n,
+    }
+}
 
 /// 执行物理计划
 pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
@@ -547,6 +793,38 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::Aggregate { input, group_by, aggregates } => {
+            // M1-3：列式路径（子计划列式执行 + 聚合），失败回退行式
+            if let Some((sub_cols, chunks)) = try_execute_chunks(&input, db)? {
+                let agg_funcs: Vec<_> = aggregates.iter()
+                    .map(|a| (a.func, a.input, a.distinct))
+                    .collect();
+
+                let result = if group_by.is_empty() {
+                    operators::aggregate::execute(&chunks, &agg_funcs)?
+                } else {
+                    operators::aggregate::execute_grouped(&chunks, &group_by, &agg_funcs)?
+                };
+                // 列名：分组列 + 聚合列
+                let mut columns: Vec<String> = group_by.iter()
+                    .map(|&i| {
+                        if i < sub_cols.len() {
+                            sub_cols[i].clone()
+                        } else {
+                            format!("group_{}", i)
+                        }
+                    })
+                    .collect();
+                let agg_names: Vec<String> = aggregates.iter()
+                    .map(|a| format!("{:?}({})", a.func, a.input))
+                    .collect();
+                columns.extend(agg_names);
+                let rows = chunks_to_rows(&result);
+                return Ok(QueryResult {
+                    columns,
+                    rows,
+                    rows_affected: 0,
+                });
+            }
             let input_result = execute(*input, db)?;
             let input_chunks = rows_to_chunks(&input_result.rows);
 
@@ -588,6 +866,16 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::Sort { input, sort_keys, limit } => {
+            // M1-3：列式路径（跳过行→列→行双重转置），失败回退行式
+            if let Some((columns, chunks)) = try_execute_chunks(&input, db)? {
+                let sorted = operators::sort::execute(&chunks, &sort_keys, limit)?;
+                let rows = chunks_to_rows(&sorted);
+                return Ok(QueryResult {
+                    columns,
+                    rows,
+                    rows_affected: 0,
+                });
+            }
             let input_result = execute(*input, db)?;
             let input_chunks = rows_to_chunks(&input_result.rows);
 

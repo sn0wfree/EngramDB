@@ -9,7 +9,7 @@ use crate::common::column_data::ColumnData;
 use crate::Value;
 use crate::executor::vector::{DataChunk, Vector};
 
-use super::column_store::{ColumnStore, PredicateOp};
+use super::column_store::{matches_predicate, matches_predicate_typed, ColumnStore, PredicateOp};
 use super::delta_store::DeltaStore;
 use super::index::inverted_index::InvertedIndex;
 use super::index::skiplist::SkipListIndex;
@@ -111,6 +111,20 @@ pub struct Table {
 }
 
 impl Table {
+    /// 估算比较谓词可跳过的 row group 数（Zone Map，M1-6）
+    ///
+    /// 列存 row group 用 chunk min/max 判断可跳过；Delta 层全读（不可跳过，计 1 组）。
+    pub fn estimate_skip_for(
+        &self,
+        col_idx: usize,
+        op: PredicateOp,
+        val: &Value,
+    ) -> (usize, usize) {
+        let (total, skipped) = self.column_store.estimate_skip(col_idx, op, val);
+        let delta_total = if self.delta_store.len() > 0 { 1 } else { 0 };
+        (total + delta_total, skipped)
+    }
+
     pub fn new(def: TableDef, strategy: CompactStrategy) -> Self {
         let row_group_size = match strategy {
             CompactStrategy::Adaptive { max_threshold, .. } => max_threshold as u32,
@@ -1625,15 +1639,54 @@ impl Table {
 
             let row_count = col_owned[0].len();
 
+            // PREWHERE：谓词列在输出列时，batch 内用 Typed 谓词直扫筛幸存行
+            // （零 Value 构造，只物化幸存行——1% 选择性只输出 1% 行）
+            let pred_pos: Option<usize> = skip_pred
+                .as_ref()
+                .and_then(|(ci, _, _)| column_indices.iter().position(|&c| c == *ci));
+
+
             // 2. 按 batch_size 分块，逐 chunk 构造
             // S2-M2：take_front 移出类型化子列 → Vector::Typed（零 Value 转换）
             let mut batch_start = 0;
             while batch_start < row_count {
                 let batch_len = BATCH_SIZE.min(row_count - batch_start);
 
+                // PREWHERE 筛选（TTL 场景不做：相对行号语义冲突，走原路径）
+                let survivors: Option<Vec<usize>> = if full_row_for_ttl {
+                    None
+                } else {
+                    match (pred_pos, &skip_pred) {
+                        (Some(pos), Some((_, op, val))) => Some(
+                            (0..batch_len)
+                                .filter(|&j| {
+                                    matches_predicate_typed(&col_owned[pos], j, *op, val)
+                                })
+                                .collect(),
+                        ),
+                        _ => None,
+                    }
+                };
+
                 let mut columns: Vec<Vector> = Vec::with_capacity(col_owned.len());
-                for col in &mut col_owned {
-                    columns.push(Vector::Typed(col.take_front(batch_len)));
+                if let Some(sel) = &survivors {
+                    if sel.is_empty() {
+                        // 本 batch 全过滤：消费列后跳过
+                        for col in &mut col_owned {
+                            col.take_front(batch_len);
+                        }
+                        batch_start += batch_len;
+                        continue;
+                    }
+                    // 先 take_front 取本 batch，再按相对索引 gather 幸存行
+                    for col in &mut col_owned {
+                        let batch_col = col.take_front(batch_len);
+                        columns.push(Vector::Typed(batch_col.gather(sel)));
+                    }
+                } else {
+                    for col in &mut col_owned {
+                        columns.push(Vector::Typed(col.take_front(batch_len)));
+                    }
                 }
 
                 // TTL 过滤：每行检查是否过期
@@ -1662,8 +1715,9 @@ impl Table {
                     }
                 }
 
+                let out_count = survivors.as_ref().map_or(batch_len, |sel| sel.len());
                 chunks.push(DataChunk {
-                    count: batch_len,
+                    count: out_count,
                     columns,
                 });
                 batch_start += batch_len;
@@ -1674,6 +1728,12 @@ impl Table {
         for (_, row) in self.delta_store.all_rows() {
             if self.def.is_expired(&row) {
                 continue;
+            }
+            // PREWHERE：Delta 行级筛选（匹配 scan 层语义）
+            if let Some((ci, op, val)) = &skip_pred {
+                if row.get(*ci).map_or(true, |cell| !matches_predicate(cell, *op, val)) {
+                    continue;
+                }
             }
             let mut columns: Vec<Vector> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {

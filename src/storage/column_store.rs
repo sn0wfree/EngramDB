@@ -21,6 +21,23 @@ pub enum PredicateOp {
     GtEq,
 }
 
+/// 比较两个 Value（数值含 Timestamp 按数值语义，Varchar 字典序，Boolean 布尔序）
+fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return Some(x.cmp(&y));
+    }
+    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
+        return x.partial_cmp(&y);
+    }
+    if let (Value::Varchar(x), Value::Varchar(y)) = (a, b) {
+        return Some(x.cmp(y));
+    }
+    if let (Value::Boolean(x), Value::Boolean(y)) = (a, b) {
+        return Some(x.cmp(y));
+    }
+    None
+}
+
 /// 列存表
 pub struct ColumnStore {
     table_def: TableDef,
@@ -57,6 +74,38 @@ pub struct ColumnChunk {
 }
 
 impl ColumnStore {
+    /// 估算比较谓词可跳过的 row group 数：(total, skipped)
+    ///
+    /// Zone Map（M1-6）：利用每 chunk 的 min/max（写入时自动维护）
+    /// 判断谓词是否与 chunk 范围无交集，无交集则整块跳过。
+    pub fn estimate_skip(&self, col_idx: usize, op: PredicateOp, val: &Value) -> (usize, usize) {
+        let total = self.row_groups.len();
+        let mut skipped = 0;
+        for rg in &self.row_groups {
+            let Some(chunk) = rg.columns.get(col_idx) else { continue };
+            let (Some(min), Some(max)) = (&chunk.min_value, &chunk.max_value) else { continue };
+            let Some(lo) = cmp_values(min, val) else { continue };
+            let Some(hi) = cmp_values(max, val) else { continue };
+            use std::cmp::Ordering::*;
+            let can_skip = match op {
+                // val == x：chunk.max < x || chunk.min > x → 无交集
+                PredicateOp::Eq => hi == Less || lo == Greater,
+                // val > x：chunk.max <= x
+                PredicateOp::Gt => hi != Greater,
+                // val >= x：chunk.max < x
+                PredicateOp::GtEq => hi == Less,
+                // val < x：chunk.min >= x
+                PredicateOp::Lt => lo != Less,
+                // val <= x：chunk.min > x
+                PredicateOp::LtEq => lo == Greater,
+            };
+            if can_skip {
+                skipped += 1;
+            }
+        }
+        (total, skipped)
+    }
+
     pub fn new(table_def: TableDef, row_group_size: u32) -> Self {
         Self {
             table_def,

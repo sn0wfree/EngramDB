@@ -68,6 +68,10 @@ rusqlite = "0.31"
 
 # 基准测试目标（均自带 main()，需关闭默认 test harness）
 [[bench]]
+name = "m1_acceptance_bench"
+harness = false
+
+[[bench]]
 name = "bench_main"
 harness = false
 
