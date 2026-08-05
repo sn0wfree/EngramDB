@@ -242,11 +242,48 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
     Ok(())
 }
 
-/// 执行列式插入（向量化写入路径）
+/// 执行列式插入（③：批量 INSERT 列式路径）
 ///
-/// 直接以列式数据写入，跳过 SQL 解析和行→列转置。
-/// 性能比行式插入高 30-50%（取决于列数和数据类型）。
+/// 与 `execute()` 一样按配置选择路径：
+/// - 事务路径（enable_transaction=true）：转置为行后走事务插入
+///   （WAL + MVCC），保证与 DELETE/UPDATE 的事务语义一致
+/// - 非事务路径（enable_transaction=false）：直接列式写入
+///   `table.insert_columns`（语义与 `table.insert(rows)` 一致：
+///   类型强转 / AUTO_INCREMENT / TTL / NOT NULL / 索引维护）
 pub fn execute_columns(
+    db: &mut Database,
+    table_name: &str,
+    columns: Vec<Vec<Value>>,
+) -> Result<u64> {
+    let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
+    if num_rows == 0 {
+        return Ok(0);
+    }
+
+    // 防御性检查：事务路径需要 txn_manager 已初始化（与 execute() 一致）
+    if db.config().enable_transaction {
+        if !db.txn_manager().is_ready() {
+            warn!("Falling back to non-transaction path due to txn_manager not ready");
+            return insert_columns_direct(db, table_name, columns);
+        }
+        // 事务路径：转置为行后走事务插入（保证 MVCC 可见性 / WAL 一致性）
+        let num_cols = columns.len();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(num_rows);
+        for r in 0..num_rows {
+            let mut row = Vec::with_capacity(num_cols);
+            for col in &columns {
+                row.push(col[r].clone());
+            }
+            rows.push(row);
+        }
+        return execute_with_txn(db, table_name, rows);
+    }
+
+    insert_columns_direct(db, table_name, columns)
+}
+
+/// 非事务路径的列式直写
+fn insert_columns_direct(
     db: &mut Database,
     table_name: &str,
     columns: Vec<Vec<Value>>,
@@ -254,22 +291,5 @@ pub fn execute_columns(
     let table = db.get_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
-    let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
-    if num_rows == 0 {
-        return Ok(0);
-    }
-
-    // 大批量：直接写入列存（跳过 Delta 层）
-    let direct_threshold = (table.column_store().row_group_size() / 4) as usize;
-    if num_rows >= direct_threshold && num_rows >= 1000 {
-        table.column_store_mut().append_columns(&columns)?;
-        table.def_mut().row_count += num_rows as u64;
-    } else {
-        // 小批量：走列式 Delta 层
-        table.delta_store_mut().insert_columns(columns)?;
-        // 与 table.insert() 一致：写入 Delta 层即计入总行数
-        table.def_mut().row_count += num_rows as u64;
-    }
-
-    Ok(num_rows as u64)
+    table.insert_columns(columns)
 }

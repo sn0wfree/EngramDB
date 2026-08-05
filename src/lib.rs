@@ -1045,6 +1045,56 @@ mod value_tests {
         assert_eq!(result.rows[0], vec![Value::Int64(30), Value::Int64(300)]);
     }
 
+    #[test]
+    fn test_batch_insert_columns_path() {
+        // ③：非事务模式下批量 VALUES 走 InsertColumns 列式路径，
+        // 索引维护必须与 insert(rows) 等价（防索引失配回归）
+        let config = crate::common::config::Config {
+            enable_transaction: false,
+            ..Default::default()
+        };
+        let mut conn = Connection::open_with_config(":memory:", config).unwrap();
+
+        conn.execute("CREATE TABLE scores (id INT, score INT, name VARCHAR)").unwrap();
+        // 多行 VALUES → 列式路径
+        conn.execute(
+            "INSERT INTO scores VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')"
+        ).unwrap();
+        conn.execute("CREATE INDEX idx_score ON scores (score)").unwrap();
+
+        // 数据正确（全表扫描）
+        let result = conn.execute("SELECT COUNT(*) FROM scores").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(4));
+
+        // 索引查询正确（等值 + 范围，覆盖二级索引维护）
+        let result = conn.execute("SELECT id, name FROM scores WHERE score = 20").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(2));
+        assert_eq!(result.rows[0][1], Value::Varchar("b".into()));
+
+        let result = conn.execute("SELECT id FROM scores WHERE score BETWEEN 15 AND 35").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], Value::Int64(2));
+        assert_eq!(result.rows[1][0], Value::Int64(3));
+
+        // 大批量（>1000 行）直落列存路径 + 索引维护
+        let mut sql = String::from("INSERT INTO scores VALUES ");
+        for i in 100..1100 {
+            sql.push_str(&format!("({}, {}, 'u{}'),", i, i * 2, i));
+        }
+        sql.pop();
+        conn.execute(&sql).unwrap();
+        let result = conn.execute("SELECT id FROM scores WHERE score = 2000").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(1000));
+
+        // DELETE 在列式直写后仍正确（非事务路径物理删除）
+        let r = conn.execute("DELETE FROM scores WHERE score < 50").unwrap();
+        assert_eq!(r.rows_affected, 4);
+        let result = conn.execute("SELECT COUNT(*) FROM scores").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(1000));
+    }
+
     // --- INCLUDE 子句 SQL 语法测试（v0.12.0 新增）---
 
     #[test]

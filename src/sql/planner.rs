@@ -512,6 +512,29 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
     let num_cols = table.def.columns.len();
     let num_rows = stmt.values.len();
 
+    // ③：批量 VALUES → 列式 InsertColumns 快速路径
+    // 条件：非事务模式（列式直写不经 MVCC/WAL）、无列名重排（全列按表顺序）、
+    // 无 returning/on_conflict、每行值数量与表列数一致（列式要求每列等长）
+    // （事务模式下列式写入会转置回行式走 WAL，无收益，保持 Insert 路径）
+    if !db.config().enable_transaction
+        && num_rows > 0
+        && stmt.columns.is_none()
+        && stmt.returning.is_none()
+        && stmt.on_conflict.is_none()
+        && stmt.values.iter().all(|r| r.len() == num_cols)
+    {
+        let mut columns: Vec<Vec<Value>> = vec![Vec::with_capacity(num_rows); num_cols];
+        for value_row in &stmt.values {
+            for (i, expr) in value_row.iter().enumerate() {
+                columns[i].push(eval_constant_expr(expr, params)?);
+            }
+        }
+        return Ok(PhysicalPlan::InsertColumns {
+            table_name: stmt.table_name,
+            columns,
+        });
+    }
+
     // 如果指定了列，预先计算列索引映射，避免逐行查找
     let col_map: Option<Vec<usize>> = stmt.columns.as_ref().map(|col_names| {
         col_names.iter()

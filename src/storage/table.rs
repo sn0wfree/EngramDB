@@ -987,6 +987,128 @@ impl Table {
         Ok(count)
     }
 
+    /// 列式批量插入（③：批量 INSERT 列式路径）
+    ///
+    /// 语义与 `insert(rows)` 完全一致：类型强转 / AUTO_INCREMENT / TTL /
+    /// NOT NULL 约束 / 主键 + 二级 + 向量索引维护，仅落盘走列式
+    /// `append_columns`（比 append_rows 快约 2x，跳过行→列转置）。
+    ///
+    /// 输入：每列一个 Vec<Value>，列数与表定义一致、每列等长。
+    /// 仅适用于完整行（所有列都提供）的批量写入场景。
+    pub fn insert_columns(&mut self, mut columns: Vec<Vec<Value>>) -> Result<u64> {
+        let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
+        if num_rows == 0 {
+            return Ok(0);
+        }
+
+        // 防御：列数与表定义一致
+        if columns.len() != self.def.columns.len() {
+            return Err(EngramDbError::ConstraintViolation(format!(
+                "INSERT column count mismatch: expected {}, got {}",
+                self.def.columns.len(),
+                columns.len()
+            )));
+        }
+
+        // 类型强转：Varchar → Vector（处理 JSON 字面量）
+        for (col_idx, col) in columns.iter_mut().enumerate() {
+            for val in col.iter_mut() {
+                self.coerce_value_for_column(col_idx, val)?;
+            }
+        }
+
+        // AUTO_INCREMENT 自增分配（与 insert() 相同的分配规则）
+        let auto_inc_cols: Vec<usize> = self.def.columns.iter().enumerate()
+            .filter(|(_, c)| c.auto_increment)
+            .map(|(i, _)| i)
+            .collect();
+        for col_idx in &auto_inc_cols {
+            for val in columns[*col_idx].iter_mut() {
+                match val {
+                    Value::Null => {
+                        *val = Value::Int64(self.def.next_auto_increment_id as i64);
+                        self.def.next_auto_increment_id += 1;
+                    }
+                    Value::Int64(n) => {
+                        if *n == 0 {
+                            *val = Value::Int64(self.def.next_auto_increment_id as i64);
+                            self.def.next_auto_increment_id += 1;
+                        } else if (*n as u64) >= self.def.next_auto_increment_id {
+                            self.def.next_auto_increment_id = (*n as u64) + 1;
+                        }
+                    }
+                    Value::Int32(n) => {
+                        if *n == 0 {
+                            *val = Value::Int64(self.def.next_auto_increment_id as i64);
+                            self.def.next_auto_increment_id += 1;
+                        } else if (*n as u64) >= self.def.next_auto_increment_id {
+                            self.def.next_auto_increment_id = (*n as u64) + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // TTL 时间戳自动填充（与 insert() 相同规则）
+        if let Some(ttl_col) = self.def.ttl_column {
+            if ttl_col < columns.len() {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                for val in columns[ttl_col].iter_mut() {
+                    if val.is_null() {
+                        *val = Value::Timestamp(now_ms);
+                    }
+                }
+            }
+        }
+
+        // NOT NULL 约束检查
+        for (col_idx, col_def) in self.def.columns.iter().enumerate() {
+            if !col_def.nullable {
+                for val in &columns[col_idx] {
+                    if val.is_null() {
+                        return Err(EngramDbError::ConstraintViolation(
+                            format!("NOT NULL constraint failed: column '{}'", col_def.name)
+                        ));
+                    }
+                }
+            }
+        }
+
+        let direct_threshold = (self.column_store.row_group_size() / 4) as usize;
+        let base_row_id = self.def.row_count as u32;
+
+        // 落盘：列式直接写入（大批量直落列存，小批量走 Delta）
+        if num_rows >= direct_threshold && num_rows >= 1000 {
+            self.column_store.append_columns(&columns)?;
+        } else {
+            self.delta_store.insert_columns(columns.clone())?;
+            let _ = self.maybe_compact()?;
+        }
+
+        // 更新总行数
+        self.def.row_count += num_rows as u64;
+
+        // 索引维护（与 insert() 一致；仅在需要时才转置为行）
+        if self.primary_index.is_some() || !self.indexes.is_empty() || !self.vector_indexes.is_empty() {
+            let rows = transpose_columns_to_rows(&columns, num_rows);
+            if self.primary_index.is_some() {
+                self.primary_index_insert_batch(&rows, base_row_id);
+            }
+            if !self.indexes.is_empty() {
+                self.update_indexes_for_rows(&rows, base_row_id);
+            }
+            if !self.vector_indexes.is_empty() {
+                self.update_vector_indexes_for_rows(&rows, base_row_id);
+            }
+        }
+
+        Ok(num_rows as u64)
+    }
+
     /// Varchar → Vector/VectorInt8 类型强转（v0.16.0）
     ///
     /// 当目标列是 VECTOR/VectorInt8 类型时，将 Varchar 字符串字面量
@@ -2020,4 +2142,20 @@ impl Table {
     pub fn fts_indexes_mut(&mut self) -> &mut std::collections::HashMap<String, InvertedIndex> {
         &mut self.fts_indexes
     }
+}
+
+/// 列式数据转置为行式（用于 insert_columns 的索引维护）
+///
+/// 仅在有索引需要维护时才调用；无索引的批量导入完全走列式路径。
+fn transpose_columns_to_rows(columns: &[Vec<Value>], num_rows: usize) -> Vec<Vec<Value>> {
+    let num_cols = columns.len();
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(num_rows);
+    for r in 0..num_rows {
+        let mut row = Vec::with_capacity(num_cols);
+        for col in columns {
+            row.push(col[r].clone());
+        }
+        rows.push(row);
+    }
+    rows
 }
