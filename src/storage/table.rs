@@ -187,7 +187,7 @@ impl Table {
             for col_idx in 0..num_cols {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
                 if row_in_rg < col_data.len() {
-                    row.push(col_data[row_in_rg].clone());
+                    row.push(col_data.get(row_in_rg));
                 } else {
                     row.push(crate::Value::Null);
                 }
@@ -258,7 +258,7 @@ impl Table {
                     for &col_idx in col_indices {
                         let col_data = self.column_store.read_column(rg_idx, col_idx)?;
                         let v = if row_in_rg < col_data.len() {
-                            col_data[row_in_rg].clone()
+                            col_data.get(row_in_rg)
                         } else {
                             crate::Value::Null
                         };
@@ -372,8 +372,8 @@ impl Table {
         let mut row_id = 0u32;
         for rg_idx in 0..self.column_store.row_group_count() {
             let col_data = self.column_store.read_column(rg_idx, pk_idx)?;
-            for val in col_data.iter() {
-                idx.insert(val.clone(), row_id);
+            for val in col_data.iter_values() {
+                idx.insert(val, row_id);
                 row_id += 1;
             }
         }
@@ -422,11 +422,11 @@ impl Table {
         for rg_idx in 0..num_row_groups {
             let mut key_data: Vec<Vec<Value>> = Vec::with_capacity(key_cols.len());
             for &k in key_cols {
-                key_data.push(self.column_store.read_column(rg_idx, k)?.to_vec());
+                key_data.push(self.column_store.read_column(rg_idx, k)?.to_values());
             }
             let mut included_data: Vec<Vec<Value>> = Vec::with_capacity(included_cols.len());
             for &col_idx in included_cols {
-                included_data.push(self.column_store.read_column(rg_idx, col_idx)?.to_vec());
+                included_data.push(self.column_store.read_column(rg_idx, col_idx)?.to_values());
             }
             let row_count = key_data[0].len();
             for row_idx in 0..row_count {
@@ -549,9 +549,9 @@ impl Table {
         let num_row_groups = self.column_store.row_group_count();
         for rg_idx in 0..num_row_groups {
             let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-            for val in col_data.iter() {
+            for val in col_data.iter_values() {
                 if let Value::Vector(v) = val {
-                    let hnsw_id = hnsw.insert(v.clone())?;
+                    let hnsw_id = hnsw.insert(v)?;
                     // 确保映射向量足够大
                     if hnsw_id as usize >= id_mapping.len() {
                         id_mapping.resize(hnsw_id as usize + 1, 0);
@@ -1512,7 +1512,7 @@ impl Table {
             let mut columns_data = Vec::new();
             for &col_idx in column_indices {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                columns_data.push(col_data.to_vec());
+                columns_data.push(col_data.to_values());
             }
 
             // 按行组装
@@ -1531,7 +1531,7 @@ impl Table {
                         let mut full_row: Vec<Value> = Vec::new();
                         for ci in 0..self.def.columns.len() {
                             let col_data = self.column_store.read_column(rg_idx, ci)?;
-                            full_row.push(if row_idx < col_data.len() { col_data[row_idx].clone() } else { Value::Null });
+                            full_row.push(if row_idx < col_data.len() { col_data.get(row_idx) } else { Value::Null });
                         }
                         if self.def.is_expired(&full_row) {
                             continue;
@@ -1611,11 +1611,11 @@ impl Table {
                 }
             }
 
-            // 1. 读取需要的所有列（克隆切片以断开借用链）
+            // 1. 读取需要的所有列（克隆为 owned Value 数组；S2-M2 将直出 Typed）
             let mut col_owned: Vec<Vec<Value>> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.to_vec());
+                col_owned.push(col_data.to_values());
             }
 
             if col_owned.is_empty() {
@@ -1649,7 +1649,7 @@ impl Table {
                         let mut full_row: Vec<Value> = Vec::with_capacity(self.def.columns.len());
                         for ci in 0..self.def.columns.len() {
                             let col_data = self.column_store.read_column(rg_idx, ci)?;
-                            full_row.push(if row_idx < col_data.len() { col_data[row_idx].clone() } else { Value::Null });
+                            full_row.push(if row_idx < col_data.len() { col_data.get(row_idx) } else { Value::Null });
                         }
                         if self.def.is_expired(&full_row) {
                             ttl_pass[i] = false;
@@ -1749,7 +1749,7 @@ impl Table {
             let mut col_owned: Vec<Vec<Value>> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.to_vec());
+                col_owned.push(col_data.to_values());
             }
             if col_owned.is_empty() {
                 continue;
@@ -1779,7 +1779,7 @@ impl Table {
                         let mut full_row: Vec<Value> = Vec::with_capacity(self.def.columns.len());
                         for ci in 0..self.def.columns.len() {
                             let col_data = self.column_store.read_column(rg_idx, ci)?;
-                            full_row.push(if row_idx < col_data.len() { col_data[row_idx].clone() } else { Value::Null });
+                            full_row.push(if row_idx < col_data.len() { col_data.get(row_idx) } else { Value::Null });
                         }
                         if self.def.is_expired(&full_row) {
                             continue;

@@ -5,6 +5,7 @@
 use crate::common::error::Result;
 use crate::common::types::{DataType, TableDef};
 use crate::common::config::CompressionType;
+use crate::common::column_data::{ColumnData, ColumnValue};
 use crate::Value;
 
 use super::compression;
@@ -36,17 +37,17 @@ pub struct RowGroup {
 
 /// 列 Chunk
 ///
-/// **已知限制（P0-3）**：`values: Vec<Value>` 使用带 tag 的 enum，
-/// 破坏列存的内存连续性，无法做 SIMD 向量化。
-/// 后续应重构为 `enum ColumnData { Int64(Vec<i64>), Float64(Vec<f64>), ... }`，
-/// 但需同步修改 `read_column` 签名与所有调用方，工作量较大，留作独立后续任务。
+/// S2-M1：内存态改用类型化 `ColumnData`（连续数组 + NULL 位图），
+/// 替代带 tag 的 `Vec<Value>`——内存连续、cache 友好、可 SIMD。
+/// 磁盘字节格式不变（serialize_typed 与 serialize_values 完全一致）。
 #[derive(Debug, Clone)]
 pub struct ColumnChunk {
     pub data_type: DataType,
-    pub values: Vec<Value>,
+    /// 解压后的类型化数据（压缩态时为 None）
+    pub data: Option<ColumnData>,
     pub null_count: u32,
     pub compression: CompressionType,
-    /// 压缩后的数据（当 values 为空且 compressed_data 非空时表示已压缩）
+    /// 压缩后的数据（当 data 为 None 且 compressed_data 非空时表示已压缩）
     pub compressed_data: Vec<u8>,
     /// 未压缩时的行数（用于解压后验证）
     pub uncompressed_count: u32,
@@ -89,7 +90,7 @@ impl ColumnStore {
                     columns: (0..num_cols)
                         .map(|i| ColumnChunk {
                             data_type: self.table_def.columns[i].data_type.clone(),
-                            values: Vec::new(),
+                            data: None,
                             null_count: 0,
                             compression: CompressionType::Uncompressed,
                             compressed_data: Vec::new(),
@@ -108,10 +109,14 @@ impl ColumnStore {
             let space = (self.row_group_size - rg.row_count) as usize;
             let take = std::cmp::min(space, remaining.len());
 
-            // 按列追加，同时维护 MinMax 索引
+            // 按列追加，同时维护 MinMax 索引（S2-M1：直接构造类型化 ColumnData）
             for (col_idx, col_chunk) in rg.columns.iter_mut().enumerate() {
-                for row in &remaining[..take] {
-                    let val = &row[col_idx];
+                let vals: Vec<Value> = remaining[..take]
+                    .iter()
+                    .map(|row| row[col_idx].clone())
+                    .collect();
+                let new_data = ColumnData::from_values_typed(&vals, &col_chunk.data_type);
+                for (i, val) in vals.iter().enumerate() {
                     if val.is_null() {
                         col_chunk.null_count += 1;
                     } else {
@@ -131,7 +136,10 @@ impl ColumnStore {
                             }
                         }
                     }
-                    col_chunk.values.push(val.clone());
+                }
+                match &mut col_chunk.data {
+                    Some(d) => d.append(&new_data),
+                    None => col_chunk.data = Some(new_data),
                 }
             }
             rg.row_count += take as u32;
@@ -166,7 +174,7 @@ impl ColumnStore {
                     columns: (0..num_cols)
                         .map(|i| ColumnChunk {
                             data_type: self.table_def.columns[i].data_type.clone(),
-                            values: Vec::new(),
+                            data: None,
                             null_count: 0,
                             compression: CompressionType::Uncompressed,
                             compressed_data: Vec::new(),
@@ -184,14 +192,14 @@ impl ColumnStore {
             let space = (self.row_group_size - rg.row_count) as usize;
             let take = std::cmp::min(space, remaining_rows);
 
-            // 按列直接追加（P4 核心：无需转置）
+            // 按列直接追加（P4 核心：无需转置；S2-M1：直接类型化）
             for (col_idx, col_chunk) in rg.columns.iter_mut().enumerate() {
                 if col_idx < columns.len() {
-                    let src_col = &columns[col_idx];
-                    col_chunk.values.extend_from_slice(&src_col[offset..offset + take]);
+                    let src_col = &columns[col_idx][offset..offset + take];
+                    let new_data = ColumnData::from_values_typed(src_col, &col_chunk.data_type);
 
                     // 更新 MinMax 和 null_count
-                    for val in &src_col[offset..offset + take] {
+                    for val in src_col {
                         if val.is_null() {
                             col_chunk.null_count += 1;
                         } else {
@@ -211,11 +219,26 @@ impl ColumnStore {
                             }
                         }
                     }
+                    match &mut col_chunk.data {
+                        Some(d) => d.append(&new_data),
+                        None => col_chunk.data = Some(new_data),
+                    }
                 } else {
                     // 列数不足，补 NULL
                     for _ in 0..take {
-                        col_chunk.values.push(Value::Null);
                         col_chunk.null_count += 1;
+                    }
+                    if let Some(d) = &mut col_chunk.data {
+                        let nulls = ColumnData::from_values_typed(
+                            &vec![Value::Null; take],
+                            &col_chunk.data_type,
+                        );
+                        d.append(&nulls);
+                    } else {
+                        col_chunk.data = Some(ColumnData::from_values_typed(
+                            &vec![Value::Null; take],
+                            &col_chunk.data_type,
+                        ));
                     }
                 }
             }
@@ -228,16 +251,16 @@ impl ColumnStore {
         Ok(())
     }
 
-    /// 确保指定 RowGroup 的所有列处于解压态（values 非空）
+    /// 确保指定 RowGroup 的所有列处于解压态（data 非空）
     ///
-    /// 追加数据到已压缩的 RowGroup 前必须调用：压缩态下 `values` 为空，
-    /// 直接 `extend` 会丢失原有数据。解压后清空 `compressed_data`，后续追加正常写入 `values`。
+    /// 追加数据到已压缩的 RowGroup 前必须调用：压缩态下 `data` 为 None，
+    /// 直接 append 会丢失原有数据。解压后清空 `compressed_data`，后续追加正常写入 `data`。
     fn ensure_rg_decompressed(&mut self, rg_idx: usize) -> Result<()> {
         let rg = &mut self.row_groups[rg_idx];
         for col in &mut rg.columns {
-            if col.values.is_empty() && !col.compressed_data.is_empty() {
+            if col.data.is_none() && !col.compressed_data.is_empty() {
                 let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
-                col.values = deserialize_values(&bytes, &col.data_type, col.uncompressed_count as usize);
+                col.data = Some(ColumnData::deserialize_typed(&bytes, &col.data_type, col.uncompressed_count as usize));
                 col.compressed_data.clear();
                 col.compressed_data.shrink_to_fit();
                 col.compression = CompressionType::Uncompressed;
@@ -248,22 +271,27 @@ impl ColumnStore {
 
     /// 读取指定 row group 的指定列
     ///
-    /// 如果列数据已压缩，会自动解压到 values 中（惰性解压）。
-    pub fn read_column(&mut self, row_group_idx: usize, col_idx: usize) -> Result<&[Value]> {
+    /// 如果列数据已压缩，会自动解压为类型化数据（惰性解压）。
+    pub fn read_column(&mut self, row_group_idx: usize, col_idx: usize) -> Result<&ColumnData> {
         let rg = &mut self.row_groups[row_group_idx];
         let col = &mut rg.columns[col_idx];
 
         // 惰性解压：如果数据是压缩状态，先解压
-        if !col.compressed_data.is_empty() && col.values.is_empty() {
+        if col.data.is_none() && !col.compressed_data.is_empty() {
             let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
-            col.values = deserialize_values(&bytes, &col.data_type, col.uncompressed_count as usize);
+            col.data = Some(ColumnData::deserialize_typed(&bytes, &col.data_type, col.uncompressed_count as usize));
             // 清空压缩态，避免后续 append / data_to_bytes 误用陈旧的 compressed_data
             col.compressed_data.clear();
             col.compressed_data.shrink_to_fit();
             col.compression = CompressionType::Uncompressed;
         }
 
-        Ok(&col.values)
+        // 空列（从未写入数据）返回空 ColumnData
+        if col.data.is_none() {
+            col.data = Some(ColumnData::deserialize_typed(&[], &col.data_type, 0));
+        }
+
+        Ok(col.data.as_ref().unwrap())
     }
 
     /// 获取 row group 数量
@@ -289,22 +317,31 @@ impl ColumnStore {
     /// 压缩所有列（真正的列式压缩）
     ///
     /// 对每个 row group 的每列数据调用压缩模块，自动选择最优压缩算法。
-    /// 压缩后 values 被清空，数据存储在 compressed_data 中。
+    /// 压缩后 data 被清空，数据存储在 compressed_data 中。
     /// 读取时通过 read_column 自动解压。
     pub fn compress_all(&mut self) -> Result<CompressionStats> {
         let mut stats = CompressionStats::default();
 
         for rg in &mut self.row_groups {
             for col in &mut rg.columns {
-                if col.values.is_empty() && !col.compressed_data.is_empty() {
+                if col.data.is_none() && !col.compressed_data.is_empty() {
                     continue; // 已经压缩过
                 }
 
-                let row_count = col.values.len();
-                let original_size = values_byte_size(&col.values, &col.data_type);
+                let row_count = match &col.data {
+                    Some(d) => d.len(),
+                    None => 0,
+                };
+                let original_size = match &col.data {
+                    Some(d) => data_byte_size(d, &col.data_type),
+                    None => 0,
+                };
 
-                // 将 Value 列转为字节序列
-                let bytes = values_to_bytes(&col.values, &col.data_type);
+                // 将类型化列转为字节序列（S2-M1：直接从类型数组序列化）
+                let bytes = match &col.data {
+                    Some(d) => d.serialize_typed(&col.data_type),
+                    None => Vec::new(),
+                };
 
                 // 调用压缩模块（自动选择最优算法）
                 let (ctype, compressed) = compression::compress(&bytes, &col.data_type)?;
@@ -317,8 +354,7 @@ impl ColumnStore {
                 col.compression = ctype;
                 col.compressed_data = compressed;
                 col.uncompressed_count = row_count as u32;
-                col.values.clear(); // 释放未压缩数据
-                col.values.shrink_to_fit();
+                col.data = None; // 释放未压缩数据
             }
         }
 
@@ -334,7 +370,7 @@ impl ColumnStore {
                 }
 
                 let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
-                col.values = bytes_to_values(&bytes, &col.data_type, col.uncompressed_count as usize);
+                col.data = Some(ColumnData::deserialize_typed(&bytes, &col.data_type, col.uncompressed_count as usize));
                 col.compressed_data.clear();
                 col.compressed_data.shrink_to_fit();
                 col.compression = CompressionType::Uncompressed;
@@ -368,8 +404,16 @@ impl ColumnStore {
                     stats.total_original += est_original;
                 } else {
                     // 未压缩状态
-                    stats.total_original += values_byte_size(&col.values, &col.data_type);
-                    stats.total_compressed += values_byte_size(&col.values, &col.data_type);
+                    match &col.data {
+                        Some(d) => {
+                            let sz = data_byte_size(d, &col.data_type);
+                            stats.total_original += sz;
+                            stats.total_compressed += sz;
+                        }
+                        None => {
+                            // 空列（未压缩且无数据）
+                        }
+                    }
                 }
                 stats.columns_compressed += 1;
             }
@@ -440,8 +484,14 @@ impl ColumnStore {
                     if !col.compressed_data.is_empty() {
                         (col.compression, col.compressed_data.clone(), col.uncompressed_count)
                     } else {
-                        let serialized = serialize_values(&col.values, &col.data_type);
-                        let count = col.values.len() as u32;
+                        let serialized = match &col.data {
+                            Some(d) => d.serialize_typed(&col.data_type),
+                            None => Vec::new(),
+                        };
+                        let count = match &col.data {
+                            Some(d) => d.len() as u32,
+                            None => 0,
+                        };
                         if compress && !serialized.is_empty() {
                             let (c, comp) = compression::compress(&serialized, &col.data_type)?;
                             (c, comp, count)
@@ -528,13 +578,13 @@ impl ColumnStore {
                 }
                 let payload = &data[offset..offset + values_len];
                 // compression 字段决定 payload 语义：
-                // - Uncompressed → 裸序列化字节，直接解出 values
+                // - Uncompressed → 裸序列化字节，直接解出 data（S2-M1：类型化）
                 // - 其它 → 压缩字节，惰性存入 compressed_data，由 read_column 首次访问时解压
-                let (values, compressed_data): (Vec<Value>, Vec<u8>) =
+                let (col_data, compressed_data): (Option<ColumnData>, Vec<u8>) =
                     if compression == CompressionType::Uncompressed {
-                        (deserialize_values(payload, &data_type, uncompressed_count as usize), Vec::new())
+                        (Some(ColumnData::deserialize_typed(payload, &data_type, uncompressed_count as usize)), Vec::new())
                     } else {
-                        (Vec::new(), payload.to_vec())
+                        (None, payload.to_vec())
                     };
                 offset += values_len;
 
@@ -569,7 +619,7 @@ impl ColumnStore {
 
                 columns.push(ColumnChunk {
                     data_type,
-                    values,
+                    data: col_data,
                     null_count,
                     compression,
                     compressed_data,
@@ -1132,6 +1182,24 @@ fn values_to_bytes(values: &[Value], data_type: &DataType) -> Vec<u8> {
 
 fn bytes_to_values(data: &[u8], data_type: &DataType, count: usize) -> Vec<Value> {
     deserialize_values(data, data_type, count)
+}
+
+/// 类型化列的未压缩字节大小估算（S2-M1，压缩统计用）
+fn data_byte_size(data: &ColumnData, data_type: &DataType) -> usize {
+    match (data_type, &data.values) {
+        (DataType::Boolean, ColumnValue::Boolean(v)) => v.len(),
+        (DataType::Int32, ColumnValue::Int32(v)) => v.len() * 4,
+        (DataType::Int64, ColumnValue::Int64(v)) => v.len() * 8,
+        (DataType::Float32, ColumnValue::Float32(v)) => v.len() * 4,
+        (DataType::Float64, ColumnValue::Float64(v)) => v.len() * 8,
+        (DataType::Varchar, ColumnValue::Varchar(v)) => v.iter().map(|s| 4 + s.len()).sum(),
+        (DataType::Json, ColumnValue::Json(v)) => v.iter().map(|s| 4 + s.len()).sum(),
+        (DataType::Blob, ColumnValue::Blob(v)) => v.iter().map(|b| 4 + b.len()).sum(),
+        (DataType::Vector { .. }, ColumnValue::Vector(v)) => v.iter().map(|x| 4 + x.len() * 4).sum(),
+        (DataType::VectorInt8 { .. }, ColumnValue::VectorInt8(v)) => v.iter().map(|x| 4 + x.len()).sum(),
+        (DataType::Timestamp, ColumnValue::Timestamp(v)) => v.len() * 8,
+        _ => data.len(),
+    }
 }
 
 fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
