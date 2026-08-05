@@ -1723,8 +1723,21 @@ impl Table {
         column_indices: &[usize],
         skip_pred: Option<(usize, PredicateOp, Value)>,
     ) -> Result<Vec<Vec<Value>>> {
+        use super::column_store::matches_predicate;
+
+        // P-W1 PREWHERE：按 batch 处理，过滤在前、物化在后。
+        // 1% 选择性场景：未 MinMax 跳过的 row group 中，1% 行被物化 → 节省 99% cell 克隆
+        const BATCH_SIZE: usize = 2048;
+
         let mut rows: Vec<Vec<Value>> = Vec::new();
         let full_row_for_ttl = self.def.has_ttl();
+
+        // 谓词列在 output column_indices 中的位置
+        // - Some(pos)：谓词列是输出列之一，可做 PREWHERE 短路
+        // - None：谓词列不在输出（少见，例如 WHERE 仅引用非 SELECT 列），退化为全量扫描
+        let pred_col_pos_in_output: Option<usize> = skip_pred.as_ref().and_then(|(col_idx, _, _)| {
+            column_indices.iter().position(|&c| c == *col_idx)
+        });
 
         for rg_idx in 0..self.column_store.row_group_count() {
             // P2.4/P3.2：MinMax 跳过索引 —— 整个 row group 可跳过时不解压
@@ -1745,24 +1758,42 @@ impl Table {
             }
 
             let row_count = col_owned[0].len();
-            for row_idx in 0..row_count {
-                let mut row: Vec<Value> = Vec::with_capacity(column_indices.len());
-                for col in &col_owned {
-                    row.push(if row_idx < col.len() { col[row_idx].clone() } else { Value::Null });
-                }
 
-                // TTL 过滤
-                if full_row_for_ttl {
-                    let mut full_row: Vec<Value> = Vec::with_capacity(self.def.columns.len());
-                    for ci in 0..self.def.columns.len() {
-                        let col_data = self.column_store.read_column(rg_idx, ci)?;
-                        full_row.push(if row_idx < col_data.len() { col_data[row_idx].clone() } else { Value::Null });
+            // 按 batch 处理：先按谓词列筛掉绝大多数行，再为幸存行构造完整 row
+            for batch_start in (0..row_count).step_by(BATCH_SIZE) {
+                let batch_end = std::cmp::min(batch_start + BATCH_SIZE, row_count);
+
+                // 1. 找出 batch 内通过谓词的行索引
+                let survivors: Vec<usize> = match (pred_col_pos_in_output, &skip_pred) {
+                    (Some(pos), Some((_, op, val))) => {
+                        let col = &col_owned[pos];
+                        (batch_start..batch_end)
+                            .filter(|&i| i < col.len() && matches_predicate(&col[i], *op, val))
+                            .collect()
                     }
-                    if self.def.is_expired(&full_row) {
-                        continue;
+                    _ => (batch_start..batch_end).collect(),
+                };
+
+                // 2. 为幸存行构造完整 row（避免对被过滤行分配 Vec + 克隆 cell）
+                for row_idx in survivors {
+                    // TTL 过滤：必须重建完整行
+                    if full_row_for_ttl {
+                        let mut full_row: Vec<Value> = Vec::with_capacity(self.def.columns.len());
+                        for ci in 0..self.def.columns.len() {
+                            let col_data = self.column_store.read_column(rg_idx, ci)?;
+                            full_row.push(if row_idx < col_data.len() { col_data[row_idx].clone() } else { Value::Null });
+                        }
+                        if self.def.is_expired(&full_row) {
+                            continue;
+                        }
                     }
+
+                    let mut row: Vec<Value> = Vec::with_capacity(column_indices.len());
+                    for col in &col_owned {
+                        row.push(if row_idx < col.len() { col[row_idx].clone() } else { Value::Null });
+                    }
+                    rows.push(row);
                 }
-                rows.push(row);
             }
         }
 

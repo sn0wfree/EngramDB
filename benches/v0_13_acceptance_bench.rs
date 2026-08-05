@@ -4,6 +4,7 @@
 //! - A-1: 事务内逐行写入 ≤ 10× 慢（vs SQLite）
 //! - A-2: 索引点查 ≤ 5× 慢（vs SQLite）
 //! - A-3: COUNT(*) 持平或更快（vs SQLite）
+//! - A-4: WHERE 选择性过滤（v0.16 P-W1 新增；验收 MinMax + PREWHERE 真接通）
 //!
 //! 运行：`cargo run --release --bench v0.13_acceptance_bench`
 //!
@@ -338,12 +339,180 @@ fn main() {
     // A-3: COUNT(*)
     run_scenario("A-3: COUNT(*) (1M 行, 无 WHERE)", 1.05, a3_engramdb, a3_sqlite);
 
+    // A-4: WHERE 1% 选择性过滤（P-W1 PREWHERE 验收）
+    // 验证 v0.16 P-W1: MinMax + PREWHERE 真接通
+    println!("\n--- 设置 A-4 测试数据 (1M 行) ---");
+    println!("  EngramDB setup...");
+    let t0 = Instant::now();
+    a4_setup_engramdb();
+    println!("  EngramDB setup done in {}", fmt_ms(t0.elapsed()));
+    println!("  SQLite setup...");
+    let t0 = Instant::now();
+    a4_setup_sqlite();
+    println!("  SQLite setup done in {}", fmt_ms(t0.elapsed()));
+
+    // 1% 选择性：val > 990（val ∈ [0, 1000] 均匀）
+    run_scenario(
+        "A-4a: WHERE val > 990 (1% 选择性, 1M 行)",
+        10.0,  // 目标：从 21.1x 降到 10x 以内
+        a4a_engramdb,
+        a4a_sqlite,
+    );
+
+    // 10% 选择性：val > 900
+    run_scenario(
+        "A-4b: WHERE val > 900 (10% 选择性, 1M 行)",
+        8.0,
+        a4b_engramdb,
+        a4b_sqlite,
+    );
+
+    // 50% 选择性：val > 500
+    run_scenario(
+        "A-4c: WHERE val > 500 (50% 选择性, 1M 行)",
+        5.0,
+        a4c_engramdb,
+        a4c_sqlite,
+    );
+
     println!("\n==================================================================");
     println!("  验收完成");
     println!("  详细结果请记录到: docs/v0.13-acceptance-report.md");
     println!("==================================================================");
 
     cleanup_files();
+}
+
+// ============================================================
+// A-4: WHERE 选择性过滤（v0.16 P-W1 验收）
+// ============================================================
+
+/// EngramDB 1M 行 setup（val 均匀分布 [0, 1000]）
+fn a4_setup_engramdb() {
+    cleanup_files();
+    let mut conn = open_hdb();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)").unwrap();
+
+    const BATCH: usize = 50_000;
+    for chunk_start in (0..POINT_QUERY_TABLE_SIZE).step_by(BATCH) {
+        let end = (chunk_start + BATCH).min(POINT_QUERY_TABLE_SIZE);
+        let count = end - chunk_start;
+        let mut col_id = Vec::with_capacity(count);
+        let mut col_val = Vec::with_capacity(count);
+        let mut col_name = Vec::with_capacity(count);
+        for i in chunk_start..end {
+            col_id.push(Value::Int64(i as i64));
+            // val ∈ [0.0, 999.0] 均匀分布（与 SQLite setup 一致）
+            col_val.push(Value::Float64(i as f64 % 1000.0));
+            col_name.push(Value::Varchar(format!("row_{}", i)));
+        }
+        conn.import_columns("t", vec![col_id, col_val, col_name]).unwrap();
+    }
+    conn.close().unwrap();
+}
+
+fn a4_setup_sqlite() {
+    let _ = std::fs::remove_file(SQLITE_PATH);
+    let _ = std::fs::remove_file(format!("{}-wal", SQLITE_PATH));
+    let _ = std::fs::remove_file(format!("{}-shm", SQLITE_PATH));
+    let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA cache_size = -20000;
+         PRAGMA temp_store = MEMORY;",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)",
+        [],
+    )
+    .unwrap();
+
+    const BATCH: usize = 50_000;
+    let tx = conn.unchecked_transaction().unwrap();
+    for chunk_start in (0..POINT_QUERY_TABLE_SIZE).step_by(BATCH) {
+        let end = (chunk_start + BATCH).min(POINT_QUERY_TABLE_SIZE);
+        let mut sql = String::with_capacity(end - chunk_start);
+        for i in chunk_start..end {
+            if i > chunk_start {
+                sql.push_str(", ");
+            }
+            // val ∈ [0.0, 999.0] 均匀分布
+            sql.push_str(&format!("({}, {}, 'row_{}')", i, i as f64 % 1000.0, i));
+        }
+        tx.execute(&format!("INSERT INTO t VALUES {}", sql), []).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+}
+
+fn a4a_engramdb() -> Duration {
+    let mut conn = open_hdb();
+    let start = Instant::now();
+    let r = conn.execute("SELECT COUNT(*) FROM t WHERE val > 990").unwrap();
+    let elapsed = start.elapsed();
+    // val ∈ [0, 999]，val > 990 → val ∈ [991, 999] = 9 个值/1000，每值 1000 行 = 9000 行
+    debug_assert_eq!(r.rows[0][0], Value::Int64(9000), "A-4a expected 9000 rows");
+    conn.close().unwrap();
+    elapsed
+}
+
+fn a4a_sqlite() -> Duration {
+    let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
+    let start = Instant::now();
+    let v: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t WHERE val > 990", [], |row| row.get(0))
+        .unwrap();
+    let elapsed = start.elapsed();
+    debug_eq_i64(v, 9000);
+    drop(conn);
+    elapsed
+}
+
+fn a4b_engramdb() -> Duration {
+    let mut conn = open_hdb();
+    let start = Instant::now();
+    let r = conn.execute("SELECT COUNT(*) FROM t WHERE val > 900").unwrap();
+    let elapsed = start.elapsed();
+    debug_assert_eq!(r.rows[0][0], Value::Int64(99000), "A-4b expected 99000 rows");
+    conn.close().unwrap();
+    elapsed
+}
+
+fn a4b_sqlite() -> Duration {
+    let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
+    let start = Instant::now();
+    let v: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t WHERE val > 900", [], |row| row.get(0))
+        .unwrap();
+    let elapsed = start.elapsed();
+    debug_eq_i64(v, 99000);
+    drop(conn);
+    elapsed
+}
+
+fn a4c_engramdb() -> Duration {
+    let mut conn = open_hdb();
+    let start = Instant::now();
+    let r = conn.execute("SELECT COUNT(*) FROM t WHERE val > 500").unwrap();
+    let elapsed = start.elapsed();
+    // val ∈ [0, 999]，val > 500 → val ∈ [501, 999] = 499 个值/1000，每值 1000 行 = 499000 行
+    debug_assert_eq!(r.rows[0][0], Value::Int64(499000), "A-4c expected 499000 rows");
+    conn.close().unwrap();
+    elapsed
+}
+
+fn a4c_sqlite() -> Duration {
+    let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
+    let start = Instant::now();
+    let v: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t WHERE val > 500", [], |row| row.get(0))
+        .unwrap();
+    let elapsed = start.elapsed();
+    debug_eq_i64(v, 499000);
+    drop(conn);
+    elapsed
 }
 
 // ============================================================

@@ -3087,4 +3087,166 @@ mod value_tests {
         // 第一行应是 id=1（自己，距离最近）
         assert_eq!(result.rows[0][0], Value::Int64(1));
     }
+
+    // ========================================================================
+    // P-W1 PREWHERE 真接通测试（v0.16 新增）
+    //
+    // 验证 storage 层的 PREWHERE 短路：
+    // - 简单比较谓词 col OP literal
+    // - 选择性 1%/10%/50%/90% 都返回正确结果
+    // - 谓词列在输出 vs 不在输出（退化到原路径）
+    // - 跨类型比较（Int32/Int64/Float64）
+    // - 复合谓词（AND 拆分后单谓词 PREWHERE + executor 二次过滤）
+    // ========================================================================
+
+    /// 工具：建表 + 写入 N 行数据
+    /// `val_fn(i)` 生成 val 列值；用于构造不同选择性的过滤场景
+    /// 用多行 VALUES 一次写入 1000 行（避免 execute_prepared_batch 的 params bug）
+    fn setup_where_table(n: usize, rg_size: u32, val_fn: impl Fn(usize) -> i64) -> Connection {
+        let mut config = crate::common::config::Config::default();
+        config.row_group_size = rg_size;
+        let mut conn = Connection::open_with_config(":memory:", config).unwrap();
+        conn.execute("CREATE TABLE t (id INT, val INT, name VARCHAR)").unwrap();
+
+        const BATCH: usize = 1000;
+        for chunk_start in (0..n).step_by(BATCH) {
+            let end = (chunk_start + BATCH).min(n);
+            let mut sql = String::with_capacity((end - chunk_start) * 40);
+            sql.push_str("INSERT INTO t VALUES ");
+            for i in chunk_start..end {
+                if i > chunk_start { sql.push_str(", "); }
+                let val = val_fn(i);
+                sql.push_str(&format!("({}, {}, 'name_{}')", i, val, i));
+            }
+            conn.execute(&sql).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn test_prewhere_selectivity_1pct() {
+        // 1% 选择性：val = 100 的只有 1 行
+        let mut conn = setup_where_table(1000, 100, |i| {
+            if i == 500 { 100 } else { (i as i64) % 50 + 1 }  // 1 row matches val=100
+        });
+        // val=100 实际只有 1 行（i=500），其他都是 [1,50] 范围
+        let result = conn.execute("SELECT id FROM t WHERE val = 100").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(500));
+    }
+
+    #[test]
+    fn test_prewhere_selectivity_10pct() {
+        // 10% 选择性：val > 90 命中约 10%
+        let mut conn = setup_where_table(1000, 100, |i| (i as i64) % 100);
+        let result = conn.execute("SELECT COUNT(*) FROM t WHERE val > 90").unwrap();
+        // val ∈ [0, 99]，val > 90 → val ∈ [91, 99] = 9 个值，每值 10 行 = 90 行
+        assert_eq!(result.rows[0][0], Value::Int64(90));
+    }
+
+    #[test]
+    fn test_prewhere_selectivity_50pct() {
+        // 50% 选择性：val >= 50 命中约 50%
+        let mut conn = setup_where_table(1000, 100, |i| (i as i64) % 100);
+        let result = conn.execute("SELECT COUNT(*) FROM t WHERE val >= 50").unwrap();
+        // val ∈ [0, 99]，val >= 50 → val ∈ [50, 99] = 50 个值，每值 10 行 = 500 行
+        assert_eq!(result.rows[0][0], Value::Int64(500));
+    }
+
+    #[test]
+    fn test_prewhere_selectivity_90pct() {
+        // 90% 选择性：val < 90 命中约 90%
+        let mut conn = setup_where_table(1000, 100, |i| (i as i64) % 100);
+        let result = conn.execute("SELECT COUNT(*) FROM t WHERE val < 90").unwrap();
+        // val ∈ [0, 99]，val < 90 → val ∈ [0, 89] = 90 个值，每值 10 行 = 900 行
+        assert_eq!(result.rows[0][0], Value::Int64(900));
+    }
+
+    #[test]
+    fn test_prewhere_no_minmax_skip_needed() {
+        // 选择性 100%（所有行都通过）—— 验证无 MinMax 短路时 PREWHERE 仍正确
+        let mut conn = setup_where_table(100, 50, |i| (i as i64) % 10);
+        let result = conn.execute("SELECT COUNT(*) FROM t WHERE val >= 0").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(100));
+    }
+
+    #[test]
+    fn test_prewhere_no_match() {
+        // 0 选择性：没有行匹配
+        let mut conn = setup_where_table(100, 50, |i| (i as i64) % 10);
+        let result = conn.execute("SELECT id FROM t WHERE val > 1000").unwrap();
+        assert_eq!(result.rows.len(), 0, "no rows should match val > 1000");
+    }
+
+    #[test]
+    fn test_prewhere_predicate_not_in_output() {
+        // 谓词列不在输出（少见场景，例如 SELECT name, id WHERE val > 5）
+        // 验证退化路径正确
+        let mut conn = setup_where_table(100, 50, |i| (i as i64) % 10);
+        let result = conn.execute("SELECT name, id FROM t WHERE val > 5").unwrap();
+        // val ∈ [0, 9]，val > 5 → [6, 9] = 4 个值，每值 10 行 = 40 行
+        assert_eq!(result.rows.len(), 40);
+        // 输出列应是 [name, id]（不含 val）
+        assert_eq!(result.columns, vec!["name", "id"]);
+    }
+
+    #[test]
+    fn test_prewhere_compound_predicate_and() {
+        // 复合谓词 AND：a > 5 AND a < 8
+        // 验证 storage PREWHERE 处理 a > 5，executor 二次过滤 a < 8
+        let mut conn = setup_where_table(100, 50, |i| (i as i64) % 10);
+        let result = conn.execute("SELECT COUNT(*) FROM t WHERE val > 5 AND val < 8").unwrap();
+        // val ∈ [0, 9]，val > 5 AND val < 8 → [6, 7] = 2 个值，每值 10 行 = 20 行
+        assert_eq!(result.rows[0][0], Value::Int64(20));
+    }
+
+    #[test]
+    fn test_prewhere_cross_row_groups_correctness() {
+        // 关键测试：跨多个 row group 的过滤
+        // 1000 行，row_group_size=100 → 10 个 row group
+        // val 在 [0, 99] 均匀分布
+        // 验证 val = 50 跨所有 row group 返回 10 行
+        let mut conn = setup_where_table(1000, 100, |i| (i as i64) % 100);
+        let result = conn.execute("SELECT id FROM t WHERE val = 50 ORDER BY id").unwrap();
+        // id = 50, 150, 250, ..., 950（10 个）
+        assert_eq!(result.rows.len(), 10);
+        for (i, row) in result.rows.iter().enumerate() {
+            assert_eq!(row[0], Value::Int64(50 + i as i64 * 100));
+        }
+    }
+
+    #[test]
+    fn test_prewhere_double_precision() {
+        // 验证 Float64 谓词：val < 0.5
+        let mut config = crate::common::config::Config::default();
+        config.row_group_size = 50;
+        let mut conn = Connection::open_with_config(":memory:", config).unwrap();
+        conn.execute("CREATE TABLE t (id INT, val DOUBLE)").unwrap();
+
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        for i in 0..200 {
+            if i > 0 { sql.push_str(", "); }
+            let v = (i as f64) / 200.0;  // [0.0, 0.995]
+            sql.push_str(&format!("({}, {})", i, v));
+        }
+        conn.execute(&sql).unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t WHERE val < 0.5").unwrap();
+        // val ∈ [0.0, 0.995)，val < 0.5 → i ∈ [0, 99]，100 行
+        assert_eq!(result.rows[0][0], Value::Int64(100));
+    }
+
+    #[test]
+    fn test_prewhere_with_projection() {
+        // PREWHERE + 投影：SELECT id, name FROM t WHERE val > 5
+        // 验证输出列包含谓词列时的物化正确性
+        let mut conn = setup_where_table(100, 50, |i| (i as i64) % 10);
+        let result = conn.execute("SELECT id, val, name FROM t WHERE val > 5").unwrap();
+        assert_eq!(result.rows.len(), 40); // val ∈ [6, 9]
+        for row in &result.rows {
+            // 0=id, 1=val, 2=name
+            let val = match &row[1] { Value::Int64(v) => *v, _ => panic!("expected Int64") };
+            assert!(val > 5, "val should be > 5, got {}", val);
+        }
+    }
 }

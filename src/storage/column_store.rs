@@ -700,6 +700,70 @@ impl ColumnStore {
             .map(|col| (col.min_value.as_ref(), col.max_value.as_ref()))
             .unwrap_or((None, None))
     }
+
+    /// 收集所有 row group 的 min/max 统计（仅返回有 MinMax 索引的列）
+    ///
+    /// 用于执行器调试 / 性能分析。
+    pub fn debug_minmax(&self) -> Vec<Vec<(Option<Value>, Option<Value>)>> {
+        self.row_groups
+            .iter()
+            .map(|rg| {
+                rg.columns
+                    .iter()
+                    .map(|c| (c.min_value.clone(), c.max_value.clone()))
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+// ============================================================================
+// 标量谓词求值（P-W1 PREWHERE 真接通）
+// ============================================================================
+
+/// 标量谓词求值：检查 `val OP target` 是否成立
+///
+/// 与 `can_skip_predicate`（MinMax 粗筛）配套：粗筛命中的行再用本函数精确求值。
+/// 跨类型比较遵循 `value_less` 的约定（Int32/Int64 互通等），类型不匹配返回 false。
+///
+/// 用于 PREWHERE 路径：在存储层对每个 batch 内的行做"过滤在前、物化在后"，
+/// 避免对被过滤行分配 `Vec<Value>` 和克隆 cell。
+pub fn matches_predicate(val: &Value, op: PredicateOp, target: &Value) -> bool {
+    use Value::*;
+    // SQL 三值逻辑：与 NULL 比较结果为 NULL（视为 false，即被过滤）
+    // 例外：NULL = NULL 返回 true
+    if matches!(val, Null) && matches!(target, Null) {
+        return matches!(op, PredicateOp::Eq);
+    }
+    if matches!(val, Null) || matches!(target, Null) {
+        return false;
+    }
+    match op {
+        PredicateOp::Eq => values_equal(val, target),
+        PredicateOp::Lt => value_less(val, target),
+        PredicateOp::LtEq => value_less(val, target) || values_equal(val, target),
+        PredicateOp::Gt => value_greater(val, target),
+        PredicateOp::GtEq => value_greater(val, target) || values_equal(val, target),
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Int32(x), Int32(y)) => x == y,
+        (Int64(x), Int64(y)) => x == y,
+        (Int32(x), Int64(y)) => (*x as i64) == *y,
+        (Int64(x), Int32(y)) => *x == (*y as i64),
+        (Float64(x), Float64(y)) => x == y,
+        (Int32(x), Float64(y)) => (*x as f64) == *y,
+        (Int64(x), Float64(y)) => (*x as f64) == *y,
+        (Float64(x), Int32(y)) => *x == (*y as f64),
+        (Float64(x), Int64(y)) => *x == (*y as f64),
+        (Varchar(x), Varchar(y)) => x == y,
+        (Boolean(x), Boolean(y)) => x == y,
+        (Null, Null) => true,
+        _ => false,
+    }
 }
 
 // ============================================================================
@@ -714,6 +778,10 @@ fn value_less(a: &Value, b: &Value) -> bool {
         (Int32(x), Int64(y)) => (*x as i64) < *y,
         (Int64(x), Int32(y)) => *x < (*y as i64),
         (Float64(x), Float64(y)) => x < y,
+        (Int32(x), Float64(y)) => (*x as f64) < *y,
+        (Int64(x), Float64(y)) => (*x as f64) < *y,
+        (Float64(x), Int32(y)) => *x < (*y as f64),
+        (Float64(x), Int64(y)) => *x < (*y as f64),
         (Varchar(x), Varchar(y)) => x < y,
         (Boolean(x), Boolean(y)) => x < y,
         (Null, _) => true,
@@ -1266,5 +1334,59 @@ mod tests {
         // 越界 col / rg 索引一律视为可跳过（保守安全）
         assert!(store.can_skip_predicate(99, 0, PredicateOp::Eq, &Value::Int64(1)));
         assert!(store.can_skip_predicate(0, 99, PredicateOp::Eq, &Value::Int64(1)));
+    }
+
+    // ========================================================================
+    // P-W1 PREWHERE：matches_predicate 标量求值
+    // ========================================================================
+
+    #[test]
+    fn test_matches_predicate_int64() {
+        // Eq
+        assert!(matches_predicate(&Value::Int64(5), PredicateOp::Eq, &Value::Int64(5)));
+        assert!(!matches_predicate(&Value::Int64(5), PredicateOp::Eq, &Value::Int64(6)));
+        // Lt / LtEq
+        assert!(matches_predicate(&Value::Int64(4), PredicateOp::Lt, &Value::Int64(5)));
+        assert!(!matches_predicate(&Value::Int64(5), PredicateOp::Lt, &Value::Int64(5)));
+        assert!(matches_predicate(&Value::Int64(5), PredicateOp::LtEq, &Value::Int64(5)));
+        // Gt / GtEq
+        assert!(matches_predicate(&Value::Int64(6), PredicateOp::Gt, &Value::Int64(5)));
+        assert!(!matches_predicate(&Value::Int64(5), PredicateOp::Gt, &Value::Int64(5)));
+        assert!(matches_predicate(&Value::Int64(5), PredicateOp::GtEq, &Value::Int64(5)));
+    }
+
+    #[test]
+    fn test_matches_predicate_cross_type() {
+        // Int32 / Int64 互通
+        assert!(matches_predicate(&Value::Int32(5), PredicateOp::Eq, &Value::Int64(5)));
+        assert!(matches_predicate(&Value::Int64(5), PredicateOp::Eq, &Value::Int32(5)));
+        assert!(matches_predicate(&Value::Int32(4), PredicateOp::Lt, &Value::Int64(5)));
+        // Int / Float64
+        assert!(matches_predicate(&Value::Int64(5), PredicateOp::Eq, &Value::Float64(5.0)));
+        assert!(matches_predicate(&Value::Int32(5), PredicateOp::Gt, &Value::Float64(4.9)));
+        // 类型不匹配：返回 false（保守）
+        assert!(!matches_predicate(&Value::Varchar("x".into()), PredicateOp::Eq, &Value::Int64(0)));
+    }
+
+    #[test]
+    fn test_matches_predicate_string_bool() {
+        // Varchar
+        assert!(matches_predicate(&Value::Varchar("b".into()), PredicateOp::Gt, &Value::Varchar("a".into())));
+        assert!(!matches_predicate(&Value::Varchar("a".into()), PredicateOp::Gt, &Value::Varchar("a".into())));
+        assert!(matches_predicate(&Value::Varchar("a".into()), PredicateOp::LtEq, &Value::Varchar("a".into())));
+        // Boolean
+        assert!(matches_predicate(&Value::Boolean(true), PredicateOp::Eq, &Value::Boolean(true)));
+        assert!(!matches_predicate(&Value::Boolean(true), PredicateOp::Eq, &Value::Boolean(false)));
+        assert!(matches_predicate(&Value::Boolean(false), PredicateOp::Lt, &Value::Boolean(true)));
+    }
+
+    #[test]
+    fn test_matches_predicate_null() {
+        // SQL 三值逻辑：与 NULL 比较视为 false
+        assert!(!matches_predicate(&Value::Null, PredicateOp::Eq, &Value::Int64(0)));
+        assert!(!matches_predicate(&Value::Int64(0), PredicateOp::Eq, &Value::Null));
+        assert!(!matches_predicate(&Value::Null, PredicateOp::Gt, &Value::Int64(0)));
+        // Null == Null
+        assert!(matches_predicate(&Value::Null, PredicateOp::Eq, &Value::Null));
     }
 }
