@@ -132,15 +132,24 @@ impl TransactionManager {
         // 获取 commit_ts
         let commit_ts = self.active_table.commit_txn(txn_id);
 
-        // 提交 MVCC 版本
-        for (table_id, _rowid) in &write_set {
+        // 提交 MVCC 版本（P1.1：只处理本事务写过的 key，避免 O(所有key) 全链扫描）
+        for (table_id, rowid) in &write_set {
             if let Some(store) = self.mvcc.get_mut(table_id) {
-                store.commit_txn(txn_id, commit_ts);
+                store.commit_txn_key(*rowid, txn_id, commit_ts);
             }
         }
         
         // 收集待应用操作（方案 B：返回 apply_ops，由 executor 应用到存储层）
+        // 注意：必须在 GC 之前收集，因为 gc_key 会清掉旧版本，导致 has_committed_version_before 失效
         let apply_ops = self.collect_apply_ops(&write_set, txn_id)?;
+
+        // P1.2：commit 后立即对写过的 key 做 GC，防止版本链无限增长
+        let oldest_active_ts = self.active_table.oldest_start_ts().unwrap_or(commit_ts);
+        for (table_id, rowid) in &write_set {
+            if let Some(store) = self.mvcc.get_mut(table_id) {
+                store.gc_key(*rowid, oldest_active_ts);
+            }
+        }
 
         Ok(CommitResult { commit_ts, apply_ops })
     }

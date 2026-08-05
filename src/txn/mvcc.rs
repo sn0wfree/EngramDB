@@ -132,6 +132,41 @@ impl<T: Clone> MvccStore<T> {
         }
     }
 
+    /// 提交单个 key 的版本链（性能优化：只处理本事务写过的 key，避免 O(所有key) 扫描）
+    ///
+    /// 语义与 `commit_txn` 相同，但只更新 `key` 对应的链。
+    pub fn commit_txn_key(&mut self, key: u64, txn_id: TxnId, commit_ts: Timestamp) {
+        if let Some(chain) = self.versions.get_mut(&key) {
+            let mut prev_committed_idx: Option<usize> = None;
+
+            for i in 0..chain.len() {
+                if !chain[i].committed && chain[i].txn_id == txn_id {
+                    if let Some(prev_idx) = prev_committed_idx {
+                        chain[prev_idx].end_ts = Some(commit_ts);
+                    }
+                    chain[i].begin_ts = commit_ts;
+                    chain[i].committed = true;
+                    prev_committed_idx = Some(i);
+                } else if chain[i].committed {
+                    prev_committed_idx = Some(i);
+                }
+            }
+        }
+    }
+
+    /// 垃圾回收单个 key 的旧版本（性能优化：commit 后对写过的 key 立即清理）
+    ///
+    /// 与 `gc` 相同规则，但只处理 `key`：清理 end_ts <= oldest_active_ts 的已提交版本。
+    /// 最新已提交版本（end_ts = None）始终保留。
+    pub fn gc_key(&mut self, key: u64, oldest_active_ts: Timestamp) {
+        if let Some(chain) = self.versions.get_mut(&key) {
+            chain.retain(|node| {
+                if !node.committed { return true; }
+                node.end_ts.map_or(true, |e| e > oldest_active_ts)
+            });
+        }
+    }
+
     /// 回滚事务的所有写入：移除未提交版本
     pub fn rollback_txn(&mut self, txn_id: TxnId) {
         for chain in self.versions.values_mut() {
