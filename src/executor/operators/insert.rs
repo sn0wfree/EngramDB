@@ -265,6 +265,8 @@ pub fn execute_columns(
     } else {
         // 小批量：走列式 Delta 层
         table.delta_store_mut().insert_columns(columns)?;
+        // 与 table.insert() 一致：写入 Delta 层即计入总行数
+        table.def_mut().row_count += num_rows as u64;
     }
 
     Ok(num_rows as u64)

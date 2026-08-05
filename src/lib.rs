@@ -278,6 +278,8 @@ impl Connection {
         } else {
             // 小批量：走 Delta 层（列式 Delta，P4）
             table.delta_store_mut().insert_columns(columns)?;
+            // 与 insert() 一致：写入 Delta 层即计入总行数
+            table.def_mut().row_count += num_rows as u64;
         }
 
         Ok(num_rows as u64)
@@ -1841,6 +1843,68 @@ mod value_tests {
         table.insert(rows).unwrap();
         let all = table.scan(&[0, 1]).unwrap();
         assert_eq!(all.len(), 1, "compaction 后只有新数据");
+    }
+
+    #[test]
+    fn test_count_after_batch_insert_triggering_compact() {
+        // 回归测试：批量 INSERT 触发 compaction 后 COUNT(*) 不应翻倍
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64, val VARCHAR)").unwrap();
+
+        // 默认 Adaptive 策略 min_threshold = 10,000：
+        // 单批 10,000 行写入 Delta 层（< direct_threshold 30,720）
+        // 会触发 maybe_compact → compact_delta_partial，此前此处会重复累加 row_count
+        let rows: Vec<String> = (0..10_000)
+            .map(|i| format!("({}, 'v{}')", i, i))
+            .collect();
+        let sql = format!("INSERT INTO t VALUES {}", rows.join(", "));
+        conn.execute(&sql).unwrap();
+
+        // COUNT(*) fast-path（元数据）与实际行数必须一致
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(10_000), "COUNT(*) 应等于 10000，不应翻倍");
+
+        // SELECT * 全量扫描验证实际行数
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(10_000));
+    }
+
+    #[test]
+    fn test_count_after_explicit_compact() {
+        // 回归测试：显式 compact_delta 后 COUNT(*) 保持不变
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)").unwrap();
+        conn.compact_all().unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(5), "compact 后 COUNT 应保持 5");
+
+        // compact 后继续插入，计数仍正确
+        conn.execute("INSERT INTO t VALUES (6), (7)").unwrap();
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(7), "compact 后继续插入 COUNT 应为 7");
+    }
+
+    #[test]
+    fn test_count_after_import_columns_compact() {
+        // 回归测试：import_columns 小批量 + compact 后 COUNT(*) 正确
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64, val VARCHAR)").unwrap();
+
+        // 小批量（< direct_threshold），走 Delta 层
+        let ids: Vec<Value> = (0..100).map(|i| Value::Int64(i)).collect();
+        let vals: Vec<Value> = (0..100).map(|i| Value::Varchar(format!("v{}", i))).collect();
+        conn.import_columns("t", vec![ids, vals]).unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(100), "import_columns 小批量 COUNT 应为 100");
+
+        // compact 后计数不变
+        conn.compact_all().unwrap();
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(100), "compact 后 COUNT 应为 100");
     }
 
     #[test]

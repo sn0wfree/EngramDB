@@ -1596,7 +1596,8 @@ impl Table {
                 let columns = transpose_rows(&alive_rows, self.def.columns.len());
                 self.column_store.append_columns(&columns)?;
             }
-            self.def.row_count += alive_count as u64;
+            // 只减去被 TTL 淘汰的行数（存活行仍计入总数）
+            self.def.row_count = self.def.row_count.saturating_sub(row_count - alive_count as u64);
             return Ok(());
         }
 
@@ -1608,7 +1609,8 @@ impl Table {
 
         self.column_store.append_columns(&columns_to_write)?;
         self.delta_store.clear();
-        self.def.row_count += row_count;
+        // 注意：不更新 row_count —— Delta → 列存只是数据迁移，总行数不变。
+        // 行数在 insert/insert_row/execute_columns 写入 Delta 时已累加。
 
         Ok(())
     }
@@ -1640,7 +1642,7 @@ impl Table {
 
         // 合并到列存
         self.column_store.append_columns(&columns)?;
-        self.def.row_count += actual_rows as u64;
+        // 注意：不更新 row_count —— Delta → 列存只是数据迁移，总行数不变。
 
         Ok(actual_rows)
     }
