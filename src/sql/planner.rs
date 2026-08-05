@@ -601,6 +601,16 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         }
     }
 
+    // ===== Q23：FROM 子查询（Derived Table）=====
+    // SELECT * FROM (SELECT ...) AS sub:
+    // 规划内层查询，通过 SubqueryScan 节点获取结果行。
+    if let Some(TableRef::Derived { query, .. }) = &stmt.from {
+        let inner_plan = plan_select(*query.clone(), db)?;
+        return Ok(PhysicalPlan::SubqueryScan {
+            plan: Box::new(inner_plan),
+        });
+    }
+
     let table_name = stmt.from
         .as_ref()
         .and_then(|t| match t {

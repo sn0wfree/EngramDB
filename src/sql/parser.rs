@@ -227,11 +227,34 @@ fn extract_include_clause(sql: &str) -> Option<(String, Vec<String>)> {
 /// 预处理 INSERT OR IGNORE / INSERT OR REPLACE 语法（v0.15.0 M05 新增）
 ///
 /// sqlparser 不原生支持 SQLite 的 `INSERT OR REPLACE/IGNORE` 语法。
-/// 将其转换为等价的 `INSERT ... ON CONFLICT DO NOTHING` 形式（在语句末尾追加）。
+/// 将其转换为等价的 `INSERT ... ON CONFLICT DO NOTHING/UPDATE` 形式。
 ///
-/// 注意：OR REPLACE 暂不支持（需要显式 SET 子句指定列）。
+/// INSERT OR REPLACE → INSERT ... ON CONFLICT DO UPDATE SET ...
+/// （实际列名在执行器阶段根据表结构填充）
 fn normalize_insert_or(sql: &str) -> String {
     let upper = sql.to_uppercase();
+
+    // INSERT OR REPLACE：转换为 ON CONFLICT DO UPDATE（替换所有列）
+    if upper.starts_with("INSERT OR REPLACE ") || upper.starts_with("INSERT OR REPLACE\t")
+        || upper.starts_with("INSERT OR REPLACE\n") || upper.starts_with("INSERT OR REPLACE\r")
+    {
+        let after = &sql["INSERT OR REPLACE".len()..];
+        let stripped = after.trim_start();
+        if !upper.contains("ON CONFLICT") {
+            return format!("INSERT {} ON CONFLICT DO UPDATE SET __replace_all__ = __replace_all__", stripped);
+        }
+    }
+
+    // REPLACE INTO：等价于 INSERT OR REPLACE
+    if upper.starts_with("REPLACE INTO ") || upper.starts_with("REPLACE INTO\t")
+        || upper.starts_with("REPLACE INTO\n") || upper.starts_with("REPLACE INTO\r")
+    {
+        let after = &sql["REPLACE INTO".len()..];
+        let stripped = after.trim_start();
+        if !upper.contains("ON CONFLICT") {
+            return format!("INSERT {} ON CONFLICT DO UPDATE SET __replace_all__ = __replace_all__", stripped);
+        }
+    }
 
     if upper.starts_with("INSERT OR IGNORE ") || upper.starts_with("INSERT OR IGNORE\t")
         || upper.starts_with("INSERT OR IGNORE\n") || upper.starts_with("INSERT OR IGNORE\r")
@@ -525,13 +548,20 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                                 OnConflictAction::DoNothing
                             }
                             sqlast::OnConflictAction::DoUpdate(do_update) => {
-                                let mut assignments = Vec::new();
-                                for assignment in &do_update.assignments {
-                                    let col_name = assignment.id[0].value.clone();
-                                    let expr = convert_expression(&assignment.value)?;
-                                    assignments.push((col_name, expr));
+                                // 检测 INSERT OR REPLACE / REPLACE INTO 标记
+                                if do_update.assignments.len() == 1
+                                    && do_update.assignments[0].id[0].value.eq_ignore_ascii_case("__replace_all__")
+                                {
+                                    OnConflictAction::Replace
+                                } else {
+                                    let mut assignments = Vec::new();
+                                    for assignment in &do_update.assignments {
+                                        let col_name = assignment.id[0].value.clone();
+                                        let expr = convert_expression(&assignment.value)?;
+                                        assignments.push((col_name, expr));
+                                    }
+                                    OnConflictAction::DoUpdate { assignments }
                                 }
-                                OnConflictAction::DoUpdate { assignments }
                             }
                         };
 

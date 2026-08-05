@@ -2154,6 +2154,104 @@ mod value_tests {
     }
 
     #[test]
+    fn test_insert_or_replace() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')").unwrap();
+
+        // INSERT OR REPLACE：替换重复的 id=1，插入新的 id=3
+        conn.execute("INSERT OR REPLACE INTO t VALUES (1, 'replaced'), (3, 'new')").unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3), "应保留 3 行（1 替换 + 1 新增 + 1 不变）");
+
+        // 验证 id=1 的 val 被替换
+        let result = conn.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("replaced".into()), "id=1 的 val 应被替换");
+
+        // 验证 id=2 的 val 不变
+        let result = conn.execute("SELECT val FROM t WHERE id = 2").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("world".into()), "id=2 的 val 应保持不变");
+    }
+
+    #[test]
+    fn test_replace_into() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 100), (2, 200)").unwrap();
+
+        // REPLACE INTO：等价于 INSERT OR REPLACE
+        conn.execute("REPLACE INTO t VALUES (1, 999), (3, 300)").unwrap();
+
+        let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(3), "应保留 3 行");
+
+        // 验证 id=1 被替换
+        let result = conn.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(999), "id=1 的 val 应被替换为 999");
+    }
+
+    #[test]
+    fn test_subquery_in_list() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64, val VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1), (3)").unwrap();
+
+        // IN (SELECT ...) — 子查询
+        let result = conn.execute("SELECT val FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id").unwrap();
+        assert_eq!(result.rows.len(), 2, "IN 子查询应返回 2 行");
+        assert_eq!(result.rows[0][0], Value::Varchar("a".into()));
+        assert_eq!(result.rows[1][0], Value::Varchar("c".into()));
+    }
+
+    #[test]
+    fn test_subquery_exists() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64, val VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1), (3)").unwrap();
+
+        // EXISTS (SELECT ...) — 子查询（非关联）
+        let result = conn.execute("SELECT val FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = 1)").unwrap();
+        assert_eq!(result.rows.len(), 3, "EXISTS 为真时应返回所有行");
+    }
+
+    #[test]
+    fn test_subquery_not_exists() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64, val VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1)").unwrap();
+
+        // NOT EXISTS (SELECT ...) — 子查询（非关联）
+        let result = conn.execute("SELECT val FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = 999)").unwrap();
+        assert_eq!(result.rows.len(), 3, "NOT EXISTS 为真（子查询无结果）时应返回所有行");
+    }
+
+    #[test]
+    fn test_subquery_scalar() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t (id INT64, val VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+
+        // 标量子查询 (SELECT ...) 作为表达式
+        let result = conn.execute("SELECT val, (SELECT COUNT(*) FROM t) AS cnt FROM t WHERE id = 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Varchar("a".into()));
+        assert_eq!(result.rows[0][1], Value::Int64(2), "标量子查询应返回 COUNT");
+    }
+
+    #[test]
     fn test_between() {
         let mut conn = Connection::open(":memory:").unwrap();
 

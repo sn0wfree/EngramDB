@@ -6,6 +6,7 @@
 use crate::common::error::{Result, EngramDbError};
 use crate::storage::Database;
 use crate::QueryResult;
+use crate::Value;
 
 use super::physical_plan::{PhysicalPlan, JoinType, SetUnionOp};
 use super::vector::DataChunk;
@@ -15,6 +16,8 @@ use fxhash::FxHashSet;
 
 /// 执行物理计划
 pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
+    // Q23：执行前解析计划树中的子查询表达式（IN/EXISTS/标量子查询）
+    let plan = resolve_subqueries_in_plan(plan, db)?;
     match plan {
         PhysicalPlan::CreateTable { table_def } => {
             let name = table_def.name.clone();
@@ -1003,6 +1006,13 @@ fn execute_upsert(
             Some(rid) => {
                 match &conflict_clause.action {
                     OnConflictAction::DoNothing => {}
+                    OnConflictAction::Replace => {
+                        // INSERT OR REPLACE / REPLACE INTO：替换所有列
+                        let table = db.get_table_mut(table_name)
+                            .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
+                        table.update_row(rid, row.as_slice())?;
+                        rows_affected += 1;
+                    }
                     OnConflictAction::DoUpdate { assignments } => {
                         let table = db.get_table_mut(table_name)
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
@@ -1144,6 +1154,164 @@ fn find_conflicting_row(
     }
 
     Ok(None)
+}
+
+// ============================================================================
+// Q23：子查询解析
+// ============================================================================
+// 在计划树中递归查找子查询表达式（Subquery/Exists/InSubquery），提前求值并
+// 替换为字面量。子查询在执行前被求值，因为：
+// 1. 简单子查询（IN/EXISTS/标量）不依赖外层查询的行
+// 2. 避免在表达式执行器中引入子查询执行逻辑
+// ============================================================================
+
+/// 在计划树中递归解析所有子查询表达式
+fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::Filter { input, condition } => {
+            let input = resolve_subqueries_in_plan(*input, db)?;
+            let condition = resolve_subqueries_in_expr(condition, db)?;
+            Ok(PhysicalPlan::Filter {
+                input: Box::new(input),
+                condition,
+            })
+        }
+        PhysicalPlan::Projection { input, expressions, column_names } => {
+            let input = resolve_subqueries_in_plan(*input, db)?;
+            let mut resolved = Vec::with_capacity(expressions.len());
+            for expr in expressions {
+                resolved.push(resolve_subqueries_in_expr(expr, db)?);
+            }
+            Ok(PhysicalPlan::Projection {
+                input: Box::new(input),
+                expressions: resolved,
+                column_names,
+            })
+        }
+        PhysicalPlan::Aggregate { input, group_by, aggregates } => {
+            let input = resolve_subqueries_in_plan(*input, db)?;
+            Ok(PhysicalPlan::Aggregate { input: Box::new(input), group_by, aggregates })
+        }
+        PhysicalPlan::Sort { input, sort_keys, limit } => {
+            let input = resolve_subqueries_in_plan(*input, db)?;
+            Ok(PhysicalPlan::Sort { input: Box::new(input), sort_keys, limit })
+        }
+        PhysicalPlan::Limit { input, limit } => {
+            let input = resolve_subqueries_in_plan(*input, db)?;
+            Ok(PhysicalPlan::Limit { input: Box::new(input), limit })
+        }
+        PhysicalPlan::Window { input, window_functions, column_names } => {
+            let input = resolve_subqueries_in_plan(*input, db)?;
+            Ok(PhysicalPlan::Window { input: Box::new(input), window_functions, column_names })
+        }
+        PhysicalPlan::SubqueryScan { plan } => {
+            let inner = resolve_subqueries_in_plan(*plan, db)?;
+            Ok(PhysicalPlan::SubqueryScan { plan: Box::new(inner) })
+        }
+        PhysicalPlan::SetUnion { op, left, right } => {
+            let left = resolve_subqueries_in_plan(*left, db)?;
+            let right = resolve_subqueries_in_plan(*right, db)?;
+            Ok(PhysicalPlan::SetUnion { op, left: Box::new(left), right: Box::new(right) })
+        }
+        PhysicalPlan::HashJoin { join_type, left, right, left_keys, right_keys } => {
+            let left = resolve_subqueries_in_plan(*left, db)?;
+            let right = resolve_subqueries_in_plan(*right, db)?;
+            Ok(PhysicalPlan::HashJoin { join_type, left: Box::new(left), right: Box::new(right), left_keys, right_keys })
+        }
+        other => Ok(other),
+    }
+}
+
+/// 在表达式中递归解析子查询节点
+fn resolve_subqueries_in_expr(expr: Expression, db: &mut Database) -> Result<Expression> {
+    match expr {
+        Expression::Subquery(subquery) => {
+            let plan = crate::sql::planner::plan(
+                crate::sql::ast::Statement::Select(*subquery), db
+            )?;
+            let result = crate::executor::execute(plan, db)?;
+            let val = result.rows.first()
+                .and_then(|r| r.first().cloned())
+                .unwrap_or(Value::Null);
+            Ok(Expression::Literal(val))
+        }
+        Expression::Exists { subquery, negated } => {
+            let plan = crate::sql::planner::plan(
+                crate::sql::ast::Statement::Select(*subquery), db
+            )?;
+            let result = crate::executor::execute(plan, db)?;
+            let exists = !result.rows.is_empty();
+            let val = if negated { !exists } else { exists };
+            Ok(Expression::Literal(Value::Boolean(val)))
+        }
+        Expression::InSubquery { expr, subquery, negated } => {
+            let plan = crate::sql::planner::plan(
+                crate::sql::ast::Statement::Select(*subquery), db
+            )?;
+            let result = crate::executor::execute(plan, db)?;
+            let values: Vec<Expression> = result.rows.iter()
+                .filter_map(|r| r.first().cloned())
+                .map(Expression::Literal)
+                .collect();
+            let list = Expression::InList {
+                expr,
+                list: values,
+            };
+            if negated {
+                Ok(Expression::UnaryOp {
+                    op: crate::sql::ast::UnaryOperator::Not,
+                    expr: Box::new(list),
+                })
+            } else {
+                Ok(list)
+            }
+        }
+        Expression::BinaryOp { left, op, right } => Ok(Expression::BinaryOp {
+            left: Box::new(resolve_subqueries_in_expr(*left, db)?),
+            op,
+            right: Box::new(resolve_subqueries_in_expr(*right, db)?),
+        }),
+        Expression::UnaryOp { op, expr: inner } => Ok(Expression::UnaryOp {
+            op,
+            expr: Box::new(resolve_subqueries_in_expr(*inner, db)?),
+        }),
+        Expression::Function { name, args, distinct, count_star, over } => {
+            let mut resolved = Vec::with_capacity(args.len());
+            for arg in args {
+                resolved.push(resolve_subqueries_in_expr(arg, db)?);
+            }
+            Ok(Expression::Function { name, args: resolved, distinct, count_star, over })
+        }
+        Expression::Like { expr, pattern } => Ok(Expression::Like {
+            expr: Box::new(resolve_subqueries_in_expr(*expr, db)?),
+            pattern: Box::new(resolve_subqueries_in_expr(*pattern, db)?),
+        }),
+        Expression::Case { when_then, else_expr } => {
+            let mut resolved = Vec::with_capacity(when_then.len());
+            for (w, t) in when_then {
+                resolved.push((resolve_subqueries_in_expr(w, db)?, resolve_subqueries_in_expr(t, db)?));
+            }
+            let resolved_else = match else_expr {
+                Some(e) => Some(Box::new(resolve_subqueries_in_expr(*e, db)?)),
+                None => None,
+            };
+            Ok(Expression::Case { when_then: resolved, else_expr: resolved_else })
+        }
+        Expression::Cast { expr, data_type } => Ok(Expression::Cast {
+            expr: Box::new(resolve_subqueries_in_expr(*expr, db)?),
+            data_type,
+        }),
+        Expression::IsNull(inner) => Ok(Expression::IsNull(Box::new(resolve_subqueries_in_expr(*inner, db)?))),
+        Expression::IsNotNull(inner) => Ok(Expression::IsNotNull(Box::new(resolve_subqueries_in_expr(*inner, db)?))),
+        Expression::InList { expr, list } => {
+            let mut resolved = Vec::with_capacity(list.len());
+            for item in list {
+                resolved.push(resolve_subqueries_in_expr(item, db)?);
+            }
+            Ok(Expression::InList { expr: Box::new(resolve_subqueries_in_expr(*expr, db)?), list: resolved })
+        }
+        other => Ok(other),
+    }
 }
 
 

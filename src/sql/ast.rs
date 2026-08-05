@@ -121,7 +121,10 @@ pub struct OnConflictClause {
 #[derive(Debug, Clone)]
 pub enum OnConflictAction {
     DoNothing,
-    DoUpdate { assignments: Vec<(String, Expression)> }}
+    DoUpdate { assignments: Vec<(String, Expression)> },
+    /// INSERT OR REPLACE / REPLACE INTO：替换所有列（v0.15.0 M05 新增）
+    Replace,
+}
 
 /// DELETE 语句（v0.12.0 新增）
 #[derive(Debug, Clone)]
