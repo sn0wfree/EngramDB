@@ -1625,20 +1625,17 @@ impl Table {
             let row_count = col_owned[0].len();
 
             // 2. 按 batch_size 分块，逐 chunk 构造
-            for batch_start in (0..row_count).step_by(BATCH_SIZE) {
-                let batch_end = (batch_start + BATCH_SIZE).min(row_count);
-                let batch_len = batch_end - batch_start;
+            // S1.5：drain 移动替代逐 cell clone（String/Blob/Vector 免深拷贝）
+            let mut batch_start = 0;
+            while batch_start < row_count {
+                let batch_len = BATCH_SIZE.min(row_count - batch_start);
 
-                // 构造每个列的 Vector（克隆本 batch 的 cell）
+                // 构造每个列的 Vector：从 col_owned 移出本 batch 的 cell
                 let mut columns: Vec<Vector> = Vec::with_capacity(col_owned.len());
-                for col in &col_owned {
-                    let mut vec = Vec::with_capacity(batch_len);
-                    for i in batch_start..batch_end {
-                        if i < col.len() {
-                            vec.push(col[i].clone());
-                        } else {
-                            vec.push(Value::Null);
-                        }
+                for col in &mut col_owned {
+                    let mut vec: Vec<Value> = col.drain(0..batch_len).collect();
+                    if vec.len() < batch_len {
+                        vec.resize(batch_len, Value::Null);
                     }
                     columns.push(Vector::Flat(vec));
                 }
@@ -1673,6 +1670,7 @@ impl Table {
                     count: batch_len,
                     columns,
                 });
+                batch_start += batch_len;
             }
         }
 
