@@ -3283,3 +3283,152 @@ mod value_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod multi_engine_tests {
+    use super::*;
+    use crate::sql::ast::Statement;
+
+    #[test]
+    fn test_engine_clause_parse() {
+        // ENGINE = Memory 子句剥离
+        let stmt = sql::parser::parse("CREATE TABLE t (id INT) ENGINE = Memory").unwrap();
+        match stmt {
+            Statement::CreateTable(ct) => {
+                assert_eq!(ct.engine.as_deref(), Some("Memory"));
+                assert_eq!(ct.table_name, "t");
+            }
+            _ => panic!("expected CreateTable"),
+        }
+        // 无 ENGINE：默认 None
+        let stmt = sql::parser::parse("CREATE TABLE t (id INT)").unwrap();
+        match stmt {
+            Statement::CreateTable(ct) => assert_eq!(ct.engine, None),
+            _ => panic!("expected CreateTable"),
+        }
+        // 带分号
+        let stmt = sql::parser::parse("CREATE TABLE t (id INT) ENGINE=Log;").unwrap();
+        match stmt {
+            Statement::CreateTable(ct) => assert_eq!(ct.engine.as_deref(), Some("Log")),
+            _ => panic!("expected CreateTable"),
+        }
+        // 小写
+        let stmt = sql::parser::parse("CREATE TABLE t (id INT) engine = memory").unwrap();
+        match stmt {
+            Statement::CreateTable(ct) => assert_eq!(ct.engine.as_deref(), Some("memory")),
+            _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_engine_clause_planner() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT) ENGINE = Memory").unwrap();
+        let engine = conn
+            .database_mut()
+            .get_engine_table("t")
+            .map(|et| et.engine_type());
+        assert_eq!(engine, Some(common::types::EngineType::Memory));
+
+        // 非法引擎名报错
+        let err = conn.execute("CREATE TABLE bad (id INT) ENGINE = Nope").unwrap_err();
+        assert!(err.to_string().contains("unsupported ENGINE"), "got: {err}");
+
+        // 默认 Columnar
+        conn.execute("CREATE TABLE c (id INT)").unwrap();
+        let engine = conn
+            .database_mut()
+            .get_engine_table("c")
+            .map(|et| et.engine_type());
+        assert_eq!(engine, Some(common::types::EngineType::Columnar));
+    }
+
+    #[test]
+    fn test_table_def_serde_backward_compat() {
+        // 旧版本文件（无 engine 字段）反序列化应默认 Columnar：
+        // serde default 机制与具体格式无关，用 JSON 验证缺失字段回退
+        let json = r#"{"id":7,"name":"legacy","columns":[],"row_count":0,
+            "indexes":[],"cluster_key":null,"foreign_keys":[],
+            "next_auto_increment_id":1,"ttl_seconds":null,"ttl_column":null}"#;
+        let def: common::types::TableDef = serde_json::from_str(json).unwrap();
+        assert_eq!(def.engine, common::types::EngineType::Columnar, "旧文件应默认 Columnar");
+        assert_eq!(def.id, 7);
+
+        // 新格式：engine 字段往返保留
+        let mut def2 = common::types::TableDef::new(8, "t2", vec![]);
+        def2.engine = common::types::EngineType::Log;
+        let bytes = serde_json::to_vec(&def2).unwrap();
+        let back: common::types::TableDef = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.engine, common::types::EngineType::Log);
+    }
+
+    #[test]
+    fn test_engine_table_dispatch() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+        // 引擎句柄访问
+        let engine = conn.database_mut().get_engine_table_mut("t").unwrap();
+        assert_eq!(engine.engine_type(), common::types::EngineType::Columnar);
+        assert_eq!(engine.def().name, "t");
+        assert!(engine.as_columnar().is_some());
+
+        // 扫描分派
+        let chunks = engine.scan_to_chunks(&[0, 1], None).unwrap();
+        let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![Value::Int64(1), Value::Varchar("a".into())]);
+
+        // 点查分派
+        let row = engine.get_row_by_id(0).unwrap().unwrap();
+        assert_eq!(row[0], Value::Int64(1));
+
+        // 主键查询分派
+        let rid = engine.lookup_primary_key(&Value::Int64(1));
+        assert_eq!(rid, Some(0));
+
+        // 删除分派
+        engine.delete_row(0).unwrap();
+        assert!(engine.get_row_by_id(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_engine_persistence_roundtrip() {
+        // ENGINE 字段随 catalog 持久化：写入 → 关闭 → 重开 → 引擎类型保留
+        let path = format!("/tmp/engramdb_engine_rt_{}.hdb", std::process::id());
+        std::fs::remove_file(&path).ok();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE t (id INT) ENGINE = Memory").unwrap();
+            conn.close().unwrap();
+        }
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let engine = conn
+                .database_mut()
+                .get_engine_table("t")
+                .map(|et| et.engine_type());
+            assert_eq!(engine, Some(common::types::EngineType::Memory));
+            conn.close().unwrap();
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_engine_table_ops_trait() {
+        use crate::storage::engine::EngineTableOps;
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+        let mut table = conn.database_mut().get_table_mut("t").unwrap();
+        // 通过 trait 对象调用
+        let ops: &mut dyn EngineTableOps = table;
+        assert_eq!(ops.engine_type(), common::types::EngineType::Columnar);
+        let chunks = ops.scan_to_chunks(&[0, 1], None).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].count, 1);
+        assert!(ops.lookup_primary_key(&Value::Int64(1)).is_some());
+    }
+}

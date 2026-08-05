@@ -2244,3 +2244,60 @@ fn transpose_columns_to_rows(columns: &[Vec<Value>], num_rows: usize) -> Vec<Vec
     }
     rows
 }
+
+impl crate::storage::engine::EngineTableOps for Table {
+    fn engine_type(&self) -> crate::common::types::EngineType {
+        crate::common::types::EngineType::Columnar
+    }
+
+    fn def(&self) -> &crate::common::types::TableDef {
+        &self.def
+    }
+
+    fn insert_rows(&mut self, rows: Vec<Vec<crate::Value>>) -> crate::common::error::Result<u64> {
+        self.insert(rows)
+    }
+
+    fn insert_row(
+        &mut self,
+        row_id: u32,
+        row: &[crate::Value],
+    ) -> crate::common::error::Result<()> {
+        self.insert_row(row_id, row)
+    }
+
+    fn update_row(
+        &mut self,
+        row_id: u32,
+        new_row: &[crate::Value],
+    ) -> crate::common::error::Result<()> {
+        self.update_row(row_id, new_row)
+    }
+
+    fn delete_row(&mut self, row_id: u32) -> crate::common::error::Result<()> {
+        self.delete_row(row_id)
+    }
+
+    fn truncate(&mut self) -> crate::common::error::Result<()> {
+        self.truncate()
+    }
+
+    fn scan_to_chunks(
+        &mut self,
+        column_indices: &[usize],
+        skip_pred: Option<(usize, crate::storage::column_store::PredicateOp, crate::Value)>,
+    ) -> crate::common::error::Result<Vec<crate::executor::vector::DataChunk>> {
+        self.scan_to_chunks_with_skip(column_indices, skip_pred)
+    }
+
+    fn get_row_by_id(
+        &mut self,
+        row_id: u32,
+    ) -> crate::common::error::Result<Option<Vec<crate::Value>>> {
+        self.get_row_by_id(row_id)
+    }
+
+    fn lookup_primary_key(&self, pk: &crate::Value) -> Option<u32> {
+        self.lookup_primary_key(pk)
+    }
+}

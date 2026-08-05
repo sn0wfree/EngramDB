@@ -84,6 +84,8 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnDef>,
     /// CREATE TABLE AS SELECT 子查询（v0.15.0 新增）
     pub as_select: Option<Box<SelectStmt>>,
+    /// 存储引擎（v0.17.0 M0 多引擎）：`ENGINE = Memory` 等，None = Columnar
+    pub engine: Option<String>,
 }
 
 /// 列定义

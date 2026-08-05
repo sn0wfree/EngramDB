@@ -55,11 +55,11 @@ impl CatalogSnapshot {
     /// 从数据库实例收集 catalog 快照
     pub fn collect(
         next_table_id: u32,
-        tables: &HashMap<u32, crate::storage::table::Table>,
+        tables: &HashMap<u32, crate::storage::engine::EngineTable>,
     ) -> Self {
         let mut snapshot_tables = Vec::with_capacity(tables.len());
         for (&table_id, table) in tables {
-            snapshot_tables.push((table_id, table.def.clone()));
+            snapshot_tables.push((table_id, table.def().clone()));
         }
         snapshot_tables.sort_by_key(|(id, _)| *id);
         Self {

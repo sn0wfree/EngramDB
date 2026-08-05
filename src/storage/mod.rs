@@ -12,12 +12,14 @@ pub mod cache;
 pub mod rate_limiter;
 pub mod index;
 pub mod catalog;
+pub mod engine;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::common::error::{Result, EngramDbError};
 use crate::common::types::TableDef;
+use engine::EngineTable;
 use crate::common::config::Config;
 use crate::txn::TransactionManager;
 use file_format::FileHeader;
@@ -28,7 +30,7 @@ pub struct Database {
     path: PathBuf,
     config: Config,
     header: FileHeader,
-    tables: HashMap<u32, Table>,
+    tables: HashMap<u32, EngineTable>,
     table_names: HashMap<String, u32>,
     next_table_id: u32,
     file: std::fs::File,
@@ -169,7 +171,7 @@ impl Database {
         let table_id = self.next_table_id;
         self.next_table_id += 1;
 
-        let table = Table::new(table_def.clone(), self.config.compact_strategy);
+        let table = EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy));
         self.tables.insert(table_id, table);
         self.table_names.insert(table_def.name.clone(), table_id);
 
@@ -179,7 +181,7 @@ impl Database {
             .filter(|idx| idx.unique)
             .map(|idx| (idx.name.clone(), idx.key_columns.clone(), idx.included_columns.clone(), idx.unique))
             .collect();
-        if let Some(table_mut) = self.tables.get_mut(&table_id) {
+        if let Some(EngineTable::Columnar(table_mut)) = self.tables.get_mut(&table_id) {
             for (idx_name, key_cols, included_cols, unique) in &unique_index_specs {
                 table_mut.create_index(idx_name, key_cols, included_cols, *unique)?;
             }
@@ -191,15 +193,38 @@ impl Database {
         Ok(())
     }
 
-    /// 获取表
+    /// 获取表（Columnar 引擎解包；非 Columnar 引擎返回 None）
+    ///
+    /// 引擎感知的调用方应使用 [`Database::get_engine_table`] / 
+    /// [`Database::get_engine_table_mut`] 获取引擎句柄。
     pub fn get_table(&self, name: &str) -> Option<&Table> {
-        self.table_names.get(name).and_then(|id| self.tables.get(id))
+        self.table_names
+            .get(name)
+            .and_then(|id| self.tables.get(id))
+            .and_then(|et| et.as_columnar())
     }
 
-    /// 获取可变表
+    /// 获取可变表（Columnar 引擎解包）
     pub fn get_table_mut(&mut self, name: &str) -> Option<&mut Table> {
         let id = *self.table_names.get(name)?;
+        self.tables.get_mut(&id).and_then(|et| et.as_columnar_mut())
+    }
+
+    /// 获取引擎表句柄（引擎感知路径）
+    pub fn get_engine_table(&self, name: &str) -> Option<&EngineTable> {
+        let id = *self.table_names.get(name)?;
+        self.tables.get(&id)
+    }
+
+    /// 获取可变引擎表句柄（引擎感知路径）
+    pub fn get_engine_table_mut(&mut self, name: &str) -> Option<&mut EngineTable> {
+        let id = *self.table_names.get(name)?;
         self.tables.get_mut(&id)
+    }
+
+    /// 按表 ID 获取可变引擎表句柄（事务 apply 路径）
+    pub fn get_engine_table_mut_by_id(&mut self, table_id: u32) -> Option<&mut EngineTable> {
+        self.tables.get_mut(&table_id)
     }
 
     /// 创建覆盖索引（v0.12.0 新增）
@@ -215,8 +240,8 @@ impl Database {
         &self.table_names
     }
     
-    /// 获取所有表的可变引用（用于事务提交后应用）
-    pub fn tables_mut(&mut self) -> &mut HashMap<u32, table::Table> {
+    /// 获取所有引擎表的可变引用（用于事务提交后应用）
+    pub fn tables_mut(&mut self) -> &mut HashMap<u32, EngineTable> {
         &mut self.tables
     }
 
@@ -268,7 +293,7 @@ impl Database {
             // 收集表名避免借用冲突
             let table_names: Vec<String> = self.table_names.keys().cloned().collect();
             for name in &table_names {
-                if let Some(table) = self.tables.get_mut(&self.table_names[name]) {
+                if let Some(EngineTable::Columnar(table)) = self.tables.get_mut(&self.table_names[name]) {
                     let _ = table.maybe_compact()?;
                 }
             }
@@ -583,7 +608,7 @@ impl Database {
             }
 
             // 加载到对应表
-            if let Some(table) = self.tables.get_mut(&table_id) {
+            if let Some(EngineTable::Columnar(table)) = self.tables.get_mut(&table_id) {
                 let before_skip = table.indexes().len();
                 let before_vec = table.vector_indexes().len();
                 table.indexes_from_bytes(&data[offset..offset+index_data_len])?;
@@ -664,7 +689,8 @@ impl Database {
         self.next_table_id = snapshot.next_table_id;
 
         for (table_id, table_def) in snapshot.tables {
-            let table = Table::new(table_def.clone(), self.config.compact_strategy);
+            // M0：按引擎构造（当前仅 Columnar；Memory/Log 待 M2/M3）
+            let table = EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy));
             self.table_names.insert(table_def.name.clone(), table_id);
             self.tables.insert(table_id, table);
         }
@@ -694,6 +720,9 @@ impl Database {
         let compress = self.config.compress_on_persist;
         for table_id in table_ids {
             let table = self.tables.get_mut(&table_id).unwrap();
+            let EngineTable::Columnar(table) = table else {
+                continue; // M0：非 Columnar 引擎的数据段持久化待 M2/M3 实现
+            };
             let data_bytes = table.column_store_mut().data_to_bytes(compress)?;
             section_buf.extend_from_slice(&table_id.to_le_bytes());
             section_buf.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
@@ -761,7 +790,7 @@ impl Database {
                 return Err(EngramDbError::InvalidFormat("truncated data table body".into()));
             }
 
-            if let Some(table) = self.tables.get_mut(&table_id) {
+            if let Some(EngineTable::Columnar(table)) = self.tables.get_mut(&table_id) {
                 table.column_store_mut().data_from_bytes(&data[offset..offset + data_len])?;
                 // 同步列的 data_type（修正 Vector dim 等）
                 table.sync_column_data_types();
@@ -792,6 +821,9 @@ impl Database {
         // 后续 append 路径会通过 ensure_rg_decompressed 按需惰性解压。
         if self.config.compress_on_persist {
             for table in self.tables.values_mut() {
+                let EngineTable::Columnar(table) = table else {
+                    continue;
+                };
                 let _ = table.column_store_mut().compress_all()?;
             }
         }

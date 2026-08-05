@@ -276,6 +276,17 @@ fn plan_create_table(stmt: CreateTableStmt, db: &Database) -> Result<PhysicalPla
 
     let mut table_def = TableDef::new(0, &stmt.table_name, columns);
 
+    // v0.17.0 M0：ENGINE 子句 → TableDef.engine（校验引擎名）
+    if let Some(engine_name) = &stmt.engine {
+        table_def.engine = crate::common::types::EngineType::from_str(engine_name)
+            .ok_or_else(|| {
+                EngramDbError::Parse(format!(
+                    "unsupported ENGINE '{}' (supported: columnar, memory, log)",
+                    engine_name
+                ))
+            })?;
+    }
+
     // v0.14.0：为列级 UNIQUE 列自动创建 UniqueIndex
     for (i, c) in stmt.columns.iter().enumerate() {
         if c.unique && !c.primary_key {

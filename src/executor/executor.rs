@@ -1411,6 +1411,11 @@ fn execute_explain_analyze(plan: PhysicalPlan, db: &mut Database) -> Result<Quer
     })
 }
 
+/// 测试辅助：chunks → 行（公开版，供集成测试使用）
+pub fn debug_chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {
+    chunks_to_rows(chunks)
+}
+
 fn chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {
     let mut all_rows = Vec::new();
     for chunk in chunks {

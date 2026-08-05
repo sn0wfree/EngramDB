@@ -135,6 +135,36 @@ pub struct IndexDef {
     pub index_type: String,
 }
 
+/// 存储引擎类型（v0.17.0 多引擎架构 M0 新增）
+///
+/// 不同引擎面向不同工作负载，建表时通过 `ENGINE = xxx` 指定：
+/// - Columnar：列存主力引擎（分析 / 向量混合查询），默认
+/// - Memory：全内存高频读写（Agent 推理中间状态，不持久化）
+/// - Log：追加写日志引擎（trace / 事件流，v0.18 规划）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EngineType {
+    Columnar,
+    Memory,
+    Log,
+}
+
+impl Default for EngineType {
+    fn default() -> Self {
+        EngineType::Columnar
+    }
+}
+
+impl EngineType {
+    pub fn from_str(name: &str) -> Option<Self> {
+        match name.to_lowercase().as_str() {
+            "columnar" => Some(EngineType::Columnar),
+            "memory" => Some(EngineType::Memory),
+            "log" => Some(EngineType::Log),
+            _ => None,
+        }
+    }
+}
+
 /// 表定义
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableDef {
@@ -145,6 +175,12 @@ pub struct TableDef {
     pub indexes: Vec<IndexDef>,
     pub cluster_key: Option<usize>,
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// 存储引擎（v0.17.0 M0 新增）
+    ///
+    /// `#[serde(default)]`：旧版本文件无此字段时反序列化为 Columnar，
+    /// 磁盘格式向后兼容（v0.16 及更早的 .hdb 文件可直接打开）。
+    #[serde(default)]
+    pub engine: EngineType,
     /// AUTO_INCREMENT 计数器（v0.14.0 新增）
     ///
     /// 下一个待分配的自增 ID。每次 INSERT 自增列时从该值分配并 +1。
@@ -191,6 +227,7 @@ impl TableDef {
             indexes: Vec::new(),
             cluster_key: None,
             foreign_keys: Vec::new(),
+            engine: EngineType::Columnar,
             next_auto_increment_id: 1,
             ttl_seconds: None,
             ttl_column: None,

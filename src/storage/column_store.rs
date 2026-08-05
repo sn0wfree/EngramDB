@@ -1428,6 +1428,7 @@ mod tests {
     fn make_table_def() -> TableDef {
         TableDef {
             id: 1,
+            engine: crate::common::types::EngineType::Columnar,
             name: "t".to_string(),
             columns: vec![
                 crate::common::types::ColumnDef { name: "id".to_string(), data_type: DataType::Int64, nullable: true, is_primary_key: false, default_value: None, auto_increment: false },

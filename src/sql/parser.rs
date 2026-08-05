@@ -38,6 +38,14 @@ pub fn parse(sql: &str) -> Result<Statement> {
     // 转换为 CREATE INDEX ... USING hnsw，并提取 WITH 选项
     let (sql_for_parse, with_options, has_using_hnsw) = normalize_vector_index(&normalized_sql);
 
+    // 处理 CREATE TABLE ... ENGINE = xxx（v0.17.0 M0 多引擎）
+    // 仅 CREATE TABLE 语句尝试剥离（其他语句无 ENGINE 子句，原样返回）
+    let (sql_for_parse, engine_name) = if sql_for_parse.trim_start().to_uppercase().starts_with("CREATE TABLE") {
+        strip_engine_clause(&sql_for_parse)
+    } else {
+        (sql_for_parse, None)
+    };
+
     // 处理 CREATE INDEX ... INCLUDE (...) 语法（v0.12.0 覆盖索引）
     // sqlparser 0.47 不原生支持 INCLUDE 子句，需要预处理
     if let Some((base_sql, included_cols)) = extract_include_clause(&sql_for_parse) {
@@ -72,6 +80,12 @@ pub fn parse(sql: &str) -> Result<Statement> {
 
     // 只处理第一条语句
     let mut stmt = convert_statement(&stmts[0])?;
+    // 注入 ENGINE 选项（多引擎架构 v0.17.0 M0）
+    if let Some(engine) = engine_name {
+        if let Statement::CreateTable(ref mut ct) = stmt {
+            ct.engine = Some(engine);
+        }
+    }
     // 注入 WITH 选项和 USING hnsw 标记（向量索引）
     if let Statement::CreateIndex(ref mut idx_stmt) = stmt {
         if !with_options.is_empty() {
@@ -388,6 +402,42 @@ fn extract_with_options(sql: &str) -> (String, Vec<(String, String)>) {
     (base_sql, options)
 }
 
+/// 从 CREATE TABLE 语句中提取 ENGINE = xxx 子句
+///
+/// sqlparser 0.47 不支持 ENGINE 表选项（MySQL 方言），需要先剥离。
+/// 返回 (基础 SQL, 引擎名)。仅处理语句尾部的 `ENGINE = xxx` / `ENGINE xxx`
+/// 或 `) ENGINE = xxx` 形式（MySQL 风格，位于列定义之后）。
+fn strip_engine_clause(sql: &str) -> (String, Option<String>) {
+    let upper = sql.to_uppercase();
+    let marker = " ENGINE";
+    let Some(pos) = upper.find(marker) else {
+        return (sql.to_string(), None);
+    };
+    // 检查前缀：必须是 ") ENGINE"（列定义闭合括号后）或行首空白 + ENGINE
+    let before = &sql[..pos];
+    let trimmed_before = before.trim_end();
+    let valid_anchor = trimmed_before.ends_with(')') || trimmed_before.is_empty();
+    if !valid_anchor {
+        return (sql.to_string(), None);
+    }
+    let after = &sql[pos + marker.len()..];
+    let after_trimmed = after.trim_start();
+    // 去掉可选的 '='
+    let rest = after_trimmed.strip_prefix('=').map(|r| r.trim_start()).unwrap_or(after_trimmed);
+    // 取标识符（字母数字下划线）
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return (sql.to_string(), None);
+    }
+    let engine_name = rest[..end].to_string();
+    // 尾部可能还有分号/空白
+    let trailing = rest[end..].trim_start();
+    let base = format!("{}{}", trimmed_before, trailing);
+    (base, Some(engine_name))
+}
+
 /// 从 CREATE INDEX 语句中去除 USING hnsw 子句
 ///
 /// sqlparser 0.47 不支持 hnsw 作为 USING 值，需要先去除。
@@ -468,6 +518,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 table_name,
                 columns: cols,
                 as_select,
+                engine: None,
             }))
         }
 

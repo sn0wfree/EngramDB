@@ -142,7 +142,7 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
 
             // 仅当 base_row_id 与当前表行数对齐时走 insert_columns（列式批量）
             // 否则退回逐行 insert_row（保持 rowid 语义）
-            let base = table.def.row_count as u32;
+            let base = table.def().row_count as u32;
             if *base_row_id == base as u64 && !columns.is_empty() {
                 let cols = columns.clone();
                 let inserted = table.insert_columns(cols)?;
@@ -202,7 +202,7 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
 
                 // 只有当 row_ids 与当前 table.def.row_count 连续对齐时，才能走 table.insert()
                 // （因为 insert() 内部使用 def.row_count 作为 base_row_id）
-                let base = table.def.row_count as u32;
+                let base = table.def().row_count as u32;
                 let contiguous = row_ids.iter().enumerate()
                     .all(|(i, &rid)| rid == base + i as u32);
 
