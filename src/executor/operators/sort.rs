@@ -7,7 +7,7 @@ use crate::common::error::Result;
 use crate::Value;
 
 use super::super::physical_plan::{SortKey, SortDirection};
-use super::super::vector::DataChunk;
+use super::super::vector::{DataChunk, Vector};
 
 /// 执行排序
 ///
@@ -19,6 +19,18 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>)
     }
 
     let num_columns = input[0].num_columns();
+
+    // S2-M3：全 Typed 输入 → 索引排序 + gather（零行式物化）
+    // 仅全排序场景（无 limit 或 limit >= 总行数）；Top-N 堆路径保持行式
+    let full_sort = match limit {
+        Some(n) => n >= input.iter().map(|c| c.len()).sum::<usize>(),
+        None => true,
+    };
+    if full_sort && input.iter().all(|c| c.columns.iter().all(|v| v.is_typed())) {
+        if let Some(result) = try_execute_typed(input, sort_keys) {
+            return Ok(result);
+        }
+    }
 
     // 收集所有行
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
@@ -91,8 +103,110 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>)
     Ok(result)
 }
 
-// S1.1：单列整数 Radix Sort（LSD 16-bit × 4 pass，O(N) 非比较排序）
-//
+/// S2-M3：全 Typed 输入的索引排序 + gather（零行式物化）
+///
+/// 1. 每列合并所有 chunk 的类型化数据（append，O(N) 数组扩展）
+/// 2. 单列整数键 → radix 索引排序；否则索引比较排序（value_cmp 语义）
+/// 3. 输出按 order 分块 gather → Vector::Typed
+/// 不适用（类型不符）→ None → 回退行式路径
+fn try_execute_typed(input: &[DataChunk], sort_keys: &[SortKey]) -> Option<Vec<DataChunk>> {
+    use crate::common::column_data::ColumnData;
+    use crate::common::column_data::ColumnValue;
+
+    let num_columns = input[0].num_columns();
+    let total: usize = input.iter().map(|c| c.len()).sum();
+    if total <= 1 {
+        return Some(input.to_vec());
+    }
+
+    // 1. 合并每列（类型一致性由 append 保证，不符 → None）
+    let mut merged_cols: Vec<ColumnData> = Vec::with_capacity(num_columns);
+    for col_idx in 0..num_columns {
+        let mut acc: Option<ColumnData> = None;
+        for chunk in input {
+            let d = match &chunk.columns[col_idx] {
+                Vector::Typed(d) => d,
+                _ => return None,
+            };
+            match &mut acc {
+                None => acc = Some(d.clone()),
+                Some(a) => a.append(d),
+            }
+        }
+        merged_cols.push(acc?);
+    }
+
+    // 2. 排序索引
+    let mut order: Vec<usize> = Vec::with_capacity(total);
+    if sort_keys.len() == 1 {
+        let key = &sort_keys[0];
+        let desc = matches!(key.direction, SortDirection::Desc);
+        let col = &merged_cols[key.column_index];
+        // 单列整数 → radix 索引排序
+        let mut keys: Vec<(u64, usize)> = Vec::with_capacity(total);
+        let mut nulls: Vec<usize> = Vec::new();
+        for i in 0..total {
+            if col.nulls.as_ref().map_or(false, |n| n.test(i)) {
+                nulls.push(i);
+                continue;
+            }
+            match &col.values {
+                ColumnValue::Int64(v) => keys.push((int_to_key(v[i], desc), i)),
+                ColumnValue::Timestamp(v) => keys.push((int_to_key(v[i], desc), i)),
+                _ => return None,
+            }
+        }
+        radix_sort_16bit(&mut keys);
+        if desc {
+            order.extend(keys.iter().map(|&(_, i)| i));
+            order.extend(nulls);
+        } else {
+            order.extend(nulls);
+            order.extend(keys.iter().map(|&(_, i)| i));
+        }
+    } else {
+        // 多列：索引比较排序（value_cmp 语义，含 NULL 最前 / DESC）
+        let mut idx: Vec<usize> = (0..total).collect();
+        idx.sort_by(|&a, &b| {
+            for key in sort_keys {
+                let va = merged_cols[key.column_index].get(a);
+                let vb = merged_cols[key.column_index].get(b);
+                let c = value_cmp(&va, &vb);
+                match c {
+                    std::cmp::Ordering::Equal => continue,
+                    other => {
+                        return match key.direction {
+                            SortDirection::Asc => other,
+                            SortDirection::Desc => other.reverse(),
+                        };
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        order = idx;
+    }
+
+    // 3. 输出：order 分块 gather
+    let mut result = Vec::new();
+    let chunk_size = crate::executor::vector::VECTOR_SIZE;
+    for chunk_start in (0..total).step_by(chunk_size) {
+        let chunk_end = std::cmp::min(chunk_start + chunk_size, total);
+        let sel = &order[chunk_start..chunk_end];
+        let columns: Vec<Vector> = merged_cols
+            .iter()
+            .map(|col| Vector::Typed(col.gather(sel)))
+            .collect();
+        result.push(DataChunk {
+            columns,
+            count: chunk_end - chunk_start,
+        });
+    }
+
+    Some(result)
+}
+
+// S1.1：单列整数 Radix Sort（LSD 16-bit × 4 pass，O(N) 非比较排序）//
 // 适用条件：单排序键且列为 Int32/Int64/Timestamp（纯整数，无 NaN 语义问题）。
 // 语义与 value_cmp 一致：NULL 在 ASC 最前 / DESC 最后；稳定（保持原相对顺序）。
 // 不满足条件时返回 false，调用方退回 sort_by 比较排序。
@@ -561,6 +675,67 @@ mod tests {
         assert_eq!(rows[0][1], Value::Int64(0));
         assert_eq!(rows[1][1], Value::Int64(1));
         assert_eq!(rows[2][1], Value::Int64(2));
+    }
+
+    /// S2-M3：Typed 索引排序与行式路径等价性（单列 radix + 多列比较 + NULL + DESC）
+    #[test]
+    fn test_typed_sort_matches_rowwise() {
+        use crate::common::column_data::ColumnData;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for trial in 0..20 {
+            let n = 20 + rng.gen_range(0..300);
+            let keys: Vec<Value> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(0.15) {
+                        Value::Null
+                    } else {
+                        Value::Int64(rng.gen_range(-100000..100000))
+                    }
+                })
+                .collect();
+            let payload: Vec<Value> = (0..n).map(|i| Value::Int64(i as i64)).collect();
+            let data = ColumnData::try_from_values(&keys).unwrap();
+            let typed = DataChunk {
+                columns: vec![Vector::Typed(data), Vector::Flat(payload.clone())],
+                count: n,
+            };
+            let flat = DataChunk {
+                columns: vec![Vector::Flat(keys), Vector::Flat(payload)],
+                count: n,
+            };
+            for desc in [false, true] {
+                let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
+                let keys_ref = vec![SortKey { column_index: 0, direction: dir }];
+                let typed_out = execute(&[typed.clone()], &keys_ref, None).unwrap();
+                let flat_out = execute_force_compare(&[flat.clone()], &keys_ref).unwrap();
+                let t: Vec<Vec<Value>> = typed_out.iter().flat_map(|c| c.to_rows()).collect();
+                let f: Vec<Vec<Value>> = flat_out.iter().flat_map(|c| c.to_rows()).collect();
+                assert_eq!(t, f, "trial {} desc {}", trial, desc);
+            }
+        }
+    }
+
+    #[test]
+    fn test_typed_sort_multi_key() {
+        use crate::common::column_data::ColumnData;
+        // 多列：先 k1 降序再 k2 升序（索引比较路径）
+        let k1 = ColumnData::try_from_values(&vec![Value::Int64(2), Value::Int64(1), Value::Int64(2)]).unwrap();
+        let k2 = ColumnData::try_from_values(&vec![Value::Varchar("b".into()), Value::Varchar("a".into()), Value::Varchar("c".into())]).unwrap();
+        let typed = DataChunk {
+            columns: vec![Vector::Typed(k1), Vector::Typed(k2)],
+            count: 3,
+        };
+        let keys = vec![
+            SortKey { column_index: 0, direction: SortDirection::Desc },
+            SortKey { column_index: 1, direction: SortDirection::Asc },
+        ];
+        let out = execute(&[typed], &keys, None).unwrap();
+        let rows: Vec<Vec<Value>> = out.iter().flat_map(|c| c.to_rows()).collect();
+        // (2,b) (2,c) (1,a)
+        assert_eq!(rows[0], vec![Value::Int64(2), Value::Varchar("b".into())]);
+        assert_eq!(rows[1], vec![Value::Int64(2), Value::Varchar("c".into())]);
+        assert_eq!(rows[2], vec![Value::Int64(1), Value::Varchar("a".into())]);
     }
 
     /// 排序核心对比（radix vs sort_by），仅手动运行：cargo test --release --lib -- --ignored radix
