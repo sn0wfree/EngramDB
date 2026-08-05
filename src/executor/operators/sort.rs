@@ -55,11 +55,17 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>)
             all_rows = top_n;
         } else {
             // limit >= total_rows，全排序
-            all_rows.sort_by(|a, b| cmp_rows(a, b, &keys));
+            // S1.1：单列整数 → Radix Sort（O(N)）；否则退回比较排序
+            if keys.len() != 1 || !try_radix_sort(&mut all_rows, &keys[0]) {
+                all_rows.sort_by(|a, b| cmp_rows(a, b, &keys));
+            }
         }
     } else {
         // 无 limit：全排序
-        all_rows.sort_by(|a, b| cmp_rows(a, b, &keys));
+        // S1.1：单列整数 → Radix Sort（O(N)）；否则退回比较排序
+        if keys.len() != 1 || !try_radix_sort(&mut all_rows, &keys[0]) {
+            all_rows.sort_by(|a, b| cmp_rows(a, b, &keys));
+        }
     }
 
     // 重新分块
@@ -83,6 +89,86 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>)
     }
 
     Ok(result)
+}
+
+// S1.1：单列整数 Radix Sort（LSD 16-bit × 4 pass，O(N) 非比较排序）
+//
+// 适用条件：单排序键且列为 Int32/Int64/Timestamp（纯整数，无 NaN 语义问题）。
+// 语义与 value_cmp 一致：NULL 在 ASC 最前 / DESC 最后；稳定（保持原相对顺序）。
+// 不满足条件时返回 false，调用方退回 sort_by 比较排序。
+
+/// 尝试用 Radix Sort 排序，成功返回 true（all_rows 原地重排）
+fn try_radix_sort(all_rows: &mut Vec<Vec<Value>>, key: &SortKey) -> bool {
+    let col = key.column_index;
+    let desc = matches!(key.direction, SortDirection::Desc);
+
+    // 1. 提取排序键：(u64 key, 原行号)；NULL 单独记录
+    let mut keys: Vec<(u64, usize)> = Vec::with_capacity(all_rows.len());
+    let mut nulls: Vec<usize> = Vec::new();
+    for (i, row) in all_rows.iter().enumerate() {
+        match &row[col] {
+            Value::Null => nulls.push(i),
+            Value::Int32(v) => keys.push((int_to_key(*v as i64, desc), i)),
+            Value::Int64(v) => keys.push((int_to_key(*v, desc), i)),
+            Value::Timestamp(v) => keys.push((int_to_key(*v, desc), i)),
+            _ => return false, // 非整数列（Float/Varchar/…）→ 退回比较排序
+        }
+    }
+
+    // 2. LSD 基数排序（16-bit × 4 pass，稳定）
+    radix_sort_16bit(&mut keys);
+
+    // 3. 按排序索引重排行（mem::take 移动，零深拷贝）
+    let mut rows = std::mem::take(all_rows);
+    let mut order: Vec<usize> = Vec::with_capacity(rows.len());
+    if desc {
+        order.extend(keys.iter().map(|&(_, i)| i));
+        order.extend(nulls); // DESC：NULL 最后，保持原相对顺序
+    } else {
+        order.extend(nulls); // ASC：NULL 最前，保持原相对顺序
+        order.extend(keys.iter().map(|&(_, i)| i));
+    }
+    for i in order {
+        all_rows.push(std::mem::take(&mut rows[i]));
+    }
+    true
+}
+
+/// i64 → 单调 u64 键：ASC 时按位翻转符号位（负值映射到前半段），DESC 时整体取反
+#[inline]
+fn int_to_key(v: i64, desc: bool) -> u64 {
+    let k = v as u64 ^ (1u64 << 63);
+    if desc { !k } else { k }
+}
+
+/// LSD 基数排序：16-bit 分桶，4 趟（覆盖 u64 全范围），稳定
+fn radix_sort_16bit(keys: &mut Vec<(u64, usize)>) {
+    const PASSES: usize = 4;
+    const BUCKETS: usize = 65536;
+    let mut count = vec![0u32; BUCKETS];
+    let mut out: Vec<(u64, usize)> = Vec::with_capacity(keys.len());
+
+    for pass in 0..PASSES {
+        let shift = pass * 16;
+        count.iter_mut().for_each(|c| *c = 0);
+        for &(k, _) in keys.iter() {
+            count[((k >> shift) & 0xFFFF) as usize] += 1;
+        }
+        let mut sum = 0u32;
+        for c in count.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        out.clear();
+        out.resize(keys.len(), (0, 0));
+        for &(k, i) in keys.iter() {
+            let bucket = ((k >> shift) & 0xFFFF) as usize;
+            out[count[bucket] as usize] = (k, i);
+            count[bucket] += 1;
+        }
+        std::mem::swap(keys, &mut out);
+    }
 }
 
 /// 按排序键比较两行（方向感知：ASC / DESC）
@@ -162,6 +248,16 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Int64(x), Int32(y)) => x.cmp(&(*y as i64)),
         (Int32(x), Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
         (Float64(x), Int32(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
+
+        // S1.1：Timestamp 按 i64 数值语义比较（此前落 `_` 分支按类型名恒等，
+        // 导致 Timestamp 列排序失效——保持原序）
+        (Timestamp(x), Timestamp(y)) => x.cmp(y),
+        (Timestamp(x), Int32(y)) => x.cmp(&(*y as i64)),
+        (Int32(x), Timestamp(y)) => (*x as i64).cmp(y),
+        (Timestamp(x), Int64(y)) => x.cmp(y),
+        (Int64(x), Timestamp(y)) => x.cmp(y),
+        (Timestamp(x), Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
+        (Float64(x), Timestamp(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
 
         _ => {
             // 不同类型：按类型名排序（确定性）
@@ -320,5 +416,150 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Int64(1));
         assert_eq!(rows[1][0], Value::Int64(2));
+    }
+
+    // ========================================================================
+    // S1.1 Radix Sort 测试
+    // ========================================================================
+
+    /// 强制走比较排序路径（等价性测试对照，execute 本身会选 radix 路径）
+    fn execute_force_compare(input: &[DataChunk], sort_keys: &[SortKey]) -> Result<Vec<DataChunk>> {
+        let num_columns = input[0].num_columns();
+        let mut all_rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in input {
+            all_rows.extend(chunk.to_rows());
+        }
+        all_rows.sort_by(|a, b| cmp_rows(a, b, sort_keys));
+        let mut result = Vec::new();
+        let chunk_size = crate::executor::vector::VECTOR_SIZE;
+        for chunk_start in (0..all_rows.len()).step_by(chunk_size) {
+            let chunk_end = std::cmp::min(chunk_start + chunk_size, all_rows.len());
+            let chunk_rows = &all_rows[chunk_start..chunk_end];
+            let mut columns = Vec::with_capacity(num_columns);
+            for col_idx in 0..num_columns {
+                let col_values: Vec<Value> = chunk_rows.iter().map(|r| r[col_idx].clone()).collect();
+                columns.push(crate::executor::vector::Vector::from_values(col_values));
+            }
+            result.push(DataChunk {
+                columns,
+                count: chunk_end - chunk_start,
+            });
+        }
+        Ok(result)
+    }
+
+    /// 构造 N 行双列 chunk：col0 为排序键（含 NULL），col1 为原行号标记
+    fn make_radix_chunk(keys: Vec<Value>) -> DataChunk {
+        let n = keys.len();
+        let col0 = Vector::Flat(keys);
+        let col1 = Vector::Flat((0..n).map(|i| Value::Int64(i as i64)).collect());
+        DataChunk {
+            columns: vec![col0, col1],
+            count: n,
+        }
+    }
+
+    #[test]
+    fn test_radix_matches_sort_by_random() {
+        // 随机数据等价性：radix 结果 == sort_by 结果（ASC + DESC，含 NULL）
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for trial in 0..20 {
+            let n = 1 + (trial * 37) % 5000;
+            let mut keys: Vec<Value> = Vec::with_capacity(n);
+            for _ in 0..n {
+                keys.push(match rng.gen_range(0..10) {
+                    0 => Value::Null,
+                    1 => Value::Int32(rng.gen_range(-1000..1000)),
+                    2 => Value::Timestamp(rng.gen_range(-10000..10000)),
+                    _ => Value::Int64(rng.gen_range(-1_000_000..1_000_000)),
+                });
+            }
+            for desc in [false, true] {
+                let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
+                let keys_ref = vec![SortKey { column_index: 0, direction: dir }];
+
+                let chunk_radix = make_radix_chunk(keys.clone());
+                let r_radix = execute(&[chunk_radix], &keys_ref, None).unwrap();
+                let rows_radix: Vec<Vec<Value>> = r_radix.iter().flat_map(|c| c.to_rows()).collect();
+
+                let chunk_cmp = make_radix_chunk(keys.clone());
+                let r_cmp = execute_force_compare(&[chunk_cmp], &keys_ref).unwrap();
+                let rows_cmp: Vec<Vec<Value>> = r_cmp.iter().flat_map(|c| c.to_rows()).collect();
+
+                assert_eq!(rows_radix.len(), rows_cmp.len(),
+                    "trial {} desc {} radix={} cmp={}", trial, desc, rows_radix.len(), rows_cmp.len());
+                for (a, b) in rows_radix.iter().zip(rows_cmp.iter()) {
+                    assert_eq!(a[0], b[0], "key mismatch trial {} desc {}", trial, desc);
+                    assert_eq!(a[1], b[1], "row order mismatch trial {} desc {}", trial, desc);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_radix_null_order() {
+        // ASC：NULL 最前；DESC：NULL 最后
+        let keys = vec![
+            Value::Int64(5), Value::Null, Value::Int64(1), Value::Null, Value::Int64(3),
+        ];
+        let asc = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys.clone())], &asc, None)
+            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(rows[0][0], Value::Null);
+        assert_eq!(rows[1][0], Value::Null);
+        assert_eq!(rows[2][0], Value::Int64(1));
+        assert_eq!(rows[3][0], Value::Int64(3));
+        assert_eq!(rows[4][0], Value::Int64(5));
+
+        let desc = vec![SortKey { column_index: 0, direction: SortDirection::Desc }];
+        let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys)], &desc, None)
+            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(rows[0][0], Value::Int64(5));
+        assert_eq!(rows[1][0], Value::Int64(3));
+        assert_eq!(rows[2][0], Value::Int64(1));
+        assert_eq!(rows[3][0], Value::Null);
+        assert_eq!(rows[4][0], Value::Null);
+    }
+
+    #[test]
+    fn test_radix_stability() {
+        // 重复键保持原相对顺序（与 sort_by 稳定一致）
+        let keys = vec![
+            Value::Int64(2), Value::Int64(1), Value::Int64(2), Value::Int64(1), Value::Int64(2),
+        ];
+        let asc = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys)], &asc, None)
+            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+        // 原序号：key=1 的是行 1,3；key=2 的是行 0,2,4
+        assert_eq!(rows[0][1], Value::Int64(1));
+        assert_eq!(rows[1][1], Value::Int64(3));
+        assert_eq!(rows[2][1], Value::Int64(0));
+        assert_eq!(rows[3][1], Value::Int64(2));
+        assert_eq!(rows[4][1], Value::Int64(4));
+    }
+
+    #[test]
+    fn test_radix_fallback_non_integer() {
+        // 非整数列（Float64）：radix 不可用，走 sort_by，结果仍正确
+        let chunk = make_test_chunk();
+        let keys = vec![SortKey { column_index: 2, direction: SortDirection::Asc }];
+        let result = execute(&[chunk], &keys, None).unwrap();
+        let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0][0], Value::Int64(5)); // 72.3: eve（idx 3）
+        assert_eq!(rows[4][0], Value::Int64(2)); // 95.0: bob（idx 2，稳定序最后）
+    }
+
+    #[test]
+    fn test_radix_all_null() {
+        // 全 NULL 列：保持原序
+        let keys = vec![Value::Null, Value::Null, Value::Null];
+        let asc = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys)], &asc, None)
+            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(rows[0][1], Value::Int64(0));
+        assert_eq!(rows[1][1], Value::Int64(1));
+        assert_eq!(rows[2][1], Value::Int64(2));
     }
 }
