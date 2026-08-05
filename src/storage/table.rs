@@ -313,7 +313,42 @@ impl Table {
 
     /// 通过主键值查找 row_id（O(log n)）
     pub fn lookup_primary_key(&self, key: &crate::Value) -> Option<u32> {
-        self.primary_index.as_ref().and_then(|idx| idx.get(key).copied())
+        let idx = self.primary_index.as_ref()?;
+        if let Some(v) = idx.get(key) {
+            return Some(*v);
+        }
+        // 数值主键类型归一化兜底（v0.17.0 M1-7）：
+        // INSERT 参数类型（Int32/Int64/Timestamp）与查询字面量类型可能不同，
+        // 按数值语义互查（如 Int32 主键 + Int64 字面量）。
+        use crate::Value::*;
+        match key {
+            Int32(v) => {
+                if let Some(r) = idx.get(&Int64(*v as i64)) {
+                    return Some(*r);
+                }
+                if let Some(r) = idx.get(&Timestamp(*v as i64)) {
+                    return Some(*r);
+                }
+            }
+            Int64(v) => {
+                if let Some(r) = idx.get(&Int32(*v as i32)) {
+                    return Some(*r);
+                }
+                if let Some(r) = idx.get(&Timestamp(*v)) {
+                    return Some(*r);
+                }
+            }
+            Timestamp(v) => {
+                if let Some(r) = idx.get(&Int64(*v)) {
+                    return Some(*r);
+                }
+                if let Some(r) = idx.get(&Int32(*v as i32)) {
+                    return Some(*r);
+                }
+            }
+            _ => {}
+        }
+        None
     }
 
     /// 获取主键索引引用（用于 planner/executor 检测）
@@ -377,11 +412,8 @@ impl Table {
             Some(i) => i,
             None => return Ok(()),
         };
-        let idx = match self.primary_index.as_mut() {
-            Some(i) => i,
-            None => return Ok(()),
-        };
-        idx.clear();
+        // M1-7：无条件重建（索引缺失时也从零构建，而非直接返回）
+        let mut idx = std::collections::BTreeMap::new();
 
         // 从列存遍历
         let mut row_id = 0u32;
@@ -400,6 +432,7 @@ impl Table {
             }
         }
 
+        self.primary_index = Some(idx);
         Ok(())
     }
 
@@ -712,6 +745,20 @@ impl Table {
             }
         }
 
+        // --- 主键 Mark Index 段（v0.17.0 M1-7 新增）---
+        // 完整主键索引持久化（mark 间隔=1）：重启免全行扫描重建，
+        // 点查保持 O(log N) 二分精确定位。旧文件无此段 → 读取时重建兜底。
+        // 格式：[mark_len:u32][bincode(BTreeMap<Value, u32>)]
+        match &self.primary_index {
+            Some(idx) => {
+                let bytes = bincode::serialize(idx)
+                    .expect("BTreeMap<Value, u32> serialization cannot fail");
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+            None => buf.extend_from_slice(&0u32.to_le_bytes()),
+        }
+
         buf
     }
 
@@ -811,7 +858,33 @@ impl Table {
             self.vector_indexes.insert(name, (hnsw, id_mapping));
         }
 
+        // --- 主键 Mark Index 段（v0.17.0 M1-7 新增，可选）---
+        // 旧格式文件（v0.17.0 之前）没有该段：剩余 0 字节 → 返回，由
+        // 调用方（Database::load_indexes）做全量重建兜底。
+        if offset + 4 > data.len() {
+            return Ok(()); // 旧格式，无主键段
+        }
+        let mark_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + mark_len > data.len() {
+            return Err(EngramDbError::InvalidFormat("truncated primary mark index".into()));
+        }
+        if mark_len > 0 {
+            let idx: std::collections::BTreeMap<crate::Value, u32> =
+                bincode::deserialize(&data[offset..offset+mark_len]).map_err(|e| {
+                    crate::common::error::EngramDbError::Serialization(e.to_string())
+                })?;
+            self.primary_index = Some(idx);
+        }
+        // 注意：mark_len == 0 表示表无主键索引（primary_index 保持 None）
+
         Ok(())
+    }
+
+    /// 测试辅助：清空内存主键索引（模拟无持久化段的旧文件）
+    #[cfg(test)]
+    pub fn clear_primary_index_for_test(&mut self) {
+        self.primary_index = None;
     }
 
     /// 获取当前合并策略

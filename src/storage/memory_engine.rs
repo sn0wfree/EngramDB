@@ -201,9 +201,21 @@ impl MemoryTable {
         ))
     }
 
-    /// 主键点查（O(log n)）
+    /// 主键点查（O(log n)，数值类型归一化：Int32/Int64/Timestamp 互查）
     pub fn lookup_primary_key(&self, key: &Value) -> Option<u32> {
-        self.primary.get(key).copied()
+        if let Some(v) = self.primary.get(key) {
+            return Some(*v);
+        }
+        use Value::*;
+        match key {
+            Int32(v) => self.primary.get(&Int64(*v as i64)).copied()
+                .or_else(|| self.primary.get(&Timestamp(*v as i64)).copied()),
+            Int64(v) => self.primary.get(&Int32(*v as i32)).copied()
+                .or_else(|| self.primary.get(&Timestamp(*v)).copied()),
+            Timestamp(v) => self.primary.get(&Int64(*v)).copied()
+                .or_else(|| self.primary.get(&Int32(*v as i32)).copied()),
+            _ => None,
+        }
     }
 
     /// 扫描（支持谓词筛选 + 列裁剪），输出 Typed DataChunk

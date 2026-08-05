@@ -445,7 +445,7 @@ fn count_placeholder_in_expr(expr: &sql::ast::Expression, max_idx: &mut usize) {
 }
 
 /// 值类型
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Boolean(bool),

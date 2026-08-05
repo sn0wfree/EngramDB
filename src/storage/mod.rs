@@ -596,6 +596,7 @@ impl Database {
         use std::io::{Read, Seek};
 
         if self.header.index_root == 0 || self.header.index_size == 0 {
+            self.rebuild_missing_primary_indexes()?;
             return Ok(0); // 无索引
         }
 
@@ -642,7 +643,32 @@ impl Database {
             offset += index_data_len;
         }
 
+        self.rebuild_missing_primary_indexes()?;
+
         Ok(total_indexes)
+    }
+
+    /// 主键 Mark Index 兜底重建（v0.17.0 M1-7）
+    ///
+    /// 持久化主键段不存在（旧文件 / 无索引段）时全量重建；
+    /// 已从索引段恢复的表跳过。幂等：多次调用无副作用。
+    fn rebuild_missing_primary_indexes(&mut self) -> Result<()> {
+        let mut rebuilt = 0u32;
+        for engine in self.tables.values_mut() {
+            let EngineTable::Columnar(table) = engine else {
+                continue;
+            };
+            if table.def.primary_key_index().is_some()
+                && table.primary_index().map_or(true, |i| i.is_empty())
+            {
+                table.rebuild_primary_index()?;
+                rebuilt += 1;
+            }
+        }
+        if rebuilt > 0 {
+            log::trace!("Mark Index: rebuilt primary index for {} tables (no persisted mark segment)", rebuilt);
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -970,8 +996,9 @@ mod tests {
     fn test_table_empty_indexes() {
         let table = make_test_table();
         let bytes = table.indexes_to_bytes();
-        // skip_count(4B) = 0 + vec_count(4B) = 0 = 8 bytes
-        assert_eq!(bytes.len(), 8);
+        // skip_count(4B) = 0 + vec_count(4B) = 0 + mark_len(4B) = 0 = 12 bytes
+        // （v0.17.0 M1-7：尾部追加主键 Mark Index 长度字段）
+        assert_eq!(bytes.len(), 12);
 
         let mut table2 = make_test_table();
         table2.indexes_from_bytes(&bytes).unwrap();
