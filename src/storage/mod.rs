@@ -160,6 +160,9 @@ impl Database {
         // 索引在 schema 与数据均就绪后构建
         let _ = db.load_indexes();
 
+        // M4：WAL 崩溃恢复（重放 checkpoint 后已提交事务）
+        let _ = crate::wal::recovery::recover_and_apply(&mut db)?;
+
         Ok(db)
     }
 
@@ -189,6 +192,8 @@ impl Database {
         if table_def.engine == crate::common::types::EngineType::Memory {
             self.txn_manager.mark_non_persistent(table_id);
         }
+        // M4：注册表引擎（WAL 记录头 engine_type 来源）
+        self.txn_manager.register_table_engine(table_id, table_def.engine);
         self.tables.insert(table_id, table);
         self.table_names.insert(table_def.name.clone(), table_id);
 
@@ -756,6 +761,8 @@ impl Database {
             if table_def.engine == crate::common::types::EngineType::Memory {
                 self.txn_manager.mark_non_persistent(table_id);
             }
+            // M4：注册表引擎（WAL 记录头 engine_type 来源）
+            self.txn_manager.register_table_engine(table_id, table_def.engine);
             self.table_names.insert(table_def.name.clone(), table_id);
             self.tables.insert(table_id, table);
         }

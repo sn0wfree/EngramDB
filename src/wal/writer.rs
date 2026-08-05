@@ -86,6 +86,7 @@ impl WalWriter {
         record_type: WalRecordType,
         txn_id: u32,
         table_id: u32,
+        engine_type: crate::common::types::EngineType,
         payload: &[u8],
     ) -> Result<u64> {
         let record = WalRecord {
@@ -93,6 +94,7 @@ impl WalWriter {
             record_type,
             txn_id,
             table_id,
+            engine_type,
             payload: payload.to_vec(),
         };
 
@@ -116,7 +118,13 @@ impl WalWriter {
         let mut lsns = Vec::with_capacity(records.len());
 
         for (rec_type, txn_id, table_id, payload) in records {
-            let lsn = self.write_record(*rec_type, *txn_id, *table_id, payload)?;
+            let lsn = self.write_record(
+                *rec_type,
+                *txn_id,
+                *table_id,
+                crate::common::types::EngineType::Columnar,
+                payload,
+            )?;
             lsns.push(lsn);
         }
 
@@ -296,8 +304,8 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            let lsn1 = writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            let lsn2 = writer.write_record(WalRecordType::Insert, 1, 1, &[1, 2, 3]).unwrap();
+            let lsn1 = writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            let lsn2 = writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1, 2, 3]).unwrap();
             writer.sync().unwrap();
 
             assert_eq!(lsn1, 0);
@@ -332,7 +340,7 @@ mod tests {
         // 写入多条，验证 LSN 连续
         let mut prev_lsn = 0;
         for i in 0..100 {
-            let lsn = writer.write_record(WalRecordType::Insert, 1, 1, &[i as u8]).unwrap();
+            let lsn = writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[i as u8]).unwrap();
             assert!(lsn >= prev_lsn);
             prev_lsn = lsn;
         }
@@ -349,16 +357,16 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             // Begin/Commit/Rollback/Checkpoint 都有空 payload
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Rollback, 2, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Checkpoint, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Rollback, 2, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            let lsn2 = writer.write_record(WalRecordType::Checkpoint, 0, 0, crate::common::types::EngineType::Columnar, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
             writer.sync().unwrap();
         }
 
-        // 验证文件大小：4 条记录 × 19 字节头 + 8 字节 checkpoint payload
+        // 验证文件大小：4 条记录 × 20 字节头 + 8 字节 checkpoint payload
         let meta = std::fs::metadata(&tmp).unwrap();
-        assert_eq!(meta.len(), (19 * 4 + 8) as u64);
+        assert_eq!(meta.len(), (20 * 4 + 8) as u64);
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -372,7 +380,7 @@ mod tests {
         let mut last_lsn = u64::MAX;
 
         for i in 0..50 {
-            let lsn = writer.write_record(WalRecordType::Insert, i, i, &[i as u8; 10]).unwrap();
+            let lsn = writer.write_record(WalRecordType::Insert, i, i, crate::common::types::EngineType::Columnar, &[i as u8; 10]).unwrap();
             if last_lsn != u64::MAX {
                 assert!(lsn > last_lsn, "LSN not monotonic: {} <= {}", lsn, last_lsn);
             }
@@ -388,10 +396,10 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let mut writer = WalWriter::open(&tmp).unwrap();
-        let lsn = writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
+        let lsn = writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
 
         // sync 前 current_lsn 应该已经是写入后的位置
-        assert_eq!(writer.current_lsn(), lsn + 19); // 19 = header + empty payload + crc
+        assert_eq!(writer.current_lsn(), lsn + 20); // 20 = header + engine + empty payload + crc
 
         writer.sync().unwrap();
         assert_eq!(writer.durable_lsn(), writer.current_lsn());
@@ -405,7 +413,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let mut writer = WalWriter::open(&tmp).unwrap();
-        writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
+        writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
         writer.flush().unwrap();
 
         // flush 后文件应该有数据
@@ -423,11 +431,11 @@ mod tests {
         let mut writer = WalWriter::open(&tmp).unwrap();
         // 写入一条大于默认 buffer size (64KB) 的记录
         let large_payload = vec![42u8; 100_000];
-        let lsn = writer.write_record(WalRecordType::Insert, 1, 1, &large_payload).unwrap();
+        let lsn = writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &large_payload).unwrap();
         writer.sync().unwrap();
 
         let file_size = std::fs::metadata(&tmp).unwrap().len();
-        assert_eq!(file_size, lsn + 19 + large_payload.len() as u64);
+        assert_eq!(file_size, lsn + 20 + large_payload.len() as u64);
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -448,16 +456,16 @@ mod tests {
 
         // 前 3 次 commit 不应触发 fsync
         for i in 0..3 {
-            writer.write_record(WalRecordType::Begin, i, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Commit, i, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.commit_flush().unwrap();
         }
         assert_eq!(writer.pending_commits(), 3);
         assert!(writer.bytes_since_sync() > 0);
 
         // 第 4 次 commit 应触发 fsync
-        writer.write_record(WalRecordType::Begin, 3, 0, &[]).unwrap();
-        writer.write_record(WalRecordType::Commit, 3, 0, &[]).unwrap();
+        writer.write_record(WalRecordType::Begin, 3, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        writer.write_record(WalRecordType::Commit, 3, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
         writer.commit_flush().unwrap();
         assert_eq!(writer.pending_commits(), 0);
         assert_eq!(writer.bytes_since_sync(), 0);
@@ -483,7 +491,7 @@ mod tests {
         // 写入小记录，累计字节数直到触发
         let mut count = 0;
         loop {
-            writer.write_record(WalRecordType::Insert, count, 1, &[count as u8; 10]).unwrap();
+            writer.write_record(WalRecordType::Insert, count, 1, crate::common::types::EngineType::Columnar, &[count as u8; 10]).unwrap();
             writer.commit_flush().unwrap();
             count += 1;
             if writer.pending_commits() == 0 && count > 1 {
@@ -512,7 +520,7 @@ mod tests {
 
         // 写入 5 次 commit，都在组内
         for i in 0..5 {
-            writer.write_record(WalRecordType::Commit, i, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.commit_flush().unwrap();
         }
         assert_eq!(writer.pending_commits(), 5);
@@ -541,7 +549,7 @@ mod tests {
 
         // 每次 commit 都应 fsync（pending 始终为 0）
         for i in 0..5 {
-            writer.write_record(WalRecordType::Commit, i, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.commit_flush().unwrap();
             assert_eq!(writer.pending_commits(), 0);
         }

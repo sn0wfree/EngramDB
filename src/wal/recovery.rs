@@ -146,6 +146,69 @@ pub fn recover(wal_path: &str) -> Result<RecoveryResult> {
     Ok(result)
 }
 
+/// 崩溃恢复：真实重放已提交事务（M4）
+///
+/// 语义：主文件 = 最后 checkpoint 的状态；WAL 中 checkpoint 之后的
+/// 已提交事务记录未落盘 → 按序重放到引擎表（引擎分派 insert_row /
+/// update_row / delete_row，Log 表追加语义天然顺序兼容）。
+/// 未提交事务从未 apply 到存储（apply 在 commit 时发生）→ 无需 undo。
+///
+/// 幂等：重放前按 row_id 检查存在性（双崩溃窗口防护）；恢复完成后
+/// 立即 checkpoint（数据落盘 + 写 Checkpoint 记录 → 下次恢复零重放）。
+pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryResult> {
+    let mut result = RecoveryResult::default();
+    let wal_path = format!("{}-wal", db.path().to_string_lossy());
+    let redo = get_redo_records(&wal_path)?;
+    if redo.is_empty() {
+        result.success = true;
+        return Ok(result);
+    }
+
+    use crate::wal::{parse_delete_payload, parse_insert_batch_payload, parse_insert_payload, parse_update_payload};
+    for rec in &redo {
+        let Some(table) = db.tables_mut().get_mut(&rec.table_id) else {
+            continue; // schema 已删
+        };
+        match rec.record_type {
+            WalRecordType::Insert => {
+                let Some((rowid, row)) = parse_insert_payload(&rec.payload) else { continue };
+                // 幂等：row 已存在则跳过（双崩溃窗口）
+                if table.get_row_by_id(rowid as u32)?.is_none() {
+                    table.insert_row(rowid as u32, &row)?;
+                }
+                result.records_redone += 1;
+            }
+            WalRecordType::InsertBatch => {
+                let Some((base, rows)) = parse_insert_batch_payload(&rec.payload) else { continue };
+                for (i, row) in rows.iter().enumerate() {
+                    let rid = base + i as u64;
+                    if table.get_row_by_id(rid as u32)?.is_none() {
+                        table.insert_row(rid as u32, row)?;
+                    }
+                }
+                result.records_redone += 1;
+            }
+            WalRecordType::Update => {
+                let Some((rowid, _, new_row)) = parse_update_payload(&rec.payload) else { continue };
+                table.update_row(rowid as u32, &new_row)?;
+                result.records_redone += 1;
+            }
+            WalRecordType::Delete => {
+                let Some((rowid, _)) = parse_delete_payload(&rec.payload) else { continue };
+                table.delete_row(rowid as u32)?;
+                result.records_redone += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // 恢复完成：立即 checkpoint（数据落盘 + 写 Checkpoint 记录 → 幂等）
+    db.checkpoint()?;
+    result.transactions_committed = redo.iter().filter(|r| r.record_type == WalRecordType::Commit).count() as u64;
+    result.success = true;
+    Ok(result)
+}
+
 /// 获取需要重做的记录列表（供调用方实际应用）
 pub fn get_redo_records(wal_path: &str) -> Result<Vec<WalRecord>> {
     if !std::path::Path::new(wal_path).exists() {
@@ -213,10 +276,10 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             let payload = make_insert_payload(1, &[Value::Int64(42)]);
-            writer.write_record(WalRecordType::Insert, 1, 1, &payload).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 
@@ -237,9 +300,9 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             let payload = make_insert_payload(1, &[Value::Int64(42)]);
-            writer.write_record(WalRecordType::Insert, 1, 1, &payload).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
             // 没有 Commit — 模拟崩溃
             writer.flush().unwrap();
         }
@@ -262,14 +325,14 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             let payload = make_insert_batch_payload(0, &[
                 vec![Value::Int64(1), Value::Varchar("a".into())],
                 vec![Value::Int64(2), Value::Varchar("b".into())],
                 vec![Value::Int64(3), Value::Varchar("c".into())],
             ]);
-            writer.write_record(WalRecordType::InsertBatch, 1, 1, &payload).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::InsertBatch, 1, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 
@@ -296,13 +359,13 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             // Txn 1: 已提交
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, &[1]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1]).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             // Txn 2: 未提交（崩溃）
-            writer.write_record(WalRecordType::Begin, 2, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 2, 1, &[2]).unwrap();
-            writer.write_record(WalRecordType::Insert, 2, 1, &[3]).unwrap();
+            writer.write_record(WalRecordType::Begin, 2, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Insert, 2, 1, crate::common::types::EngineType::Columnar, &[2]).unwrap();
+            writer.write_record(WalRecordType::Insert, 2, 1, crate::common::types::EngineType::Columnar, &[3]).unwrap();
             // 没有 Commit
             writer.flush().unwrap();
         }
@@ -325,9 +388,9 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 1..=5 {
-                writer.write_record(WalRecordType::Begin, i, 0, &[]).unwrap();
-                writer.write_record(WalRecordType::Insert, i, 1, &[i as u8]).unwrap();
-                writer.write_record(WalRecordType::Commit, i, 0, &[]).unwrap();
+                writer.write_record(WalRecordType::Begin, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+                writer.write_record(WalRecordType::Insert, i, 1, crate::common::types::EngineType::Columnar, &[i as u8]).unwrap();
+                writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             }
             writer.sync().unwrap();
         }
@@ -350,8 +413,8 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 1..=3 {
-                writer.write_record(WalRecordType::Begin, i, 0, &[]).unwrap();
-                writer.write_record(WalRecordType::Insert, i, 1, &[i as u8]).unwrap();
+                writer.write_record(WalRecordType::Begin, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+                writer.write_record(WalRecordType::Insert, i, 1, crate::common::types::EngineType::Columnar, &[i as u8]).unwrap();
                 // 没有 Commit
             }
             writer.flush().unwrap();
@@ -374,9 +437,9 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, &[1, 2, 3]).unwrap();
-            writer.write_record(WalRecordType::Rollback, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1, 2, 3]).unwrap();
+            writer.write_record(WalRecordType::Rollback, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 
@@ -395,10 +458,10 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, &[10]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, &[20]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[10]).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[20]).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 

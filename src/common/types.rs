@@ -142,10 +142,23 @@ pub struct IndexDef {
 /// - Memory：全内存高频读写（Agent 推理中间状态，不持久化）
 /// - Log：追加写日志引擎（trace / 事件流，v0.18 规划）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
 pub enum EngineType {
     Columnar,
     Memory,
     Log,
+}
+
+impl EngineType {
+    /// 磁盘/网络编码（WAL 记录头 engine 字节）
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(EngineType::Columnar),
+            1 => Some(EngineType::Memory),
+            2 => Some(EngineType::Log),
+            _ => None,
+        }
+    }
 }
 
 impl Default for EngineType {

@@ -20,9 +20,10 @@ use crate::Value;
 /// WAL 页大小（4KB，与数据库页对齐）
 pub const WAL_PAGE_SIZE: u32 = 4096;
 
-/// WAL 记录头部大小：magic(2) + type(1) + txn_id(4) + table_id(4) + payload_len(4) + crc32(4) = 19 字节
+/// WAL 记录头部大小：magic(2) + type(1) + txn_id(4) + table_id(4) + engine(1) + payload_len(4) + crc32(4) = 20 字节
 /// 注意：LSN 不在记录内，由文件偏移隐式确定
-pub const WAL_RECORD_HEADER_SIZE: usize = 19;
+/// v0.17.0 M4：头加 engine_type（19→20 字节）；from_bytes 双解析兼容旧 19 字节格式
+pub const WAL_RECORD_HEADER_SIZE: usize = 20;
 
 /// WAL 记录魔数（用于检测记录边界）
 pub const WAL_MAGIC: u16 = 0x5741; // "WA"
@@ -70,6 +71,8 @@ pub struct WalRecord {
     pub record_type: WalRecordType,
     pub txn_id: u32,
     pub table_id: u32,
+    /// 目标表引擎（M4：恢复时分派语义；旧格式记录回退 Columnar）
+    pub engine_type: crate::common::types::EngineType,
     pub payload: Vec<u8>,
 }
 
@@ -80,7 +83,7 @@ impl WalRecord {
     }
 
     /// 序列化（不含 LSN，LSN 由文件位置隐式确定）
-    /// 格式：[magic:2][type:1][txn_id:4][table_id:4][payload_len:4][payload:N][crc32:4]
+    /// 格式：[magic:2][type:1][txn_id:4][table_id:4][engine:1][payload_len:4][payload:N][crc32:4]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.total_size());
 
@@ -92,6 +95,8 @@ impl WalRecord {
         buf.extend_from_slice(&self.txn_id.to_le_bytes());
         // table_id
         buf.extend_from_slice(&self.table_id.to_le_bytes());
+        // engine_type（M4）
+        buf.push(self.engine_type as u8);
         // payload_len
         buf.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
         // payload
@@ -119,29 +124,60 @@ impl WalRecord {
         let record_type = WalRecordType::from_u8(data[2])?;
         let txn_id = u32::from_le_bytes(data[3..7].try_into().unwrap());
         let table_id = u32::from_le_bytes(data[7..11].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(data[11..15].try_into().unwrap()) as usize;
 
-        let total_len = WAL_RECORD_HEADER_SIZE + payload_len;
-        if data.len() < total_len {
-            return None;
+        // M4 双解析兼容：
+        // 1) 新格式（20B 头）：engine@11 + payload_len@12..16 + crc@16+len..20+len
+        // 2) 旧格式（19B 头，v0.17.0 前）：payload_len@11..15 + crc@15+len..19+len，
+        //    engine 回退 Columnar。CRC 校验区不同 → 双解析互不误判。
+        // 新格式（engine@11, payload_len@12..16, crc@16+len..20+len）
+        if data.len() >= WAL_RECORD_HEADER_SIZE {
+            let payload_len =
+                u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+            let total_len = WAL_RECORD_HEADER_SIZE + payload_len;
+            if data.len() >= total_len {
+                let stored_crc = u32::from_le_bytes(
+                    data[16 + payload_len..20 + payload_len].try_into().unwrap(),
+                );
+                let computed_crc = crc32(&data[..16 + payload_len]);
+                if stored_crc == computed_crc {
+                    let payload = data[16..16 + payload_len].to_vec();
+                    let engine_type = crate::common::types::EngineType::from_u8(data[11])
+                        .unwrap_or(crate::common::types::EngineType::Columnar);
+                    return Some(Self {
+                        lsn: 0, // 由调用者设置
+                        record_type,
+                        txn_id,
+                        table_id,
+                        engine_type,
+                        payload,
+                    });
+                }
+            }
         }
 
-        // 校验 CRC32
-        let stored_crc = u32::from_le_bytes(data[15 + payload_len..19 + payload_len].try_into().unwrap());
-        let computed_crc = crc32(&data[..15 + payload_len]);
-        if stored_crc != computed_crc {
-            return None; // CRC 不匹配，记录损坏
+        // 旧格式（v0.17.0 前：19B 头，payload_len@11..15, crc@15+len..19+len）
+        if data.len() >= 19 {
+            let payload_len = u32::from_le_bytes(data[11..15].try_into().unwrap()) as usize;
+            let total_len = 19 + payload_len;
+            if data.len() >= total_len {
+                let stored_crc =
+                    u32::from_le_bytes(data[15 + payload_len..19 + payload_len].try_into().unwrap());
+                let computed_crc = crc32(&data[..15 + payload_len]);
+                if stored_crc == computed_crc {
+                    let payload = data[15..15 + payload_len].to_vec();
+                    return Some(Self {
+                        lsn: 0, // 由调用者设置
+                        record_type,
+                        txn_id,
+                        table_id,
+                        engine_type: crate::common::types::EngineType::Columnar,
+                        payload,
+                    });
+                }
+            }
         }
 
-        let payload = data[15..15 + payload_len].to_vec();
-
-        Some(Self {
-            lsn: 0, // 由调用者设置
-            record_type,
-            txn_id,
-            table_id,
-            payload,
-        })
+        None // 损坏或不完整
     }
 }
 
@@ -534,6 +570,7 @@ mod tests {
             record_type: WalRecordType::Insert,
             txn_id: 42,
             table_id: 1,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload: vec![1, 2, 3, 4, 5],
         };
 
@@ -553,12 +590,13 @@ mod tests {
             record_type: WalRecordType::Begin,
             txn_id: 100,
             table_id: 0,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload: vec![],
         };
 
         let bytes = record.to_bytes();
-        // 19 字节头部 + 0 负载 = 19 字节
-        assert_eq!(bytes.len(), 19);
+        // 20 字节头部 + 0 负载 = 20 字节
+        assert_eq!(bytes.len(), 20);
         let parsed = WalRecord::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.record_type, WalRecordType::Begin);
         assert_eq!(parsed.txn_id, 100);
@@ -573,6 +611,7 @@ mod tests {
             record_type: WalRecordType::Insert,
             txn_id: 1,
             table_id: 1,
+            engine_type: crate::common::types::EngineType::Log,
             payload: payload.clone(),
         };
 
@@ -600,6 +639,7 @@ mod tests {
                 record_type: t,
                 txn_id: 7,
                 table_id: 3,
+            engine_type: crate::common::types::EngineType::Columnar,
                 payload: vec![10, 20],
             };
             let bytes = rec.to_bytes();
@@ -615,6 +655,7 @@ mod tests {
             record_type: WalRecordType::Insert,
             txn_id: 1,
             table_id: 1,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload: vec![10, 20, 30],
         };
 
@@ -630,6 +671,7 @@ mod tests {
             record_type: WalRecordType::Insert,
             txn_id: 1,
             table_id: 1,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload: vec![10, 20, 30],
         };
 
@@ -645,6 +687,7 @@ mod tests {
             record_type: WalRecordType::Insert,
             txn_id: 1,
             table_id: 1,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload: vec![10, 20, 30],
         };
 
@@ -660,6 +703,7 @@ mod tests {
             record_type: WalRecordType::Insert,
             txn_id: 1,
             table_id: 1,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload: vec![1, 2, 3],
         };
 
@@ -792,6 +836,7 @@ mod tests {
             record_type: WalRecordType::InsertBatch,
             txn_id: 42,
             table_id: 3,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload,
         };
         let bytes = record.to_bytes();
@@ -919,9 +964,10 @@ mod tests {
             record_type: WalRecordType::Insert,
             txn_id: 1,
             table_id: 1,
+            engine_type: crate::common::types::EngineType::Columnar,
             payload: vec![0; 100],
         };
-        // magic(2) + type(1) + txn_id(4) + table_id(4) + payload_len(4) + payload(100) + crc(4)
-        assert_eq!(rec.total_size(), 2 + 1 + 4 + 4 + 4 + 100 + 4);
+        // magic(2) + type(1) + txn_id(4) + table_id(4) + engine(1) + payload_len(4) + payload(100) + crc(4)
+        assert_eq!(rec.total_size(), 2 + 1 + 4 + 4 + 1 + 4 + 100 + 4);
     }
 }

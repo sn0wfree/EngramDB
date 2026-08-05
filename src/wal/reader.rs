@@ -36,13 +36,19 @@ impl WalReader {
 
     /// 读取下一条有效记录
     /// 返回 Ok(None) 表示到达文件末尾
+    ///
+    /// M4 双解析兼容：先按新格式（20B 头，engine@11 + len@12..16）尝试，
+    /// CRC 失败则回退旧格式（19B 头，len@11..15）——升级后追加写入的
+    /// 混合格式 WAL 文件两种记录都能正确读取。
     pub fn read_next(&mut self) -> Result<Option<WalRecord>> {
         loop {
-            // 读取头部
-            let mut header_buf = [0u8; 15]; // magic(2) + type(1) + txn_id(4) + table_id(4) + payload_len(4)
+            let record_start = self.position;
+
+            // 读取头部（新格式 16 字节：magic2 + type1 + txn4 + table4 + engine1 + len4）
+            let mut header_buf = [0u8; 16];
             match self.file.read(&mut header_buf) {
                 Ok(0) => return Ok(None), // EOF
-                Ok(n) if n < 15 => {
+                Ok(n) if n < 16 => {
                     // 不完整的头部，到达文件末尾
                     self.position += n as u64;
                     return Ok(None);
@@ -61,39 +67,51 @@ impl WalReader {
                 continue;
             }
 
-            // 解析 payload 长度
-            let payload_len = u32::from_le_bytes(header_buf[11..15].try_into().unwrap()) as usize;
-            let total_size = WAL_RECORD_HEADER_SIZE + payload_len;
-
-            // 读取剩余部分（payload + crc）
-            let mut rest = vec![0u8; total_size - 15];
-            match self.file.read_exact(&mut rest) {
-                Ok(_) => {}
-                Err(_) => {
-                    // 不完整的记录，到达文件末尾
-                    self.position += 15;
-                    return Ok(None);
-                }
+            // 新格式解析（len@12..16，engine@11）
+            let new_len = u32::from_le_bytes(header_buf[12..16].try_into().unwrap()) as usize;
+            let new_total = WAL_RECORD_HEADER_SIZE + new_len;
+            if let Some(rec) = self.try_read_record(record_start, 16, new_total)? {
+                return Ok(Some(rec));
             }
 
-            // 组装完整记录
-            let mut full_record = header_buf.to_vec();
-            full_record.extend_from_slice(&rest);
-
-            // 解析（含 CRC 校验）
-            match WalRecord::from_bytes(&full_record) {
-                Some(mut rec) => {
-                    rec.lsn = self.position;
-                    self.position += total_size as u64;
-                    return Ok(Some(rec));
-                }
-                None => {
-                    // CRC 校验失败，跳过 1 字节继续找
-                    self.position += 1;
-                    self.file.seek(SeekFrom::Start(self.position))?;
-                    continue;
-                }
+            // 旧格式解析（len@11..15，engine 回退 Columnar）
+            let old_len = u32::from_le_bytes(header_buf[11..15].try_into().unwrap()) as usize;
+            let old_total = 19 + old_len;
+            if let Some(rec) = self.try_read_record(record_start, 15, old_total)? {
+                return Ok(Some(rec));
             }
+
+            // 两种格式都失败（损坏或部分写入），跳过 1 字节继续找
+            self.position = record_start + 1;
+            self.file.seek(SeekFrom::Start(self.position))?;
+        }
+    }
+
+    /// 按指定头部长度与记录总长读取并解析（含 CRC 校验）
+    /// 返回 Ok(None) 表示解析失败或到文件末尾
+    fn try_read_record(&mut self, record_start: u64, header_len: usize, total: usize) -> Result<Option<WalRecord>> {
+        let rest_len = total as u64 - header_len as u64;
+        let mut full = vec![0u8; total];
+        // 重读完整记录（头部已在 buffer 中，直接 seek 重读简单可靠）
+        self.file.seek(SeekFrom::Start(record_start))?;
+        match self.file.read_exact(&mut full) {
+            Ok(_) => {}
+            Err(_) => {
+                // 不完整，到达文件末尾
+                self.position = record_start + header_len as u64 + rest_len.min(0);
+                // 读取了多少算多少：按已读位置推进（简化：EOF 返回 None）
+                self.position = record_start + header_len as u64;
+                self.file.seek(SeekFrom::Start(self.position))?;
+                return Ok(None);
+            }
+        }
+        match WalRecord::from_bytes(&full) {
+            Some(mut rec) => {
+                rec.lsn = record_start;
+                self.position = record_start + total as u64;
+                Ok(Some(rec))
+            }
+            None => Ok(None),
         }
     }
 
@@ -151,9 +169,9 @@ mod tests {
         // 写入
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, &[10, 20, 30]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[10, 20, 30]).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 
@@ -189,9 +207,9 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, &[1, 2]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1, 2]).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 
@@ -229,8 +247,8 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 
@@ -256,7 +274,7 @@ mod tests {
         {
             use std::io::Write;
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, &[]).unwrap();
+            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
             writer.sync().unwrap();
         }
 
@@ -286,7 +304,7 @@ mod tests {
             let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 0..n {
                 let payload = vec![i as u8; 20];
-                writer.write_record(WalRecordType::Insert, i, 1, &payload).unwrap();
+                writer.write_record(WalRecordType::Insert, i, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
             }
             writer.sync().unwrap();
         }
