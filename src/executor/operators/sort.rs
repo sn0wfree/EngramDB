@@ -39,84 +39,27 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>)
         // 若 n >= total_rows，退化为全排序
         if n < total_rows {
             use std::collections::BinaryHeap;
-            // 使用 BinaryHeap，根据 sort direction 选择堆类型：
-            //   - ASC: 最小堆（保留最小的 N 个）
-            //   - DESC: 最大堆（保留最大的 N 个）
-            // 全部存到堆后，再 sort 一次得到正确顺序
-            if keys.iter().all(|k| matches!(k.direction, SortDirection::Asc)) {
-                let mut heap: BinaryHeap<Vec<Value>> = BinaryHeap::with_capacity(n + 1);
-                for row in all_rows {
-                    heap.push(row);
-                    if heap.len() > n {
-                        heap.pop();
-                    }
+            // P3.4：方向感知堆 —— ASC/DESC/混合方向统一走堆排序，
+            // 不再让 DESC 退化为全排序。
+            // 堆按「目标排序序」比较：堆溢出时 pop 掉序最大的行，
+            // 保留序最小的 N 行（即 Top-N 结果集）。
+            let mut heap: BinaryHeap<HeapRow> = BinaryHeap::with_capacity(n + 1);
+            for row in all_rows {
+                heap.push(HeapRow { row, keys: &keys });
+                if heap.len() > n {
+                    heap.pop();
                 }
-                let mut top_n: Vec<Vec<Value>> = heap.into_iter().collect();
-                top_n.sort_by(|a, b| {
-                    for key in &keys {
-                        let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
-                        match cmp {
-                            std::cmp::Ordering::Equal => continue,
-                            other => return other,
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-                all_rows = top_n;
-            } else {
-                // 包含 DESC 方向，退化为全排序
-                all_rows.sort_by(|a, b| {
-                    for key in &keys {
-                        let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
-                        match cmp {
-                            std::cmp::Ordering::Equal => continue,
-                            other => {
-                                return match key.direction {
-                                    SortDirection::Asc => other,
-                                    SortDirection::Desc => other.reverse(),
-                                };
-                            }
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-                all_rows.truncate(n);
             }
+            let mut top_n: Vec<Vec<Value>> = heap.into_iter().map(|h| h.row).collect();
+            top_n.sort_by(|a, b| cmp_rows(a, b, &keys));
+            all_rows = top_n;
         } else {
             // limit >= total_rows，全排序
-            all_rows.sort_by(|a, b| {
-                for key in &keys {
-                    let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
-                    match cmp {
-                        std::cmp::Ordering::Equal => continue,
-                        other => {
-                            return match key.direction {
-                                SortDirection::Asc => other,
-                                SortDirection::Desc => other.reverse(),
-                            };
-                        }
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
+            all_rows.sort_by(|a, b| cmp_rows(a, b, &keys));
         }
     } else {
         // 无 limit：全排序
-        all_rows.sort_by(|a, b| {
-            for key in &keys {
-                let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
-                match cmp {
-                    std::cmp::Ordering::Equal => continue,
-                    other => {
-                        return match key.direction {
-                            SortDirection::Asc => other,
-                            SortDirection::Desc => other.reverse(),
-                        };
-                    }
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        all_rows.sort_by(|a, b| cmp_rows(a, b, &keys));
     }
 
     // 重新分块
@@ -140,6 +83,54 @@ pub fn execute(input: &[DataChunk], sort_keys: &[SortKey], limit: Option<usize>)
     }
 
     Ok(result)
+}
+
+/// 按排序键比较两行（方向感知：ASC / DESC）
+fn cmp_rows(a: &[Value], b: &[Value], keys: &[SortKey]) -> std::cmp::Ordering {
+    for key in keys {
+        let cmp = value_cmp(&a[key.column_index], &b[key.column_index]);
+        match cmp {
+            std::cmp::Ordering::Equal => continue,
+            other => {
+                return match key.direction {
+                    SortDirection::Asc => other,
+                    SortDirection::Desc => other.reverse(),
+                };
+            }
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Top-N 堆元素（P3.4）
+///
+/// 通过 `Ord` 实现方向感知比较，使 BinaryHeap 在 ASC 和 DESC 下
+/// 都能在溢出时弹出「序最大」的行，保留 Top-N 最小序集合。
+struct HeapRow<'a> {
+    row: Vec<Value>,
+    keys: &'a [SortKey],
+}
+
+impl<'a> PartialEq for HeapRow<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        cmp_rows(&self.row, &other.row, self.keys) == std::cmp::Ordering::Equal
+    }
+}
+
+impl<'a> Eq for HeapRow<'a> {}
+
+impl<'a> PartialOrd for HeapRow<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a> Ord for HeapRow<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // 注意：BinaryHeap 是最大堆，弹出「序最大」的行。
+        // 方向感知比较直接作用于堆排序，ASC/DESC 统一处理。
+        cmp_rows(&self.row, &other.row, self.keys)
+    }
 }
 
 /// Value 比较（用于排序）
@@ -286,5 +277,48 @@ mod tests {
         let result = execute(&[chunk], &keys, None).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].count, 0);
+    }
+
+    // P3.4：DESC / 混合方向 Top-N（此前 DESC 退化为全排序，现走反向堆）
+
+    #[test]
+    fn test_sort_desc_top_n() {
+        let chunk = make_test_chunk();
+        let keys = vec![SortKey { column_index: 0, direction: SortDirection::Desc }];
+        // Top-3（desc）：5, 4, 3
+        let result = execute(&[chunk], &keys, Some(3)).unwrap();
+        let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], Value::Int64(5));
+        assert_eq!(rows[1][0], Value::Int64(4));
+        assert_eq!(rows[2][0], Value::Int64(3));
+    }
+
+    #[test]
+    fn test_sort_mixed_direction_top_n() {
+        let chunk = make_test_chunk();
+        // score DESC, name ASC；Top-3 应为 95.0 的两行（alice, bob）+ 88.5 的 charlie
+        let keys = vec![
+            SortKey { column_index: 2, direction: SortDirection::Desc },
+            SortKey { column_index: 1, direction: SortDirection::Asc },
+        ];
+        let result = execute(&[chunk], &keys, Some(3)).unwrap();
+        let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][1], Value::Varchar("alice".into()));
+        assert_eq!(rows[1][1], Value::Varchar("bob".into()));
+        assert_eq!(rows[2][1], Value::Varchar("charlie".into()));
+    }
+
+    #[test]
+    fn test_sort_asc_top_n() {
+        let chunk = make_test_chunk();
+        let keys = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        // Top-2（asc）：1, 2
+        let result = execute(&[chunk], &keys, Some(2)).unwrap();
+        let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Int64(1));
+        assert_eq!(rows[1][0], Value::Int64(2));
     }
 }

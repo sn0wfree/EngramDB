@@ -8,7 +8,7 @@ use crate::common::types::{TableDef, IndexDef, ColumnDef};
 use crate::Value;
 use crate::executor::vector::{DataChunk, Vector};
 
-use super::column_store::ColumnStore;
+use super::column_store::{ColumnStore, PredicateOp};
 use super::delta_store::DeltaStore;
 use super::index::inverted_index::InvertedIndex;
 use super::index::skiplist::SkipListIndex;
@@ -145,25 +145,44 @@ impl Table {
         let cs_rows = self.column_store.total_rows();
         let row_id_u = row_id as u64;
         if row_id_u < cs_rows {
-            // 位于列存主存储：定位 row_group 和 row_idx
-            let mut remaining = row_id_u;
-            let num_cols = self.def.columns.len();
+            // 位于列存主存储：定位 row_group 和 row_idx（P3.3：O(1) 算术定位，替代线性扫描）
+            // 注意：最后一个 row group 可能不满 row_group_size，需回退校验
+            let rg_size = self.column_store.row_group_size() as u64;
             let mut located_rg: Option<usize> = None;
             let mut located_row_in_rg: Option<usize> = None;
-            for (rg_idx, rg) in self.column_store.row_groups().iter().enumerate() {
-                let rc = rg.row_count as u64;
-                if remaining < rc {
-                    located_rg = Some(rg_idx);
-                    located_row_in_rg = Some(remaining as usize);
-                    break;
+
+            if rg_size > 0 {
+                let estimated_rg = (row_id_u / rg_size) as usize;
+                let estimated_row = (row_id_u % rg_size) as usize;
+                // 校验估算位置是否落在最后一个不满的 group 内
+                if let Some(rg) = self.column_store.row_groups().get(estimated_rg) {
+                    if (estimated_row as u64) < rg.row_count as u64 {
+                        located_rg = Some(estimated_rg);
+                        located_row_in_rg = Some(estimated_row);
+                    }
                 }
-                remaining -= rc;
             }
+
+            // 估算失效（最后一个 group 不满）时回退线性扫描
+            if located_rg.is_none() {
+                let mut remaining = row_id_u;
+                for (rg_idx, rg) in self.column_store.row_groups().iter().enumerate() {
+                    let rc = rg.row_count as u64;
+                    if remaining < rc {
+                        located_rg = Some(rg_idx);
+                        located_row_in_rg = Some(remaining as usize);
+                        break;
+                    }
+                    remaining -= rc;
+                }
+            }
+
             let rg_idx = match located_rg {
                 Some(i) => i,
                 None => return Ok(None),
             };
             let row_in_rg = located_row_in_rg.unwrap();
+            let num_cols = self.def.columns.len();
             let mut row: Vec<crate::Value> = Vec::with_capacity(num_cols);
             for col_idx in 0..num_cols {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
@@ -202,19 +221,36 @@ impl Table {
         let cs_rows = self.column_store.total_rows();
         let row_id_u = row_id as u64;
         let row_opt: Option<Vec<crate::Value>> = if row_id_u < cs_rows {
-            // 位于列存主存储：定位 row_group 和 row_idx
-            let mut remaining = row_id_u;
+            // 位于列存主存储：定位 row_group 和 row_idx（P3.3：O(1) 算术定位，替代线性扫描）
+            let rg_size = self.column_store.row_group_size() as u64;
             let mut located_rg: Option<usize> = None;
             let mut located_row_in_rg: Option<usize> = None;
-            for (rg_idx, rg) in self.column_store.row_groups().iter().enumerate() {
-                let rc = rg.row_count as u64;
-                if remaining < rc {
-                    located_rg = Some(rg_idx);
-                    located_row_in_rg = Some(remaining as usize);
-                    break;
+
+            if rg_size > 0 {
+                let estimated_rg = (row_id_u / rg_size) as usize;
+                let estimated_row = (row_id_u % rg_size) as usize;
+                if let Some(rg) = self.column_store.row_groups().get(estimated_rg) {
+                    if (estimated_row as u64) < rg.row_count as u64 {
+                        located_rg = Some(estimated_rg);
+                        located_row_in_rg = Some(estimated_row);
+                    }
                 }
-                remaining -= rc;
             }
+
+            // 估算失效（最后一个 group 不满）时回退线性扫描
+            if located_rg.is_none() {
+                let mut remaining = row_id_u;
+                for (rg_idx, rg) in self.column_store.row_groups().iter().enumerate() {
+                    let rc = rg.row_count as u64;
+                    if remaining < rc {
+                        located_rg = Some(rg_idx);
+                        located_row_in_rg = Some(remaining as usize);
+                        break;
+                    }
+                    remaining -= rc;
+                }
+            }
+
             match located_rg {
                 Some(rg_idx) => {
                     let row_in_rg = located_row_in_rg.unwrap();
@@ -1415,12 +1451,44 @@ impl Table {
     /// - 跨 Row Group 的边界 chunk 自动处理（最后一个 chunk 可能 < 2048 行）
     /// - Delta 层走原 `scan` 路径（数据量小，开销可忽略）
     pub fn scan_to_chunks(&mut self, column_indices: &[usize]) -> Result<Vec<DataChunk>> {
+        self.scan_to_chunks_impl(column_indices, None)
+    }
+
+    /// 带 MinMax 跳过索引的全表扫描（P2.4）
+    ///
+    /// 当查询带简单比较谓词（如 `col > 100` / `col = 'x'`）时，
+    /// 先对每个 row group 用 `can_skip_predicate` 判断其 [min, max] 是否
+    /// 与谓词区间无交集；无交集则整个 row group 跳过，不解压不扫描。
+    ///
+    /// `skip_pred` 为 `(过滤列索引, 谓词操作符, 比较值)`。
+    /// 注意：跳过索引只做粗粒度裁剪，结果仍可能包含不满足条件的行，
+    /// 调用方仍需执行 Filter 算子做精确过滤。
+    pub fn scan_to_chunks_with_skip(
+        &mut self,
+        column_indices: &[usize],
+        skip_pred: Option<(usize, PredicateOp, Value)>,
+    ) -> Result<Vec<DataChunk>> {
+        self.scan_to_chunks_impl(column_indices, skip_pred)
+    }
+
+    fn scan_to_chunks_impl(
+        &mut self,
+        column_indices: &[usize],
+        skip_pred: Option<(usize, PredicateOp, Value)>,
+    ) -> Result<Vec<DataChunk>> {
         const BATCH_SIZE: usize = 2048; // 与 executor::vector::VECTOR_SIZE 对齐
 
         let mut chunks: Vec<DataChunk> = Vec::new();
         let full_row_for_ttl = self.def.has_ttl();
 
         for rg_idx in 0..self.column_store.row_group_count() {
+            // P2.4：MinMax 跳过索引 —— 整个 row group 可跳过时不解压
+            if let Some((col_idx, op, val)) = &skip_pred {
+                if self.column_store.can_skip_predicate(rg_idx, *col_idx, *op, val) {
+                    continue;
+                }
+            }
+
             // 1. 读取需要的所有列（克隆切片以断开借用链）
             let mut col_owned: Vec<Vec<Value>> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
@@ -1514,10 +1582,36 @@ impl Table {
     ///
     /// 调用方仍需 `column_names`（从 schema 派生），无需再做 chunks_to_rows。
     pub fn scan_to_rows_direct(&mut self, column_indices: &[usize]) -> Result<Vec<Vec<Value>>> {
+        self.scan_to_rows_direct_impl(column_indices, None)
+    }
+
+    /// 带 MinMax 跳过索引的 `scan_to_rows_direct`（P3.2）
+    ///
+    /// 谓词语义与 `scan_to_chunks_with_skip` 相同。
+    pub fn scan_to_rows_direct_with_skip(
+        &mut self,
+        column_indices: &[usize],
+        skip_pred: Option<(usize, PredicateOp, Value)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.scan_to_rows_direct_impl(column_indices, skip_pred)
+    }
+
+    fn scan_to_rows_direct_impl(
+        &mut self,
+        column_indices: &[usize],
+        skip_pred: Option<(usize, PredicateOp, Value)>,
+    ) -> Result<Vec<Vec<Value>>> {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         let full_row_for_ttl = self.def.has_ttl();
 
         for rg_idx in 0..self.column_store.row_group_count() {
+            // P2.4/P3.2：MinMax 跳过索引 —— 整个 row group 可跳过时不解压
+            if let Some((col_idx, op, val)) = &skip_pred {
+                if self.column_store.can_skip_predicate(rg_idx, *col_idx, *op, val) {
+                    continue;
+                }
+            }
+
             // 一次性克隆整个列到 owned Vec（断开借用链）
             let mut col_owned: Vec<Vec<Value>> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {

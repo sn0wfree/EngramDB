@@ -30,6 +30,19 @@ pub enum PhysicalPlan {
         /// output_col_map[i] = j 表示第 i 个输出列对应索引条目的第 j 个值
         output_col_map: Vec<usize>,
     },
+    /// 非覆盖索引点查（P2：IndexScan）
+    ///
+    /// 当 WHERE 条件为索引键列等值比较，但输出列不完全在索引覆盖范围内时，
+    /// 先用索引拿到 row_id 集合，再回表读取所需列。
+    /// 相比全表扫描：只回表命中行，避免全量扫描 + 逐行过滤。
+    IndexScan {
+        table_name: String,
+        index_name: String,
+        /// 索引键列的等值查找值
+        key_value: Value,
+        /// 输出列的索引（对应表定义中的列索引）
+        output_column_indices: Vec<usize>,
+    },
     /// 过滤
     Filter {
         input: Box<PhysicalPlan>,

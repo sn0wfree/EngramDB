@@ -917,6 +917,41 @@ mod value_tests {
         }
     }
 
+    #[test]
+    fn test_index_scan_non_covering() {
+        // P2 回归：非覆盖索引点查（SELECT 列超出索引覆盖范围 → IndexScan 回表）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, content VARCHAR)").unwrap();
+        for i in 0..10 {
+            conn.execute(&format!(
+                "INSERT INTO messages VALUES ({}, 'sess{}', 'payload_{}')",
+                i, i % 4, i
+            )).unwrap();
+        }
+        conn.execute("CREATE INDEX idx_sess ON messages (session_id)").unwrap();
+
+        // 索引只覆盖 session_id，content 需要回表 → 走 IndexScan
+        let result = conn.execute(
+            "SELECT session_id, content FROM messages WHERE session_id = 'sess2'"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 2); // i%4==2 → i=2,6
+        for row in &result.rows {
+            assert_eq!(row[0], Value::Varchar("sess2".to_string()));
+        }
+
+        // 无匹配
+        let result = conn.execute(
+            "SELECT session_id, content FROM messages WHERE session_id = 'none'"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 0);
+
+        // 多列结果 + 回表列裁剪正确性
+        let result = conn.execute(
+            "SELECT content FROM messages WHERE session_id = 'sess0'"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
+
     // --- INCLUDE 子句 SQL 语法测试（v0.12.0 新增）---
 
     #[test]
@@ -973,6 +1008,44 @@ mod value_tests {
     }
 
     // --- ORDER BY 排序测试（v0.12.0 新增）---
+
+    #[test]
+    fn test_minmax_skip_where_filter() {
+        // P2.4 回归：简单比较谓词下推 MinMax 跳过（多 row group 表）
+        // 用小的 row_group_size（10 行）制造多个 row group
+        let mut config = crate::common::config::Config::default();
+        config.row_group_size = 10;
+        let mut conn = Connection::open_with_config(":memory:", config).unwrap();
+        conn.execute("CREATE TABLE t (id INT, name VARCHAR)").unwrap();
+
+        // 40 行 → 4 个 row group（id 均匀分布 1..=40）
+        for i in 1..=40 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, 'name_{}')", i, i)).unwrap();
+        }
+
+        // 范围过滤：id > 35 → 只有最后 5 行
+        let result = conn.execute("SELECT id FROM t WHERE id > 35").unwrap();
+        assert_eq!(result.rows.len(), 5);
+        for row in &result.rows {
+            assert!(matches!(&row[0], Value::Int64(v) if *v > 35));
+        }
+
+        // id <= 5
+        let result = conn.execute("SELECT id FROM t WHERE id <= 5").unwrap();
+        assert_eq!(result.rows.len(), 5);
+        for row in &result.rows {
+            assert!(matches!(&row[0], Value::Int64(v) if *v <= 5));
+        }
+
+        // 等值：id = 20
+        let result = conn.execute("SELECT name FROM t WHERE id = 20").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Varchar("name_20".to_string()));
+
+        // 无命中
+        let result = conn.execute("SELECT id FROM t WHERE id > 100").unwrap();
+        assert_eq!(result.rows.len(), 0);
+    }
 
     #[test]
     fn test_order_by_asc() {

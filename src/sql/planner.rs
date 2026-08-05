@@ -642,7 +642,8 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         && stmt.group_by.is_empty()
         && stmt.having.is_none()
         && stmt.order_by.is_empty()
-        && stmt.limit.is_none()
+        // P3.3：主键点查最多返回 1 行，LIMIT 天然满足，放开该限制
+        //（LIMIT 0 由 Limit 算子的 take(0) 处理）
     {
         if let Some(ref where_expr) = stmt.where_clause {
             if let Expression::BinaryOp { left, op, right } = where_expr {
@@ -711,6 +712,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         }
     } else if can_use_index_only {
         try_index_only_scan(&stmt, db, &table_name, &scan_column_indices)
+            .or_else(|| try_index_scan(&stmt, db, &table_name, &scan_column_indices))
             .unwrap_or_else(|| PhysicalPlan::TableScan {
                 table_name: table_name.clone(),
                 column_indices: scan_column_indices.clone(),
@@ -1046,6 +1048,53 @@ fn try_index_only_scan(
                 key_value,
                 output_column_indices: scan_column_indices.to_vec(),
                 output_col_map,
+            });
+        }
+    }
+
+    None
+}
+
+/// 尝试生成非覆盖索引点查计划（P2：IndexScan）
+///
+/// 与 `try_index_only_scan` 的区别：不要求输出列全部在索引覆盖范围内。
+/// 条件：
+/// 1. WHERE 为单列等值比较（col = literal）
+/// 2. 该列是某个普通索引（SkipList）的首键列
+/// 3. 无 GROUP BY / HAVING / ORDER BY / 聚合（由调用方保证）
+///
+/// 执行方式：索引 O(log n) 定位 row_id → 回表读取所需列。
+fn try_index_scan(
+    stmt: &SelectStmt,
+    db: &Database,
+    table_name: &str,
+    scan_column_indices: &[usize],
+) -> Option<PhysicalPlan> {
+    // 必须有 WHERE 条件
+    let where_expr = stmt.where_clause.as_ref()?;
+
+    // 解析 WHERE 中的等值条件 col = value
+    let (col_name, key_value) = extract_equality_condition(where_expr)?;
+
+    // 查找表和匹配的索引
+    let table = db.get_table(table_name)?;
+    let col_idx = table.def.column_index(&col_name)?;
+
+    for idx_def in &table.def.indexes {
+        // 只考虑普通跳表索引（位图/布隆/向量不走回表路径）
+        let is_skiplist = idx_def.index_type.is_empty()
+            || idx_def.index_type.eq_ignore_ascii_case("skiplist")
+            || idx_def.index_type.eq_ignore_ascii_case("btree")
+            || idx_def.index_type.eq_ignore_ascii_case("default");
+        if !is_skiplist {
+            continue;
+        }
+        if idx_def.key_columns.first() == Some(&col_idx) {
+            return Some(PhysicalPlan::IndexScan {
+                table_name: table_name.to_string(),
+                index_name: idx_def.name.clone(),
+                key_value,
+                output_column_indices: scan_column_indices.to_vec(),
             });
         }
     }

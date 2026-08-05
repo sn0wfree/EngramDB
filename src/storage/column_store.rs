@@ -10,6 +10,16 @@ use crate::Value;
 use super::compression;
 use super::file_format::{ColumnChunkHeader, RowGroupHeader};
 
+/// 可下推到扫描层的比较谓词（P2.4 MinMax 跳过接线）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateOp {
+    Eq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
 /// 列存表
 pub struct ColumnStore {
     table_def: TableDef,
@@ -641,6 +651,47 @@ impl ColumnStore {
         }
     }
 
+    /// 检查任意比较谓词能否跳过（P2.4）
+    ///
+    /// 统一入口：把单侧比较映射为等价的 [low, high] 区间重叠判断。
+    /// - Eq  → 等价 can_skip_eq
+    /// - Gt / GtEq → 区间 (val, +∞)：val 在 max 之上可跳过
+    /// - Lt / LtEq → 区间 (-∞, val)：val 在 min 之下可跳过
+    ///
+    /// 返回 true 表示该 row group 不可能包含满足条件的值。
+    pub fn can_skip_predicate(
+        &self,
+        row_group_idx: usize,
+        col_idx: usize,
+        op: PredicateOp,
+        val: &Value,
+    ) -> bool {
+        let rg = match self.row_groups.get(row_group_idx) {
+            Some(rg) => rg,
+            None => return true,
+        };
+
+        let col = match rg.columns.get(col_idx) {
+            Some(col) => col,
+            None => return true,
+        };
+
+        match (&col.min_value, &col.max_value) {
+            (Some(min), Some(max)) => match op {
+                PredicateOp::Eq => value_less(val, min) || value_greater(val, max),
+                // Gt: col > val 命中的条件是 max > val，val >= max 时整个 group 无命中
+                PredicateOp::Gt => !value_less(val, max),
+                // GtEq: col >= val 命中的条件是 max >= val，val > max 时无命中
+                PredicateOp::GtEq => value_greater(val, max),
+                // Lt: col < val 命中的条件是 min < val，val <= min 时无命中
+                PredicateOp::Lt => !value_greater(val, min),
+                // LtEq: col <= val 命中的条件是 min <= val，val < min 时无命中
+                PredicateOp::LtEq => value_less(val, min),
+            },
+            _ => false, // 无统计信息，不能跳过
+        }
+    }
+
     /// 获取指定 row group 和列的 min/max 值
     pub fn get_min_max(&self, row_group_idx: usize, col_idx: usize) -> (Option<&Value>, Option<&Value>) {
         self.row_groups
@@ -1132,5 +1183,88 @@ fn compression_type_from_u8(b: u8) -> CompressionType {
         9 => CompressionType::BooleanPack,
         10 => CompressionType::DoubleDelta,
         _ => CompressionType::Uncompressed,
+    }
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_table_def() -> TableDef {
+        TableDef {
+            id: 1,
+            name: "t".to_string(),
+            columns: vec![
+                crate::common::types::ColumnDef { name: "id".to_string(), data_type: DataType::Int64, nullable: true, is_primary_key: false, default_value: None, auto_increment: false },
+                crate::common::types::ColumnDef { name: "name".to_string(), data_type: DataType::Varchar, nullable: true, is_primary_key: false, default_value: None, auto_increment: false },
+            ],
+            row_count: 0,
+            indexes: Vec::new(),
+            cluster_key: None,
+            foreign_keys: Vec::new(),
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+        }
+    }
+
+    fn make_store() -> ColumnStore {
+        let mut store = ColumnStore::new(make_table_def(), 4);
+        // 两个 row group：
+        // RG0: id ∈ [1, 2, 3, 4], name = a/b/c/d
+        // RG1: id ∈ [5, 6, 7, 8], name = e/f/g/h
+        let ids: Vec<Value> = (1..=8).map(Value::Int64).collect();
+        let names: Vec<Value> = (b'a'..=b'h').map(|c| Value::Varchar((c as char).to_string())).collect();
+        store.append_columns(&[ids, names]).unwrap();
+        assert_eq!(store.row_group_count(), 2);
+        store
+    }
+
+    #[test]
+    fn test_can_skip_predicate_eq() {
+        let store = make_store();
+        // RG0 [1,4]：值 5 在范围外 → 可跳过
+        assert!(store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(5)));
+        // RG1 [5,8]：值 5 在范围内 → 不可跳过
+        assert!(!store.can_skip_predicate(1, 0, PredicateOp::Eq, &Value::Int64(5)));
+        // 值 0 在两个 group 之外
+        assert!(store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(0)));
+        assert!(store.can_skip_predicate(1, 0, PredicateOp::Eq, &Value::Int64(0)));
+        // 值 4 在 RG0 内
+        assert!(!store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(4)));
+    }
+
+    #[test]
+    fn test_can_skip_predicate_range() {
+        let store = make_store();
+        // Gt: id > 4 → RG0 (max=4) 可跳过（4 不大于 4），RG1 不可跳过
+        assert!(store.can_skip_predicate(0, 0, PredicateOp::Gt, &Value::Int64(4)));
+        assert!(!store.can_skip_predicate(1, 0, PredicateOp::Gt, &Value::Int64(4)));
+        // GtEq: id >= 4 → RG0 max=4 → 不可跳过（边界值命中）
+        assert!(!store.can_skip_predicate(0, 0, PredicateOp::GtEq, &Value::Int64(4)));
+        // Gt: id > 100 → 所有 group 跳过
+        assert!(store.can_skip_predicate(0, 0, PredicateOp::Gt, &Value::Int64(100)));
+        assert!(store.can_skip_predicate(1, 0, PredicateOp::Gt, &Value::Int64(100)));
+        // Lt: id < 5 → RG0 [1,4] 不可跳过，RG1 [5,8] 可跳过（min=5，5 不小于 5）
+        assert!(!store.can_skip_predicate(0, 0, PredicateOp::Lt, &Value::Int64(5)));
+        assert!(store.can_skip_predicate(1, 0, PredicateOp::Lt, &Value::Int64(5)));
+        // Lt: id < 0 → 全部跳过
+        assert!(store.can_skip_predicate(0, 0, PredicateOp::Lt, &Value::Int64(0)));
+        assert!(store.can_skip_predicate(1, 0, PredicateOp::Lt, &Value::Int64(0)));
+        // LtEq: id <= 4 → RG0 不可跳过，RG1 (min=5) 可跳过
+        assert!(!store.can_skip_predicate(0, 0, PredicateOp::LtEq, &Value::Int64(4)));
+        assert!(store.can_skip_predicate(1, 0, PredicateOp::LtEq, &Value::Int64(4)));
+    }
+
+    #[test]
+    fn test_can_skip_predicate_out_of_bounds_index() {
+        let store = make_store();
+        // 越界 col / rg 索引一律视为可跳过（保守安全）
+        assert!(store.can_skip_predicate(99, 0, PredicateOp::Eq, &Value::Int64(1)));
+        assert!(store.can_skip_predicate(0, 99, PredicateOp::Eq, &Value::Int64(1)));
     }
 }

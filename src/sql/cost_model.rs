@@ -90,6 +90,10 @@ impl<'a> CostModel<'a> {
             PhysicalPlan::IndexOnlyScan { .. } => {
                 (PlanProperties { row_count: 10.0, num_columns: 1, row_size: 50 }, Cost { startup: 0.001, total: 0.01 })
             }
+            // 非覆盖索引点查（P2）：索引 O(log n) 定位 + 回表 k 行，代价介于 IndexOnlyScan 与全表扫描之间
+            PhysicalPlan::IndexScan { .. } => {
+                (PlanProperties { row_count: 10.0, num_columns: 1, row_size: 50 }, Cost { startup: 0.002, total: 0.02 })
+            }
             PhysicalPlan::Filter { input, condition } => {
                 self.cost_filter(input, condition)
             }

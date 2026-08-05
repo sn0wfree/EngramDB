@@ -310,8 +310,94 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        PhysicalPlan::IndexScan { table_name, index_name, key_value, output_column_indices } => {
+            // P2：非覆盖索引点查 —— 索引拿 row_id，回表读列
+            let (row_ids, columns): (Vec<u32>, Vec<String>) = {
+                let table = db.get_table(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                let cols: Vec<String> = output_column_indices.iter()
+                    .map(|&i| table.def.columns[i].name.clone())
+                    .collect();
+                let index = table.get_index(&index_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::Parse(
+                        format!("Index '{}' not found during execution", index_name)
+                    ))?;
+                (index.get(&key_value).unwrap_or_default(), cols)
+            };
+
+            let mut rows: Vec<Vec<crate::Value>> = Vec::with_capacity(row_ids.len());
+            {
+                let table = db.get_table_mut(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                for row_id in row_ids {
+                    // 回表读取（列裁剪）
+                    rows.extend(table.get_row_by_id_columns(row_id, &output_column_indices)?);
+                }
+            }
+
+            Ok(QueryResult {
+                columns,
+                rows,
+                rows_affected: 0,
+            })
+        }
+
         PhysicalPlan::Filter { input, condition } => {
-            // 先执行子计划
+            // P2.4/P3.2：若输入是 TableScan 且条件为简单比较谓词（col OP literal），
+            // 用 MinMax 跳过索引扫描 + 逐行求值，跳过 DataChunk 中间层
+            // （省去 rows→chunks→filter→rows 的整列克隆链）
+            if let PhysicalPlan::TableScan { table_name, column_indices } = input.as_ref() {
+                if let Some((pred_col, pred_op, pred_val)) = extract_skip_predicate(&condition) {
+                    let (column_names, rows) = {
+                        let table = db.get_table_mut(table_name)
+                            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                        // 谓词列在表定义中的索引（MinMax 按表列索引判断）
+                        let pred_col_idx = table.def.column_index(&pred_col);
+                        // 谓词列在扫描输出中的位置（column_indices 顺序即输出顺序）
+                        let pred_pos = pred_col_idx.and_then(|ci| column_indices.iter().position(|&c| c == ci));
+                        let names: Vec<String> = column_indices.iter()
+                            .map(|&i| table.def.columns[i].name.clone())
+                            .collect();
+                        let skip = pred_col_idx.map(|ci| (ci, pred_op, pred_val.clone()));
+                        let scanned = table.scan_to_rows_direct_with_skip(column_indices, skip)?;
+
+                        // 逐行精确过滤（复用向量化求值的标量语义）
+                        let rows: Vec<Vec<crate::Value>> = match pred_pos {
+                            Some(pos) => {
+                                // PredicateOp → BinaryOperator（eval_binary_value 的输入）
+                                let bin_op = match pred_op {
+                                    crate::storage::column_store::PredicateOp::Eq => crate::sql::ast::BinaryOperator::Eq,
+                                    crate::storage::column_store::PredicateOp::Lt => crate::sql::ast::BinaryOperator::Lt,
+                                    crate::storage::column_store::PredicateOp::LtEq => crate::sql::ast::BinaryOperator::LtEq,
+                                    crate::storage::column_store::PredicateOp::Gt => crate::sql::ast::BinaryOperator::Gt,
+                                    crate::storage::column_store::PredicateOp::GtEq => crate::sql::ast::BinaryOperator::GtEq,
+                                };
+                                let mut out = Vec::with_capacity(scanned.len());
+                                for row in scanned {
+                                    let keep = match super::expression::eval_binary_value(&row[pos], bin_op, &pred_val) {
+                                        Ok(Value::Boolean(true)) => true,
+                                        _ => false,
+                                    };
+                                    if keep {
+                                        out.push(row);
+                                    }
+                                }
+                                out
+                            }
+                            None => scanned,
+                        };
+                        (names, rows)
+                    };
+
+                    return Ok(QueryResult {
+                        columns: column_names,
+                        rows,
+                        rows_affected: 0,
+                    });
+                }
+            }
+
+            // 常规路径：先执行子计划
             let input_result = execute(*input, db)?;
             let input_chunks = rows_to_chunks(&input_result.rows);
             let column_names = input_result.columns.clone();
@@ -808,6 +894,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
     match plan {
         PhysicalPlan::TableScan { .. } => "TableScan",
         PhysicalPlan::IndexOnlyScan { .. } => "IndexOnlyScan",
+        PhysicalPlan::IndexScan { .. } => "IndexScan",
         PhysicalPlan::Filter { .. } => "Filter",
         PhysicalPlan::Projection { .. } => "Projection",
         PhysicalPlan::Aggregate { .. } => "Aggregate",
@@ -983,6 +1070,39 @@ fn rows_to_chunks(rows: &[Vec<crate::Value>]) -> Vec<DataChunk> {
     }
     chunks
 }
+
+/// 从过滤表达式中提取可下推的比较谓词（P2.4 MinMax 跳过）
+///
+/// 仅支持 `col OP literal` 形式（OP ∈ {=, <, <=, >, >=}）。
+/// 返回 `(列名, 谓词操作符, 比较值)`，列名由调用方映射为列索引。
+fn extract_skip_predicate(
+    condition: &Expression,
+) -> Option<(String, crate::storage::column_store::PredicateOp, Value)> {
+    use crate::sql::ast::BinaryOperator;
+
+    let (left, op, right) = match condition {
+        Expression::BinaryOp { left, op, right } => (left.as_ref(), *op, right.as_ref()),
+        _ => return None,
+    };
+
+    let (col_name, val) = match (left, right) {
+        (Expression::ColumnRef { column, .. }, Expression::Literal(v)) => (column, v),
+        (Expression::Literal(v), Expression::ColumnRef { column, .. }) => (column, v),
+        _ => return None,
+    };
+
+    let pred_op = match op {
+        BinaryOperator::Eq => crate::storage::column_store::PredicateOp::Eq,
+        BinaryOperator::Lt => crate::storage::column_store::PredicateOp::Lt,
+        BinaryOperator::LtEq => crate::storage::column_store::PredicateOp::LtEq,
+        BinaryOperator::Gt => crate::storage::column_store::PredicateOp::Gt,
+        BinaryOperator::GtEq => crate::storage::column_store::PredicateOp::GtEq,
+        _ => return None,
+    };
+
+    Some((col_name.clone(), pred_op, val.clone()))
+}
+
 
 /// 评估 INSERT...RETURNING 表达式
 fn evaluate_returning_expr(

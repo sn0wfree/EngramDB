@@ -119,6 +119,28 @@ fn eval_binary_vectorized(left: &Vector, op: BinaryOperator, right: &Vector) -> 
         return Ok(Vector::Constant(result, *n));
     }
 
+    // P3.1：单侧 Constant 快速路径 —— 不物化整列常量，
+    // 直接按值逐元素计算，避免 to_flat() 的整列克隆 + 分配
+    match (left, right) {
+        (Vector::Constant(l, n), Vector::Flat(r)) => {
+            let len = (*n).min(r.len());
+            let mut result = Vec::with_capacity(len);
+            for i in 0..len {
+                result.push(eval_binary_pair(l, op, &r[i]));
+            }
+            return Ok(Vector::Flat(result));
+        }
+        (Vector::Flat(l), Vector::Constant(r, n)) => {
+            let len = l.len().min(*n);
+            let mut result = Vec::with_capacity(len);
+            for i in 0..len {
+                result.push(eval_binary_pair(&l[i], op, r));
+            }
+            return Ok(Vector::Flat(result));
+        }
+        _ => {}
+    }
+
     // 展开为 flat 后逐元素计算（TODO: 可进一步按类型特化提升性能）
     let left_flat = left.to_flat();
     let right_flat = right.to_flat();
@@ -126,42 +148,30 @@ fn eval_binary_vectorized(left: &Vector, op: BinaryOperator, right: &Vector) -> 
 
     let mut result = Vec::with_capacity(len);
 
-    match op {
-        // 算术运算
-        Plus | Minus | Multiply | Divide | Modulo => {
-            for i in 0..len {
-                result.push(eval_arith(&left_flat[i], op, &right_flat[i]));
-            }
-        }
-        // 比较运算 → 布尔结果
-        Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-            for i in 0..len {
-                result.push(eval_compare(&left_flat[i], op, &right_flat[i]));
-            }
-        }
-        // 逻辑运算 → 布尔结果，带短路
-        And => {
-            for i in 0..len {
-                result.push(eval_logic_and(&left_flat[i], &right_flat[i]));
-            }
-        }
-        Or => {
-            for i in 0..len {
-                result.push(eval_logic_or(&left_flat[i], &right_flat[i]));
-            }
-        }
-        // 字符串拼接
-        Concat => {
-            for i in 0..len {
-                result.push(eval_concat(&left_flat[i], &right_flat[i]));
-            }
-        }
+    for i in 0..len {
+        result.push(eval_binary_pair(&left_flat[i], op, &right_flat[i]));
     }
 
     Ok(Vector::Flat(result))
 }
 
-fn eval_binary_value(left: &Value, op: BinaryOperator, right: &Value) -> Result<Value> {
+/// 对一对值执行二元运算（供向量化路径逐元素复用）
+fn eval_binary_pair(left: &Value, op: BinaryOperator, right: &Value) -> Value {
+    use BinaryOperator::*;
+    match op {
+        // 算术运算
+        Plus | Minus | Multiply | Divide | Modulo => eval_arith(left, op, right),
+        // 比较运算 → 布尔结果
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => eval_compare(left, op, right),
+        // 逻辑运算 → 布尔结果，带短路
+        And => eval_logic_and(left, right),
+        Or => eval_logic_or(left, right),
+        // 字符串拼接
+        Concat => eval_concat(left, right),
+    }
+}
+
+pub(crate) fn eval_binary_value(left: &Value, op: BinaryOperator, right: &Value) -> Result<Value> {
     use BinaryOperator::*;
     match op {
         Plus | Minus | Multiply | Divide | Modulo => Ok(eval_arith(left, op, right)),
@@ -545,6 +555,23 @@ fn eval_like(expr_vec: &Vector, pattern_vec: &Vector) -> Result<Vector> {
         (Vector::Constant(e, n), Vector::Constant(p, _)) => {
             let result = like_match(e, p);
             Ok(Vector::Constant(result, *n))
+        }
+        // P3.1：单侧 Constant 快速路径，避免 to_flat() 整列物化
+        (Vector::Constant(e, n), Vector::Flat(p)) => {
+            let len = (*n).min(p.len());
+            let mut result = Vec::with_capacity(len);
+            for i in 0..len {
+                result.push(like_match(e, &p[i]));
+            }
+            Ok(Vector::Flat(result))
+        }
+        (Vector::Flat(e), Vector::Constant(p, n)) => {
+            let len = e.len().min(*n);
+            let mut result = Vec::with_capacity(len);
+            for i in 0..len {
+                result.push(like_match(&e[i], p));
+            }
+            Ok(Vector::Flat(result))
         }
         _ => {
             let e_flat = expr_vec.to_flat();
