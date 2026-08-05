@@ -915,7 +915,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 // 辅助函数：Value 比较（用于 MinMax 索引）
 // ============================================================================
 
-fn value_less(a: &Value, b: &Value) -> bool {
+pub(crate) fn value_less(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
         (Int32(x), Int32(y)) => x < y,
@@ -927,6 +927,14 @@ fn value_less(a: &Value, b: &Value) -> bool {
         (Int64(x), Float64(y)) => (*x as f64) < *y,
         (Float64(x), Int32(y)) => *x < (*y as f64),
         (Float64(x), Int64(y)) => *x < (*y as f64),
+        // M3：Timestamp 与数值互比（时间列 MinMax 跳读：SQL 字面量均为 Int64）
+        (Timestamp(x), Timestamp(y)) => x < y,
+        (Timestamp(x), Int32(y)) => *x < (*y as i64),
+        (Timestamp(x), Int64(y)) => *x < *y,
+        (Int32(x), Timestamp(y)) => (*x as i64) < *y,
+        (Int64(x), Timestamp(y)) => *x < *y,
+        (Timestamp(x), Float64(y)) => (*x as f64) < *y,
+        (Float64(x), Timestamp(y)) => *x < (*y as f64),
         (Varchar(x), Varchar(y)) => x < y,
         (Boolean(x), Boolean(y)) => x < y,
         (Null, _) => true,
@@ -935,7 +943,7 @@ fn value_less(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn value_greater(a: &Value, b: &Value) -> bool {
+pub(crate) fn value_greater(a: &Value, b: &Value) -> bool {
     value_less(b, a)
 }
 

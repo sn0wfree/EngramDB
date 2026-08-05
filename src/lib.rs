@@ -288,6 +288,9 @@ impl Connection {
             crate::storage::engine::EngineTable::Memory(table) => {
                 table.insert_columns(columns)?;
             }
+            crate::storage::engine::EngineTable::Log(table) => {
+                table.insert_columns(columns)?;
+            }
         }
 
         Ok(num_rows as u64)
@@ -3298,6 +3301,7 @@ mod multi_engine_tests {
     use crate::sql::ast::Statement;
 
     include!("memory_engine_tests.rs");
+    include!("log_engine_tests.rs");
 
 
     #[test]

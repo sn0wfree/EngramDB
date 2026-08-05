@@ -13,7 +13,8 @@ pub mod rate_limiter;
 pub mod index;
 pub mod catalog;
 pub mod engine;
-pub mod memory_engine;
+pub mod log_engine;
+mod memory_engine;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -180,9 +181,7 @@ impl Database {
                 EngineTable::Memory(memory_engine::MemoryTable::new(table_def.clone()))
             }
             crate::common::types::EngineType::Log => {
-                return Err(EngramDbError::NotSupported(
-                    "Log engine is not implemented yet (planned in v0.18)".into(),
-                ));
+                EngineTable::Log(log_engine::LogTable::new(table_def.clone()))
             }
         };
         // M2：Memory 表标记为非持久化（事务跳过 WAL）
@@ -749,9 +748,7 @@ impl Database {
                     EngineTable::Memory(memory_engine::MemoryTable::new(mem_def))
                 }
                 crate::common::types::EngineType::Log => {
-                    return Err(EngramDbError::NotSupported(
-                        "Log engine is not implemented yet (planned in v0.18)".into(),
-                    ));
+                    EngineTable::Log(log_engine::LogTable::new(table_def.clone()))
                 }
             };
             // M2：Memory 表标记为非持久化（事务跳过 WAL）
@@ -778,12 +775,12 @@ impl Database {
         use std::io::{Seek, Write};
 
         // 格式：table_count + per-table (table_id + data_len + data)
-        // 仅持久化 Columnar 表；Memory 表数据不落盘（进程退出丢失，符合语义）
+        // 持久化 Columnar + Log 表；Memory 表数据不落盘（进程退出丢失，符合语义）
         let mut section_buf = Vec::new();
         let persistent_ids: Vec<u32> = self
             .tables
             .iter()
-            .filter(|(_, t)| matches!(t, EngineTable::Columnar(_)))
+            .filter(|(_, t)| !matches!(t, EngineTable::Memory(_)))
             .map(|(id, _)| *id)
             .collect();
         let table_count = persistent_ids.len() as u32;
@@ -792,10 +789,11 @@ impl Database {
         let compress = self.config.compress_on_persist;
         for table_id in persistent_ids {
             let table = self.tables.get_mut(&table_id).unwrap();
-            let EngineTable::Columnar(table) = table else {
-                continue;
+            let data_bytes = match table {
+                EngineTable::Columnar(t) => t.column_store_mut().data_to_bytes(compress)?,
+                EngineTable::Log(t) => t.to_bytes(),
+                EngineTable::Memory(_) => continue,
             };
-            let data_bytes = table.column_store_mut().data_to_bytes(compress)?;
             section_buf.extend_from_slice(&table_id.to_le_bytes());
             section_buf.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
             section_buf.extend_from_slice(&data_bytes);
@@ -862,16 +860,23 @@ impl Database {
                 return Err(EngramDbError::InvalidFormat("truncated data table body".into()));
             }
 
-            if let Some(EngineTable::Columnar(table)) = self.tables.get_mut(&table_id) {
-                table.column_store_mut().data_from_bytes(&data[offset..offset + data_len])?;
-                // 同步列的 data_type（修正 Vector dim 等）
-                table.sync_column_data_types();
-                // 重建主键索引（重启后恢复）
-                table.rebuild_primary_index()?;
-                loaded += 1;
+            match self.tables.get_mut(&table_id) {
+                Some(EngineTable::Columnar(table)) => {
+                    table.column_store_mut().data_from_bytes(&data[offset..offset + data_len])?;
+                    // 同步列的 data_type（修正 Vector dim 等）
+                    table.sync_column_data_types();
+                    // 重建主键索引（重启后恢复）
+                    table.rebuild_primary_index()?;
+                    loaded += 1;
+                }
+                Some(EngineTable::Log(table)) => {
+                    table.from_bytes(&data[offset..offset + data_len])?;
+                    loaded += 1;
+                }
+                // Memory 表无数据段（跳过，保持空白内存表）
+                // 表不存在则跳过（schema 已删但数据未清理）
+                _ => {}
             }
-            // Memory 表无数据段（跳过，保持空白内存表）
-            // 表不存在则跳过（schema 已删但数据未清理）
             offset += data_len;
         }
 

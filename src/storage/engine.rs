@@ -7,10 +7,11 @@
 //! 当前仅有 Columnar 引擎（原 Table 列存）。M2 起加入 Memory/Log 变体，
 //! 新增引擎只需实现 [`StorageEngine`] 并加入枚举。
 
-use crate::common::error::Result;
+use crate::common::error::{Result, EngramDbError};
 use crate::common::types::{EngineType, TableDef};
 use crate::executor::vector::{DataChunk, Vector};
 use crate::storage::column_store::PredicateOp;
+use crate::storage::log_engine::LogTable;
 use crate::storage::memory_engine::MemoryTable;
 use crate::storage::table::Table;
 use crate::Value;
@@ -90,7 +91,8 @@ pub enum EngineTable {
     Columnar(Table),
     /// 全内存表（M2）：不持久化，进程退出数据丢失
     Memory(MemoryTable),
-    // M3: Log(LogTable)
+    /// 追加式时间序列表（M3）：块级 MinMax 跳读，禁 UPDATE/DELETE
+    Log(LogTable),
 }
 
 impl EngineTable {
@@ -104,6 +106,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => &t.def,
             EngineTable::Memory(t) => &t.def,
+            EngineTable::Log(t) => &t.def,
         }
     }
 
@@ -111,6 +114,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => &mut t.def,
             EngineTable::Memory(t) => &mut t.def,
+            EngineTable::Log(t) => &mut t.def,
         }
     }
 
@@ -118,29 +122,44 @@ impl EngineTable {
     pub fn as_columnar(&self) -> Option<&Table> {
         match self {
             EngineTable::Columnar(t) => Some(t),
-            EngineTable::Memory(_) => None,
+            EngineTable::Memory(_) | EngineTable::Log(_) => None,
         }
     }
 
     pub fn as_columnar_mut(&mut self) -> Option<&mut Table> {
         match self {
             EngineTable::Columnar(t) => Some(t),
-            EngineTable::Memory(_) => None,
+            EngineTable::Memory(_) | EngineTable::Log(_) => None,
         }
     }
 
     /// 解包 Memory 引擎（非 Memory 返回 None）
     pub fn as_memory(&self) -> Option<&MemoryTable> {
         match self {
-            EngineTable::Columnar(_) => None,
+            EngineTable::Columnar(_) | EngineTable::Log(_) => None,
             EngineTable::Memory(t) => Some(t),
         }
     }
 
     pub fn as_memory_mut(&mut self) -> Option<&mut MemoryTable> {
         match self {
-            EngineTable::Columnar(_) => None,
+            EngineTable::Columnar(_) | EngineTable::Log(_) => None,
             EngineTable::Memory(t) => Some(t),
+        }
+    }
+
+    /// 解包 Log 引擎（非 Log 返回 None）
+    pub fn as_log(&self) -> Option<&LogTable> {
+        match self {
+            EngineTable::Log(t) => Some(t),
+            EngineTable::Columnar(_) | EngineTable::Memory(_) => None,
+        }
+    }
+
+    pub fn as_log_mut(&mut self) -> Option<&mut LogTable> {
+        match self {
+            EngineTable::Log(t) => Some(t),
+            EngineTable::Columnar(_) | EngineTable::Memory(_) => None,
         }
     }
 
@@ -153,6 +172,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.scan_to_chunks_with_skip(column_indices, skip_pred),
             EngineTable::Memory(t) => t.scan_to_chunks(column_indices, skip_pred),
+            EngineTable::Log(t) => t.scan_to_chunks(column_indices, skip_pred),
         }
     }
 
@@ -161,6 +181,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.insert(rows),
             EngineTable::Memory(t) => t.insert(rows),
+            EngineTable::Log(t) => t.insert(rows),
         }
     }
 
@@ -177,6 +198,10 @@ impl EngineTable {
                 .get_row_by_id_columns(row_id, col_indices)?
                 .map(|row| vec![row])
                 .unwrap_or_default()),
+            EngineTable::Log(t) => Ok(t
+                .get_row_by_id_columns(row_id, col_indices)?
+                .map(|row| vec![row])
+                .unwrap_or_default()),
         }
     }
 
@@ -184,6 +209,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.get_row_by_id(row_id),
             EngineTable::Memory(t) => t.get_row_by_id(row_id),
+            EngineTable::Log(t) => t.get_row_by_id(row_id),
         }
     }
 
@@ -192,6 +218,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.lookup_primary_key(pk),
             EngineTable::Memory(t) => t.lookup_primary_key(pk),
+            EngineTable::Log(_) => None,
         }
     }
 
@@ -200,6 +227,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.delete_row(row_id),
             EngineTable::Memory(t) => t.delete_row(row_id),
+            EngineTable::Log(t) => t.delete_row(row_id),
         }
     }
 
@@ -208,6 +236,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.update_row(row_id, new_row),
             EngineTable::Memory(t) => t.update_row(row_id, new_row),
+            EngineTable::Log(t) => t.update_row(row_id, new_row),
         }
     }
 
@@ -216,6 +245,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.truncate(),
             EngineTable::Memory(t) => t.truncate(),
+            EngineTable::Log(t) => t.truncate(),
         }
     }
 
@@ -225,6 +255,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.def.row_count,
             EngineTable::Memory(t) => t.row_count(),
+            EngineTable::Log(t) => t.row_count(),
         }
     }
 
@@ -239,13 +270,17 @@ impl EngineTable {
                 Ok(rows.iter().map(|(rid, row)| (*rid, row.clone())).collect())
             }
             EngineTable::Memory(t) => t.all_rows_with_ids(),
+            // Log 表无行级写语义：UPDATE/DELETE 在此明确拒绝
+            EngineTable::Log(_) => Err(EngramDbError::NotSupported(
+                "LogEngine 不支持 UPDATE/DELETE（追加式时间序列引擎）".into(),
+            )),
         }
     }
 
     pub fn indexes_to_bytes(&self) -> Vec<u8> {
         match self {
             EngineTable::Columnar(t) => t.indexes_to_bytes(),
-            EngineTable::Memory(_) => Vec::new(),
+            EngineTable::Memory(_) | EngineTable::Log(_) => Vec::new(),
         }
     }
 
@@ -253,7 +288,7 @@ impl EngineTable {
     pub fn indexes_from_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         match self {
             EngineTable::Columnar(t) => t.indexes_from_bytes(bytes),
-            EngineTable::Memory(_) => Ok(()),
+            EngineTable::Memory(_) | EngineTable::Log(_) => Ok(()),
         }
     }
 
@@ -262,6 +297,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.insert_columns(columns),
             EngineTable::Memory(t) => t.insert_columns(columns),
+            EngineTable::Log(t) => t.insert_columns(columns),
         }
     }
 
@@ -270,6 +306,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.insert_row(row_id, row),
             EngineTable::Memory(t) => t.insert_row(row_id, row),
+            EngineTable::Log(t) => t.insert_row(row_id, row),
         }
     }
 
@@ -278,6 +315,7 @@ impl EngineTable {
         match self {
             EngineTable::Columnar(t) => t.insert(rows),
             EngineTable::Memory(t) => t.insert(rows),
+            EngineTable::Log(t) => t.insert(rows),
         }
     }
 }

@@ -61,6 +61,7 @@ pub fn execute_with_filter_pushdown(
     let rows = match engine {
         crate::storage::engine::EngineTable::Columnar(t) => t.scan(column_indices)?,
         crate::storage::engine::EngineTable::Memory(t) => t.scan_to_rows_direct(column_indices, None)?,
+        crate::storage::engine::EngineTable::Log(t) => t.scan_to_rows_direct(column_indices, None)?,
     };
     let mut chunks = Vec::new();
     let batch_size = super::super::vector::VECTOR_SIZE;

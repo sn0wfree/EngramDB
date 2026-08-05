@@ -188,7 +188,16 @@ pub fn execute(
     aggregates: &[(AggregateFunc, usize, bool)],
 ) -> Result<Vec<DataChunk>> {
     if input.is_empty() {
-        return Ok(vec![]);
+        // SQL 语义：无 GROUP BY 聚合在空输入下仍返回一行
+        // （COUNT → 0，SUM/AVG/MIN/MAX → NULL——finalize 空态即正确值）
+        let chunk = DataChunk {
+            columns: aggregates
+                .iter()
+                .map(|(func, _, _)| Vector::Constant(PartialAggState::new(*func).finalize(), 1))
+                .collect(),
+            count: 1,
+        };
+        return Ok(vec![chunk]);
     }
 
     let mut results: Vec<Value> = Vec::with_capacity(aggregates.len());

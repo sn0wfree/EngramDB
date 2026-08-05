@@ -511,6 +511,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                     crate::storage::engine::EngineTable::Memory(t) => {
                         t.scan_to_rows_direct(&column_indices, None)?
                     }
+                    crate::storage::engine::EngineTable::Log(t) => {
+                        t.scan_to_rows_direct(&column_indices, None)?
+                    }
                 };
                 (columns, rows)
             };
@@ -643,17 +646,27 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             if let PhysicalPlan::TableScan { table_name, column_indices } = input.as_ref() {
                 if let Some((pred_col, pred_op, pred_val)) = extract_skip_predicate(&condition) {
                     let (column_names, rows) = {
-                        let table = db.get_table_mut(table_name)
+                        let table = db.get_engine_table_mut(table_name)
                             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                         // 谓词列在表定义中的索引（MinMax 按表列索引判断）
-                        let pred_col_idx = table.def.column_index(&pred_col);
+                        let pred_col_idx = table.def().column_index(&pred_col);
                         // 谓词列在扫描输出中的位置（column_indices 顺序即输出顺序）
                         let pred_pos = pred_col_idx.and_then(|ci| column_indices.iter().position(|&c| c == ci));
                         let names: Vec<String> = column_indices.iter()
-                            .map(|&i| table.def.columns[i].name.clone())
+                            .map(|&i| table.def().columns[i].name.clone())
                             .collect();
                         let skip = pred_col_idx.map(|ci| (ci, pred_op, pred_val.clone()));
-                        let scanned = table.scan_to_rows_direct_with_skip(column_indices, skip)?;
+                        let scanned = match table {
+                            crate::storage::engine::EngineTable::Columnar(t) => {
+                                t.scan_to_rows_direct_with_skip(column_indices, skip)?
+                            }
+                            crate::storage::engine::EngineTable::Memory(t) => {
+                                t.scan_to_rows_direct(column_indices, skip)?
+                            }
+                            crate::storage::engine::EngineTable::Log(t) => {
+                                t.scan_to_rows_direct(column_indices, skip)?
+                            }
+                        };
 
                         // 逐行精确过滤（复用向量化求值的标量语义）
                         let rows: Vec<Vec<crate::Value>> = match pred_pos {
@@ -1505,6 +1518,15 @@ fn execute_upsert(
     returning: Option<Vec<crate::sql::ast::SelectItem>>,
 ) -> Result<QueryResult> {
     use crate::sql::ast::OnConflictAction;
+
+    // M3：Log 引擎 —— 追加式引擎不支持 UPSERT（INSERT ... ON CONFLICT）
+    if let Some(engine) = db.get_engine_table(table_name) {
+        if matches!(engine, crate::storage::engine::EngineTable::Log(_)) {
+            return Err(EngramDbError::NotSupported(
+                "LogEngine 不支持 UPSERT（追加式时间序列引擎）".into(),
+            ));
+        }
+    }
 
     let table = db.get_table(table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;

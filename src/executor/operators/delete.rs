@@ -174,6 +174,13 @@ fn execute_without_txn(
     }
     let col_names: Vec<String> = engine.def().columns.iter().map(|c| c.name.clone()).collect();
 
+    // M3：Log 引擎 —— 追加式引擎不支持 DELETE
+    if let crate::storage::engine::EngineTable::Log(_) = engine {
+        return Err(EngramDbError::NotSupported(
+            "LogEngine 不支持 DELETE（追加式时间序列引擎）".into(),
+        ));
+    }
+
     // M2：Memory 引擎 —— 全表删除（内存表无列存/Delta 之分）
     if let crate::storage::engine::EngineTable::Memory(mem) = engine {
         let rows = mem.scan_to_rows_direct(&(0..num_cols).collect::<Vec<usize>>(), None)?;
