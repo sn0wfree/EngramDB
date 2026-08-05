@@ -251,10 +251,10 @@ impl Connection {
     pub fn import_columns(&mut self, table_name: &str, columns: Vec<Vec<Value>>) -> Result<u64> {
         use crate::common::error::EngramDbError;
 
-        let table = self.db.get_table_mut(table_name)
+        let engine = self.db.get_engine_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
-        let num_cols = table.def.columns.len();
+        let num_cols = engine.def().columns.len();
         let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
 
         if num_rows == 0 {
@@ -269,17 +269,25 @@ impl Connection {
             ));
         }
 
-        // 直接走列式路径写入（P1 + P4 优化的极致）
-        let direct_threshold = (table.column_store().row_group_size() / 4) as usize;
-        if num_rows >= direct_threshold && num_rows >= 1000 {
-            // 大批量：直接写入列存
-            table.column_store_mut().append_columns(&columns)?;
-            table.def_mut().row_count += num_rows as u64;
-        } else {
-            // 小批量：走 Delta 层（列式 Delta，P4）
-            table.delta_store_mut().insert_columns(columns)?;
-            // 与 insert() 一致：写入 Delta 层即计入总行数
-            table.def_mut().row_count += num_rows as u64;
+        // 引擎分派（M2：Memory 表走列式批量插入）
+        match engine {
+            crate::storage::engine::EngineTable::Columnar(table) => {
+                // 直接走列式路径写入（P1 + P4 优化的极致）
+                let direct_threshold = (table.column_store().row_group_size() / 4) as usize;
+                if num_rows >= direct_threshold && num_rows >= 1000 {
+                    // 大批量：直接写入列存
+                    table.column_store_mut().append_columns(&columns)?;
+                    table.def_mut().row_count += num_rows as u64;
+                } else {
+                    // 小批量：走 Delta 层（列式 Delta，P4）
+                    table.delta_store_mut().insert_columns(columns)?;
+                    // 与 insert() 一致：写入 Delta 层即计入总行数
+                    table.def_mut().row_count += num_rows as u64;
+                }
+            }
+            crate::storage::engine::EngineTable::Memory(table) => {
+                table.insert_columns(columns)?;
+            }
         }
 
         Ok(num_rows as u64)
@@ -3288,6 +3296,9 @@ mod value_tests {
 mod multi_engine_tests {
     use super::*;
     use crate::sql::ast::Statement;
+
+    include!("memory_engine_tests.rs");
+
 
     #[test]
     fn test_engine_clause_parse() {

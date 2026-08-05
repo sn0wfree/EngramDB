@@ -21,6 +21,9 @@ pub enum EngramDbError {
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
+    #[error("Operation not supported by engine: {0}")]
+    NotSupported(String),
+
     #[error("Column not found: {0}")]
     ColumnNotFound(String),
 

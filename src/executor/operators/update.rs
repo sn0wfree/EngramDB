@@ -86,25 +86,25 @@ fn execute_with_txn(
     debug!("Starting transaction path UPDATE execution...");
     
     // 步骤 1：先收集要更新的行并计算新值（在开启事务之前，避免借用冲突）
+    // 引擎分派（M2）：Columnar = Delta 层行（现有语义），Memory = 全部存活行
     let updates = {
-        let table = db.get_table(table_name)
+        let table = db.get_engine_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
-        
-        let num_cols = table.def.columns.len();
+
+        let num_cols = table.def().columns.len();
         if num_cols == 0 {
             return Ok(0);
         }
-        
-        let col_names: Vec<String> = table.def.columns.iter().map(|c| c.name.clone()).collect();
-        
-        // 使用 delta_store.all_rows() 获取 Delta 层的行（包含正确的 row_id）
-        let delta_rows = table.delta_store().all_rows();
-        
-        // 找出匹配的 Delta 行，并计算新值
+
+        let col_names: Vec<String> = table.def().columns.iter().map(|c| c.name.clone()).collect();
+
+        let mutable_rows = table.collect_mutable_rows()?;
+
+        // 找出匹配的行，并计算新值
         let mut updates: Vec<(u64, Vec<Value>, Vec<Value>)> = Vec::new();
         // (row_id, old_row, new_row)
-        
-        for (row_id, row) in delta_rows.iter() {
+
+        for (row_id, row) in mutable_rows {
             // 评估 WHERE 条件
             if let Some(ref cond) = condition {
                 let chunks = rows_to_chunks(&[row.clone()]);
@@ -137,7 +137,7 @@ fn execute_with_txn(
             }
             
             if updated {
-                updates.push((*row_id, row.clone(), new_row));
+                updates.push((row_id, row, new_row));
             }
         }
         
@@ -198,21 +198,65 @@ fn execute_without_txn(
 ) -> Result<usize> {
     debug!("Starting non-transaction path UPDATE execution...");
     
-    let table = db.get_table_mut(table_name)
+    let engine = db.get_engine_table_mut(table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
-    
-    let num_cols = table.def.columns.len();
+
+    let num_cols = engine.def().columns.len();
     if num_cols == 0 {
         return Ok(0);
     }
-    
+    let col_names: Vec<String> = engine.def().columns.iter().map(|c| c.name.clone()).collect();
+
+    // M2：Memory 引擎 —— 全表更新（内存表无列存/Delta 之分）
+    if let crate::storage::engine::EngineTable::Memory(mem) = engine {
+        let all_rows = mem.scan_to_rows_direct(&(0..num_cols).collect::<Vec<usize>>(), None)?;
+        let mut count = 0;
+        for row in &all_rows {
+            if let Some(ref cond) = condition {
+                let chunks = rows_to_chunks(&[row.clone()]);
+                let filtered = operators::filter::execute(&chunks, cond, &col_names)?;
+                if filtered.is_empty() || filtered[0].count == 0 {
+                    continue;
+                }
+            }
+            let mut new_vals: Vec<(usize, Value)> = Vec::new();
+            for &(col_idx, ref expr) in assignments {
+                let chunks = rows_to_chunks(&[row.clone()]);
+                let result = operators::projection::execute(
+                    &chunks,
+                    &[expr.clone()],
+                    &col_names,
+                    &[],
+                )?;
+                if !result.is_empty() && result[0].count > 0 {
+                    new_vals.push((col_idx, result[0].columns[0].get(0).clone()));
+                }
+            }
+            if !new_vals.is_empty() {
+                let mut new_row = row.clone();
+                for (ci, v) in &new_vals {
+                    if *ci < new_row.len() {
+                        new_row[*ci] = v.clone();
+                    }
+                }
+                if let Some(rid) = mem.pk_row_id(&new_row) {
+                    mem.update_row(rid, &new_row)?;
+                    count += 1;
+                }
+            }
+        }
+        info!("Non-transaction path completed: {} rows updated (Memory)", count);
+        return Ok(count);
+    }
+
+    // Columnar：现有逻辑（Delta 层）
+    let table = engine.as_columnar_mut().expect("checked above");
     // 扫描所有列
     let all_col_indices: Vec<usize> = (0..num_cols).collect();
     let all_rows = table.scan(&all_col_indices)?;
-    
+
     let delta_total = table.delta_store().len();
     let cs_rows = table.def.row_count as usize - delta_total;
-    let col_names: Vec<String> = table.def.columns.iter().map(|c| c.name.clone()).collect();
     
     // 找出匹配的 Delta 行，并计算新值
     let mut updates: Vec<(usize, Vec<(usize, Value)>)> = Vec::new();

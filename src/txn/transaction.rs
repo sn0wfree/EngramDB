@@ -71,7 +71,7 @@ impl<'a> Transaction<'a> {
     pub fn insert(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
         // 注意：表的权威 ID 在 table_names 映射中（TableDef.id 未由 create_table 回填）
         let (table_id, base_row_count) = self.db.table_names().get(table_name)
-            .and_then(|id| self.db.get_table(table_name).map(|t| (*id, t.def.row_count)))
+            .and_then(|id| self.db.get_engine_table(table_name).map(|t| (*id, t.def().row_count)))
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
         let txn_id = self.id;

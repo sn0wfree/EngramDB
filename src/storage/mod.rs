@@ -13,6 +13,7 @@ pub mod rate_limiter;
 pub mod index;
 pub mod catalog;
 pub mod engine;
+pub mod memory_engine;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -171,7 +172,23 @@ impl Database {
         let table_id = self.next_table_id;
         self.next_table_id += 1;
 
-        let table = EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy));
+        let table = match table_def.engine {
+            crate::common::types::EngineType::Columnar => {
+                EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy))
+            }
+            crate::common::types::EngineType::Memory => {
+                EngineTable::Memory(memory_engine::MemoryTable::new(table_def.clone()))
+            }
+            crate::common::types::EngineType::Log => {
+                return Err(EngramDbError::NotSupported(
+                    "Log engine is not implemented yet (planned in v0.18)".into(),
+                ));
+            }
+        };
+        // M2：Memory 表标记为非持久化（事务跳过 WAL）
+        if table_def.engine == crate::common::types::EngineType::Memory {
+            self.txn_manager.mark_non_persistent(table_id);
+        }
         self.tables.insert(table_id, table);
         self.table_names.insert(table_def.name.clone(), table_id);
 
@@ -464,8 +481,13 @@ impl Database {
     ///
     /// 返回合并的行数。
     pub fn compact_table(&mut self, table_name: &str) -> Result<u64> {
-        let table = self.get_table_mut(table_name)
-            .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
+        // 引擎分派：Memory 表无 Delta 层，跳过
+        let Some(engine) = self.get_engine_table_mut(table_name) else {
+            return Err(crate::common::error::EngramDbError::TableNotFound(table_name.into()));
+        };
+        let EngineTable::Columnar(table) = engine else {
+            return Ok(0);
+        };
         let rows = table.delta_store().len() as u64;
         table.compact_delta()?;
         Ok(rows)
@@ -689,8 +711,27 @@ impl Database {
         self.next_table_id = snapshot.next_table_id;
 
         for (table_id, table_def) in snapshot.tables {
-            // M0：按引擎构造（当前仅 Columnar；Memory/Log 待 M2/M3）
-            let table = EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy));
+            // 按引擎构造（M2：Memory 表重建为空白内存表，数据不恢复）
+            let table = match table_def.engine {
+                crate::common::types::EngineType::Columnar => {
+                    EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy))
+                }
+                crate::common::types::EngineType::Memory => {
+                    // 内存表数据不恢复：行数统计清零（catalog 中的 row_count 是上次会话的）
+                    let mut mem_def = table_def.clone();
+                    mem_def.row_count = 0;
+                    EngineTable::Memory(memory_engine::MemoryTable::new(mem_def))
+                }
+                crate::common::types::EngineType::Log => {
+                    return Err(EngramDbError::NotSupported(
+                        "Log engine is not implemented yet (planned in v0.18)".into(),
+                    ));
+                }
+            };
+            // M2：Memory 表标记为非持久化（事务跳过 WAL）
+            if table_def.engine == crate::common::types::EngineType::Memory {
+                self.txn_manager.mark_non_persistent(table_id);
+            }
             self.table_names.insert(table_def.name.clone(), table_id);
             self.tables.insert(table_id, table);
         }
@@ -711,17 +752,22 @@ impl Database {
         use std::io::{Seek, Write};
 
         // 格式：table_count + per-table (table_id + data_len + data)
+        // 仅持久化 Columnar 表；Memory 表数据不落盘（进程退出丢失，符合语义）
         let mut section_buf = Vec::new();
-        let table_count = self.tables.len() as u32;
+        let persistent_ids: Vec<u32> = self
+            .tables
+            .iter()
+            .filter(|(_, t)| matches!(t, EngineTable::Columnar(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        let table_count = persistent_ids.len() as u32;
         section_buf.extend_from_slice(&table_count.to_le_bytes());
 
-        // 收集 table_id 列表（避免借用冲突）
-        let table_ids: Vec<u32> = self.tables.keys().copied().collect();
         let compress = self.config.compress_on_persist;
-        for table_id in table_ids {
+        for table_id in persistent_ids {
             let table = self.tables.get_mut(&table_id).unwrap();
             let EngineTable::Columnar(table) = table else {
-                continue; // M0：非 Columnar 引擎的数据段持久化待 M2/M3 实现
+                continue;
             };
             let data_bytes = table.column_store_mut().data_to_bytes(compress)?;
             section_buf.extend_from_slice(&table_id.to_le_bytes());
@@ -798,6 +844,7 @@ impl Database {
                 table.rebuild_primary_index()?;
                 loaded += 1;
             }
+            // Memory 表无数据段（跳过，保持空白内存表）
             // 表不存在则跳过（schema 已删但数据未清理）
             offset += data_len;
         }

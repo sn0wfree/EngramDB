@@ -29,13 +29,13 @@ fn try_execute_chunks(
     match plan {
         PhysicalPlan::TableScan { table_name, column_indices } => {
             let table = db
-                .get_table_mut(table_name)
+                .get_engine_table_mut(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
             let columns: Vec<String> = column_indices
                 .iter()
-                .map(|&i| table.def.columns[i].name.clone())
+                .map(|&i| table.def().columns[i].name.clone())
                 .collect();
-            let chunks = table.scan_to_chunks(column_indices)?;
+            let chunks = table.scan_to_chunks(column_indices, None)?;
             Ok(Some((columns, chunks)))
         }
         PhysicalPlan::Projection {
@@ -92,18 +92,18 @@ fn try_execute_chunks(
                 if let Some((pred_col, pred_op, pred_val)) = extract_skip_predicate(condition) {
                     let (names, chunks, filtered) = {
                         let table = db
-                            .get_table_mut(table_name)
+                            .get_engine_table_mut(table_name)
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
                         let names: Vec<String> = column_indices
                             .iter()
-                            .map(|&i| table.def.columns[i].name.clone())
+                            .map(|&i| table.def().columns[i].name.clone())
                             .collect();
-                        let pred_col_idx = table.def.column_index(&pred_col);
+                        let pred_col_idx = table.def().column_index(&pred_col);
                         // 谓词列是否在输出列：在 → 扫描已精确筛选；不在 → 需 filter 兜底
                         let pred_pos = pred_col_idx
                             .and_then(|ci| column_indices.iter().position(|&c| c == ci));
                         let skip = pred_col_idx.map(|ci| (ci, pred_op, pred_val.clone()));
-                        let chunks = table.scan_to_chunks_with_skip(column_indices, skip)?;
+                        let chunks = table.scan_to_chunks(column_indices, skip)?;
                         (names, chunks, pred_pos.is_some())
                     };
                     if filtered {
@@ -383,9 +383,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
             // 记录插入前的 row_count，用于 RETURNING 读取实际行
             let base_row_id = if returning.is_some() {
-                let t = db.get_table(&table_name)
+                let t = db.get_engine_table(&table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
-                t.def.row_count as u32
+                t.def().row_count as u32
             } else {
                 0
             };
@@ -394,7 +394,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
             // INSERT...RETURNING: 从表中读取实际插入的行（含 AUTO_INCREMENT 值）
             if let Some(returning_items) = returning {
-                let table = db.get_table_mut(&table_name)
+                let table = db.get_engine_table_mut(&table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
 
                 let mut result_rows = Vec::with_capacity(num_rows);
@@ -410,7 +410,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                                 result_row.extend(row.iter().cloned());
                             }
                             crate::sql::ast::SelectItem::Expression(expr, _alias) => {
-                                let val = evaluate_returning_expr(expr, &row, &table.def)?;
+                                let val = evaluate_returning_expr(expr, &row, table.def())?;
                                 result_row.push(val);
                             }
                         }
@@ -497,13 +497,21 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         PhysicalPlan::TableScan { table_name, column_indices } => {
             // 性能优化：直传路径（最常见场景 SELECT * / 简单 SELECT）
             // 跳过 DataChunk 中间层，直接产出行 Vec，避免 chunks_to_rows 的二次克隆
+            // 引擎分派（M2：Memory 表走同语义扫描）
             let (columns, rows) = {
-                let table = db.get_table_mut(&table_name)
+                let table = db.get_engine_table_mut(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 let columns: Vec<String> = column_indices.iter()
-                    .map(|&i| table.def.columns[i].name.clone())
+                    .map(|&i| table.def().columns[i].name.clone())
                     .collect();
-                let rows = table.scan_to_rows_direct(&column_indices)?;
+                let rows = match table {
+                    crate::storage::engine::EngineTable::Columnar(t) => {
+                        t.scan_to_rows_direct(&column_indices)?
+                    }
+                    crate::storage::engine::EngineTable::Memory(t) => {
+                        t.scan_to_rows_direct(&column_indices, None)?
+                    }
+                };
                 (columns, rows)
             };
             Ok(QueryResult {
@@ -1093,21 +1101,21 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         // Perf03：主键点查短路（WHERE pk = Literal）
         PhysicalPlan::PrimaryKeyLookup { table_name, pk_value, output_column_indices } => {
-            // Phase 1：不可变借 -> 查主键索引拿 row_id + 列名
+            // Phase 1：不可变借 -> 查主键索引拿 row_id + 列名（引擎分派）
             let (row_id_opt, columns): (Option<u32>, Vec<String>) = {
-                let table = db.get_table(&table_name)
+                let table = db.get_engine_table(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 let cols: Vec<String> = if output_column_indices.is_empty() {
-                    table.def.columns.iter().map(|c| c.name.clone()).collect()
+                    table.def().columns.iter().map(|c| c.name.clone()).collect()
                 } else {
-                    output_column_indices.iter().map(|&i| table.def.columns[i].name.clone()).collect()
+                    output_column_indices.iter().map(|&i| table.def().columns[i].name.clone()).collect()
                 };
                 (table.lookup_primary_key(&pk_value), cols)
             };
             // Phase 2：可变借 -> 回表读指定列（避免读无关列）
             let rows: Vec<Vec<crate::Value>> = match row_id_opt {
                 Some(row_id) => {
-                    let table = db.get_table_mut(&table_name)
+                    let table = db.get_engine_table_mut(&table_name)
                         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                     if output_column_indices.is_empty() {
                         match table.get_row_by_id(row_id)? {
@@ -1164,7 +1172,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let table_id = db.table_names().get(&table_name).copied()
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
             {
-                let table = db.get_table_mut(&table_name)
+                let table = db.get_engine_table_mut(&table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
                 table.truncate()?;
             }

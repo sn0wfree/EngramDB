@@ -78,7 +78,10 @@ fn execute_with_txn(
     // 2. 事务内插入行（P-W2a：批量走 batch_insert，单次 WAL + MVCC）
     debug!("Inserting {} rows in transaction {}...", rows.len(), txn_id);
     let table_id = *db.table_names().get(table_name).unwrap();
-    let base_row_id = db.get_table(table_name).unwrap().def.row_count as u32;
+    let base_row_id = db
+        .get_engine_table(table_name)
+        .map(|et| et.def().row_count as u32)
+        .unwrap_or(0);
     let rows_len = rows.len();
 
     db.txn_manager_mut().batch_insert(txn_id, table_id, base_row_id as u64, rows)?;
@@ -110,11 +113,11 @@ fn execute_without_txn(
 ) -> Result<u64> {
     debug!("Starting non-transaction path execution...");
     
-    let table = db.get_table_mut(table_name)
+    let table = db.get_engine_table_mut(table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
     
     debug!("Inserting {} rows directly into table '{}'...", rows.len(), table_name);
-    table.insert(rows.clone())?;
+    table.insert_rows(rows.clone())?;
     
     info!("Non-transaction path completed: {} rows inserted", rows.len());
     Ok(rows.len() as u64)
@@ -338,7 +341,7 @@ fn insert_columns_direct(
     table_name: &str,
     columns: Vec<Vec<Value>>,
 ) -> Result<u64> {
-    let table = db.get_table_mut(table_name)
+    let table = db.get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     table.insert_columns(columns)

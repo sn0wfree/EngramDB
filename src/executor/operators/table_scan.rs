@@ -18,11 +18,12 @@ pub fn execute(
     table_name: &str,
     column_indices: &[usize],
 ) -> Result<Vec<DataChunk>> {
-    let table = db.get_table_mut(table_name)
+    // 引擎分派（M2：Memory 表走同一扫描接口）
+    let table = db.get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     // 性能优化：直接走 scan_to_chunks，跳过 row→chunk 转置（每次转置都做 cell 级 clone）
-    table.scan_to_chunks(column_indices)
+    table.scan_to_chunks(column_indices, None)
 }
 
 /// 带条件下推的表扫描（PREWHERE 优化）
@@ -54,8 +55,13 @@ pub fn execute_with_filter_pushdown(
     // 3. 根据 selection 读取数据列（projection columns）
     // 4. 返回物化结果
 
-    // MVP 回退：全量扫描
-    let rows = table.scan(column_indices)?;
+    // MVP 回退：全量扫描（引擎分派）
+    let engine = db.get_engine_table_mut(table_name)
+        .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
+    let rows = match engine {
+        crate::storage::engine::EngineTable::Columnar(t) => t.scan(column_indices)?,
+        crate::storage::engine::EngineTable::Memory(t) => t.scan_to_rows_direct(column_indices, None)?,
+    };
     let mut chunks = Vec::new();
     let batch_size = super::super::vector::VECTOR_SIZE;
 

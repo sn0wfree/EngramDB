@@ -49,6 +49,9 @@ pub struct TransactionManager {
     /// 数据库路径（用于 WAL 路径生成）
     #[allow(dead_code)]
     db_path: PathBuf,
+    /// 非持久化表集合（MemoryEngine，M2）：这些表的操作不写 WAL，
+    /// 事务提交也不 fsync（进程退出数据丢失，符合内存表语义）。
+    non_persistent_tables: std::collections::HashSet<u32>,
 }
 
 impl TransactionManager {
@@ -69,6 +72,7 @@ impl TransactionManager {
             wal,
             txns: HashMap::new(),
             db_path: PathBuf::from(db_path),
+            non_persistent_tables: std::collections::HashSet::new(),
         })
     }
 
@@ -119,12 +123,15 @@ impl TransactionManager {
         }
 
         ctx.state = TxnState::Committed;
+        let read_only = ctx.read_only;
         // 注意：必须在 take 之前克隆 write_set，因为 collect_apply_ops 需要它
         let write_set = ctx.write_set.clone();
         let _dropped = std::mem::take(&mut ctx.write_set);
 
-        // 只读事务跳过 WAL COMMIT 记录和 fsync（v0.15.0 Txn09）
-        if !ctx.read_only {
+        // 只读事务跳过 WAL COMMIT 记录和 fsync（v0.15.0 Txn09）；
+        // 全部写入仅涉及非持久化表（MemoryEngine）时同样跳过（M2）
+        let has_persistent_write = write_set.iter().any(|(tid, _)| self.is_persistent(*tid));
+        if !read_only && has_persistent_write {
             self.wal.write_record(WalRecordType::Commit, txn_id, 0, &[])?;
             self.wal.commit_flush()?;
         }
@@ -236,12 +243,15 @@ impl TransactionManager {
         }
 
         ctx.state = TxnState::RolledBack;
+        let read_only = ctx.read_only;
         let write_set = std::mem::take(&mut ctx.write_set);
         // 同时清空 savepoint 栈（事务回滚后所有 savepoint 失效）
         let _ = std::mem::take(&mut ctx.savepoints);
 
-        // 只读事务跳过 WAL ROLLBACK 记录（v0.15.0 Txn09）
-        if !ctx.read_only {
+        // 只读事务跳过 WAL ROLLBACK 记录（v0.15.0 Txn09）；
+        // 仅涉及非持久化表（MemoryEngine）时同样跳过（M2）
+        let has_persistent_write = write_set.iter().any(|(tid, _)| self.is_persistent(*tid));
+        if !read_only && has_persistent_write {
             self.wal.write_record(WalRecordType::Rollback, txn_id, 0, &[])?;
             self.wal.commit_flush()?;
         }
@@ -362,6 +372,16 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// 标记表为非持久化（MemoryEngine）：其操作不写 WAL（M2）
+    pub fn mark_non_persistent(&mut self, table_id: u32) {
+        self.non_persistent_tables.insert(table_id);
+    }
+
+    /// 表是否持久化（写 WAL）
+    pub fn is_persistent(&self, table_id: u32) -> bool {
+        !self.non_persistent_tables.contains(&table_id)
+    }
+
     /// 事务内插入一行
     pub fn insert(&mut self, txn_id: TxnId, table_id: u32, rowid: u64, row: Vec<Value>) -> Result<()> {
         self.ensure_active(txn_id)?;
@@ -369,9 +389,11 @@ impl TransactionManager {
         let ctx = self.txns.get(&txn_id).unwrap();
         let write_ts = ctx.start_ts;
 
-        // 写入 WAL
-        let payload = make_insert_payload(rowid, &row);
-        self.wal.write_record(WalRecordType::Insert, txn_id, table_id, &payload)?;
+        // 写入 WAL（Memory 表跳过）
+        if self.is_persistent(table_id) {
+            let payload = make_insert_payload(rowid, &row);
+            self.wal.write_record(WalRecordType::Insert, txn_id, table_id, &payload)?;
+        }
 
         // 写入 MVCC
         let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
@@ -413,9 +435,11 @@ impl TransactionManager {
         let ctx = self.txns.get(&txn_id).unwrap();
         let write_ts = ctx.start_ts;
 
-        // 1. 写入 WAL（单条 InsertBatch 记录）
-        let payload = make_insert_batch_payload(base_rowid, &rows);
-        self.wal.write_record(WalRecordType::InsertBatch, txn_id, table_id, &payload)?;
+        // 1. 写入 WAL（单条 InsertBatch 记录；Memory 表跳过）
+        if self.is_persistent(table_id) {
+            let payload = make_insert_batch_payload(base_rowid, &rows);
+            self.wal.write_record(WalRecordType::InsertBatch, txn_id, table_id, &payload)?;
+        }
 
         // 2. 写入 MVCC（单次批量写）
         let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
@@ -441,9 +465,11 @@ impl TransactionManager {
         let ctx = self.txns.get(&txn_id).unwrap();
         let write_ts = ctx.start_ts;
 
-        // 写入 WAL（含旧值，用于回滚）
-        let payload = make_update_payload(rowid, &old_row, &new_row);
-        self.wal.write_record(WalRecordType::Update, txn_id, table_id, &payload)?;
+        // 写入 WAL（含旧值，用于回滚；Memory 表跳过）
+        if self.is_persistent(table_id) {
+            let payload = make_update_payload(rowid, &old_row, &new_row);
+            self.wal.write_record(WalRecordType::Update, txn_id, table_id, &payload)?;
+        }
 
         // 写入 MVCC
         let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
@@ -464,9 +490,11 @@ impl TransactionManager {
     pub fn delete(&mut self, txn_id: TxnId, table_id: u32, rowid: u64, old_row: Vec<Value>) -> Result<()> {
         self.ensure_active(txn_id)?;
 
-        // 写入 WAL（含旧值，用于回滚）
-        let payload = make_delete_payload(rowid, &old_row);
-        self.wal.write_record(WalRecordType::Delete, txn_id, table_id, &payload)?;
+        // 写入 WAL（含旧值，用于回滚；Memory 表跳过）
+        if self.is_persistent(table_id) {
+            let payload = make_delete_payload(rowid, &old_row);
+            self.wal.write_record(WalRecordType::Delete, txn_id, table_id, &payload)?;
+        }
 
         // MVCC 中删除 = 写入一个 tombstone（空行或标记）
         // 简化：写入一个特殊的删除标记版本

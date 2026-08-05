@@ -72,6 +72,10 @@ name = "m1_acceptance_bench"
 harness = false
 
 [[bench]]
+name = "m2_memory_bench"
+harness = false
+
+[[bench]]
 name = "bench_main"
 harness = false
 

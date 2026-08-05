@@ -384,13 +384,13 @@ fn infer_columns_from_select(
 /// 规划 CREATE INDEX（v0.12.0 新增，覆盖索引）
 fn plan_create_index(stmt: CreateIndexStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
-    let table = db.get_table(&stmt.table_name)
+    let table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     // 解析键列 → 列索引
     let mut key_cols = Vec::with_capacity(stmt.key_columns.len());
     for col_name in &stmt.key_columns {
-        let idx = table.def.column_index(col_name)
+        let idx = table.def().column_index(col_name)
             .ok_or_else(|| EngramDbError::ColumnNotFound(format!(
                 "index key column '{}' not found in table '{}'", col_name, stmt.table_name
             )))?;
@@ -400,7 +400,7 @@ fn plan_create_index(stmt: CreateIndexStmt, db: &Database) -> Result<PhysicalPla
     // 解析覆盖列 → 列索引（INCLUDE 子句）
     let mut included_cols = Vec::with_capacity(stmt.included_columns.len());
     for col_name in &stmt.included_columns {
-        let idx = table.def.column_index(col_name)
+        let idx = table.def().column_index(col_name)
             .ok_or_else(|| EngramDbError::ColumnNotFound(format!(
                 "included column '{}' not found in table '{}'", col_name, stmt.table_name
             )))?;
@@ -459,7 +459,7 @@ fn plan_vector_search(args: &[Expression], db: &Database) -> Result<PhysicalPlan
     };
 
     // 验证表存在
-    db.get_table(&table_name)
+    db.get_engine_table(&table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
 
     Ok(PhysicalPlan::VectorSearch {
@@ -473,7 +473,7 @@ fn plan_vector_search(args: &[Expression], db: &Database) -> Result<PhysicalPlan
 /// 规划 DELETE 语句（v0.12.0 新增）
 fn plan_delete(stmt: DeleteStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
-    let _table = db.get_table(&stmt.table_name)
+    let _table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     Ok(PhysicalPlan::Delete {
@@ -485,13 +485,13 @@ fn plan_delete(stmt: DeleteStmt, db: &Database) -> Result<PhysicalPlan> {
 /// 规划 UPDATE 语句（v0.12.0 新增）
 fn plan_update(stmt: UpdateStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
-    let table = db.get_table(&stmt.table_name)
+    let table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     // 解析 SET 子句中的列名 → 列索引
     let mut assignments = Vec::with_capacity(stmt.assignments.len());
     for (col_name, expr) in stmt.assignments {
-        let col_idx = table.def.column_index(&col_name)
+        let col_idx = table.def().column_index(&col_name)
             .ok_or_else(|| EngramDbError::ColumnNotFound(format!(
                 "update column '{}' not found in table '{}'", col_name, stmt.table_name
             )))?;
@@ -517,10 +517,10 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
     }
 
     // 验证表存在
-    let table = db.get_table(&stmt.table_name)
+    let table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
-    let num_cols = table.def.columns.len();
+    let num_cols = table.def().columns.len();
     let num_rows = stmt.values.len();
 
     // ③：批量 VALUES → 列式 InsertColumns 快速路径
@@ -549,7 +549,7 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
     // 如果指定了列，预先计算列索引映射，避免逐行查找
     let col_map: Option<Vec<usize>> = stmt.columns.as_ref().map(|col_names| {
         col_names.iter()
-            .filter_map(|name| table.def.column_index(name))
+            .filter_map(|name| table.def().column_index(name))
             .collect()
     });
 
@@ -615,7 +615,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                         TableRef::Table { table_name, .. } => Some(table_name.clone()),
                         _ => None,
                     }) {
-                        let table = db.get_table(&table_name)
+                        let table = db.get_engine_table(&table_name)
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
                         let count = table.row_count() as i64;
                         let output_name = alias.clone().unwrap_or_else(|| "count(*)".to_string());
@@ -660,7 +660,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         })
         .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
 
-    let table = db.get_table(&table_name)
+    let table = db.get_engine_table(&table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
 
     // ===== Perf03：主键点查短路（WHERE pk = Literal）=====
@@ -669,7 +669,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     // 2. WHERE 唯一条件为 `pk_col = Literal`（BinaryEq）
     // 3. 无 GROUP BY / HAVING / ORDER BY / LIMIT（简化，后续可扩展）
     let mut pk_short_circuit: Option<crate::Value> = None;
-    if table.has_primary_index()
+    if table.def().primary_key_index().is_some()
         && stmt.group_by.is_empty()
         && stmt.having.is_none()
         && stmt.order_by.is_empty()
@@ -679,8 +679,8 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         if let Some(ref where_expr) = stmt.where_clause {
             if let Expression::BinaryOp { left, op, right } = where_expr {
                 if *op == BinaryOperator::Eq {
-                    let pk_idx = table.def.primary_key_index().unwrap();
-                    let pk_name = &table.def.columns[pk_idx].name;
+                    let pk_idx = table.def().primary_key_index().unwrap();
+                    let pk_name = &table.def().columns[pk_idx].name;
                     let mut maybe_pk_value: Option<crate::Value> = None;
                     // 接受 (pk_col = literal) 或 (literal = pk_col)
                     match (left.as_ref(), right.as_ref()) {
@@ -704,20 +704,20 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
 
     // 确定扫描的列（所有被引用的列）
     // 注意：collect_referenced_columns 现在返回列名（Vec 而非 HashSet），保持 SELECT/WHERE 中出现的顺序
-    let all_referenced_cols = collect_referenced_columns(&stmt, &table.def.columns);
+    let all_referenced_cols = collect_referenced_columns(&stmt, &table.def().columns);
     let mut scan_column_indices: Vec<usize> = all_referenced_cols.iter()
-        .filter_map(|name| table.def.column_index(name))
+        .filter_map(|name| table.def().column_index(name))
         .collect();
 
     // 纯聚合（如 COUNT(*)）不引用任何列时，至少扫描第一列用于计数
     let has_agg_in_select = select_list_has_aggregates(&stmt.select_list);
-    if scan_column_indices.is_empty() && has_agg_in_select && !table.def.columns.is_empty() {
+    if scan_column_indices.is_empty() && has_agg_in_select && !table.def().columns.is_empty() {
         scan_column_indices.push(0);
     }
 
     // 扫描阶段的列名映射（扫描输出的列名）
     let scan_column_names: Vec<String> = scan_column_indices.iter()
-        .map(|&i| table.def.columns[i].name.clone())
+        .map(|&i| table.def().columns[i].name.clone())
         .collect();
 
     // ===== 覆盖索引优化（v0.12.0 新增）=====
@@ -852,7 +852,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         let mut funcs = Vec::new();
         for item in &stmt.select_list {
             if let SelectItem::Expression(expr, alias) = item {
-                extract_window_functions(expr, alias, &scan_column_names, &table.def.columns, &mut funcs);
+                extract_window_functions(expr, alias, &scan_column_names, &table.def().columns, &mut funcs);
             }
         }
         funcs
@@ -874,7 +874,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         &stmt.select_list,
         &scan_column_names,
         needs_aggregate,
-        &table.def.columns,
+        &table.def().columns,
     )?;
 
     if needs_aggregate {
@@ -1225,7 +1225,7 @@ fn plan_join_tree_inner(
 ) -> Result<(PhysicalPlan, Vec<String>)> {
     match table_ref {
         TableRef::Table { table_name, .. } => {
-            let table = db.get_table(table_name)
+            let table = db.get_engine_table(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
 
             // 扫描列 = stmt 引用列（仅本表）∪ 所有 ON 引用列（仅本表）
@@ -1234,26 +1234,26 @@ fn plan_join_tree_inner(
             // 输出列名带表前缀（"users.name"），消除跨表重名列歧义。
             let mut names: Vec<String> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for name in collect_referenced_columns(stmt, &table.def.columns) {
-                if table.def.column_index(&name).is_some() && !seen.contains(&name) {
+            for name in collect_referenced_columns(stmt, &table.def().columns) {
+                if table.def().column_index(&name).is_some() && !seen.contains(&name) {
                     seen.insert(name.clone());
                     names.push(format!("{}.{}", table_name, name));
                 }
             }
             for col in all_on_columns {
-                if table.def.column_index(col).is_some() && !seen.contains(col) {
+                if table.def().column_index(col).is_some() && !seen.contains(col) {
                     seen.insert(col.clone());
                     names.push(format!("{}.{}", table_name, col));
                 }
             }
 
             let indices: Vec<usize> = names.iter()
-                .filter_map(|n| table.def.column_index(n.rsplit('.').next().unwrap_or(n)))
+                .filter_map(|n| table.def().column_index(n.rsplit('.').next().unwrap_or(n)))
                 .collect();
-            let indices = if indices.is_empty() && !table.def.columns.is_empty() {
+            let indices = if indices.is_empty() && !table.def().columns.is_empty() {
                 // 无引用列时扫描第一列（与单表路径一致）
-                if !names.contains(&format!("{}.{}", table_name, table.def.columns[0].name)) {
-                    names.push(format!("{}.{}", table_name, table.def.columns[0].name));
+                if !names.contains(&format!("{}.{}", table_name, table.def().columns[0].name)) {
+                    names.push(format!("{}.{}", table_name, table.def().columns[0].name));
                 }
                 vec![0]
             } else {
@@ -1268,7 +1268,7 @@ fn plan_join_tree_inner(
             let expressions: Vec<Expression> = indices.iter()
                 .map(|&i| Expression::ColumnRef {
                     table: None,
-                    column: table.def.columns[i].name.clone(),
+                    column: table.def().columns[i].name.clone(),
                 })
                 .collect();
             let plan = PhysicalPlan::Projection {
@@ -1541,13 +1541,13 @@ fn plan_table_ref(table_ref: &TableRef, db: &Database, stmt: &SelectStmt) -> Res
             Ok(plan)
         }
         TableRef::Table { table_name, .. } => {
-            let table = db.get_table(table_name)
+            let table = db.get_engine_table(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
-            let scan_columns = collect_referenced_columns(stmt, &table.def.columns);
+            let scan_columns = collect_referenced_columns(stmt, &table.def().columns);
             let scan_column_indices: Vec<usize> = scan_columns.iter()
-                .filter_map(|name| table.def.column_index(name))
+                .filter_map(|name| table.def().column_index(name))
                 .collect();
-            let indices = if scan_column_indices.is_empty() && !table.def.columns.is_empty() {
+            let indices = if scan_column_indices.is_empty() && !table.def().columns.is_empty() {
                 vec![0]
             } else {
                 scan_column_indices
@@ -1594,10 +1594,10 @@ fn try_index_only_scan(
     let (col_name, key_value) = extract_equality_condition(where_expr)?;
 
     // 查找表和匹配的索引
-    let table = db.get_table(table_name)?;
-    let col_idx = table.def.column_index(&col_name)?;
+    let table = db.get_engine_table(table_name)?;
+    let col_idx = table.def().column_index(&col_name)?;
 
-    for idx_def in &table.def.indexes {
+    for idx_def in &table.def().indexes {
         if idx_def.key_columns.first() == Some(&col_idx) {
             // 检查所有扫描列是否都在索引覆盖范围内（键列 + 覆盖列）
             let all_index_cols: std::collections::HashSet<usize> = idx_def.key_columns
@@ -1658,10 +1658,10 @@ fn try_index_scan(
     let (col_name, key_value) = extract_equality_condition(where_expr)?;
 
     // 查找表和匹配的索引
-    let table = db.get_table(table_name)?;
-    let col_idx = table.def.column_index(&col_name)?;
+    let table = db.get_engine_table(table_name)?;
+    let col_idx = table.def().column_index(&col_name)?;
 
-    for idx_def in &table.def.indexes {
+    for idx_def in &table.def().indexes {
         // 只考虑普通跳表索引（位图/布隆/向量不走回表路径）
         let is_skiplist = idx_def.index_type.is_empty()
             || idx_def.index_type.eq_ignore_ascii_case("skiplist")
@@ -1859,10 +1859,10 @@ fn try_index_range_scan(
     }
 
     // 查找表和匹配的索引
-    let table = db.get_table(table_name)?;
-    let col_idx = table.def.column_index(&range.col_name)?;
+    let table = db.get_engine_table(table_name)?;
+    let col_idx = table.def().column_index(&range.col_name)?;
 
-    for idx_def in &table.def.indexes {
+    for idx_def in &table.def().indexes {
         // 只考虑普通跳表索引（位图/布隆/向量不走回表路径）
         let is_skiplist = idx_def.index_type.is_empty()
             || idx_def.index_type.eq_ignore_ascii_case("skiplist")
@@ -1907,11 +1907,11 @@ fn can_skip_sort_by_index(
 
     if let Some(PhysicalPlan::IndexOnlyScan { index_name, output_column_indices, .. }) = scan_plan {
         // 获取索引定义
-        let table = match db.get_table(table_name) {
+        let table = match db.get_engine_table(table_name) {
             Some(t) => t,
             None => return false,
         };
-        let idx_def = match table.def.indexes.iter().find(|i| i.name == *index_name) {
+        let idx_def = match table.def().indexes.iter().find(|i| i.name == *index_name) {
             Some(idx) => idx,
             None => return false,
         };
@@ -2335,17 +2335,17 @@ fn eval_constant_expr(expr: &Expression, params: &[Value]) -> Result<Value> {
 
 fn plan_analyze(stmt: AnalyzeStmt, db: &Database) -> Result<PhysicalPlan> {
     // 验证表存在
-    let table = db.get_table(&stmt.table_name)
+    let table = db.get_engine_table(&stmt.table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
 
     // 确定要分析的列索引
     let column_indices = if stmt.columns.is_empty() {
         // 所有列
-        (0..table.def.columns.len()).collect()
+        (0..table.def().columns.len()).collect()
     } else {
         let mut indices = Vec::new();
         for col_name in &stmt.columns {
-            let idx = table.def.columns.iter()
+            let idx = table.def().columns.iter()
                 .position(|c| c.name == *col_name)
                 .ok_or_else(|| EngramDbError::Internal(
                     format!("column '{}' not found in table '{}'", col_name, stmt.table_name)

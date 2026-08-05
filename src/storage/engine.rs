@@ -11,6 +11,7 @@ use crate::common::error::Result;
 use crate::common::types::{EngineType, TableDef};
 use crate::executor::vector::{DataChunk, Vector};
 use crate::storage::column_store::PredicateOp;
+use crate::storage::memory_engine::MemoryTable;
 use crate::storage::table::Table;
 use crate::Value;
 
@@ -87,13 +88,14 @@ pub trait EngineTableOps {
 /// Columnar 变体（M0 阶段），新引擎变体随里程碑逐步加入。
 pub enum EngineTable {
     Columnar(Table),
-    // M2: Memory(MemoryTable)
+    /// 全内存表（M2）：不持久化，进程退出数据丢失
+    Memory(MemoryTable),
     // M3: Log(LogTable)
 }
 
 impl EngineTable {
     pub fn engine_type(&self) -> EngineType {
-        // 引擎类型来自表定义（M2/M3 引擎表也会在 def 中记录引擎类型）
+        // 引擎类型来自表定义（各引擎表在 def 中记录引擎类型）
         self.def().engine
     }
 
@@ -101,25 +103,44 @@ impl EngineTable {
     pub fn def(&self) -> &TableDef {
         match self {
             EngineTable::Columnar(t) => &t.def,
+            EngineTable::Memory(t) => &t.def,
         }
     }
 
     pub fn def_mut(&mut self) -> &mut TableDef {
         match self {
             EngineTable::Columnar(t) => &mut t.def,
+            EngineTable::Memory(t) => &mut t.def,
         }
     }
 
-    /// 解包 Columnar 引擎（仅 M0 阶段存在该变体时使用）
+    /// 解包 Columnar 引擎（非 Columnar 返回 None）
     pub fn as_columnar(&self) -> Option<&Table> {
         match self {
             EngineTable::Columnar(t) => Some(t),
+            EngineTable::Memory(_) => None,
         }
     }
 
     pub fn as_columnar_mut(&mut self) -> Option<&mut Table> {
         match self {
             EngineTable::Columnar(t) => Some(t),
+            EngineTable::Memory(_) => None,
+        }
+    }
+
+    /// 解包 Memory 引擎（非 Memory 返回 None）
+    pub fn as_memory(&self) -> Option<&MemoryTable> {
+        match self {
+            EngineTable::Columnar(_) => None,
+            EngineTable::Memory(t) => Some(t),
+        }
+    }
+
+    pub fn as_memory_mut(&mut self) -> Option<&mut MemoryTable> {
+        match self {
+            EngineTable::Columnar(_) => None,
+            EngineTable::Memory(t) => Some(t),
         }
     }
 
@@ -131,6 +152,7 @@ impl EngineTable {
     ) -> Result<Vec<DataChunk>> {
         match self {
             EngineTable::Columnar(t) => t.scan_to_chunks_with_skip(column_indices, skip_pred),
+            EngineTable::Memory(t) => t.scan_to_chunks(column_indices, skip_pred),
         }
     }
 
@@ -138,13 +160,30 @@ impl EngineTable {
     pub fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
         match self {
             EngineTable::Columnar(t) => t.insert(rows),
+            EngineTable::Memory(t) => t.insert(rows),
         }
     }
 
     /// 按行号取行（引擎分派入口）
+    /// 按 row_id + 列裁剪取行（单行，按 col_indices 顺序；不存在返回空）
+    pub fn get_row_by_id_columns(
+        &mut self,
+        row_id: u32,
+        col_indices: &[usize],
+    ) -> Result<Vec<Vec<Value>>> {
+        match self {
+            EngineTable::Columnar(t) => t.get_row_by_id_columns(row_id, col_indices),
+            EngineTable::Memory(t) => Ok(t
+                .get_row_by_id_columns(row_id, col_indices)?
+                .map(|row| vec![row])
+                .unwrap_or_default()),
+        }
+    }
+
     pub fn get_row_by_id(&mut self, row_id: u32) -> Result<Option<Vec<Value>>> {
         match self {
             EngineTable::Columnar(t) => t.get_row_by_id(row_id),
+            EngineTable::Memory(t) => t.get_row_by_id(row_id),
         }
     }
 
@@ -152,6 +191,7 @@ impl EngineTable {
     pub fn lookup_primary_key(&self, pk: &Value) -> Option<u32> {
         match self {
             EngineTable::Columnar(t) => t.lookup_primary_key(pk),
+            EngineTable::Memory(t) => t.lookup_primary_key(pk),
         }
     }
 
@@ -159,6 +199,7 @@ impl EngineTable {
     pub fn delete_row(&mut self, row_id: u32) -> Result<()> {
         match self {
             EngineTable::Columnar(t) => t.delete_row(row_id),
+            EngineTable::Memory(t) => t.delete_row(row_id),
         }
     }
 
@@ -166,6 +207,7 @@ impl EngineTable {
     pub fn update_row(&mut self, row_id: u32, new_row: &[Value]) -> Result<()> {
         match self {
             EngineTable::Columnar(t) => t.update_row(row_id, new_row),
+            EngineTable::Memory(t) => t.update_row(row_id, new_row),
         }
     }
 
@@ -173,13 +215,37 @@ impl EngineTable {
     pub fn truncate(&mut self) -> Result<()> {
         match self {
             EngineTable::Columnar(t) => t.truncate(),
+            EngineTable::Memory(t) => t.truncate(),
         }
     }
 
     /// 序列化索引段（引擎分派入口，供 Database::save_indexes 使用）
+    /// 实际行数（引擎感知：Columnar = def.row_count，Memory = 内存实际存活行）
+    pub fn row_count(&self) -> u64 {
+        match self {
+            EngineTable::Columnar(t) => t.def.row_count,
+            EngineTable::Memory(t) => t.row_count(),
+        }
+    }
+
+    /// 收集可操作行：(row_id, row)。
+    ///
+    /// 引擎语义：Columnar = Delta 层行（现有 UPDATE/DELETE 支持范围），
+    /// Memory = 全部存活行（内存表无列存/Delta 之分）。
+    pub fn collect_mutable_rows(&mut self) -> Result<Vec<(u64, Vec<Value>)>> {
+        match self {
+            EngineTable::Columnar(t) => {
+                let rows = t.delta_store().all_rows();
+                Ok(rows.iter().map(|(rid, row)| (*rid, row.clone())).collect())
+            }
+            EngineTable::Memory(t) => t.all_rows_with_ids(),
+        }
+    }
+
     pub fn indexes_to_bytes(&self) -> Vec<u8> {
         match self {
             EngineTable::Columnar(t) => t.indexes_to_bytes(),
+            EngineTable::Memory(_) => Vec::new(),
         }
     }
 
@@ -187,6 +253,7 @@ impl EngineTable {
     pub fn indexes_from_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         match self {
             EngineTable::Columnar(t) => t.indexes_from_bytes(bytes),
+            EngineTable::Memory(_) => Ok(()),
         }
     }
 
@@ -194,6 +261,7 @@ impl EngineTable {
     pub fn insert_columns(&mut self, columns: Vec<Vec<Value>>) -> Result<u64> {
         match self {
             EngineTable::Columnar(t) => t.insert_columns(columns),
+            EngineTable::Memory(t) => t.insert_columns(columns),
         }
     }
 
@@ -201,6 +269,7 @@ impl EngineTable {
     pub fn insert_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
         match self {
             EngineTable::Columnar(t) => t.insert_row(row_id, row),
+            EngineTable::Memory(t) => t.insert_row(row_id, row),
         }
     }
 
@@ -208,6 +277,7 @@ impl EngineTable {
     pub fn insert(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
         match self {
             EngineTable::Columnar(t) => t.insert(rows),
+            EngineTable::Memory(t) => t.insert(rows),
         }
     }
 }
