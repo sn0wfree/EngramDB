@@ -239,11 +239,123 @@ fn aggregate_chunk_partial(chunk: &DataChunk, func: AggregateFunc, col_idx: usiz
     }
 
     let col = &chunk.columns[col_idx];
+    // S2-M3：Typed 数值列快路径（直接数组循环，零 Value 构造）
+    if let Some(agg) = aggregate_typed_partial(col, func, chunk.count) {
+        return agg;
+    }
     for i in 0..chunk.count {
         state.accumulate(&col.get(i));
     }
 
     state
+}
+
+/// S2-M3：Typed 列聚合快路径（Int64/Float64 直接数组循环）
+fn aggregate_typed_partial(col: &Vector, func: AggregateFunc, count: usize) -> Option<PartialAggState> {
+    use crate::common::column_data::ColumnValue;
+    let data = col.as_typed()?;
+    let null_at = |i: usize| data.nulls.as_ref().map_or(false, |n| n.test(i));
+    match (&data.values, func) {
+        (ColumnValue::Int64(v), AggregateFunc::Sum) => {
+            let mut sum = 0.0f64;
+            let mut has = false;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    sum += v[i] as f64;
+                    has = true;
+                }
+            }
+            Some(PartialAggState::Sum { sum, has_value: has })
+        }
+        (ColumnValue::Int64(v), AggregateFunc::Avg) => {
+            let mut sum = 0.0f64;
+            let mut cnt = 0i64;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    sum += v[i] as f64;
+                    cnt += 1;
+                }
+            }
+            Some(PartialAggState::Avg { sum, count: cnt })
+        }
+        (ColumnValue::Int64(v), AggregateFunc::Count) => {
+            let mut cnt = 0i64;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    cnt += 1;
+                }
+            }
+            Some(PartialAggState::Count { count: cnt })
+        }
+        (ColumnValue::Int64(v), AggregateFunc::Min) => {
+            let mut min: Option<i64> = None;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    min = Some(min.map_or(v[i], |m| m.min(v[i])));
+                }
+            }
+            Some(PartialAggState::Min { value: min.map(Value::Int64) })
+        }
+        (ColumnValue::Int64(v), AggregateFunc::Max) => {
+            let mut max: Option<i64> = None;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    max = Some(max.map_or(v[i], |m| m.max(v[i])));
+                }
+            }
+            Some(PartialAggState::Max { value: max.map(Value::Int64) })
+        }
+        (ColumnValue::Float64(v), AggregateFunc::Sum) => {
+            let mut sum = 0.0f64;
+            let mut has = false;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    sum += v[i];
+                    has = true;
+                }
+            }
+            Some(PartialAggState::Sum { sum, has_value: has })
+        }
+        (ColumnValue::Float64(v), AggregateFunc::Avg) => {
+            let mut sum = 0.0f64;
+            let mut cnt = 0i64;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    sum += v[i];
+                    cnt += 1;
+                }
+            }
+            Some(PartialAggState::Avg { sum, count: cnt })
+        }
+        (ColumnValue::Float64(v), AggregateFunc::Count) => {
+            let mut cnt = 0i64;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    cnt += 1;
+                }
+            }
+            Some(PartialAggState::Count { count: cnt })
+        }
+        (ColumnValue::Float64(v), AggregateFunc::Min) => {
+            let mut min: Option<f64> = None;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    min = Some(min.map_or(v[i], |m| m.min(v[i])));
+                }
+            }
+            Some(PartialAggState::Min { value: min.map(Value::Float64) })
+        }
+        (ColumnValue::Float64(v), AggregateFunc::Max) => {
+            let mut max: Option<f64> = None;
+            for i in 0..v.len().min(count) {
+                if !null_at(i) {
+                    max = Some(max.map_or(v[i], |m| m.max(v[i])));
+                }
+            }
+            Some(PartialAggState::Max { value: max.map(Value::Float64) })
+        }
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -1090,6 +1202,59 @@ mod tests {
         assert_eq!(all_rows.len(), 1);
         assert_eq!(all_rows[0][0], Value::Null);
         assert_eq!(all_rows[0][1], Value::Float64(6.0));
+    }
+
+    /// S2-M3：Typed 列聚合与 Flat 等价性
+    #[test]
+    fn test_typed_aggregate_matches_flat() {
+        use crate::common::column_data::ColumnData;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for trial in 0..30 {
+            let n = 10 + rng.gen_range(0..500);
+            let is_float = trial % 2 == 1;
+            let values: Vec<Value> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(0.1) {
+                        return Value::Null;
+                    }
+                    if is_float {
+                        Value::Float64(rng.gen_range(-1000.0..1000.0))
+                    } else {
+                        Value::Int64(rng.gen_range(-100000..100000))
+                    }
+                })
+                .collect();
+            let data = ColumnData::try_from_values(&values).unwrap();
+            let typed_chunk = DataChunk {
+                columns: vec![Vector::Typed(data)],
+                count: n,
+            };
+            let flat_chunk = DataChunk {
+                columns: vec![Vector::Flat(values)],
+                count: n,
+            };
+
+            let funcs = [
+                AggregateFunc::Count,
+                AggregateFunc::Sum,
+                AggregateFunc::Avg,
+                AggregateFunc::Min,
+                AggregateFunc::Max,
+            ];
+            for func in funcs {
+                let typed = execute(&[typed_chunk.clone()], &[(func, 0, false)]).unwrap();
+                let flat = execute(&[flat_chunk.clone()], &[(func, 0, false)]).unwrap();
+                let tv = &typed[0].to_rows()[0][0];
+                let fv = &flat[0].to_rows()[0][0];
+                match (tv, fv) {
+                    (Value::Float64(a), Value::Float64(b)) => {
+                        assert!((a - b).abs() < 1e-9, "trial {} {:?} {} vs {}", trial, func, a, b)
+                    }
+                    _ => assert_eq!(tv, fv, "trial {} {:?}", trial, func),
+                }
+            }
+        }
     }
 
     /// 排序核心对比（S1.2 微基准），仅手动运行
