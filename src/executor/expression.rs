@@ -119,6 +119,11 @@ fn eval_binary_vectorized(left: &Vector, op: BinaryOperator, right: &Vector) -> 
         return Ok(Vector::Constant(result, *n));
     }
 
+    // S1.3：类型特化快速路径（双 Flat，纯类型数组循环 → 自动向量化）
+    if let Some(result) = try_eval_specialized(left, op, right) {
+        return result;
+    }
+
     // P3.1：单侧 Constant 快速路径 —— 不物化整列常量，
     // 直接按值逐元素计算，避免 to_flat() 的整列克隆 + 分配
     match (left, right) {
@@ -155,9 +160,343 @@ fn eval_binary_vectorized(left: &Vector, op: BinaryOperator, right: &Vector) -> 
     Ok(Vector::Flat(result))
 }
 
-/// 对一对值执行二元运算（供向量化路径逐元素复用）
-fn eval_binary_pair(left: &Value, op: BinaryOperator, right: &Value) -> Value {
+// ============================================================================
+// S1.3：类型特化快速路径
+// ============================================================================
+//
+// 双 Flat 时用「首元素启发 + 逐对完整语义」替代逐元素 eval_binary_pair：
+// - 启发（O(1)，只看首非 NULL 元素）决定组合路径（i64 / f64 / str / bool）
+// - 路径函数内每对值仍执行与 eval_arith/value_cmp 完全一致的语义
+//   （行级整数对 → 整数路径；NULL 传播；混合列 → 整列 fallback）
+// - 省去 eval_binary_pair 调用层 + 每元素 op match
+//
+// 语义约束（与原路径严格一致）：
+// - Int 算术：checked 溢出 / 除零 → NULL；结果 Int64（as_i64 优先于 as_f64）
+// - Float 算术：除零 → NAN；Float32 无 as_f64 → fallback（原路径得 NULL）
+// - 比较：Int×Float 按 f64 partial_cmp（NaN → Equal）；Str/Bool 直接比较
+// - NULL 传播 / SQL 三值逻辑
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Hint {
+    Int,  // Int32/Int64
+    Ts,   // Timestamp
+    Float,
+    Bool,
+    Str,
+    Other,    // 不支持类型 → fallback
+    AllNull,
+}
+
+/// O(1) 启发：首非 NULL 元素的类型
+fn hint_kind(values: &[Value]) -> Hint {
+    for v in values {
+        if v.is_null() {
+            continue;
+        }
+        return match v {
+            Value::Int32(_) | Value::Int64(_) => Hint::Int,
+            Value::Timestamp(_) => Hint::Ts,
+            Value::Float64(_) => Hint::Float,
+            Value::Boolean(_) => Hint::Bool,
+            Value::Varchar(_) => Hint::Str,
+            _ => Hint::Other,
+        };
+    }
+    Hint::AllNull
+}
+
+/// 特化求值入口：不适用时返回 None（调用方走原路径）
+fn try_eval_specialized(left: &Vector, op: BinaryOperator, right: &Vector) -> Option<Result<Vector>> {
+    let (l, r) = match (left, right) {
+        (Vector::Flat(l), Vector::Flat(r)) => (l, r),
+        _ => return None,
+    };
+    let lk = hint_kind(l);
+    let rk = hint_kind(r);
+    if lk == Hint::Other || rk == Hint::Other {
+        return None;
+    }
+    // 全 NULL 列兼容任意 kind（NULL 行由逐对逻辑处理；双全 NULL 列 → fallback）
+    let lk = if lk == Hint::AllNull { rk } else { lk };
+    let rk = if rk == Hint::AllNull { lk } else { rk };
+    if lk == Hint::AllNull {
+        return None;
+    }
+    let len = l.len().min(r.len());
+
+    // Timestamp × Float 组合：原路径 as_f64(Timestamp)=None → NULL / tag 比较，须 fallback
+    let ts_float_mix = (lk == Hint::Ts && rk == Hint::Float) || (lk == Hint::Float && rk == Hint::Ts);
+    let is_int = |k: Hint| k == Hint::Int || k == Hint::Ts;
+
     use BinaryOperator::*;
+    Some(match op {
+        Plus | Minus | Multiply | Divide | Modulo => {
+            let out = if ts_float_mix || lk == Hint::Bool || rk == Hint::Bool || lk == Hint::Str || rk == Hint::Str {
+                return None; // Bool/Str 算术原路径得 NULL；Ts×Float 同理 → fallback
+            } else if is_int(lk) && is_int(rk) {
+                arith_i64(&l[..len], op, &r[..len])?
+            } else if (lk == Hint::Float || rk == Hint::Float)
+                && (lk != Hint::Ts && rk != Hint::Ts)
+            {
+                arith_f64(&l[..len], op, &r[..len])?
+            } else {
+                return None;
+            };
+            Ok(Vector::Flat(out))
+        }
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+            let out = if ts_float_mix {
+                return None;
+            } else if is_int(lk) && is_int(rk) {
+                cmp_i64(&l[..len], op, &r[..len])?
+            } else if (lk == Hint::Float || rk == Hint::Float) && (lk != Hint::Ts && rk != Hint::Ts) {
+                cmp_f64(&l[..len], op, &r[..len])?
+            } else if (lk, rk) == (Hint::Str, Hint::Str) {
+                cmp_str(&l[..len], op, &r[..len])?
+            } else if (lk, rk) == (Hint::Bool, Hint::Bool) {
+                cmp_bool(&l[..len], op, &r[..len])?
+            } else {
+                return None;
+            };
+            Ok(Vector::Flat(out))
+        }
+        And | Or => {
+            if (lk, rk) != (Hint::Bool, Hint::Bool) {
+                return None;
+            }
+            Ok(Vector::Flat(logic_bool(&l[..len], op, &r[..len])))
+        }
+        Concat => {
+            if (lk, rk) != (Hint::Str, Hint::Str) {
+                return None;
+            }
+            Ok(Vector::Flat(concat_str(&l[..len], &r[..len])))
+        }
+    })
+}
+
+// --- 整数算术 ---
+
+/// 逐对完整语义（与原 eval_arith 一致）；混合列（非 NULL 非整数）→ None → fallback
+fn arith_i64(l: &[Value], op: BinaryOperator, r: &[Value]) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        match (l[i].as_i64(), r[i].as_i64()) {
+            (Some(a), Some(b)) => out.push(arith_i64_pair(a, op, b)),
+            _ => {
+                if l[i].is_null() || r[i].is_null() {
+                    out.push(Value::Null);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+#[inline(always)]
+fn arith_i64_pair(a: i64, op: BinaryOperator, b: i64) -> Value {
+    let v = match op {
+        BinaryOperator::Plus => a.checked_add(b),
+        BinaryOperator::Minus => a.checked_sub(b),
+        BinaryOperator::Multiply => a.checked_mul(b),
+        BinaryOperator::Divide => {
+            if b == 0 {
+                None
+            } else {
+                Some(a / b)
+            }
+        }
+        BinaryOperator::Modulo => {
+            if b == 0 {
+                None
+            } else {
+                Some(a % b)
+            }
+        }
+        _ => unreachable!(),
+    };
+    match v {
+        Some(v) => Value::Int64(v),
+        None => Value::Null, // 溢出或除零 → NULL
+    }
+}
+
+// --- 浮点算术（行级整数对仍走整数路径，与原 eval_arith 的 as_i64 优先一致）---
+
+fn arith_f64(l: &[Value], op: BinaryOperator, r: &[Value]) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        match (l[i].as_i64(), r[i].as_i64()) {
+            (Some(a), Some(b)) => out.push(arith_i64_pair(a, op, b)),
+            _ => match (l[i].as_f64(), r[i].as_f64()) {
+                (Some(a), Some(b)) => out.push(arith_f64_pair(a, op, b)),
+                _ => {
+                    if l[i].is_null() || r[i].is_null() {
+                        out.push(Value::Null);
+                    } else {
+                        return None; // Timestamp / 其他 → fallback
+                    }
+                }
+            },
+        }
+    }
+    Some(out)
+}
+
+#[inline(always)]
+fn arith_f64_pair(a: f64, op: BinaryOperator, b: f64) -> Value {
+    let v = match op {
+        BinaryOperator::Plus => a + b,
+        BinaryOperator::Minus => a - b,
+        BinaryOperator::Multiply => a * b,
+        // 与原 eval_arith 一致：浮点除零 → NAN（非 NULL）
+        BinaryOperator::Divide => {
+            if b == 0.0 {
+                f64::NAN
+            } else {
+                a / b
+            }
+        }
+        BinaryOperator::Modulo => {
+            if b == 0.0 {
+                f64::NAN
+            } else {
+                a % b
+            }
+        }
+        _ => unreachable!(),
+    };
+    Value::Float64(v)
+}
+
+// --- 比较（SQL 三值逻辑：NULL 比较 → NULL）---
+
+fn cmp_i64(l: &[Value], op: BinaryOperator, r: &[Value]) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        match (l[i].as_i64(), r[i].as_i64()) {
+            (Some(a), Some(b)) => out.push(cmp_pair(a.cmp(&b), op)),
+            _ => {
+                if l[i].is_null() || r[i].is_null() {
+                    out.push(Value::Null);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+fn cmp_f64(l: &[Value], op: BinaryOperator, r: &[Value]) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        match (l[i].as_i64(), r[i].as_i64()) {
+            (Some(a), Some(b)) => out.push(cmp_pair(a.cmp(&b), op)),
+            _ => match (l[i].as_f64(), r[i].as_f64()) {
+                (Some(a), Some(b)) => {
+                    // NaN → Equal（与原 value_cmp unwrap_or(Equal) 一致）
+                    out.push(cmp_pair(a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal), op));
+                }
+                _ => {
+                    if l[i].is_null() || r[i].is_null() {
+                        out.push(Value::Null);
+                    } else {
+                        return None;
+                    }
+                }
+            },
+        }
+    }
+    Some(out)
+}
+
+fn cmp_str(l: &[Value], op: BinaryOperator, r: &[Value]) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        match (l[i].as_str(), r[i].as_str()) {
+            (Some(a), Some(b)) => out.push(cmp_pair(a.cmp(b), op)),
+            _ => {
+                if l[i].is_null() || r[i].is_null() {
+                    out.push(Value::Null);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+fn cmp_bool(l: &[Value], op: BinaryOperator, r: &[Value]) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        match (&l[i], &r[i]) {
+            (Value::Boolean(a), Value::Boolean(b)) => out.push(cmp_pair(a.cmp(b), op)),
+            _ => {
+                if l[i].is_null() || r[i].is_null() {
+                    out.push(Value::Null);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+#[inline(always)]
+fn cmp_pair(cmp: std::cmp::Ordering, op: BinaryOperator) -> Value {
+    use BinaryOperator::*;
+    let result = match op {
+        Eq => cmp == std::cmp::Ordering::Equal,
+        NotEq => cmp != std::cmp::Ordering::Equal,
+        Lt => cmp == std::cmp::Ordering::Less,
+        LtEq => cmp <= std::cmp::Ordering::Equal,
+        Gt => cmp == std::cmp::Ordering::Greater,
+        GtEq => cmp >= std::cmp::Ordering::Equal,
+        _ => unreachable!(),
+    };
+    Value::Boolean(result)
+}
+
+// --- 逻辑运算（三值逻辑）---
+
+fn logic_bool(l: &[Value], op: BinaryOperator, r: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        let v = match op {
+            BinaryOperator::And => eval_logic_and(&l[i], &r[i]),
+            BinaryOperator::Or => eval_logic_or(&l[i], &r[i]),
+            _ => unreachable!(),
+        };
+        out.push(v);
+    }
+    out
+}
+
+// --- 字符串拼接 ---
+
+fn concat_str(l: &[Value], r: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        match (l[i].as_str(), r[i].as_str()) {
+            (Some(a), Some(b)) => {
+                let mut s = String::with_capacity(a.len() + b.len());
+                s.push_str(a);
+                s.push_str(b);
+                out.push(Value::Varchar(s));
+            }
+            _ => out.push(Value::Null),
+        }
+    }
+    out
+}
+
+/// 对一对值执行二元运算（供向量化路径逐元素复用）
+fn eval_binary_pair(left: &Value, op: BinaryOperator, right: &Value) -> Value {    use BinaryOperator::*;
     match op {
         // 算术运算
         Plus | Minus | Multiply | Divide | Modulo => eval_arith(left, op, right),
@@ -261,6 +600,14 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Int64(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
         (Value::Float64(x), Value::Float64(y)) => x.partial_cmp(y).unwrap_or(Equal),
         (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
+        // S1.3：Timestamp 按 i64 数值语义比较（此前落 `_` 分支：as_f64 为 None → tag 恒等）
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
+        (Value::Int32(x), Value::Timestamp(y)) => (*x as i64).cmp(y),
+        (Value::Timestamp(x), Value::Int64(y)) => x.cmp(y),
+        (Value::Int64(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
+        (Value::Float64(x), Value::Timestamp(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
         // 跨类型比较：尝试数值比较
         _ => {
             if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
@@ -3560,5 +3907,229 @@ mod tests {
         let flat = r.to_flat();
         // 2024-06-15 00:00:00 UTC = 1718409600000 ms
         assert_eq!(flat[0], Value::Timestamp(1718409600000i64));
+    }
+
+    // ========================================================================
+    // S1.3 特化路径测试
+    // ========================================================================
+
+    /// 值比较（Float64 按位，NaN 自等）
+    fn values_equal(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Float64(x), Value::Float64(y)) => x.to_bits() == y.to_bits(),
+            _ => a == b,
+        }
+    }
+
+    #[test]
+    fn test_specialized_deterministic() {
+        // 无 NULL 整数运算：1..5 + 10 = 11..15
+        let l = Vector::Flat(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3), Value::Int64(4), Value::Int64(5)]);
+        let r = Vector::Flat(vec![Value::Int64(10); 5]);
+        let out = try_eval_specialized(&l, BinaryOperator::Plus, &r).unwrap().unwrap();
+        assert_eq!(out.to_flat(), vec![
+            Value::Int64(11), Value::Int64(12), Value::Int64(13), Value::Int64(14), Value::Int64(15),
+        ]);
+
+        // 溢出 → NULL
+        let big = Vector::Flat(vec![Value::Int64(i64::MAX)]);
+        let one = Vector::Flat(vec![Value::Int64(1)]);
+        let out = try_eval_specialized(&big, BinaryOperator::Plus, &one).unwrap().unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Null]);
+
+        // 整数除零 → NULL；浮点除零 → NAN
+        let z = Vector::Flat(vec![Value::Int64(0)]);
+        let out = try_eval_specialized(&big, BinaryOperator::Divide, &z).unwrap().unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Null]);
+        let fz = Vector::Flat(vec![Value::Float64(0.0)]);
+        let out = try_eval_specialized(&big, BinaryOperator::Divide, &fz).unwrap().unwrap();
+        assert!(values_equal(&out.to_flat()[0], &Value::Float64(f64::NAN)));
+
+        // Int × Float 组合 → f64
+        let out = try_eval_specialized(&l, BinaryOperator::Multiply, &fz).unwrap().unwrap();
+        let flat = out.to_flat();
+        assert!(values_equal(&flat[0], &Value::Float64(0.0)));
+
+        // NULL 传播
+        let nl = Vector::Flat(vec![Value::Null, Value::Int64(2)]);
+        let out = try_eval_specialized(&nl, BinaryOperator::Plus, &l).unwrap().unwrap();
+        let flat = out.to_flat();
+        assert_eq!(flat[0], Value::Null);
+        assert_eq!(flat[1], Value::Int64(4)); // 2 + 2
+
+        // 布尔三值逻辑：false AND NULL = false；true AND NULL = NULL
+        let b1 = Vector::Flat(vec![Value::Boolean(false), Value::Boolean(true)]);
+        let b2 = Vector::Flat(vec![Value::Null, Value::Null]);
+        let out = try_eval_specialized(&b1, BinaryOperator::And, &b2).unwrap().unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Boolean(false), Value::Null]);
+
+        // 字符串比较 + 拼接
+        let s1 = Vector::Flat(vec![Value::Varchar("a".into()), Value::Varchar("b".into())]);
+        let s2 = Vector::Flat(vec![Value::Varchar("b".into()), Value::Varchar("a".into())]);
+        let out = try_eval_specialized(&s1, BinaryOperator::Lt, &s2).unwrap().unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Boolean(true), Value::Boolean(false)]);
+        let out = try_eval_specialized(&s1, BinaryOperator::Concat, &s2).unwrap().unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Varchar("ab".into()), Value::Varchar("ba".into())]);
+
+        // Int32+Int64 混合列 → 特化（as_i64 语义与原路径一致）
+        let mixed = Vector::Flat(vec![Value::Int32(1), Value::Int64(2)]);
+        let out = try_eval_specialized(&mixed, BinaryOperator::Plus, &l).unwrap().unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Int64(2), Value::Int64(4)]);
+
+        // Int+Float 混合同列 → fallback（原路径跨类型 tag 比较）
+        let mixed_if = Vector::Flat(vec![Value::Int64(1), Value::Float64(2.0)]);
+        assert!(try_eval_specialized(&mixed_if, BinaryOperator::Plus, &l).is_none());
+
+        // Float32 列 → fallback（原路径算术得 NULL，特化保持语义）
+        let f32col = Vector::Flat(vec![Value::Float32(1.0), Value::Float32(2.0)]);
+        assert!(try_eval_specialized(&f32col, BinaryOperator::Plus, &f32col).is_none());
+    }
+
+    #[test]
+    fn test_specialized_matches_pair_random() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let ops = [
+            BinaryOperator::Plus, BinaryOperator::Minus, BinaryOperator::Multiply,
+            BinaryOperator::Divide, BinaryOperator::Modulo,
+            BinaryOperator::Eq, BinaryOperator::NotEq, BinaryOperator::Lt,
+            BinaryOperator::LtEq, BinaryOperator::Gt, BinaryOperator::GtEq,
+            BinaryOperator::And, BinaryOperator::Or, BinaryOperator::Concat,
+        ];
+        for trial in 0..800 {
+            let n = 1 + rng.gen_range(0..40);
+            let lk = rng.gen_range(0..4); // 0 Int, 1 Float, 2 Bool, 3 Str
+            let rk = rng.gen_range(0..4);
+            let make_col = |kind: usize, rng: &mut rand::rngs::ThreadRng| -> Vec<Value> {
+                (0..n)
+                    .map(|_| {
+                        if rng.gen_bool(0.15) {
+                            return Value::Null;
+                        }
+                        match kind {
+                            0 => match rng.gen_range(0..3) {
+                                0 => Value::Int32(rng.gen_range(-100..100)),
+                                1 => Value::Int64(rng.gen_range(-1000..1000)),
+                                _ => Value::Timestamp(rng.gen_range(-1000..1000)),
+                            },
+                            1 => Value::Float64(rng.gen_range(-100.0..100.0)),
+                            2 => Value::Boolean(rng.gen_bool(0.5)),
+                            _ => Value::Varchar(format!("s{}", rng.gen_range(0..20))),
+                        }
+                    })
+                    .collect()
+            };
+            let l = make_col(lk, &mut rng);
+            let r = make_col(rk, &mut rng);
+            let op = ops[rng.gen_range(0..ops.len())];
+
+            let expected: Vec<Value> = (0..l.len().min(r.len()))
+                .map(|i| eval_binary_pair(&l[i], op, &r[i]))
+                .collect();
+
+            let specialized = try_eval_specialized(
+                &Vector::Flat(l.clone()),
+                op,
+                &Vector::Flat(r.clone()),
+            );
+            match specialized {
+                Some(Ok(Vector::Flat(out))) => {
+                    assert_eq!(out.len(), expected.len(), "trial {} op {:?}", trial, op);
+                    for (a, b) in out.iter().zip(expected.iter()) {
+                        assert!(values_equal(a, b),
+                            "trial {} op {:?} l={:?} r={:?} got {:?} want {:?}",
+                            trial, op, l, r, a, b);
+                    }
+                }
+                Some(Ok(_)) => panic!("unexpected constant result"),
+                Some(Err(e)) => panic!("err {}", e),
+                None => {
+                    // fallback：走原向量化路径，结果必须与逐元素参考一致
+                    let via_vec = eval_binary_vectorized(
+                        &Vector::Flat(l.clone()),
+                        op,
+                        &Vector::Flat(r.clone()),
+                    ).unwrap();
+                    let Vector::Flat(out) = via_vec else { panic!("expected flat") };
+                    for (a, b) in out.iter().zip(expected.iter()) {
+                        assert!(values_equal(a, b),
+                            "fallback trial {} op {:?} got {:?} want {:?}",
+                            trial, op, a, b);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 表达式求值对比（S1.3 微基准），仅手动运行
+    #[test]
+    #[ignore]
+    fn bench_specialized_vs_pair() {
+        use rand::Rng;
+        use std::time::{Duration, Instant};
+        let mut rng = rand::thread_rng();
+        let n = 1_000_000usize;
+        let l: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
+        let r: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
+
+        // 特化路径
+        let mut t = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let out = try_eval_specialized(&Vector::Flat(l.clone()), BinaryOperator::Plus, &Vector::Flat(r.clone())).unwrap().unwrap();
+            t += t0.elapsed();
+            assert_eq!(out.len(), n);
+        }
+        let spec_time = t / 3;
+
+        // 旧路径模拟（含 to_flat 克隆）：eval_binary_vectorized 原实现
+        let mut t = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let left_flat = Vector::Flat(l.clone()).to_flat();
+            let right_flat = Vector::Flat(r.clone()).to_flat();
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(eval_binary_pair(&left_flat[i], BinaryOperator::Plus, &right_flat[i]));
+            }
+            t += t0.elapsed();
+            assert_eq!(out.len(), n);
+        }
+        let old_time = t / 3;
+
+        println!("1M 行 Int64+Int64: specialized = {:?}, old(含 to_flat) = {:?}, 快 {}x",
+                 spec_time, old_time,
+                 old_time.as_nanos() as f64 / spec_time.as_nanos() as f64);
+
+        // Varchar 列比较（to_flat 深拷贝昂贵，特化应显著受益）
+        let ls: Vec<Value> = (0..n).map(|_| Value::Varchar(format!("key_{}", rng.gen_range(0..1000)))).collect();
+        let rs: Vec<Value> = (0..n).map(|_| Value::Varchar(format!("key_{}", rng.gen_range(0..1000)))).collect();
+
+        let mut t = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let out = try_eval_specialized(&Vector::Flat(ls.clone()), BinaryOperator::Lt, &Vector::Flat(rs.clone())).unwrap().unwrap();
+            t += t0.elapsed();
+            assert_eq!(out.len(), n);
+        }
+        let spec_s = t / 3;
+
+        let mut t = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let left_flat = Vector::Flat(ls.clone()).to_flat();
+            let right_flat = Vector::Flat(rs.clone()).to_flat();
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(eval_binary_pair(&left_flat[i], BinaryOperator::Lt, &right_flat[i]));
+            }
+            t += t0.elapsed();
+            assert_eq!(out.len(), n);
+        }
+        let old_s = t / 3;
+
+        println!("1M 行 Varchar<Varchar: specialized = {:?}, old(含 to_flat) = {:?}, 快 {}x",
+                 spec_s, old_s,
+                 old_s.as_nanos() as f64 / spec_s.as_nanos() as f64);
     }
 }
