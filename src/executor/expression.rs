@@ -272,9 +272,313 @@ fn eval_typed_binary(l: &ColumnData, op: BinaryOperator, r: &ColumnData) -> Opti
     Some(Ok(Vector::Typed(result)))
 }
 
+/// S2-M3：Typed 列 × Constant 运算（避免 to_flat 物化整列）
+///
+/// 语义与 eval_typed_binary 一致（as_i64 优先、checked 溢出→NULL、三值逻辑）。
+/// reversed = 常量在左（如 100 < col）。
+fn eval_typed_constant(
+    col: &ColumnData,
+    c: &Value,
+    n: usize,
+    op: BinaryOperator,
+    reversed: bool,
+) -> Option<Result<Vector>> {
+    use BinaryOperator::*;
+    use ColumnValue::{Boolean, Float64, Int64, Timestamp, Varchar};
+    let len = col.len().min(n);
+
+    let result: ColumnData = match (&col.values, c) {
+        (Int64(v), Value::Int32(_)) | (Int64(v), Value::Int64(_)) | (Int64(v), Value::Timestamp(_)) => {
+            let cv = match c {
+                Value::Int32(x) => *x as i64,
+                Value::Int64(x) => *x,
+                Value::Timestamp(x) => *x,
+                _ => unreachable!(),
+            };
+            match op {
+                Plus | Minus | Multiply | Divide | Modulo => {
+                    let out = const_arith_i64(&v[..len], cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Int64(out.0), nulls: out.1 }
+                }
+                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                    let out = const_cmp_i64(&v[..len], cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Boolean(out.0), nulls: out.1 }
+                }
+                _ => return None,
+            }
+        }
+        (Timestamp(v), Value::Int32(_)) | (Timestamp(v), Value::Int64(_)) => {
+            let cv = match c {
+                Value::Int32(x) => *x as i64,
+                Value::Int64(x) => *x,
+                _ => unreachable!(),
+            };
+            match op {
+                Plus | Minus | Multiply | Divide | Modulo => {
+                    let out = const_arith_i64(&v[..len], cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Int64(out.0), nulls: out.1 }
+                }
+                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                    let out = const_cmp_i64(&v[..len], cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Boolean(out.0), nulls: out.1 }
+                }
+                _ => return None,
+            }
+        }
+        (Float64(v), Value::Int32(_)) | (Float64(v), Value::Int64(_)) | (Float64(v), Value::Float64(_)) => {
+            let cv = match c {
+                Value::Int32(x) => *x as f64,
+                Value::Int64(x) => *x as f64,
+                Value::Float64(x) => *x,
+                _ => unreachable!(),
+            };
+            match op {
+                Plus | Minus | Multiply | Divide | Modulo => {
+                    let out = const_arith_f64(&v[..len], cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Float64(out.0), nulls: out.1 }
+                }
+                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                    let out = const_cmp_f64(&v[..len], cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Boolean(out.0), nulls: out.1 }
+                }
+                _ => return None,
+            }
+        }
+        (Int64(v), Value::Float64(cv)) => {
+            // Int64 列 × Float64 常量 → f64 路径（原语义 as_f64）
+            let vf: Vec<f64> = v[..len].iter().map(|&x| x as f64).collect();
+            match op {
+                Plus | Minus | Multiply | Divide | Modulo => {
+                    let out = const_arith_f64(&vf, *cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Float64(out.0), nulls: out.1 }
+                }
+                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                    let out = const_cmp_f64(&vf, *cv, op, &col.nulls, reversed);
+                    ColumnData { values: ColumnValue::Boolean(out.0), nulls: out.1 }
+                }
+                _ => return None,
+            }
+        }
+        (Varchar(v), Value::Varchar(cv)) => match op {
+            Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                let out = const_cmp_str(&v[..len], cv.as_str(), op, &col.nulls, reversed);
+                ColumnData { values: ColumnValue::Boolean(out.0), nulls: out.1 }
+            }
+            Concat => {
+                let out = const_concat_str(&v[..len], cv, op, &col.nulls, reversed);
+                ColumnData { values: ColumnValue::Varchar(out.0), nulls: out.1 }
+            }
+            _ => return None,
+        },
+        (Boolean(v), Value::Boolean(cv)) => match op {
+            Eq | NotEq => {
+                let out = const_cmp_bool(&v[..len], *cv, op, &col.nulls, reversed);
+                ColumnData { values: ColumnValue::Boolean(out.0), nulls: out.1 }
+            }
+            And | Or => {
+                let out = const_logic_bool(&v[..len], *cv, op, &col.nulls, reversed);
+                ColumnData { values: ColumnValue::Boolean(out.0), nulls: out.1 }
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    Some(Ok(Vector::Typed(result)))
+}
+
+/// 常量运算辅助：结果数组 + null 位
+fn nulls_from_flags(flags: &[bool]) -> Option<BitVec> {
+    if flags.iter().any(|&b| b) {
+        let mut bv = BitVec::new(flags.len());
+        for (i, &b) in flags.iter().enumerate() {
+            if b {
+                bv.set(i, true);
+            }
+        }
+        Some(bv)
+    } else {
+        None
+    }
+}
+
+fn const_arith_i64(v: &[i64], cv: i64, op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<i64>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let is_null = nulls.as_ref().map_or(false, |n| n.test(i));
+        if is_null {
+            out.push(0);
+            flags[i] = true;
+            continue;
+        }
+        let (a, b) = if reversed { (cv, v[i]) } else { (v[i], cv) };
+        match arith_i64_pair_inner(a, op, b) {
+            Some(r) => out.push(r),
+            None => {
+                out.push(0);
+                flags[i] = true;
+            }
+        }
+    }
+    (out, nulls_from_flags(&flags))
+}
+
+fn const_arith_f64(v: &[f64], cv: f64, op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<f64>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let is_null = nulls.as_ref().map_or(false, |n| n.test(i));
+        if is_null {
+            out.push(0.0);
+            flags[i] = true;
+            continue;
+        }
+        let (a, b) = if reversed { (cv, v[i]) } else { (v[i], cv) };
+        out.push(arith_f64_pair_inner(a, op, b));
+    }
+    (out, nulls_from_flags(&flags))
+}
+
+fn const_cmp_i64(v: &[i64], cv: i64, op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<bool>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let is_null = nulls.as_ref().map_or(false, |n| n.test(i));
+        if is_null {
+            out.push(false);
+            flags[i] = true;
+            continue;
+        }
+        let (a, b) = if reversed { (cv, v[i]) } else { (v[i], cv) };
+        out.push(cmp_pair_typed(a.cmp(&b), op));
+    }
+    (out, nulls_from_flags(&flags))
+}
+
+fn const_cmp_f64(v: &[f64], cv: f64, op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<bool>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let is_null = nulls.as_ref().map_or(false, |n| n.test(i));
+        if is_null {
+            out.push(false);
+            flags[i] = true;
+            continue;
+        }
+        let (a, b) = if reversed { (cv, v[i]) } else { (v[i], cv) };
+        let cmp = a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+        out.push(cmp_pair_typed(cmp, op));
+    }
+    (out, nulls_from_flags(&flags))
+}
+
+fn const_cmp_str(v: &[String], cv: &str, op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<bool>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let is_null = nulls.as_ref().map_or(false, |n| n.test(i));
+        if is_null {
+            out.push(false);
+            flags[i] = true;
+            continue;
+        }
+        let (a, b) = if reversed { (cv, v[i].as_str()) } else { (v[i].as_str(), cv) };
+        out.push(cmp_pair_typed(a.cmp(b), op));
+    }
+    (out, nulls_from_flags(&flags))
+}
+
+fn const_cmp_bool(v: &[bool], cv: bool, op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<bool>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let is_null = nulls.as_ref().map_or(false, |n| n.test(i));
+        if is_null {
+            out.push(false);
+            flags[i] = true;
+            continue;
+        }
+        let (a, b) = if reversed { (cv, v[i]) } else { (v[i], cv) };
+        out.push(cmp_pair_typed(a.cmp(&b), op));
+    }
+    (out, nulls_from_flags(&flags))
+}
+
+fn const_concat_str(v: &[String], cv: &str, _op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<String>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let is_null = nulls.as_ref().map_or(false, |n| n.test(i));
+        if is_null {
+            out.push(String::new());
+            flags[i] = true;
+            continue;
+        }
+        let mut s = if reversed {
+            String::with_capacity(cv.len() + v[i].len())
+        } else {
+            String::with_capacity(v[i].len() + cv.len())
+        };
+        if reversed {
+            s.push_str(cv);
+            s.push_str(&v[i]);
+        } else {
+            s.push_str(&v[i]);
+            s.push_str(cv);
+        }
+        out.push(s);
+    }
+    (out, nulls_from_flags(&flags))
+}
+
+fn const_logic_bool(v: &[bool], cv: bool, op: BinaryOperator, nulls: &Option<BitVec>, reversed: bool) -> (Vec<bool>, Option<BitVec>) {
+    let mut out = Vec::with_capacity(v.len());
+    let mut flags = vec![false; v.len()];
+    for i in 0..v.len() {
+        let (a, a_null) = if reversed {
+            (cv, false)
+        } else {
+            (v[i], nulls.as_ref().map_or(false, |n| n.test(i)))
+        };
+        let (b, b_null) = if reversed {
+            (v[i], nulls.as_ref().map_or(false, |n| n.test(i)))
+        } else {
+            (cv, false)
+        };
+        let (res, is_null) = match op {
+            BinaryOperator::And => {
+                if !a && !a_null {
+                    (false, false)
+                } else if !b && !b_null {
+                    (false, false)
+                } else if a && !a_null && b && !b_null {
+                    (true, false)
+                } else {
+                    (false, true)
+                }
+            }
+            BinaryOperator::Or => {
+                if a && !a_null {
+                    (true, false)
+                } else if b && !b_null {
+                    (true, false)
+                } else if !a_null && !b_null {
+                    (false, false)
+                } else {
+                    (false, true)
+                }
+            }
+            _ => unreachable!(),
+        };
+        out.push(res);
+        flags[i] = is_null;
+    }
+    (out, nulls_from_flags(&flags))
+}
+
 /// 提取 i64 语义切片（Int64/Timestamp 列）
-fn as_i64_slice(v: &ColumnValue) -> Vec<i64> {
-    match v {
+fn as_i64_slice(v: &ColumnValue) -> Vec<i64> {    match v {
         ColumnValue::Int64(a) => a.clone(),
         ColumnValue::Timestamp(a) => a.clone(),
         _ => unreachable!(),
@@ -645,6 +949,12 @@ fn try_eval_specialized(left: &Vector, op: BinaryOperator, right: &Vector) -> Op
     // S2-M2：Typed×Typed 直接类型数组运算（连续内存 + 自动向量化）
     if let (Vector::Typed(l), Vector::Typed(r)) = (left, right) {
         return eval_typed_binary(l, op, r);
+    }
+    // S2-M3：Typed×Constant（过滤条件 col OP literal 的常见模式）
+    match (left, right) {
+        (Vector::Typed(l), Vector::Constant(c, n)) => return eval_typed_constant(l, c, *n, op, false),
+        (Vector::Constant(c, n), Vector::Typed(r)) => return eval_typed_constant(r, c, *n, op, true),
+        _ => {}
     }
     let (l, r) = match (left, right) {
         (Vector::Flat(l), Vector::Flat(r)) => (l, r),
@@ -4587,6 +4897,101 @@ mod tests {
         println!("1M 行 Int64+Int64: typed = {:?}, flat = {:?}, typed 快 {}x",
                  typed_time, flat_time,
                  flat_time.as_nanos() as f64 / typed_time.as_nanos() as f64);
+    }
+
+    #[test]
+    fn test_typed_constant_matches_flat() {
+        use crate::common::column_data::ColumnData;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let ops = [
+            BinaryOperator::Plus, BinaryOperator::Minus, BinaryOperator::Multiply,
+            BinaryOperator::Divide, BinaryOperator::Modulo,
+            BinaryOperator::Eq, BinaryOperator::NotEq, BinaryOperator::Lt,
+            BinaryOperator::LtEq, BinaryOperator::Gt, BinaryOperator::GtEq,
+        ];
+        for trial in 0..300 {
+            let n = 1 + rng.gen_range(0..40);
+            let is_float = trial % 2 == 1;
+            let values: Vec<Value> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(0.15) {
+                        return Value::Null;
+                    }
+                    if is_float {
+                        Value::Float64(rng.gen_range(-100.0..100.0))
+                    } else {
+                        Value::Int64(rng.gen_range(-1000..1000))
+                    }
+                })
+                .collect();
+            let Some(data) = ColumnData::try_from_values(&values) else { continue };
+            let constant = if is_float {
+                Value::Float64(rng.gen_range(-100.0..100.0))
+            } else {
+                match rng.gen_range(0..3) {
+                    0 => Value::Int32(rng.gen_range(-1000..1000)),
+                    1 => Value::Int64(rng.gen_range(-1000..1000)),
+                    _ => Value::Float64(rng.gen_range(-100.0..100.0)),
+                }
+            };
+            let op = ops[rng.gen_range(0..ops.len())];
+
+            let typed_out = eval_binary_vectorized(
+                &Vector::Typed(data.clone()),
+                op,
+                &Vector::Constant(constant.clone(), n),
+            ).unwrap();
+            let typed_vals = typed_out.to_flat();
+
+            let flat_out = eval_binary_vectorized(
+                &Vector::Flat(data.to_values()),
+                op,
+                &Vector::Flat(vec![constant.clone(); n]),
+            ).unwrap();
+            let flat_vals = flat_out.to_flat();
+
+            assert_eq!(typed_vals.len(), flat_vals.len(), "trial {}", trial);
+            for (a, b) in typed_vals.iter().zip(flat_vals.iter()) {
+                assert!(values_equal(a, b), "trial {} op {:?} c={:?} got={:?} want={:?}",
+                    trial, op, constant, a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn test_typed_constant_reversed() {
+        use crate::common::column_data::ColumnData;
+        // 常量在左：100 > col
+        let data = ColumnData::try_from_values(&vec![Value::Int64(50), Value::Int64(150), Value::Null]).unwrap();
+        let out = eval_binary_vectorized(
+            &Vector::Constant(Value::Int64(100), 3),
+            BinaryOperator::Gt,
+            &Vector::Typed(data),
+        ).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Boolean(true), Value::Boolean(false), Value::Null]);
+        // 溢出：i64::MAX + 1
+        let data = ColumnData::try_from_values(&vec![Value::Int64(1)]).unwrap();
+        let out = eval_binary_vectorized(
+            &Vector::Typed(data),
+            BinaryOperator::Plus,
+            &Vector::Constant(Value::Int64(i64::MAX), 1),
+        ).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Null]);
+        // 字符串比较 + 拼接
+        let data = ColumnData::try_from_values(&vec![Value::Varchar("a".into()), Value::Varchar("c".into())]).unwrap();
+        let out = eval_binary_vectorized(
+            &Vector::Typed(data.clone()),
+            BinaryOperator::Lt,
+            &Vector::Constant(Value::Varchar("b".into()), 2),
+        ).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Boolean(true), Value::Boolean(false)]);
+        let out = eval_binary_vectorized(
+            &Vector::Typed(data),
+            BinaryOperator::Concat,
+            &Vector::Constant(Value::Varchar("!".into()), 2),
+        ).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Varchar("a!".into()), Value::Varchar("c!".into())]);
     }
 
     /// 表达式求值对比（S1.3 微基准），仅手动运行
