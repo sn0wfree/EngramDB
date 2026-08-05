@@ -275,6 +275,13 @@ pub fn execute_grouped(
         return execute_grouped_distinct(input, group_by, aggregates);
     }
 
+    // S1.2：单列整数键快速路径（FxHashMap<i64, …>，NULL 组单独跟踪）
+    if group_by.len() == 1 {
+        if let Some(result) = try_execute_grouped_int(input, group_by[0], aggregates) {
+            return Ok(result);
+        }
+    }
+
     // 第一阶段：每个 chunk 计算 partial 哈希表
     let mut merged_map: FxHashMap<Vec<Value>, Vec<PartialAggState>> = FxHashMap::default();
 
@@ -394,6 +401,175 @@ fn execute_grouped_distinct(
     }
 
     Ok(result_chunks)
+}
+
+/// 分组键的整数类型（S1.2）
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GroupKeyType {
+    Int32,
+    Int64,
+    Boolean,
+    Timestamp,
+}
+
+fn detect_key_type(v: &Value) -> Option<GroupKeyType> {
+    match v {
+        Value::Int32(_) => Some(GroupKeyType::Int32),
+        Value::Int64(_) => Some(GroupKeyType::Int64),
+        Value::Boolean(_) => Some(GroupKeyType::Boolean),
+        Value::Timestamp(_) => Some(GroupKeyType::Timestamp),
+        _ => None,
+    }
+}
+
+/// 整数键 → i64（类型不匹配返回 None，触发 fallback）
+fn key_to_i64(v: &Value, t: GroupKeyType) -> Option<i64> {
+    match (t, v) {
+        (GroupKeyType::Int32, Value::Int32(x)) => Some(*x as i64),
+        (GroupKeyType::Int64, Value::Int64(x)) => Some(*x),
+        (GroupKeyType::Boolean, Value::Boolean(b)) => Some(if *b { 1 } else { 0 }),
+        (GroupKeyType::Timestamp, Value::Timestamp(x)) => Some(*x),
+        _ => None,
+    }
+}
+
+/// S1.2：单列整数键分组聚合快速路径。
+///
+/// 分组列全部为 Int32/Int64/Boolean/Timestamp（允许 NULL）时，
+/// 用 `FxHashMap<i64, Vec<PartialAggState>>` 替代 `FxHashMap<Vec<Value>, …>`：
+/// - key 8 字节寄存器级，hash 单指令，比较单条 cmp，无堆分配
+/// - NULL 组单独跟踪（不占用哨兵，避免真实键冲突）
+/// - 混合类型列 / 非整数列 → 返回 None，调用方走原路径（保持旧语义）
+fn try_execute_grouped_int(
+    input: &[DataChunk],
+    group_col: usize,
+    aggregates: &[(AggregateFunc, usize, bool)],
+) -> Option<Vec<DataChunk>> {
+    let mut key_type: Option<GroupKeyType> = None;
+    let mut merged: FxHashMap<i64, Vec<PartialAggState>> = FxHashMap::default();
+    let mut merged_null: Option<Vec<PartialAggState>> = None;
+
+    for chunk in input {
+        let mut map: FxHashMap<i64, Vec<PartialAggState>> = FxHashMap::default();
+        let mut null_states: Option<Vec<PartialAggState>> = None;
+
+        if group_col < chunk.columns.len() {
+            let col = &chunk.columns[group_col];
+            for row_idx in 0..chunk.count {
+                let v = col.get(row_idx);
+                if v.is_null() {
+                    ensure_states(&mut null_states, aggregates);
+                    let states = null_states.as_mut().unwrap();
+                    accumulate_all(states, chunk, row_idx, aggregates);
+                    continue;
+                }
+                let t = match key_type {
+                    Some(t) => t,
+                    None => {
+                        let t = detect_key_type(v)?;
+                        key_type = Some(t);
+                        t
+                    }
+                };
+                let k = key_to_i64(v, t)?;
+                let states = map
+                    .entry(k)
+                    .or_insert_with(|| new_states(aggregates));
+                accumulate_all(states, chunk, row_idx, aggregates);
+            }
+        }
+
+        // 合并进全局表
+        use std::collections::hash_map::Entry;
+        for (key, source_states) in map {
+            match merged.entry(key) {
+                Entry::Vacant(v) => {
+                    v.insert(source_states);
+                }
+                Entry::Occupied(mut o) => {
+                    for (t, s) in o.get_mut().iter_mut().zip(source_states.iter()) {
+                        t.merge(s);
+                    }
+                }
+            }
+        }
+        if let Some(s) = null_states {
+            match &mut merged_null {
+                None => merged_null = Some(s),
+                Some(t) => {
+                    for (t, s) in t.iter_mut().zip(s.iter()) {
+                        t.merge(s);
+                    }
+                }
+            }
+        }
+    }
+
+    // key_type None 且 merged 为空 → 全 NULL / 列缺失，交还原路径处理
+    let t = key_type?;
+
+    // 第二阶段：finalize 所有组
+    let num_agg_cols = aggregates.len();
+    let mut result_chunks = Vec::new();
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(VECTOR_SIZE);
+
+    for (k, states) in &merged {
+        let mut row = Vec::with_capacity(1 + num_agg_cols);
+        row.push(int_to_key_value(*k, t));
+        for state in states {
+            row.push(state.clone().finalize());
+        }
+        rows.push(row);
+        if rows.len() >= VECTOR_SIZE {
+            result_chunks.push(DataChunk::from_rows(&rows));
+            rows.clear();
+        }
+    }
+    if let Some(states) = &merged_null {
+        let mut row = Vec::with_capacity(1 + num_agg_cols);
+        row.push(Value::Null);
+        for state in states {
+            row.push(state.clone().finalize());
+        }
+        rows.push(row);
+    }
+    if !rows.is_empty() {
+        result_chunks.push(DataChunk::from_rows(&rows));
+    }
+
+    Some(result_chunks)
+}
+
+#[inline]
+fn new_states(aggregates: &[(AggregateFunc, usize, bool)]) -> Vec<PartialAggState> {
+    aggregates.iter().map(|(func, _, _)| PartialAggState::new(*func)).collect()
+}
+
+#[inline]
+fn ensure_states(states: &mut Option<Vec<PartialAggState>>, aggregates: &[(AggregateFunc, usize, bool)]) {
+    if states.is_none() {
+        *states = Some(new_states(aggregates));
+    }
+}
+
+#[inline]
+fn accumulate_all(states: &mut [PartialAggState], chunk: &DataChunk, row_idx: usize, aggregates: &[(AggregateFunc, usize, bool)]) {
+    for (agg_idx, (_, col_idx, _)) in aggregates.iter().enumerate() {
+        if *col_idx < chunk.columns.len() {
+            let val = chunk.columns[*col_idx].get(row_idx);
+            states[agg_idx].accumulate(val);
+        }
+    }
+}
+
+#[inline]
+fn int_to_key_value(k: i64, t: GroupKeyType) -> Value {
+    match t {
+        GroupKeyType::Int32 => Value::Int32(k as i32),
+        GroupKeyType::Int64 => Value::Int64(k),
+        GroupKeyType::Boolean => Value::Boolean(k != 0),
+        GroupKeyType::Timestamp => Value::Timestamp(k),
+    }
 }
 
 /// 对单个 DataChunk 计算分组 partial 聚合
@@ -703,5 +879,245 @@ mod tests {
         let result = execute(&[chunk], &[(AggregateFunc::Count, 0, true)]).unwrap();
         let rows = result[0].to_rows();
         assert_eq!(rows[0][0], Value::Int64(0));
+    }
+
+    // ========================================================================
+    // S1.2 整数键快速路径测试
+    // ========================================================================
+
+    /// 强制走原 Vec<Value> 键路径（等价性测试对照）
+    fn execute_grouped_original(
+        input: &[DataChunk],
+        group_by: &[usize],
+        aggregates: &[(AggregateFunc, usize, bool)],
+    ) -> Result<Vec<DataChunk>> {
+        let mut merged_map: FxHashMap<Vec<Value>, Vec<PartialAggState>> = FxHashMap::default();
+        for chunk in input {
+            let partial_map = aggregate_chunk_grouped_partial(chunk, group_by, aggregates);
+            merge_grouped_map(&mut merged_map, partial_map, aggregates.len());
+        }
+        let num_group_cols = group_by.len();
+        let num_agg_cols = aggregates.len();
+        let total_cols = num_group_cols + num_agg_cols;
+        let mut result_chunks = Vec::new();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(VECTOR_SIZE);
+        for (key, states) in &merged_map {
+            let mut row = Vec::with_capacity(total_cols);
+            for v in key {
+                row.push(v.clone());
+            }
+            for state in states {
+                row.push(state.clone().finalize());
+            }
+            rows.push(row);
+            if rows.len() >= VECTOR_SIZE {
+                result_chunks.push(DataChunk::from_rows(&rows));
+                rows.clear();
+            }
+        }
+        if !rows.is_empty() {
+            result_chunks.push(DataChunk::from_rows(&rows));
+        }
+        Ok(result_chunks)
+    }
+
+    fn sorted_rows(chunks: &[DataChunk]) -> Vec<String> {
+        let mut rows: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| c.to_rows())
+            .map(|r| format!("{:?}", r))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn test_grouped_int_matches_original_random() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for trial in 0..20 {
+            let n = 50 + trial * 13;
+            let pure_int32 = trial % 2 == 1;
+            let mut keys: Vec<Value> = Vec::with_capacity(n);
+            for _ in 0..n {
+                if pure_int32 {
+                    match rng.gen_range(0..10) {
+                        0 => keys.push(Value::Null),
+                        _ => keys.push(Value::Int32(rng.gen_range(-20..20))),
+                    }
+                } else {
+                    match rng.gen_range(0..10) {
+                        0 => keys.push(Value::Null),
+                        _ => keys.push(Value::Int64(rng.gen_range(-100..100))),
+                    }
+                }
+            }
+            let vals: Vec<Value> = (0..n)
+                .map(|_| Value::Int64(rng.gen_range(0..1000)))
+                .collect();
+            let chunk = DataChunk {
+                columns: vec![Vector::Flat(keys), Vector::Flat(vals)],
+                count: n,
+            };
+            let aggs = vec![
+                (AggregateFunc::Count, 1, false),
+                (AggregateFunc::Sum, 1, false),
+                (AggregateFunc::Min, 1, false),
+            ];
+            let fast = execute_grouped(&[chunk.clone()], &[0], &aggs).unwrap();
+            let orig = execute_grouped_original(&[chunk], &[0], &aggs).unwrap();
+            assert_eq!(sorted_rows(&fast), sorted_rows(&orig), "trial {}", trial);
+        }
+    }
+
+    #[test]
+    fn test_grouped_int_null_group() {
+        // NULL 键组单独跟踪，与整数键共存
+        let chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![
+                    Value::Int64(10), Value::Null, Value::Int64(10), Value::Null, Value::Int64(20),
+                ]),
+                Vector::Flat(vec![
+                    Value::Int64(1), Value::Int64(2), Value::Int64(3), Value::Int64(4), Value::Int64(5),
+                ]),
+            ],
+            count: 5,
+        };
+        let result = execute_grouped(
+            &[chunk],
+            &[0],
+            &[(AggregateFunc::Count, 1, false), (AggregateFunc::Sum, 1, false)],
+        ).unwrap();
+
+        let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(all_rows.len(), 3); // 10 / NULL / 20
+
+        let g10 = all_rows.iter().find(|r| r[0] == Value::Int64(10)).unwrap();
+        assert_eq!(g10[1], Value::Int64(2)); // count
+        assert_eq!(g10[2], Value::Float64(4.0)); // sum=1+3
+
+        let gnull = all_rows.iter().find(|r| r[0] == Value::Null).unwrap();
+        assert_eq!(gnull[1], Value::Int64(2)); // count
+        assert_eq!(gnull[2], Value::Float64(6.0)); // sum=2+4
+    }
+
+    #[test]
+    fn test_grouped_int_boolean_timestamp() {
+        // Boolean / Timestamp 键
+        let chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![
+                    Value::Boolean(true), Value::Boolean(false), Value::Boolean(true),
+                    Value::Boolean(false), Value::Null,
+                ]),
+                Vector::Flat(vec![
+                    Value::Int64(1), Value::Int64(2), Value::Int64(3), Value::Int64(4), Value::Int64(5),
+                ]),
+            ],
+            count: 5,
+        };
+        let result = execute_grouped(
+            &[chunk],
+            &[0],
+            &[(AggregateFunc::Sum, 1, false)],
+        ).unwrap();
+        let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(all_rows.len(), 3);
+        let g_true = all_rows.iter().find(|r| r[0] == Value::Boolean(true)).unwrap();
+        assert_eq!(g_true[1], Value::Float64(4.0)); // 1+3
+
+        let ts_chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![
+                    Value::Timestamp(100), Value::Timestamp(200), Value::Timestamp(100),
+                ]),
+                Vector::Flat(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]),
+            ],
+            count: 3,
+        };
+        let result = execute_grouped(
+            &[ts_chunk],
+            &[0],
+            &[(AggregateFunc::Sum, 1, false)],
+        ).unwrap();
+        let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(all_rows.len(), 2);
+        let g100 = all_rows.iter().find(|r| r[0] == Value::Timestamp(100)).unwrap();
+        assert_eq!(g100[1], Value::Float64(4.0));
+    }
+
+    #[test]
+    fn test_grouped_int_mixed_type_fallback() {
+        // Int32(1) 与 Int64(1) 是不同键（derive PartialEq variant 不同）→ fallback 原路径
+        let chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![Value::Int32(1), Value::Int64(1)]),
+                Vector::Flat(vec![Value::Int64(10), Value::Int64(20)]),
+            ],
+            count: 2,
+        };
+        let result = execute_grouped(
+            &[chunk],
+            &[0],
+            &[(AggregateFunc::Sum, 1, false)],
+        ).unwrap();
+        let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
+        // 两组：Int32(1) sum=10、Int64(1) sum=20
+        assert_eq!(all_rows.len(), 2);
+        let g32 = all_rows.iter().find(|r| r[0] == Value::Int32(1)).unwrap();
+        assert_eq!(g32[1], Value::Float64(10.0));
+        let g64 = all_rows.iter().find(|r| r[0] == Value::Int64(1)).unwrap();
+        assert_eq!(g64[1], Value::Float64(20.0));
+    }
+
+    #[test]
+    fn test_grouped_int_all_null_fallback() {
+        // 全 NULL 键 → 单组，与原路径一致
+        let chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![Value::Null, Value::Null, Value::Null]),
+                Vector::Flat(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]),
+            ],
+            count: 3,
+        };
+        let result = execute_grouped(
+            &[chunk],
+            &[0],
+            &[(AggregateFunc::Sum, 1, false)],
+        ).unwrap();
+        let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
+        assert_eq!(all_rows.len(), 1);
+        assert_eq!(all_rows[0][0], Value::Null);
+        assert_eq!(all_rows[0][1], Value::Float64(6.0));
+    }
+
+    /// 排序核心对比（S1.2 微基准），仅手动运行
+    #[test]
+    #[ignore]
+    fn bench_grouped_int_vs_vec_key() {
+        use std::time::Instant;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let n = 1_000_000usize;
+        // 1000 组，均匀分布
+        let keys: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
+        let vals: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
+        let chunk = DataChunk { columns: vec![Vector::Flat(keys), Vector::Flat(vals)], count: n };
+        let aggs = vec![(AggregateFunc::Sum, 1, false), (AggregateFunc::Count, 1, false)];
+
+        let t0 = Instant::now();
+        let fast = execute_grouped(&[chunk.clone()], &[0], &aggs).unwrap();
+        let fast_time = t0.elapsed();
+        assert!(!fast.is_empty());
+
+        let t0 = Instant::now();
+        let orig = execute_grouped_original(&[chunk], &[0], &aggs).unwrap();
+        let orig_time = t0.elapsed();
+        assert!(!orig.is_empty());
+
+        println!("1M 行: int_key = {:?}, vec_key = {:?}, int 快 {}x",
+                 fast_time, orig_time,
+                 orig_time.as_nanos() as f64 / fast_time.as_nanos() as f64);
     }
 }
