@@ -11,6 +11,7 @@
 
 use crate::common::error::{EngramDbError, Result};
 use crate::Value;
+use rand::Rng;
 use crate::sql::ast::{Expression, BinaryOperator, UnaryOperator, DataType};
 
 use super::vector::{DataChunk, Vector};
@@ -876,6 +877,41 @@ fn eval_function(
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
             eval_unary_numeric(&vec, |x| x.sqrt())
         }
+        "LN" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("LN requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_unary_numeric(&vec, |x| x.ln())
+        }
+        "LOG" | "LOG10" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("LOG/LOG10 requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_unary_numeric(&vec, |x| x.log10())
+        }
+        "LOG2" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("LOG2 requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_unary_numeric(&vec, |x| x.log2())
+        }
+        "RANDOM" | "RAND" => {
+            if !args.is_empty() {
+                return Err(EngramDbError::Parse("RANDOM/RAND takes 0 arguments".into()));
+            }
+            let mut rng = rand::thread_rng();
+            Ok(Vector::Constant(Value::Float64(rng.gen::<f64>()), chunk.count))
+        }
+        "TYPEOF" => {
+            if args.len() != 1 {
+                return Err(EngramDbError::Parse("TYPEOF requires 1 argument".into()));
+            }
+            let vec = eval_vectorized(&args[0], chunk, column_names)?;
+            eval_typeof(&vec)
+        }
         "REPLACE" => {
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("REPLACE requires 3 arguments".into()));
@@ -979,6 +1015,15 @@ fn eval_function(
             let val_vec = eval_vectorized(&args[2], chunk, column_names)?;
             // JSON_REPLACE = JSON_SET 但只在路径存在时生效
             eval_json_replace(&json_vec, &path_vec, &val_vec)
+        }
+        // JSON_REMOVE(json, path) — 删除指定路径的字段（v0.15.0 新增）
+        "JSON_REMOVE" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("JSON_REMOVE requires 2 arguments".into()));
+            }
+            let json_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let path_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            eval_json_remove(&json_vec, &path_vec)
         }
         // 向量函数（v0.12.0 新增，Agent 语义记忆 / RAG 场景）
         "VECTOR_DISTANCE" | "VEC_DISTANCE" => {
@@ -1155,6 +1200,48 @@ fn eval_function(
                     Ok(Vector::Flat(result))
                 }
                 _ => Ok(Vector::Flat(vec![Value::Null; chunk.count])),
+            }
+        }
+        "DATE_TRUNC" | "DATE_BIN" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("DATE_TRUNC requires 2 arguments (unit, timestamp)".into()));
+            }
+            let unit_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let ts_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let unit = match &unit_vec {
+                Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
+                _ => return Err(EngramDbError::Parse("DATE_TRUNC unit must be a constant string".into())),
+            };
+            match &ts_vec {
+                Vector::Constant(v, n) => {
+                    let val = date_trunc_value(v, &unit);
+                    Ok(Vector::Constant(val, *n))
+                }
+                Vector::Flat(values) => {
+                    let result: Vec<Value> = values.iter().map(|v| date_trunc_value(v, &unit)).collect();
+                    Ok(Vector::Flat(result))
+                }
+            }
+        }
+        "STRPTIME" => {
+            if args.len() != 2 {
+                return Err(EngramDbError::Parse("STRPTIME requires 2 arguments (format, string)".into()));
+            }
+            let fmt_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let s_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let fmt = match &fmt_vec {
+                Vector::Constant(Value::Varchar(s), _) => s.clone(),
+                _ => return Err(EngramDbError::Parse("STRPTIME format must be a constant string".into())),
+            };
+            match &s_vec {
+                Vector::Constant(v, n) => {
+                    let val = strptime_value(&fmt, v);
+                    Ok(Vector::Constant(val, *n))
+                }
+                Vector::Flat(values) => {
+                    let result: Vec<Value> = values.iter().map(|v| strptime_value(&fmt, v)).collect();
+                    Ok(Vector::Flat(result))
+                }
             }
         }
         "MATCH" => {
@@ -1475,6 +1562,122 @@ fn date_diff_value(ts1: &Value, ts2: &Value, unit: &str) -> Value {
         _ => return Value::Null,
     };
     Value::Int64(result)
+}
+
+/// DATE_TRUNC(unit, timestamp) — 按单位截断时间戳
+fn date_trunc_value(v: &Value, unit: &str) -> Value {
+    if v.is_null() {
+        return Value::Null;
+    }
+    let ts_ms = match v.as_i64() {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    let secs = ts_ms / 1000;
+    let (days, day_secs) = if secs >= 0 {
+        (secs / 86400, secs % 86400)
+    } else {
+        ((secs - 86399) / 86400, (secs % 86400 + 86400) % 86400)
+    };
+    let result_secs = match unit {
+        "year" | "years" | "y" => {
+            // 向前找最近一年的第一天
+            let date_str = format_date(ts_ms);
+            let y: i64 = date_str[..4].parse().unwrap_or(1970);
+            // 当年 1 月 1 日 00:00:00 UTC
+            let start_of_year = format!("{}-01-01", y);
+            parse_date_to_epoch(&start_of_year)
+        }
+        "month" | "months" => {
+            let date_str = format_date(ts_ms);
+            let parts: Vec<&str> = date_str.split('-').collect();
+            let y = parts[0].parse::<i64>().unwrap_or(1970);
+            let m = parts[1].parse::<i64>().unwrap_or(1);
+            let start_of_month = format!("{:04}-{:02}-01", y, m);
+            parse_date_to_epoch(&start_of_month)
+        }
+        "week" | "weeks" | "w" => {
+            // 截断到周一 00:00:00 UTC
+            // 1970-01-01 是周四，day 0 = 周四
+            let weekday = if days >= 0 { (days + 4) % 7 } else { ((days + 4) % 7 + 7) % 7 };
+            let monday_days = days - weekday; // 向前到周一
+            monday_days * 86400
+        }
+        "day" | "days" | "d" => days * 86400,
+        "hour" | "hours" | "h" => days * 86400 + (day_secs / 3600) * 3600,
+        "minute" | "minutes" | "min" => days * 86400 + (day_secs / 60) * 60,
+        _ => secs, // 默认不截断
+    };
+    Value::Timestamp(result_secs * 1000)
+}
+
+/// 将 YYYY-MM-DD 格式的日期字符串解析为 Unix 纪元秒
+fn parse_date_to_epoch(date_str: &str) -> i64 {
+    let parts: Vec<&str> = date_str.split('-').collect();
+    if parts.len() < 3 {
+        return 0;
+    }
+    let y = parts[0].parse::<i64>().unwrap_or(1970);
+    let m = parts[1].parse::<i64>().unwrap_or(1);
+    let d = parts[2].parse::<i64>().unwrap_or(1);
+    // 计算从 1970-01-01 到 y-m-d 的天数
+    let mut days = 0i64;
+    if y >= 1970 {
+        for year in 1970..y {
+            days += if is_leap_year(year) { 366 } else { 365 };
+        }
+        let month_days = if is_leap_year(y) {
+            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        } else {
+            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        };
+        for i in 0..(m - 1) as usize {
+            days += month_days[i] as i64;
+        }
+        days += d - 1;
+    } else {
+        for year in y..1970 {
+            days -= if is_leap_year(year) { 366 } else { 365 };
+        }
+        let month_days = if is_leap_year(y) {
+            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        } else {
+            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        };
+        for i in 0..(m - 1) as usize {
+            days += month_days[i] as i64;
+        }
+        days += d - 1;
+    }
+    days * 86400
+}
+
+/// STRPTIME(format, string) — 将字符串按格式解析为时间戳
+fn strptime_value(fmt: &str, v: &Value) -> Value {
+    if v.is_null() {
+        return Value::Null;
+    }
+    let s = match v.as_str() {
+        Some(s) => s,
+        None => return Value::Null,
+    };
+    // 支持常见格式: %Y-%m-%d, %Y-%m-%d %H:%M:%S, %Y-%m-%dT%H:%M:%S
+    if fmt.contains("%Y") && fmt.contains("%m") && fmt.contains("%d") {
+        // 提取数字部分
+        let digits: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '-' || *c == 'T' || *c == ':' || *c == ' ').collect();
+        let parts: Vec<&str> = digits.split(|c| c == '-' || c == ' ' || c == 'T' || c == ':').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 3 {
+            let y = parts[0].parse::<i64>().unwrap_or(1970);
+            let m = parts[1].parse::<i64>().unwrap_or(1);
+            let d = parts[2].parse::<i64>().unwrap_or(1);
+            let h = if parts.len() > 3 { parts[3].parse::<i64>().unwrap_or(0) } else { 0 };
+            let min = if parts.len() > 4 { parts[4].parse::<i64>().unwrap_or(0) } else { 0 };
+            let sec = if parts.len() > 5 { parts[5].parse::<i64>().unwrap_or(0) } else { 0 };
+            let epoch_secs = parse_date_to_epoch(&format!("{:04}-{:02}-{:02}", y, m, d));
+            return Value::Timestamp((epoch_secs + h * 3600 + min * 60 + sec) * 1000);
+        }
+    }
+    Value::Null
 }
 
 /// 日期算术运算（内部辅助）
@@ -1849,6 +2052,31 @@ fn eval_split_part(str_vec: &Vector, delim_vec: &Vector, part_vec: &Vector) -> R
         } else {
             result.push(Value::Varchar(parts[idx].to_string()));
         }
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// TYPEOF(expr) — 返回表达式的类型名称
+fn eval_typeof(vec: &Vector) -> Result<Vector> {
+    let len = vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let v = vec.get(i);
+        let type_name = match v {
+            Value::Null => "null",
+            Value::Boolean(_) => "boolean",
+            Value::Int32(_) => "int32",
+            Value::Int64(_) => "int64",
+            Value::Float32(_) => "float32",
+            Value::Float64(_) => "float64",
+            Value::Varchar(_) => "varchar",
+            Value::Timestamp(_) => "timestamp",
+            Value::Json(_) => "json",
+            Value::Vector(_) => "vector",
+            Value::VectorInt8(_) => "vector_int8",
+            Value::Blob(_) => "blob",
+        };
+        result.push(Value::Varchar(type_name.to_string()));
     }
     Ok(Vector::Flat(result))
 }
@@ -2466,7 +2694,87 @@ fn eval_json_replace(json_vec: &Vector, path_vec: &Vector, val_vec: &Vector) -> 
     Ok(Vector::Flat(result))
 }
 
-/// 检查 JSON 路径是否存在
+/// JSON_REMOVE(json, path) — 删除指定路径的字段
+fn eval_json_remove(json_vec: &Vector, path_vec: &Vector) -> Result<Vector> {
+    let json_flat = json_vec.to_flat();
+    let path_flat = path_vec.to_flat();
+    let len = json_flat.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let jv = &json_flat[i];
+        let pv = &path_flat[i.min(path_flat.len() - 1)];
+        if jv.is_null() || pv.is_null() {
+            result.push(Value::Null);
+            continue;
+        }
+        let json_str = match jv.as_str() {
+            Some(s) => s,
+            None => { result.push(Value::Null); continue; }
+        };
+        let path_str = match pv.as_str() {
+            Some(s) => s,
+            None => { result.push(Value::Null); continue; }
+        };
+        let mut parsed = match serde_json::from_str::<serde_json::Value>(json_str) {
+            Ok(v) => v,
+            Err(_) => { result.push(Value::Null); continue; }
+        };
+        let path = parse_json_path(path_str);
+        json_remove_path(&mut parsed, &path);
+        result.push(json_to_value(&parsed));
+    }
+    Ok(Vector::Flat(result))
+}
+
+/// JSON_REMOVE 辅助：删除指定路径的字段
+fn json_remove_path(root: &mut serde_json::Value, path: &[serde_json::Value]) {
+    if path.is_empty() {
+        return;
+    }
+    let key = &path[0];
+    let rest = &path[1..];
+    if rest.is_empty() {
+        // 最后一级：直接删除
+        match root {
+            serde_json::Value::Object(map) => {
+                if let serde_json::Value::String(s) = key {
+                    map.remove(s.as_str());
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                if let Some(idx) = key.as_u64() {
+                    let idx = idx as usize;
+                    if idx < arr.len() {
+                        arr.remove(idx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else {
+        // 递归到子节点
+        match root {
+            serde_json::Value::Object(map) => {
+                let key_str = match key {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => key.to_string(),
+                };
+                if let Some(child) = map.get_mut(&key_str) {
+                    json_remove_path(child, rest);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                if let Some(idx) = key.as_u64() {
+                    let idx = idx as usize;
+                    if idx < arr.len() {
+                        json_remove_path(&mut arr[idx], rest);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
 fn json_path_exists(root: &serde_json::Value, path: &[serde_json::Value]) -> bool {
     if path.is_empty() {
         return true;
@@ -3185,5 +3493,45 @@ mod tests {
         let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
         let flat = r.to_flat();
         assert_eq!(flat[0], Value::Timestamp(2 * 86400000));
+    }
+
+    #[test]
+    fn test_date_trunc() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        // 2024-06-15 14:30:45 UTC = 1718453445000 ms
+        let ts = Value::Timestamp(1718453445000i64);
+        // TRUNC to day: 2024-06-15 00:00:00 UTC
+        let expr = func_expr("DATE_TRUNC", vec![
+            Expression::Literal(Value::Varchar("day".to_string())),
+            Expression::Literal(ts.clone()),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        // 2024-06-15 00:00:00 UTC = 1718409600000 ms (days since epoch * 86400000)
+        let expected = (1718409600000i64 / 86400000) * 86400000;
+        assert_eq!(flat[0], Value::Timestamp(expected));
+
+        // TRUNC to month: 2024-06-01 00:00:00 UTC
+        let expr = func_expr("DATE_TRUNC", vec![
+            Expression::Literal(Value::Varchar("month".to_string())),
+            Expression::Literal(ts.clone()),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        assert_eq!(flat[0], Value::Timestamp(1717200000000i64));
+    }
+
+    #[test]
+    fn test_strptime() {
+        let chunk = DataChunk { columns: vec![], count: 1 };
+        // STRPTIME('%Y-%m-%d', '2024-06-15') → Timestamp
+        let expr = func_expr("STRPTIME", vec![
+            Expression::Literal(Value::Varchar("%Y-%m-%d".to_string())),
+            Expression::Literal(Value::Varchar("2024-06-15".to_string())),
+        ]);
+        let r = eval_vectorized(&expr, &chunk, &["".to_string()]).unwrap();
+        let flat = r.to_flat();
+        // 2024-06-15 00:00:00 UTC = 1718409600000 ms
+        assert_eq!(flat[0], Value::Timestamp(1718409600000i64));
     }
 }

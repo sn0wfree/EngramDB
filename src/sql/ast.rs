@@ -168,6 +168,10 @@ pub enum SetOpType {
     Union,
     /// UNION ALL：合并两个结果集不去重
     UnionAll,
+    /// INTERSECT：返回两个结果集的交集（去重，v0.15.0 新增）
+    Intersect,
+    /// EXCEPT：返回左结果集减去右结果集（去重，v0.15.0 新增）
+    Except,
 }
 
 /// ANALYZE 语句：收集表的统计信息
@@ -219,6 +223,8 @@ pub enum TableRef {
     Derived { query: Box<SelectStmt>, alias: String },
     /// 表值函数（v0.15.0 V16 新增，如 vector_search(...)）
     TableFunction { name: String, args: Vec<Expression>, alias: Option<String> },
+    /// 交叉连接（CROSS JOIN）
+    CrossJoin { left: Box<TableRef>, right: Box<TableRef> },
 }
 
 /// ORDER BY 项

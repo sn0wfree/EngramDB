@@ -842,65 +842,61 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
             (items, from, where_clause, group_by, having, None)
         }
         sqlast::SetExpr::SetOperation { op, set_quantifier, left, right } => {
-            // UNION / UNION ALL：将右侧 SELECT 嵌套到左侧的 set_op 字段中
-            // 注意：只支持 UNION/UNION ALL，INTERSECT/EXCEPT 暂不支持
-            match op {
-                sqlast::SetOperator::Union => {
-                    // 解析右侧 SELECT
-                    let right_query = sqlast::Query {
-                        with: None,
-                        body: right.clone(),
-                        order_by: vec![],
-                        limit: None,
-                        limit_by: vec![],
-                        offset: None,
-                        fetch: None,
-                        locks: vec![],
-                        for_clause: None,
-                    };
-                    let right_select = convert_query(&right_query)?;
-
-                    // UNION ALL vs UNION
-                    let set_op_type = match set_quantifier {
-                        sqlast::SetQuantifier::All => SetOpType::UnionAll,
-                        _ => SetOpType::Union,
-                    };
-
-                    // 解析左侧（必须也是 SELECT）
-                    let left_query = sqlast::Query {
-                        with: None,
-                        body: left.clone(),
-                        order_by: vec![],
-                        limit: None,
-                        limit_by: vec![],
-                        offset: None,
-                        fetch: None,
-                        locks: vec![],
-                        for_clause: None,
-                    };
-                    let left_select = convert_query(&left_query)?;
-
-                    // 使用左侧的 select_list、from 等，set_op 指向右侧
-                    let (l_items, l_from, l_where, l_group_by, l_having) = match left_select {
-                        s if s.set_op.is_none() => (
-                            s.select_list, s.from, s.where_clause, s.group_by, s.having,
-                        ),
-                        _ => {
-                            return Err(EngramDbError::Parse(
-                                "Nested UNION/UNION ALL not supported".into(),
-                            ));
-                        }
-                    };
-
-                    (l_items, l_from, l_where, l_group_by, l_having, Some((set_op_type, Box::new(right_select))))
-                }
+            // UNION / UNION ALL / INTERSECT / EXCEPT
+            let set_op_type = match (op, set_quantifier) {
+                (sqlast::SetOperator::Union, sqlast::SetQuantifier::All) => SetOpType::UnionAll,
+                (sqlast::SetOperator::Union, _) => SetOpType::Union,
+                (sqlast::SetOperator::Intersect, _) => SetOpType::Intersect,
+                (sqlast::SetOperator::Except, _) => SetOpType::Except,
                 _ => {
                     return Err(EngramDbError::Parse(format!(
-                        "Unsupported set operator: {} (only UNION/UNION ALL supported)",
+                        "Unsupported set operator: {} (only UNION/INTERSECT/EXCEPT supported)",
                         op
                     )));
                 }
-            }
+            };
+
+            // 解析右侧 SELECT
+            let right_query = sqlast::Query {
+                with: None,
+                body: right.clone(),
+                order_by: vec![],
+                limit: None,
+                limit_by: vec![],
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+            };
+            let right_select = convert_query(&right_query)?;
+
+            // 解析左侧（必须也是 SELECT）
+            let left_query = sqlast::Query {
+                with: None,
+                body: left.clone(),
+                order_by: vec![],
+                limit: None,
+                limit_by: vec![],
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+            };
+            let left_select = convert_query(&left_query)?;
+
+            // 使用左侧的 select_list、from 等，set_op 指向右侧
+            let (l_items, l_from, l_where, l_group_by, l_having) = match left_select {
+                s if s.set_op.is_none() => (
+                    s.select_list, s.from, s.where_clause, s.group_by, s.having,
+                ),
+                _ => {
+                    return Err(EngramDbError::Parse(
+                        "Nested set operations not supported".into(),
+                    ));
+                }
+            };
+
+            (l_items, l_from, l_where, l_group_by, l_having, Some((set_op_type, Box::new(right_select))))
         }
         _ => {
             return Err(EngramDbError::Parse(
@@ -972,7 +968,69 @@ fn extract_ctes(query: &sqlast::Query) -> Vec<Cte> {
 
 /// 转换 sqlparser 的 TableRef 为 EngramDB TableRef
 fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>> {
-    match &table.relation {
+    // 先转换主表
+    let main = convert_table_factor(&table.relation)?;
+
+    // 如果有 JOIN 子句，构建连接树
+    if let Some(main_ref) = main {
+        if table.joins.is_empty() {
+            return Ok(Some(main_ref));
+        }
+        // 处理 CROSS JOIN / JOIN 等
+        // 简化处理：只支持 CROSS JOIN，其他 JOIN 暂返回错误
+        let mut result = main_ref;
+        for join in &table.joins {
+            match &join.relation {
+                sqlast::TableFactor::Table { name, alias, .. } => {
+                    let right = TableRef::Table {
+                        table_name: name.to_string(),
+                        alias: alias.as_ref().map(|a| a.name.value.clone()),
+                    };
+                    // 检查连接类型
+                    match &join.join_operator {
+                        sqlast::JoinOperator::CrossJoin => {
+                            result = TableRef::CrossJoin {
+                                left: Box::new(result),
+                                right: Box::new(right),
+                            };
+                        }
+                        sqlast::JoinOperator::Inner(constraint) => {
+                            if let Some(expr) = constraint_to_expression(constraint) {
+                                // 有 ON 条件的 INNER JOIN 暂不支持（需要更复杂的 JOIN 规划）
+                                return Err(EngramDbError::Parse(
+                                    "INNER JOIN with ON clause not yet supported, use comma-separated FROM or CROSS JOIN".into()
+                                ));
+                            }
+                            // 无 ON 条件 = CROSS JOIN
+                            result = TableRef::CrossJoin {
+                                left: Box::new(result),
+                                right: Box::new(right),
+                            };
+                        }
+                        _ => {
+                            return Err(EngramDbError::Parse(format!(
+                                "Unsupported join type: {:?} (only CROSS JOIN supported)",
+                                join.join_operator
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(EngramDbError::Parse(
+                        "Only simple table joins are supported".into()
+                    ));
+                }
+            }
+        }
+        return Ok(Some(result));
+    }
+
+    Ok(main)
+}
+
+/// 转换单个表因子
+fn convert_table_factor(factor: &sqlast::TableFactor) -> Result<Option<TableRef>> {
+    match factor {
         sqlast::TableFactor::Table { name, alias, args, .. } => {
             let alias = alias.as_ref().map(|a| a.name.value.clone());
             // sqlparser 0.47 把裸函数调用（如 `vector_search('t', ...)`）解析成
@@ -1030,6 +1088,17 @@ fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>>
             Ok(Some(TableRef::TableFunction { name, args, alias }))
         }
         _ => Ok(None),
+    }
+}
+
+/// 将 JOIN 约束转换为表达式（目前仅用于检测是否有 ON 条件）
+fn constraint_to_expression(constraint: &sqlast::JoinConstraint) -> Option<Expression> {
+    match constraint {
+        sqlast::JoinConstraint::On(_) => {
+            // 有 ON 条件，标记为 Some
+            Some(Expression::Literal(Value::Int64(1)))
+        }
+        _ => None,
     }
 }
 

@@ -115,6 +115,11 @@ pub enum PhysicalPlan {
         left_keys: Vec<usize>,  // 左表连接键列索引
         right_keys: Vec<usize>, // 右表连接键列索引
     },
+    /// 交叉连接（CROSS JOIN）：笛卡尔积
+    CrossJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+    },
     /// 限制行数
     Limit {
         input: Box<PhysicalPlan>,
@@ -235,6 +240,10 @@ pub enum SetUnionOp {
     Union,
     /// UNION ALL：合并不去重
     UnionAll,
+    /// INTERSECT：返回交集（去重）
+    Intersect,
+    /// EXCEPT：返回左减右（去重）
+    Except,
 }
 
 /// 聚合表达式

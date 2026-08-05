@@ -1996,6 +1996,59 @@ mod value_tests {
     }
 
     #[test]
+    fn test_intersect() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3), (4)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3), (4), (5), (6)").unwrap();
+
+        // INTERSECT：返回交集 {3, 4}
+        let result = conn.execute("SELECT id FROM t1 INTERSECT SELECT id FROM t2").unwrap();
+        assert_eq!(result.rows.len(), 2, "INTERSECT 应返回 2 行");
+        let ids: Vec<i64> = result.rows.iter().map(|r| match r[0] { Value::Int64(v) => v, _ => 0 }).collect();
+        assert!(ids.contains(&3));
+        assert!(ids.contains(&4));
+    }
+
+    #[test]
+    fn test_except() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT64)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3), (4)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3), (4), (5), (6)").unwrap();
+
+        // EXCEPT：t1 - t2 = {1, 2}
+        let result = conn.execute("SELECT id FROM t1 EXCEPT SELECT id FROM t2").unwrap();
+        assert_eq!(result.rows.len(), 2, "EXCEPT 应返回 2 行");
+        let ids: Vec<i64> = result.rows.iter().map(|r| match r[0] { Value::Int64(v) => v, _ => 0 }).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+    }
+
+    #[test]
+    fn test_cross_join() {
+        let mut conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INT64, name VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE t2 (val INT64)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (10), (20)").unwrap();
+
+        // CROSS JOIN：笛卡尔积，2 × 2 = 4 行
+        let result = conn.execute("SELECT t1.id, t1.name, t2.val FROM t1 CROSS JOIN t2 ORDER BY t1.id, t2.val").unwrap();
+        assert_eq!(result.rows.len(), 4, "CROSS JOIN 应返回 4 行");
+        // 验证第一行: id=1, name='a', val=10
+        assert_eq!(result.rows[0].len(), 3);
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+        assert_eq!(result.rows[0][1], Value::Varchar("a".into()));
+        assert_eq!(result.rows[0][2], Value::Int64(10));
+    }
+
+    #[test]
     fn test_insert_select_basic() {
         let mut conn = Connection::open(":memory:").unwrap();
 

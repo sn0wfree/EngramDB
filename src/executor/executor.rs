@@ -367,6 +367,31 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        PhysicalPlan::CrossJoin { left, right } => {
+            let left_result = execute(*left, db)?;
+            let right_result = execute(*right, db)?;
+
+            // 笛卡尔积：左表每行 × 右表所有行
+            let mut rows = Vec::new();
+            let left_cols = left_result.columns.len();
+            for lr in &left_result.rows {
+                for rr in &right_result.rows {
+                    let mut row = lr.clone();
+                    row.extend(rr.clone());
+                    rows.push(row);
+                }
+            }
+
+            let mut columns = left_result.columns.clone();
+            columns.extend(right_result.columns.clone());
+
+            Ok(QueryResult {
+                columns,
+                rows,
+                rows_affected: 0,
+            })
+        }
+
         PhysicalPlan::Aggregate { input, group_by, aggregates } => {
             let input_result = execute(*input, db)?;
             let input_chunks = rows_to_chunks(&input_result.rows);
@@ -457,6 +482,20 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 SetUnionOp::Union => {
                     // UNION：拼接后去重（基于行内容比较）
                     rows.extend(right_result.rows);
+                    rows.dedup();
+                }
+                SetUnionOp::Intersect => {
+                    // INTERSECT：返回两个结果集的交集（去重）
+                    let right_set: std::collections::HashSet<Vec<Value>> =
+                        right_result.rows.into_iter().collect();
+                    rows.retain(|r| right_set.contains(r));
+                    rows.dedup();
+                }
+                SetUnionOp::Except => {
+                    // EXCEPT：返回左结果集减去右结果集（去重）
+                    let right_set: std::collections::HashSet<Vec<Value>> =
+                        right_result.rows.into_iter().collect();
+                    rows.retain(|r| !right_set.contains(r));
                     rows.dedup();
                 }
             }
@@ -781,6 +820,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Update { .. } => "Update",
         PhysicalPlan::Sort { .. } => "Sort",
         PhysicalPlan::HashJoin { .. } => "HashJoin",
+        PhysicalPlan::CrossJoin { .. } => "CrossJoin",
         PhysicalPlan::Limit { .. } => "Limit",
         PhysicalPlan::Analyze { .. } => "Analyze",
         PhysicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
@@ -864,6 +904,10 @@ fn format_plan_tree(plan: &PhysicalPlan, indent: usize) -> String {
             result.push_str(&format_plan_tree(input, indent + 1));
         }
         PhysicalPlan::HashJoin { left, right, .. } => {
+            result.push_str(&format_plan_tree(left, indent + 1));
+            result.push_str(&format_plan_tree(right, indent + 1));
+        }
+        PhysicalPlan::CrossJoin { left, right } => {
             result.push_str(&format_plan_tree(left, indent + 1));
             result.push_str(&format_plan_tree(right, indent + 1));
         }
@@ -1217,6 +1261,11 @@ fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<P
             let left = resolve_subqueries_in_plan(*left, db)?;
             let right = resolve_subqueries_in_plan(*right, db)?;
             Ok(PhysicalPlan::HashJoin { join_type, left: Box::new(left), right: Box::new(right), left_keys, right_keys })
+        }
+        PhysicalPlan::CrossJoin { left, right } => {
+            let left = resolve_subqueries_in_plan(*left, db)?;
+            let right = resolve_subqueries_in_plan(*right, db)?;
+            Ok(PhysicalPlan::CrossJoin { left: Box::new(left), right: Box::new(right) })
         }
         other => Ok(other),
     }

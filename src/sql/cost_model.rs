@@ -99,6 +99,13 @@ impl<'a> CostModel<'a> {
             PhysicalPlan::HashJoin { left, right, join_type, left_keys, right_keys } => {
                 self.cost_hash_join(left, right, *join_type, left_keys.len(), right_keys.len())
             }
+            PhysicalPlan::CrossJoin { left, right } => {
+                // CROSS JOIN：笛卡尔积，代价 = left_rows * right_rows
+                let (left_props, _) = self.calculate_node(left);
+                let (right_props, _) = self.calculate_node(right);
+                let total = left_props.row_count.max(1.0) * right_props.row_count.max(1.0);
+                (PlanProperties { row_count: total, num_columns: left_props.num_columns + right_props.num_columns, row_size: left_props.row_size + right_props.row_size }, Cost { startup: 0.0, total })
+            }
             PhysicalPlan::Aggregate { input, group_by, aggregates } => {
                 self.cost_aggregate(input, group_by.len(), aggregates.len())
             }

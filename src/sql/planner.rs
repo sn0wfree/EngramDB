@@ -611,6 +611,16 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         });
     }
 
+    // ===== CROSS JOIN =====
+    if let Some(TableRef::CrossJoin { left, right }) = &stmt.from {
+        let left_plan = plan_table_ref(left, db, &stmt)?;
+        let right_plan = plan_table_ref(right, db, &stmt)?;
+        return Ok(PhysicalPlan::CrossJoin {
+            left: Box::new(left_plan),
+            right: Box::new(right_plan),
+        });
+    }
+
     let table_name = stmt.from
         .as_ref()
         .and_then(|t| match t {
@@ -925,12 +935,14 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         };
     }
 
-    // 集合操作 UNION / UNION ALL（v0.15.0 新增）
+    // 集合操作 UNION / UNION ALL / INTERSECT / EXCEPT（v0.15.0 新增）
     if let Some((op, right_stmt)) = stmt.set_op {
         let right_plan = plan_select(*right_stmt, db)?;
         let set_union_op = match op {
             SetOpType::Union => SetUnionOp::Union,
             SetOpType::UnionAll => SetUnionOp::UnionAll,
+            SetOpType::Intersect => SetUnionOp::Intersect,
+            SetOpType::Except => SetUnionOp::Except,
         };
         plan = PhysicalPlan::SetUnion {
             op: set_union_op,
@@ -940,6 +952,47 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     }
 
     Ok(plan)
+}
+
+/// 规划单个表引用（用于 CROSS JOIN 等场景）
+fn plan_table_ref(table_ref: &TableRef, db: &Database, stmt: &SelectStmt) -> Result<PhysicalPlan> {
+    match table_ref {
+        TableRef::Table { table_name, .. } => {
+            let table = db.get_table(table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+            let scan_columns = collect_referenced_columns(stmt, &table.def.columns);
+            let scan_column_indices: Vec<usize> = scan_columns.iter()
+                .filter_map(|name| table.def.column_index(name))
+                .collect();
+            let indices = if scan_column_indices.is_empty() && !table.def.columns.is_empty() {
+                vec![0]
+            } else {
+                scan_column_indices
+            };
+            Ok(PhysicalPlan::TableScan {
+                table_name: table_name.clone(),
+                column_indices: indices,
+            })
+        }
+        TableRef::Derived { query, .. } => {
+            let inner = plan_select(*query.clone(), db)?;
+            Ok(PhysicalPlan::SubqueryScan { plan: Box::new(inner) })
+        }
+        TableRef::CrossJoin { left, right } => {
+            let left_plan = plan_table_ref(left, db, stmt)?;
+            let right_plan = plan_table_ref(right, db, stmt)?;
+            Ok(PhysicalPlan::CrossJoin {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+            })
+        }
+        TableRef::TableFunction { name, args, .. } => {
+            if name.eq_ignore_ascii_case("vector_search") {
+                return plan_vector_search(args, db);
+            }
+            Err(EngramDbError::Parse(format!("Unsupported table function: {}", name)))
+        }
+    }
 }
 
 /// 尝试生成 IndexOnlyScan 计划（v0.12.0 覆盖索引优化）
@@ -1555,6 +1608,12 @@ fn extract_column_names(plan: &PhysicalPlan) -> Vec<String> {
             names
         }
         PhysicalPlan::HashJoin { left, right, .. } => {
+            let mut left_names = extract_column_names(left);
+            let right_names = extract_column_names(right);
+            left_names.extend(right_names);
+            left_names
+        }
+        PhysicalPlan::CrossJoin { left, right } => {
             let mut left_names = extract_column_names(left);
             let right_names = extract_column_names(right);
             left_names.extend(right_names);

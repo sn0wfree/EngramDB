@@ -248,6 +248,26 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
             })
         }
 
+        // P07: PRAGMA page_size / page_count — 页大小和页数
+        "page_size" => {
+            let size = db.config().block_size as i64;
+            Ok(QueryResult {
+                columns: vec!["page_size".into()],
+                rows: vec![vec![Value::Int64(size)]],
+                rows_affected: 0,
+            })
+        }
+        "page_count" => {
+            let file_size = std::fs::metadata(db.path()).map(|m| m.len()).unwrap_or(0);
+            let page_size = db.config().block_size as u64;
+            let count = if page_size > 0 { file_size / page_size } else { 0 };
+            Ok(QueryResult {
+                columns: vec!["page_count".into()],
+                rows: vec![vec![Value::Int64(count as i64)]],
+                rows_affected: 0,
+            })
+        }
+
         _ => Ok(QueryResult {
             columns: vec!["status".to_string()],
             rows: vec![vec![Value::Varchar(format!("PRAGMA {} ok", stmt.name))]],
