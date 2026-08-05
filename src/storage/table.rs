@@ -5,6 +5,7 @@
 use crate::common::config::CompactStrategy;
 use crate::common::error::Result;
 use crate::common::types::{TableDef, IndexDef, ColumnDef};
+use crate::common::column_data::ColumnData;
 use crate::Value;
 use crate::executor::vector::{DataChunk, Vector};
 
@@ -1611,11 +1612,11 @@ impl Table {
                 }
             }
 
-            // 1. 读取需要的所有列（克隆为 owned Value 数组；S2-M2 将直出 Typed）
-            let mut col_owned: Vec<Vec<Value>> = Vec::with_capacity(column_indices.len());
+            // 1. 读取需要的所有列（S2-M2：克隆类型化列，scan 直出 Vector::Typed）
+            let mut col_owned: Vec<ColumnData> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.to_values());
+                col_owned.push(col_data.clone());
             }
 
             if col_owned.is_empty() {
@@ -1625,19 +1626,14 @@ impl Table {
             let row_count = col_owned[0].len();
 
             // 2. 按 batch_size 分块，逐 chunk 构造
-            // S1.5：drain 移动替代逐 cell clone（String/Blob/Vector 免深拷贝）
+            // S2-M2：take_front 移出类型化子列 → Vector::Typed（零 Value 转换）
             let mut batch_start = 0;
             while batch_start < row_count {
                 let batch_len = BATCH_SIZE.min(row_count - batch_start);
 
-                // 构造每个列的 Vector：从 col_owned 移出本 batch 的 cell
                 let mut columns: Vec<Vector> = Vec::with_capacity(col_owned.len());
                 for col in &mut col_owned {
-                    let mut vec: Vec<Value> = col.drain(0..batch_len).collect();
-                    if vec.len() < batch_len {
-                        vec.resize(batch_len, Value::Null);
-                    }
-                    columns.push(Vector::Flat(vec));
+                    columns.push(Vector::Typed(col.take_front(batch_len)));
                 }
 
                 // TTL 过滤：每行检查是否过期

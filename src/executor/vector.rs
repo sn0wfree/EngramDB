@@ -3,15 +3,21 @@
 //! DataChunk: 一批行数据，包含多个 Vector（每列一个）
 
 use crate::Value;
+use crate::common::column_data::ColumnData;
 
 /// Vector 大小（每批行数）
 pub const VECTOR_SIZE: usize = 2048;
 
 /// 向量类型
+///
+/// S2-M2：新增 `Typed`（类型化列）——双路径并行：
+/// - 扫描/存储层直接产出 Typed（零 Value 转换，内存连续）
+/// - 表达式/算子逐步迁移到 Typed，未迁移路径经 `to_flat`/`get` 兼容
 #[derive(Debug, Clone)]
 pub enum Vector {
     Flat(Vec<Value>),
     Constant(Value, usize), // value, count
+    Typed(ColumnData),
 }
 
 impl Vector {
@@ -25,11 +31,17 @@ impl Vector {
         Vector::Flat(values)
     }
 
+    /// 从类型化列创建（Typed variant）
+    pub fn from_typed(data: ColumnData) -> Self {
+        Vector::Typed(data)
+    }
+
     /// 获取长度
     pub fn len(&self) -> usize {
         match self {
             Vector::Flat(v) => v.len(),
             Vector::Constant(_, n) => *n,
+            Vector::Typed(d) => d.len(),
         }
     }
 
@@ -38,10 +50,11 @@ impl Vector {
     }
 
     /// 获取指定位置的值
-    pub fn get(&self, idx: usize) -> &Value {
+    pub fn get(&self, idx: usize) -> Value {
         match self {
-            Vector::Flat(v) => &v[idx],
-            Vector::Constant(val, _) => val,
+            Vector::Flat(v) => v[idx].clone(),
+            Vector::Constant(val, _) => val.clone(),
+            Vector::Typed(d) => d.get(idx),
         }
     }
 
@@ -50,6 +63,7 @@ impl Vector {
         match self {
             Vector::Flat(v) => v.push(val),
             Vector::Constant(_, n) => *n += 1,
+            Vector::Typed(_) => unreachable!("不能向类型化向量 push 未知类型值"),
         }
     }
 
@@ -58,6 +72,31 @@ impl Vector {
         match self {
             Vector::Flat(v) => v.clone(),
             Vector::Constant(val, n) => vec![val.clone(); *n],
+            Vector::Typed(d) => d.to_values(),
+        }
+    }
+
+    /// 是否为类型化列（Typed variant）
+    pub fn is_typed(&self) -> bool {
+        matches!(self, Vector::Typed(_))
+    }
+
+    /// 尝试按引用访问类型化列
+    pub fn as_typed(&self) -> Option<&ColumnData> {
+        match self {
+            Vector::Typed(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// 尝试将 Flat 转为 Typed（纯类型列 → Typed；混合列保持 Flat）
+    pub fn try_typed(self) -> Vector {
+        match self {
+            Vector::Flat(v) => match ColumnData::try_from_values(&v) {
+                Some(d) => Vector::Typed(d),
+                None => Vector::Flat(v),
+            },
+            other => other,
         }
     }
 }
@@ -215,6 +254,10 @@ impl SelectionVector {
             }
             Vector::Constant(val, _) => {
                 Vector::Constant(val.clone(), self.count)
+            }
+            // S2-M2：Typed 列直接按索引 gather（类型数组零 Value 转换）
+            Vector::Typed(data) => {
+                Vector::Typed(data.gather(&self.indices))
             }
         }
     }

@@ -240,7 +240,7 @@ fn aggregate_chunk_partial(chunk: &DataChunk, func: AggregateFunc, col_idx: usiz
 
     let col = &chunk.columns[col_idx];
     for i in 0..chunk.count {
-        state.accumulate(col.get(i));
+        state.accumulate(&col.get(i));
     }
 
     state
@@ -466,12 +466,12 @@ fn try_execute_grouped_int(
                 let t = match key_type {
                     Some(t) => t,
                     None => {
-                        let t = detect_key_type(v)?;
+                        let t = detect_key_type(&v)?;
                         key_type = Some(t);
                         t
                     }
                 };
-                let k = key_to_i64(v, t)?;
+                let k = key_to_i64(&v, t)?;
                 let states = map
                     .entry(k)
                     .or_insert_with(|| new_states(aggregates));
@@ -557,7 +557,7 @@ fn accumulate_all(states: &mut [PartialAggState], chunk: &DataChunk, row_idx: us
     for (agg_idx, (_, col_idx, _)) in aggregates.iter().enumerate() {
         if *col_idx < chunk.columns.len() {
             let val = chunk.columns[*col_idx].get(row_idx);
-            states[agg_idx].accumulate(val);
+            states[agg_idx].accumulate(&val);
         }
     }
 }
@@ -600,7 +600,7 @@ fn aggregate_chunk_grouped_partial(
         for (agg_idx, (_, col_idx, _)) in aggregates.iter().enumerate() {
             if *col_idx < chunk.columns.len() {
                 let val = chunk.columns[*col_idx].get(row_idx);
-                states[agg_idx].accumulate(val);
+                states[agg_idx].accumulate(&val);
             }
         }
     }

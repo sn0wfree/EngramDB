@@ -260,7 +260,7 @@ pub fn example_square(args: &[Vector]) -> Result<Vector> {
     let mut result = Vector::new();
     for i in 0..input.len() {
         match input.get(i) {
-            Value::Int32(v) => result.push(Value::Int64(*v as i64 * *v as i64)),
+            Value::Int32(v) => result.push(Value::Int64(v as i64 * v as i64)),
             Value::Int64(v) => result.push(Value::Int64(v * v)),
             Value::Float64(v) => result.push(Value::Float64(v * v)),
             Value::Null => result.push(Value::Null),
@@ -343,10 +343,10 @@ mod tests {
 
         let result = registry.call_scalar("strlen", &[input]).unwrap();
         assert_eq!(result.len(), 4);
-        assert_eq!(result.get(0), &Value::Int64(5));
-        assert_eq!(result.get(1), &Value::Int64(0));
-        assert_eq!(result.get(2), &Value::Null);
-        assert_eq!(result.get(3), &Value::Int64(6));
+        assert_eq!(result.get(0), Value::Int64(5));
+        assert_eq!(result.get(1), Value::Int64(0));
+        assert_eq!(result.get(2), Value::Null);
+        assert_eq!(result.get(3), Value::Int64(6));
     }
 
     #[test]
@@ -363,13 +363,13 @@ mod tests {
 
         let result = registry.call_scalar("square", &[input]).unwrap();
         assert_eq!(result.len(), 4);
-        assert_eq!(result.get(0), &Value::Int64(9));
-        assert_eq!(result.get(1), &Value::Int64(25));
+        assert_eq!(result.get(0), Value::Int64(9));
+        assert_eq!(result.get(1), Value::Int64(25));
         match result.get(2) {
             Value::Float64(v) => assert!((v - 6.25).abs() < 0.001),
             _ => panic!("expected float64"),
         }
-        assert_eq!(result.get(3), &Value::Null);
+        assert_eq!(result.get(3), Value::Null);
     }
 
     #[test]

@@ -205,8 +205,447 @@ fn hint_kind(values: &[Value]) -> Hint {
     Hint::AllNull
 }
 
+// ============================================================================
+// S2-M2：Typed 列二元运算（类型数组直接运算，零 Value 转换）
+// ============================================================================
+
+use crate::common::column_data::{ColumnData, ColumnValue, BitVec};
+
+/// Typed×Typed 二元运算：按列类型组合分派到类型数组路径。
+/// 不支持组合（Float32、Timestamp×Float、Blob 等）→ None → 调用方物化 fallback。
+fn eval_typed_binary(l: &ColumnData, op: BinaryOperator, r: &ColumnData) -> Option<Result<Vector>> {
+    use BinaryOperator::*;
+    use ColumnValue::{Int64, Float64, Varchar, Boolean, Timestamp};
+    let len = l.len().min(r.len());
+
+    let result: ColumnData = match op {
+        Plus | Minus | Multiply | Divide | Modulo => match (&l.values, &r.values) {
+            (Int64(la), Int64(ra)) => arith_typed_i64(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Timestamp(la), Timestamp(ra)) => arith_typed_i64(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Timestamp(la), Int64(ra)) | (Int64(ra), Timestamp(la)) => {
+                let lb = as_i64_slice(&l.values);
+                let rb = as_i64_slice(&r.values);
+                arith_typed_i64(&lb[..len], &rb[..len], op, &l.nulls, &r.nulls)
+            }
+            (Float64(la), Float64(ra)) => arith_typed_f64(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Int64(la), Float64(ra)) => {
+                let lb: Vec<f64> = la.iter().map(|&x| x as f64).collect();
+                arith_typed_f64(&lb[..len], &ra[..len], op, &l.nulls, &r.nulls)
+            }
+            (Float64(la), Int64(ra)) => {
+                let rb: Vec<f64> = ra.iter().map(|&x| x as f64).collect();
+                arith_typed_f64(&la[..len], &rb[..len], op, &l.nulls, &r.nulls)
+            }
+            _ => return None,
+        },
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => match (&l.values, &r.values) {
+            (Int64(la), Int64(ra)) => cmp_typed_i64(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Timestamp(la), Timestamp(ra)) => cmp_typed_i64(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Timestamp(la), Int64(ra)) | (Int64(ra), Timestamp(la)) => {
+                let lb = as_i64_slice(&l.values);
+                let rb = as_i64_slice(&r.values);
+                cmp_typed_i64(&lb[..len], &rb[..len], op, &l.nulls, &r.nulls)
+            }
+            (Float64(la), Float64(ra)) => cmp_typed_f64(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Int64(la), Float64(ra)) => {
+                let lb: Vec<f64> = la.iter().map(|&x| x as f64).collect();
+                cmp_typed_f64(&lb[..len], &ra[..len], op, &l.nulls, &r.nulls)
+            }
+            (Float64(la), Int64(ra)) => {
+                let rb: Vec<f64> = ra.iter().map(|&x| x as f64).collect();
+                cmp_typed_f64(&la[..len], &rb[..len], op, &l.nulls, &r.nulls)
+            }
+            (Varchar(la), Varchar(ra)) => cmp_typed_str(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Boolean(la), Boolean(ra)) => cmp_typed_bool(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            _ => return None,
+        },
+        And | Or => match (&l.values, &r.values) {
+            (Boolean(la), Boolean(ra)) => logic_typed(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            _ => return None,
+        },
+        Concat => match (&l.values, &r.values) {
+            (Varchar(la), Varchar(ra)) => concat_typed(&la[..len], &ra[..len], &l.nulls, &r.nulls),
+            _ => return None,
+        },
+    };
+
+    Some(Ok(Vector::Typed(result)))
+}
+
+/// 提取 i64 语义切片（Int64/Timestamp 列）
+fn as_i64_slice(v: &ColumnValue) -> Vec<i64> {
+    match v {
+        ColumnValue::Int64(a) => a.clone(),
+        ColumnValue::Timestamp(a) => a.clone(),
+        _ => unreachable!(),
+    }
+}
+
+/// 合并两个 NULL 位图（OR），并扩展溢出 NULL 位
+fn merge_nulls(ln: &Option<BitVec>, rn: &Option<BitVec>, len: usize) -> Option<BitVec> {
+    match (ln, rn) {
+        (None, None) => None,
+        _ => {
+            let mut bv = BitVec::new(len);
+            let mut any = false;
+            for i in 0..len {
+                let is_null = ln.as_ref().map_or(false, |b| b.test(i))
+                    || rn.as_ref().map_or(false, |b| b.test(i));
+                if is_null {
+                    bv.set(i, true);
+                    any = true;
+                }
+            }
+            if any { Some(bv) } else { None }
+        }
+    }
+}
+
+/// 合并 NULL 位图并标记溢出位置（算术结果数组 r 中需标 null 的位置）
+fn merge_nulls_with(ln: &Option<BitVec>, rn: &Option<BitVec>, overflow: &[bool], len: usize) -> Option<BitVec> {
+    let mut bv = BitVec::new(len);
+    let mut any = false;
+    for i in 0..len {
+        let is_null = ln.as_ref().map_or(false, |b| b.test(i))
+            || rn.as_ref().map_or(false, |b| b.test(i))
+            || overflow[i];
+        if is_null {
+            bv.set(i, true);
+            any = true;
+        }
+    }
+    if any { Some(bv) } else { None }
+}
+
+// --- 整数算术（Typed）---
+
+fn arith_typed_i64(la: &[i64], ra: &[i64], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    let has_null = ln.is_some() || rn.is_some();
+    if has_null {
+        for i in 0..la.len() {
+            if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+                out.push(0);
+                overflow[i] = true;
+                continue;
+            }
+            match arith_i64_pair_inner(la[i], op, ra[i]) {
+                Some(v) => out.push(v),
+                None => {
+                    out.push(0);
+                    overflow[i] = true;
+                }
+            }
+        }
+    } else {
+        for i in 0..la.len() {
+            match arith_i64_pair_inner(la[i], op, ra[i]) {
+                Some(v) => out.push(v),
+                None => {
+                    out.push(0);
+                    overflow[i] = true;
+                }
+            }
+        }
+    }
+    let nulls = if has_null || overflow.iter().any(|&b| b) {
+        merge_nulls_with(ln, rn, &overflow, la.len())
+    } else {
+        None
+    };
+    ColumnData { values: ColumnValue::Int64(out), nulls }
+}
+
+/// 与原 eval_arith 一致：checked 溢出 / 除零 → None
+#[inline(always)]
+fn arith_i64_pair_inner(a: i64, op: BinaryOperator, b: i64) -> Option<i64> {
+    match op {
+        BinaryOperator::Plus => a.checked_add(b),
+        BinaryOperator::Minus => a.checked_sub(b),
+        BinaryOperator::Multiply => a.checked_mul(b),
+        BinaryOperator::Divide => {
+            if b == 0 {
+                None
+            } else {
+                Some(a / b)
+            }
+        }
+        BinaryOperator::Modulo => {
+            if b == 0 {
+                None
+            } else {
+                Some(a % b)
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+// --- 浮点算术（Typed；除零 → NAN，与原 eval_arith 一致）---
+
+fn arith_typed_f64(la: &[f64], ra: &[f64], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    let has_null = ln.is_some() || rn.is_some();
+    if has_null {
+        for i in 0..la.len() {
+            if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+                out.push(0.0);
+                overflow[i] = true;
+                continue;
+            }
+            out.push(arith_f64_pair_inner(la[i], op, ra[i]));
+        }
+    } else {
+        for i in 0..la.len() {
+            out.push(arith_f64_pair_inner(la[i], op, ra[i]));
+        }
+    }
+    let nulls = if has_null {
+        merge_nulls_with(ln, rn, &overflow, la.len())
+    } else {
+        None
+    };
+    ColumnData { values: ColumnValue::Float64(out), nulls }
+}
+
+#[inline(always)]
+fn arith_f64_pair_inner(a: f64, op: BinaryOperator, b: f64) -> f64 {
+    match op {
+        BinaryOperator::Plus => a + b,
+        BinaryOperator::Minus => a - b,
+        BinaryOperator::Multiply => a * b,
+        BinaryOperator::Divide => {
+            if b == 0.0 {
+                f64::NAN
+            } else {
+                a / b
+            }
+        }
+        BinaryOperator::Modulo => {
+            if b == 0.0 {
+                f64::NAN
+            } else {
+                a % b
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+// --- 比较（Typed；NULL 比较 → NULL）---
+
+fn cmp_typed_i64(la: &[i64], ra: &[i64], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    let has_null = ln.is_some() || rn.is_some();
+    if has_null {
+        for i in 0..la.len() {
+            if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+                out.push(false);
+                overflow[i] = true;
+                continue;
+            }
+            out.push(cmp_pair_typed(la[i].cmp(&ra[i]), op));
+        }
+    } else {
+        for i in 0..la.len() {
+            out.push(cmp_pair_typed(la[i].cmp(&ra[i]), op));
+        }
+    }
+    let nulls = if has_null {
+        merge_nulls_with(ln, rn, &overflow, la.len())
+    } else {
+        None
+    };
+    ColumnData { values: ColumnValue::Boolean(out), nulls }
+}
+
+fn cmp_typed_f64(la: &[f64], ra: &[f64], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    let has_null = ln.is_some() || rn.is_some();
+    if has_null {
+        for i in 0..la.len() {
+            if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+                out.push(false);
+                overflow[i] = true;
+                continue;
+            }
+            // NaN → Equal（与原 value_cmp unwrap_or(Equal) 一致）
+            let cmp = la[i].partial_cmp(&ra[i]).unwrap_or(std::cmp::Ordering::Equal);
+            out.push(cmp_pair_typed(cmp, op));
+        }
+    } else {
+        for i in 0..la.len() {
+            let cmp = la[i].partial_cmp(&ra[i]).unwrap_or(std::cmp::Ordering::Equal);
+            out.push(cmp_pair_typed(cmp, op));
+        }
+    }
+    let nulls = if has_null {
+        merge_nulls_with(ln, rn, &overflow, la.len())
+    } else {
+        None
+    };
+    ColumnData { values: ColumnValue::Boolean(out), nulls }
+}
+
+fn cmp_typed_str(la: &[String], ra: &[String], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    let has_null = ln.is_some() || rn.is_some();
+    if has_null {
+        for i in 0..la.len() {
+            if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+                out.push(false);
+                overflow[i] = true;
+                continue;
+            }
+            out.push(cmp_pair_typed(la[i].cmp(&ra[i]), op));
+        }
+    } else {
+        for i in 0..la.len() {
+            out.push(cmp_pair_typed(la[i].cmp(&ra[i]), op));
+        }
+    }
+    let nulls = if has_null {
+        merge_nulls_with(ln, rn, &overflow, la.len())
+    } else {
+        None
+    };
+    ColumnData { values: ColumnValue::Boolean(out), nulls }
+}
+
+fn cmp_typed_bool(la: &[bool], ra: &[bool], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    let has_null = ln.is_some() || rn.is_some();
+    if has_null {
+        for i in 0..la.len() {
+            if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+                out.push(false);
+                overflow[i] = true;
+                continue;
+            }
+            out.push(cmp_pair_typed(la[i].cmp(&ra[i]), op));
+        }
+    } else {
+        for i in 0..la.len() {
+            out.push(cmp_pair_typed(la[i].cmp(&ra[i]), op));
+        }
+    }
+    let nulls = if has_null {
+        merge_nulls_with(ln, rn, &overflow, la.len())
+    } else {
+        None
+    };
+    ColumnData { values: ColumnValue::Boolean(out), nulls }
+}
+
+#[inline(always)]
+fn cmp_pair_typed(cmp: std::cmp::Ordering, op: BinaryOperator) -> bool {
+    use BinaryOperator::*;
+    match op {
+        Eq => cmp == std::cmp::Ordering::Equal,
+        NotEq => cmp != std::cmp::Ordering::Equal,
+        Lt => cmp == std::cmp::Ordering::Less,
+        LtEq => cmp <= std::cmp::Ordering::Equal,
+        Gt => cmp == std::cmp::Ordering::Greater,
+        GtEq => cmp >= std::cmp::Ordering::Equal,
+        _ => unreachable!(),
+    }
+}
+
+// --- 逻辑运算（Typed；三值逻辑）---
+
+fn logic_typed(la: &[bool], ra: &[bool], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    for i in 0..la.len() {
+        let (a, a_null) = match &ln {
+            Some(b) => (la[i], b.test(i)),
+            None => (la[i], false),
+        };
+        let (b, b_null) = match &rn {
+            Some(b) => (ra[i], b.test(i)),
+            None => (ra[i], false),
+        };
+        // 三值逻辑：false AND NULL = false；true AND NULL = NULL；NULL AND NULL = NULL
+        let (v, is_null) = match op {
+            BinaryOperator::And => {
+                if !a && !a_null {
+                    (false, false)
+                } else if !b && !b_null {
+                    (false, false)
+                } else if a && !a_null && b && !b_null {
+                    (true, false)
+                } else {
+                    (false, true)
+                }
+            }
+            BinaryOperator::Or => {
+                if a && !a_null {
+                    (true, false)
+                } else if b && !b_null {
+                    (true, false)
+                } else if !a_null && !b_null {
+                    (false, false)
+                } else {
+                    (false, true)
+                }
+            }
+            _ => unreachable!(),
+        };
+        out.push(v);
+        overflow[i] = is_null;
+    }
+    // 三值逻辑：输出 NULL 只由逐行三值结果决定（NULL OR true = true，
+    // 不能简单合并输入 NULL 位）
+    let nulls = if overflow.iter().any(|&b| b) {
+        let mut bv = BitVec::new(la.len());
+        let mut any = false;
+        for i in 0..la.len() {
+            if overflow[i] {
+                bv.set(i, true);
+                any = true;
+            }
+        }
+        if any { Some(bv) } else { None }
+    } else {
+        None
+    };
+    ColumnData { values: ColumnValue::Boolean(out), nulls }
+}
+
+// --- 字符串拼接（Typed）---
+
+fn concat_typed(la: &[String], ra: &[String], ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let mut out = Vec::with_capacity(la.len());
+    let mut overflow = vec![false; la.len()];
+    for i in 0..la.len() {
+        let a_null = ln.as_ref().map_or(false, |b| b.test(i));
+        let b_null = rn.as_ref().map_or(false, |b| b.test(i));
+        if a_null || b_null {
+            out.push(String::new());
+            overflow[i] = true;
+            continue;
+        }
+        let mut s = String::with_capacity(la[i].len() + ra[i].len());
+        s.push_str(&la[i]);
+        s.push_str(&ra[i]);
+        out.push(s);
+    }
+    let nulls = merge_nulls_with(ln, rn, &overflow, la.len());
+    ColumnData { values: ColumnValue::Varchar(out), nulls }
+}
+
 /// 特化求值入口：不适用时返回 None（调用方走原路径）
 fn try_eval_specialized(left: &Vector, op: BinaryOperator, right: &Vector) -> Option<Result<Vector>> {
+    // S2-M2：Typed×Typed 直接类型数组运算（连续内存 + 自动向量化）
+    if let (Vector::Typed(l), Vector::Typed(r)) = (left, right) {
+        return eval_typed_binary(l, op, r);
+    }
     let (l, r) = match (left, right) {
         (Vector::Flat(l), Vector::Flat(r)) => (l, r),
         _ => return None,
@@ -676,7 +1115,9 @@ fn eval_concat(left: &Value, right: &Value) -> Value {
 // ============================================================================
 
 fn eval_unary_vectorized(vec: &Vector, op: UnaryOperator) -> Result<Vector> {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => {
             let result = eval_unary_value(v, op);
             Ok(Vector::Constant(result, *n))
@@ -719,7 +1160,9 @@ fn eval_unary_value(v: &Value, op: UnaryOperator) -> Value {
 // ============================================================================
 
 fn eval_is_null(vec: &Vector, negate: bool) -> Vector {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => {
             let is_null = v.is_null();
             let result = if negate { !is_null } else { is_null };
@@ -742,7 +1185,9 @@ fn eval_is_null(vec: &Vector, negate: bool) -> Vector {
 // ============================================================================
 
 fn eval_cast(vec: &Vector, target_type: &DataType) -> Result<Vector> {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => {
             let result = cast_value(v, target_type)?;
             Ok(Vector::Constant(result, *n))
@@ -832,7 +1277,9 @@ fn eval_in_list(expr_vec: &Vector, list_vecs: &[Vector]) -> Result<Vector> {
 
     let all_constant = list_values.len() == list_vecs.len();
 
-    match expr_vec {
+        let expr_vec = match expr_vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &expr_vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(val, n) => {
             // 表达式是常量
             if all_constant {
@@ -845,7 +1292,7 @@ fn eval_in_list(expr_vec: &Vector, list_vecs: &[Vector]) -> Result<Vector> {
             for i in 0..len {
                 let mut found = false;
                 for lv in list_vecs {
-                    if value_eq(val, lv.get(i)) {
+                    if value_eq(val, &lv.get(i)) {
                         found = true;
                         break;
                     }
@@ -869,7 +1316,7 @@ fn eval_in_list(expr_vec: &Vector, list_vecs: &[Vector]) -> Result<Vector> {
                 for (i, val) in values.iter().enumerate() {
                     let mut found = false;
                     for lv in list_vecs {
-                        if value_eq(val, lv.get(i)) {
+                        if value_eq(val, &lv.get(i)) {
                             found = true;
                             break;
                         }
@@ -1443,7 +1890,9 @@ fn eval_function(
                 return Err(EngramDbError::Parse("DATE requires 1 argument".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
-            match &vec {
+        let vec_norm = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+            match &vec_norm {
+                Vector::Typed(_) => unreachable!("typed column normalized to flat"),
                 Vector::Constant(v, n) => {
                     let val = date_value(v);
                     Ok(Vector::Constant(val, *n))
@@ -1464,7 +1913,9 @@ fn eval_function(
                 Vector::Constant(Value::Varchar(s), _) => s.clone(),
                 _ => return Err(EngramDbError::Parse("STRFTIME format must be a constant string".into())),
             };
-            match &ts_vec {
+        let ts_vec_norm = match ts_vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+            match &ts_vec_norm {
+                Vector::Typed(_) => unreachable!("typed column normalized to flat"),
                 Vector::Constant(v, n) => {
                     let val = strftime_value(&fmt, v);
                     Ok(Vector::Constant(val, *n))
@@ -1480,7 +1931,9 @@ fn eval_function(
                 return Err(EngramDbError::Parse("TIME requires 1 argument".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
-            match &vec {
+        let vec_norm = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+            match &vec_norm {
+                Vector::Typed(_) => unreachable!("typed column normalized to flat"),
                 Vector::Constant(v, n) => {
                     let val = time_value(v);
                     Ok(Vector::Constant(val, *n))
@@ -1496,7 +1949,9 @@ fn eval_function(
                 return Err(EngramDbError::Parse("DATETIME requires 1 argument".into()));
             }
             let vec = eval_vectorized(&args[0], chunk, column_names)?;
-            match &vec {
+        let vec_norm = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+            match &vec_norm {
+                Vector::Typed(_) => unreachable!("typed column normalized to flat"),
                 Vector::Constant(v, n) => {
                     let val = datetime_value(v);
                     Ok(Vector::Constant(val, *n))
@@ -1586,7 +2041,9 @@ fn eval_function(
                 Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
                 _ => return Err(EngramDbError::Parse("DATE_TRUNC unit must be a constant string".into())),
             };
-            match &ts_vec {
+        let ts_vec_norm = match ts_vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+            match &ts_vec_norm {
+                Vector::Typed(_) => unreachable!("typed column normalized to flat"),
                 Vector::Constant(v, n) => {
                     let val = date_trunc_value(v, &unit);
                     Ok(Vector::Constant(val, *n))
@@ -1607,7 +2064,9 @@ fn eval_function(
                 Vector::Constant(Value::Varchar(s), _) => s.clone(),
                 _ => return Err(EngramDbError::Parse("STRPTIME format must be a constant string".into())),
             };
-            match &s_vec {
+        let s_vec_norm = match s_vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+            match &s_vec_norm {
+                Vector::Typed(_) => unreachable!("typed column normalized to flat"),
                 Vector::Constant(v, n) => {
                     let val = strptime_value(&fmt, v);
                     Ok(Vector::Constant(val, *n))
@@ -1645,7 +2104,9 @@ fn eval_match(vec: &Vector, query: &str) -> Vector {
     if tokens.is_empty() {
         return Vector::Flat(vec![Value::Boolean(false); vec.len()]);
     }
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => {
             let matches = match v {
                 Value::Varchar(s) => {
@@ -2068,7 +2529,9 @@ fn apply_date_arithmetic(ts_ms: i64, delta: i64, unit: &str) -> i64 {
 }
 
 fn eval_abs(vec: &Vector) -> Result<Vector> {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => Ok(Vector::Constant(abs_value(v), *n)),
         Vector::Flat(values) => {
             let result: Vec<Value> = values.iter().map(abs_value).collect();
@@ -2091,7 +2554,9 @@ fn abs_value(v: &Value) -> Value {
 }
 
 fn eval_length(vec: &Vector) -> Result<Vector> {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => Ok(Vector::Constant(length_value(v), *n)),
         Vector::Flat(values) => {
             let result: Vec<Value> = values.iter().map(length_value).collect();
@@ -2109,7 +2574,9 @@ fn length_value(v: &Value) -> Value {
 }
 
 fn eval_upper(vec: &Vector) -> Result<Vector> {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => Ok(Vector::Constant(upper_value(v), *n)),
         Vector::Flat(values) => {
             let result: Vec<Value> = values.iter().map(upper_value).collect();
@@ -2127,7 +2594,9 @@ fn upper_value(v: &Value) -> Value {
 }
 
 fn eval_lower(vec: &Vector) -> Result<Vector> {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => Ok(Vector::Constant(lower_value(v), *n)),
         Vector::Flat(values) => {
             let result: Vec<Value> = values.iter().map(lower_value).collect();
@@ -2145,7 +2614,9 @@ fn lower_value(v: &Value) -> Value {
 }
 
 fn eval_round(vec: &Vector, decimals: i32) -> Result<Vector> {
-    match vec {
+        let vec = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(v, n) => Ok(Vector::Constant(round_value(v, decimals), *n)),
         Vector::Flat(values) => {
             let result: Vec<Value> = values.iter().map(|v| round_value(v, decimals)).collect();
@@ -2466,10 +2937,10 @@ fn eval_unary_numeric<F: Fn(f64) -> f64>(vec: &Vector, f: F) -> Result<Vector> {
                 result.push(Value::Null);
                 continue;
             }
-            Value::Int32(x) => *x as f64,
-            Value::Int64(x) => *x as f64,
-            Value::Float32(x) => *x as f64,
-            Value::Float64(x) => *x,
+            Value::Int32(x) => x as f64,
+            Value::Int64(x) => x as f64,
+            Value::Float32(x) => x as f64,
+            Value::Float64(x) => x,
             _ => {
                 result.push(Value::Null);
                 continue;
@@ -2502,20 +2973,20 @@ fn eval_binary_numeric<F: Fn(f64, f64) -> f64>(
             continue;
         }
         let x = match a {
-            Value::Int32(x) => *x as f64,
-            Value::Int64(x) => *x as f64,
-            Value::Float32(x) => *x as f64,
-            Value::Float64(x) => *x,
+            Value::Int32(x) => x as f64,
+            Value::Int64(x) => x as f64,
+            Value::Float32(x) => x as f64,
+            Value::Float64(x) => x,
             _ => {
                 result.push(Value::Null);
                 continue;
             }
         };
         let y = match b {
-            Value::Int32(y) => *y as f64,
-            Value::Int64(y) => *y as f64,
-            Value::Float32(y) => *y as f64,
-            Value::Float64(y) => *y,
+            Value::Int32(y) => y as f64,
+            Value::Int64(y) => y as f64,
+            Value::Float32(y) => y as f64,
+            Value::Float64(y) => y,
             _ => {
                 result.push(Value::Null);
                 continue;
@@ -2548,7 +3019,7 @@ fn eval_concat_func(vecs: &[Vector]) -> Result<Vector> {
                 has_null = true;
                 break;
             }
-            match v {
+            match &v {
                 Value::Varchar(s) => acc.push_str(s),
                 _ => acc.push_str(&format!("{}", v)),
             }
@@ -2609,7 +3080,9 @@ fn eval_replace(str_vec: &Vector, from_vec: &Vector, to_vec: &Vector) -> Result<
 ///
 /// 用于 Filter 算子：将向量化条件求值结果转换为 SelectionVector。
 pub fn boolean_to_selection(bool_vec: &Vector) -> Vec<usize> {
-    match bool_vec {
+        let bool_vec = match bool_vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &bool_vec {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(Value::Boolean(true), n) => {
             (0..*n).collect()
         }
@@ -3278,7 +3751,9 @@ fn vector_cosine_sim(a: &Value, b: &Value) -> Value {
 }
 
 fn eval_vector_norm(v: &Vector) -> Result<Vector> {
-    match v {
+        let v = match v { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
+    match &v {
+        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
         Vector::Constant(val, n) => Ok(Vector::Constant(vector_norm_value(val), *n)),
         Vector::Flat(values) => {
             let result: Vec<Value> = values.iter().map(vector_norm_value).collect();
@@ -4061,6 +4536,45 @@ mod tests {
         }
     }
 
+    /// S2-M2 微基准：Typed×Typed vs Flat（1M 行 Int64+Int64），仅手动运行
+    #[test]
+    #[ignore]
+    fn bench_typed_vs_flat() {
+        use rand::Rng;
+        use std::time::{Duration, Instant};
+        use crate::common::column_data::ColumnData;
+        let mut rng = rand::thread_rng();
+        let n = 1_000_000usize;
+        let l: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
+        let r: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
+        let ld = ColumnData::try_from_values(&l).unwrap();
+        let rd = ColumnData::try_from_values(&r).unwrap();
+
+        // Typed 路径（连续数组，零 Value 构造）
+        let mut t = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let out = eval_binary_vectorized(&Vector::Typed(ld.clone()), BinaryOperator::Plus, &Vector::Typed(rd.clone())).unwrap();
+            t += t0.elapsed();
+            assert_eq!(out.len(), n);
+        }
+        let typed_time = t / 3;
+
+        // Flat 路径（S1.3 特化）
+        let mut t = Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let out = eval_binary_vectorized(&Vector::Flat(l.clone()), BinaryOperator::Plus, &Vector::Flat(r.clone())).unwrap();
+            t += t0.elapsed();
+            assert_eq!(out.len(), n);
+        }
+        let flat_time = t / 3;
+
+        println!("1M 行 Int64+Int64: typed = {:?}, flat = {:?}, typed 快 {}x",
+                 typed_time, flat_time,
+                 flat_time.as_nanos() as f64 / typed_time.as_nanos() as f64);
+    }
+
     /// 表达式求值对比（S1.3 微基准），仅手动运行
     #[test]
     #[ignore]
@@ -4131,5 +4645,120 @@ mod tests {
         println!("1M 行 Varchar<Varchar: specialized = {:?}, old(含 to_flat) = {:?}, 快 {}x",
                  spec_s, old_s,
                  old_s.as_nanos() as f64 / spec_s.as_nanos() as f64);
+    }
+
+    // ========================================================================
+    // S2-M2：Typed 列运算测试
+    // ========================================================================
+
+    #[test]
+    fn test_typed_binary_matches_flat_random() {
+        use rand::{Rng, SeedableRng};
+        use crate::common::column_data::ColumnData;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let ops = [
+            BinaryOperator::Plus, BinaryOperator::Minus, BinaryOperator::Multiply,
+            BinaryOperator::Divide, BinaryOperator::Modulo,
+            BinaryOperator::Eq, BinaryOperator::NotEq, BinaryOperator::Lt,
+            BinaryOperator::LtEq, BinaryOperator::Gt, BinaryOperator::GtEq,
+            BinaryOperator::And, BinaryOperator::Or, BinaryOperator::Concat,
+        ];
+        for trial in 0..4000 {
+            let n = 1 + rng.gen_range(0..40);
+            let lk = rng.gen_range(0..5); // 0 Int64, 1 Float64, 2 Varchar, 3 Boolean, 4 Timestamp
+            let rk = rng.gen_range(0..5);
+            let make_col = |kind: usize, rng: &mut rand::rngs::StdRng| -> Vec<Value> {
+                (0..n)
+                    .map(|_| {
+                        if rng.gen_bool(0.15) {
+                            return Value::Null;
+                        }
+                        match kind {
+                            0 => Value::Int64(rng.gen_range(-1000..1000)),
+                            1 => Value::Float64(rng.gen_range(-100.0..100.0)),
+                            2 => Value::Varchar(format!("s{}", rng.gen_range(0..20))),
+                            3 => Value::Boolean(rng.gen_bool(0.5)),
+                            _ => Value::Timestamp(rng.gen_range(-100000..100000)),
+                        }
+                    })
+                    .collect()
+            };
+            let lv = make_col(lk, &mut rng);
+            let rv = make_col(rk, &mut rng);
+            let op = ops[rng.gen_range(0..ops.len())];
+
+            // Typed 路径（纯类型列 → ColumnData；全 NULL 列无类型信息 → 跳过）
+            let Some(ld) = ColumnData::try_from_values(&lv) else { continue };
+            let Some(rd) = ColumnData::try_from_values(&rv) else { continue };
+            let typed_out = eval_binary_vectorized(
+                &Vector::Typed(ld),
+                op,
+                &Vector::Typed(rd),
+            ).unwrap();
+            let typed_vals = typed_out.to_flat();
+
+            // Flat 参考路径
+            let flat_out = eval_binary_vectorized(
+                &Vector::Flat(lv.clone()),
+                op,
+                &Vector::Flat(rv.clone()),
+            ).unwrap();
+            let flat_vals = flat_out.to_flat();
+
+            assert_eq!(typed_vals.len(), flat_vals.len(), "trial {} op {:?}", trial, op);
+            for (i, (a, b)) in typed_vals.iter().zip(flat_vals.iter()).enumerate() {
+                assert!(values_equal(a, b),
+                    "trial {} op {:?} i={} l={:?} r={:?} typed={:?} flat={:?}",
+                    trial, op, i, lv, rv, a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn test_typed_binary_deterministic() {
+        use crate::common::column_data::ColumnData;
+        // Int64 算术：溢出 → NULL；除零 → NULL
+        let ld = ColumnData::try_from_values(&vec![Value::Int64(1), Value::Int64(2), Value::Null]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Int64(10), Value::Int64(0), Value::Int64(3)]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Plus, &Vector::Typed(rd)).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Int64(11), Value::Int64(2), Value::Null]);
+        let ld = ColumnData::try_from_values(&vec![Value::Int64(i64::MAX)]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Int64(1)]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Plus, &Vector::Typed(rd)).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Null]); // 溢出
+
+        // 浮点除零 → NAN；NULL 比较 → NULL
+        let ld = ColumnData::try_from_values(&vec![Value::Float64(1.0)]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Float64(0.0)]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Divide, &Vector::Typed(rd)).unwrap();
+        assert!(values_equal(&out.to_flat()[0], &Value::Float64(f64::NAN)));
+
+        // 布尔三值逻辑：false AND NULL = false；true AND NULL = NULL
+        let ld = ColumnData::try_from_values(&vec![Value::Boolean(false), Value::Boolean(true)]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Boolean(true), Value::Null]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::And, &Vector::Typed(rd)).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Boolean(false), Value::Null]);
+
+        // 字符串比较 + 拼接
+        let ld = ColumnData::try_from_values(&vec![Value::Varchar("a".into()), Value::Varchar("b".into())]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Varchar("b".into()), Value::Varchar("a".into())]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Lt, &Vector::Typed(rd)).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Boolean(true), Value::Boolean(false)]);
+        let ld = ColumnData::try_from_values(&vec![Value::Varchar("a".into())]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Varchar("b".into())]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Concat, &Vector::Typed(rd)).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Varchar("ab".into())]);
+
+        // Timestamp 算术/比较（as_i64 语义）
+        let ld = ColumnData::try_from_values(&vec![Value::Timestamp(1000), Value::Timestamp(2000)]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Timestamp(500), Value::Timestamp(1500)]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Gt, &Vector::Typed(rd)).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Boolean(true), Value::Boolean(true)]);
+
+        // 不支持组合（Float32）→ fallback 与原路径一致（NULL）
+        let ld = ColumnData::try_from_values(&vec![Value::Float32(1.0)]).unwrap();
+        let rd = ColumnData::try_from_values(&vec![Value::Float32(2.0)]).unwrap();
+        let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Plus, &Vector::Typed(rd)).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Null]); // 原路径语义
     }
 }

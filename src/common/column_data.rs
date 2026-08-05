@@ -152,9 +152,87 @@ impl ColumnData {
         (0..self.len()).map(|i| self.get(i))
     }
 
+    /// 移出前 n 行（扫描分块用，S2-M2）
+    ///
+    /// self 保留剩余行（行号重编号为 0..），返回前 n 行。
+    pub fn take_front(&mut self, n: usize) -> ColumnData {
+        let n = n.min(self.len());
+        let out_values = match &mut self.values {
+            ColumnValue::Boolean(v) => ColumnValue::Boolean(v.drain(0..n).collect()),
+            ColumnValue::Int32(v) => ColumnValue::Int32(v.drain(0..n).collect()),
+            ColumnValue::Int64(v) => ColumnValue::Int64(v.drain(0..n).collect()),
+            ColumnValue::Float32(v) => ColumnValue::Float32(v.drain(0..n).collect()),
+            ColumnValue::Float64(v) => ColumnValue::Float64(v.drain(0..n).collect()),
+            ColumnValue::Varchar(v) => ColumnValue::Varchar(v.drain(0..n).collect()),
+            ColumnValue::Json(v) => ColumnValue::Json(v.drain(0..n).collect()),
+            ColumnValue::Blob(v) => ColumnValue::Blob(v.drain(0..n).collect()),
+            ColumnValue::Vector(v) => ColumnValue::Vector(v.drain(0..n).collect()),
+            ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(v.drain(0..n).collect()),
+            ColumnValue::Timestamp(v) => ColumnValue::Timestamp(v.drain(0..n).collect()),
+        };
+        let (out_nulls, rest_nulls) = match &self.nulls {
+            None => (None, None),
+            Some(bv) => {
+                let total = bv.len();
+                let mut o = BitVec::new(n);
+                let mut any = false;
+                for i in 0..n {
+                    if bv.test(i) {
+                        o.set(i, true);
+                        any = true;
+                    }
+                }
+                let mut r = BitVec::new(total - n);
+                let mut rany = false;
+                for i in n..total {
+                    if bv.test(i) {
+                        r.set(i - n, true);
+                        rany = true;
+                    }
+                }
+                (
+                    if any { Some(o) } else { None },
+                    if rany { Some(r) } else { None },
+                )
+            }
+        };
+        self.nulls = rest_nulls;
+        ColumnData { values: out_values, nulls: out_nulls }
+    }
+
+    /// 按索引收集子列（S2-M2：SelectionVector 应用，类型数组直接 gather）
+    pub fn gather(&self, indices: &[usize]) -> ColumnData {        let out = match &self.values {
+            ColumnValue::Boolean(v) => ColumnValue::Boolean(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Int32(v) => ColumnValue::Int32(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Int64(v) => ColumnValue::Int64(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Float32(v) => ColumnValue::Float32(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Float64(v) => ColumnValue::Float64(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Varchar(v) => ColumnValue::Varchar(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Json(v) => ColumnValue::Json(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Blob(v) => ColumnValue::Blob(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Vector(v) => ColumnValue::Vector(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Timestamp(v) => ColumnValue::Timestamp(indices.iter().map(|&i| v[i]).collect()),
+        };
+        let nulls = match &self.nulls {
+            None => None,
+            Some(bv) => {
+                let mut nb = BitVec::new(indices.len());
+                let mut any = false;
+                for (j, &i) in indices.iter().enumerate() {
+                    if bv.test(i) {
+                        nb.set(j, true);
+                        any = true;
+                    }
+                }
+                if any { Some(nb) } else { None }
+            }
+        };
+        ColumnData { values: out, nulls }
+    }
+
     /// 追加另一列数据到尾部（两列类型必须一致）
-    pub fn append(&mut self, other: &ColumnData) {
-        match (&mut self.values, &other.values) {
+    pub fn append(&mut self, other: &ColumnData) {        match (&mut self.values, &other.values) {
             (ColumnValue::Boolean(a), ColumnValue::Boolean(b)) => a.extend_from_slice(b),
             (ColumnValue::Int32(a), ColumnValue::Int32(b)) => a.extend_from_slice(b),
             (ColumnValue::Int64(a), ColumnValue::Int64(b)) => a.extend_from_slice(b),
