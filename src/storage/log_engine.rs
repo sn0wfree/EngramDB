@@ -40,7 +40,7 @@ struct LogBlock {
 }
 
 impl LogBlock {
-    fn ensure_typed(&mut self, def: &TableDef) {
+    fn ensure_typed(&mut self, def: &TableDef, block_rows: usize) {
         if self.typed.is_none() {
             let typed = self
                 .columns
@@ -48,6 +48,12 @@ impl LogBlock {
                 .enumerate()
                 .map(|(i, col)| ColumnData::from_values_typed(col, &def.columns[i].data_type))
                 .collect();
+            // v0.18 P1-4：冻结块（已满、永不再追加）释放写入缓冲
+            // columns 仅追加期使用，typed 缓存全功能替代（扫描/点查/序列化）；
+            // 释放后 Log 表内存占用减半（Value 对象层不复存在）
+            if self.rows >= block_rows {
+                self.columns = Vec::new();
+            }
             self.typed = Some(typed);
         }
     }
@@ -60,15 +66,27 @@ pub struct LogTable {
     pub def: TableDef,
     blocks: Vec<LogBlock>,
     next_row_id: u32,
+    /// 块行数（v0.18 P1-5 可配置；MinMax 跳读粒度 / 序列化块头摊销）
+    block_rows: usize,
 }
 
 impl LogTable {
     pub fn new(def: TableDef) -> Self {
+        Self::with_block_rows(def, LOG_BLOCK_ROWS)
+    }
+
+    /// 自定义块行数（0/默认 → LOG_BLOCK_ROWS）
+    pub fn with_block_rows(def: TableDef, block_rows: usize) -> Self {
         Self {
             def,
             blocks: Vec::new(),
             next_row_id: 0,
+            block_rows: if block_rows == 0 { LOG_BLOCK_ROWS } else { block_rows },
         }
+    }
+
+    pub fn block_rows(&self) -> usize {
+        self.block_rows
     }
 
     pub fn row_count(&self) -> u64 {
@@ -86,13 +104,13 @@ impl LogTable {
     /// 当前追加块（满则冻结新建）
     fn current_block_mut(&mut self) -> &mut LogBlock {
         let need_new = match self.blocks.last() {
-            Some(b) => b.rows >= LOG_BLOCK_ROWS,
+            Some(b) => b.rows >= self.block_rows,
             None => true,
         };
         if need_new {
             self.blocks.push(LogBlock {
                 row_id_base: self.next_row_id,
-                columns: vec![Vec::with_capacity(LOG_BLOCK_ROWS); self.def.columns.len()],
+                columns: vec![Vec::with_capacity(self.block_rows); self.def.columns.len()],
                 typed: None,
                 min: Vec::new(),
                 max: Vec::new(),
@@ -103,19 +121,21 @@ impl LogTable {
     }
 
     /// 追加单行到当前块（维护列缓冲 + MinMax）
+    ///
+    /// v0.18：借用 `&Value` 而非克隆取行值，每值仅 push 一次克隆。
     fn append_row(&mut self, row: &[Value]) {
         let block = self.current_block_mut();
         for (i, col) in block.columns.iter_mut().enumerate() {
-            let v = row.get(i).cloned().unwrap_or(Value::Null);
+            let v = row.get(i).unwrap_or(&Value::Null);
             col.push(v.clone());
             if block.min.len() <= i {
                 block.min.push(v.clone());
                 block.max.push(v.clone());
-            } else {
-                if value_less(&v, &block.min[i]) {
+            } else if value_less(v, &block.min[i]) || value_greater(v, &block.max[i]) {
+                if value_less(v, &block.min[i]) {
                     block.min[i] = v.clone();
                 }
-                if value_greater(&v, &block.max[i]) {
+                if value_greater(v, &block.max[i]) {
                     block.max[i] = v.clone();
                 }
             }
@@ -131,28 +151,85 @@ impl LogTable {
         }
         for row in &rows {
             self.append_row(row);
+            // 每行推进 row_id：新块 base = 已写入总行数（v0.18 修复：此前循环后
+            // 一次性 += n，块满新建时 row_id_base 全部为 0，多块二分失效）
+            self.next_row_id += 1;
         }
-        self.next_row_id += n as u32;
         self.def.row_count += n as u64;
         Ok(n as u64)
     }
 
-    /// 列式批量追加（事务 apply 路径，InsertBatch）
+    /// 列式批量追加（事务 apply / 恢复重放 / import_columns 路径）
+    ///
+    /// v0.18 列式直写：跳过「列→行→列」双重转置，逐列整段 move 进块缓冲
+    /// （每值零克隆），MinMax 按段维护；超过块大小按 `block_rows` 切分。
+    /// 缺列补 Null（防御），多出的列忽略。
     pub fn insert_columns(&mut self, columns: Vec<Vec<Value>>) -> Result<u64> {
         let num_rows = columns.first().map(|c| c.len()).unwrap_or(0);
         if num_rows == 0 {
             return Ok(0);
         }
-        let num_cols = self.def.columns.len();
-        let mut rows = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let mut row = Vec::with_capacity(num_cols);
-            for c in &columns {
-                row.push(c.get(i).cloned().unwrap_or(Value::Null));
+        let mut cursor = 0usize;
+        let block_rows = self.block_rows;
+        while cursor < num_rows {
+            let block = self.current_block_mut();
+            let take = (block_rows - block.rows).min(num_rows - cursor);
+            for (ci, col) in block.columns.iter_mut().enumerate() {
+                let seg: &[Value] = match columns.get(ci) {
+                    Some(src) => src.get(cursor..cursor + take).unwrap_or(&[]),
+                    None => &[],
+                };
+                // 缺列补 Null（防御）；有列整段 move（零克隆）
+                if seg.len() == take {
+                    col.extend_from_slice(seg);
+                } else {
+                    col.extend_from_slice(seg);
+                    col.extend(std::iter::repeat(Value::Null).take(take - seg.len()));
+                }
+                // 段级 MinMax：首段初始化，其后只与新段比较（替换时才克隆）
+                if seg.is_empty() {
+                    if block.min.len() <= ci {
+                        block.min.push(Value::Null);
+                        block.max.push(Value::Null);
+                    }
+                    continue;
+                }
+                if block.min.len() <= ci {
+                    let mut mn = seg[0].clone();
+                    let mut mx = seg[0].clone();
+                    for v in &seg[1..] {
+                        if value_less(v, &mn) {
+                            mn = v.clone();
+                        }
+                        if value_greater(v, &mx) {
+                            mx = v.clone();
+                        }
+                    }
+                    block.min.push(mn);
+                    block.max.push(mx);
+                } else {
+                    let mut mn = block.min[ci].clone();
+                    let mut mx = block.max[ci].clone();
+                    for v in seg {
+                        if value_less(v, &mn) {
+                            mn = v.clone();
+                        }
+                        if value_greater(v, &mx) {
+                            mx = v.clone();
+                        }
+                    }
+                    block.min[ci] = mn;
+                    block.max[ci] = mx;
+                }
             }
-            rows.push(row);
+            block.rows += take;
+            cursor += take;
+            // 每段推进 row_id：新块 base = 已写入总行数（v0.18 修复：此前
+            // 循环后一次性 += num_rows，块满新建时 row_id_base 全部为 0）
+            self.next_row_id += take as u32;
         }
-        self.insert(rows)
+        self.def.row_count += num_rows as u64;
+        Ok(num_rows as u64)
     }
 
     /// 按指定 row_id 追加（事务 apply 路径）
@@ -180,6 +257,8 @@ impl LogTable {
     }
 
     /// 按 row_id 取行（row_id 连续 = 块内偏移；块按 row_id_base 递增有序，二分定位）
+    ///
+    /// v0.18：读路径走 typed 缓存（冻结块已释放 columns 写入缓冲）。
     pub fn get_row_by_id(&mut self, row_id: u32) -> Result<Option<Vec<Value>>> {
         let idx = match self
             .blocks
@@ -195,11 +274,13 @@ impl LogTable {
             Ok(i) => i,
             Err(_) => return Ok(None),
         };
-        let block = &self.blocks[idx];
+        let block = &mut self.blocks[idx];
         let off = (row_id - block.row_id_base) as usize;
-        let mut row = Vec::with_capacity(block.columns.len());
-        for col in &block.columns {
-            row.push(col.get(off).cloned().unwrap_or(Value::Null));
+        block.ensure_typed(&self.def, self.block_rows);
+        let typed = block.typed.as_ref().unwrap();
+        let mut row = Vec::with_capacity(typed.len());
+        for col in typed {
+            row.push(col.get(off));
         }
         Ok(Some(row))
     }
@@ -237,7 +318,7 @@ impl LogTable {
                     continue;
                 }
             }
-            block.ensure_typed(&self.def);
+            block.ensure_typed(&self.def, self.block_rows);
             let typed = block.typed.as_ref().unwrap();
             for r in 0..block.rows {
                 if let Some((ci, op, val)) = &skip_pred {
@@ -301,11 +382,11 @@ impl LogTable {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
         for b in &mut self.blocks {
-            b.ensure_typed(&self.def);
+            b.ensure_typed(&self.def, self.block_rows);
             buf.extend_from_slice(&b.row_id_base.to_le_bytes());
             buf.extend_from_slice(&(b.rows as u32).to_le_bytes());
-            buf.extend_from_slice(&(b.columns.len() as u32).to_le_bytes());
             let typed = b.typed.as_ref().unwrap();
+            buf.extend_from_slice(&(typed.len() as u32).to_le_bytes());
             for (i, col) in typed.iter().enumerate() {
                 let dt_bytes = bincode::serialize(&self.def.columns[i].data_type).unwrap_or_default();
                 buf.extend_from_slice(&(dt_bytes.len() as u32).to_le_bytes());

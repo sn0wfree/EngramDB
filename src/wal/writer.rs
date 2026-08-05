@@ -39,6 +39,10 @@ pub struct WalWriter {
     pending_commits: usize,
     /// 上次 fsync 以来写入的字节数（精确值，flush 时累计）
     bytes_since_sync: usize,
+    /// P0-3 时间窗：距上次 fsync 超过该时长则下次 commit 强制 fsync（None = 禁用）
+    max_sync_interval: Option<std::time::Duration>,
+    /// 上次 fsync 时刻
+    last_sync: std::time::Instant,
 }
 
 impl WalWriter {
@@ -76,6 +80,8 @@ impl WalWriter {
             group_commit_max_bytes,
             pending_commits: 0,
             bytes_since_sync: 0,
+            max_sync_interval: None,
+            last_sync: std::time::Instant::now(),
         })
     }
 
@@ -175,11 +181,17 @@ impl WalWriter {
                         && self.pending_commits >= self.group_commit_size;
                     let bytes_triggered = self.group_commit_max_bytes > 0
                         && self.bytes_since_sync >= self.group_commit_max_bytes;
+                    // P0-3 时间窗：距上次 fsync 超时则强制 sync（低流量延迟有界）
+                    let timeout_triggered = self
+                        .max_sync_interval
+                        .map(|d| self.last_sync.elapsed() >= d)
+                        .unwrap_or(false);
 
-                    if size_triggered || bytes_triggered {
+                    if size_triggered || bytes_triggered || timeout_triggered {
                         self.file.sync_data()?;
                         self.pending_commits = 0;
                         self.bytes_since_sync = 0;
+                        self.last_sync = std::time::Instant::now();
                     }
                 }
             }
@@ -197,7 +209,17 @@ impl WalWriter {
         self.file.sync_data()?;
         self.pending_commits = 0;
         self.bytes_since_sync = 0;
+        self.last_sync = std::time::Instant::now();
         Ok(())
+    }
+
+    /// 设置时间窗组提交：距上次 fsync 超过该毫秒数则下次 commit 强制 sync（0 = 禁用）
+    pub fn set_max_sync_interval_ms(&mut self, ms: u64) {
+        self.max_sync_interval = if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        };
     }
 
     /// 获取组提交配置

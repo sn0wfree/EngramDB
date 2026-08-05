@@ -155,3 +155,7 @@ opt-level = 3
 debug = false
 codegen-units = 256
 
+
+[[bench]]
+name = "v018_write_bench"
+harness = false

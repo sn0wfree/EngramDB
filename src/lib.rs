@@ -122,10 +122,25 @@ impl Connection {
         Ok(Self { db, closed: false })
     }
 
+    /// P0-2：非裸 INSERT 语句执行前冲刷攒批缓冲（读己之写 + 语句间顺序）
+    ///
+    /// 裸 INSERT（纯 VALUES、无 RETURNING、无 ON CONFLICT、无子查询）由
+    /// Batcher 自行攒批/触发，其余语句（SELECT/UPDATE/DELETE/DDL/CTAS/
+    /// InsertSelect/UPSERT/INSERT...RETURNING）必须先落盘缓冲行。
+    fn flush_batches(&mut self) -> Result<()> {
+        crate::executor::operators::insert::flush_all_batched(&mut self.db)
+    }
+
     /// 执行 SQL 语句
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         use executor::physical_plan::PhysicalPlan;
         let ast = sql::parser::parse(sql)?;
+        // P0-2：非裸 INSERT 语句前置冲刷攒批
+        let batcher_clean = matches!(&ast, crate::sql::ast::Statement::Insert(stmt)
+            if stmt.on_conflict.is_none() && stmt.returning.is_none() && stmt.select.is_none());
+        if !batcher_clean {
+            self.flush_batches()?;
+        }
         let plan = sql::planner::plan(ast, &self.db)?;
         // INSERT / CREATE TABLE 等 DDL/DML 语句不需要查询优化，直接执行
         // 避免对包含大量数据的计划做无谓的 clone 和优化规则遍历
@@ -173,6 +188,11 @@ impl Connection {
     /// 参数按位置绑定（? 或 $1, $2, ... 都转为 0-based 索引）。
     pub fn execute_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<QueryResult> {
         use executor::physical_plan::PhysicalPlan;
+        let batcher_clean = matches!(&stmt.ast, crate::sql::ast::Statement::Insert(ins)
+            if ins.on_conflict.is_none() && ins.returning.is_none() && ins.select.is_none());
+        if !batcher_clean {
+            self.flush_batches()?;
+        }
         let plan = sql::planner::plan_with_params(stmt.ast.clone(), &self.db, params)?;
 
         let needs_optimize = matches!(plan,
@@ -204,16 +224,23 @@ impl Connection {
         use executor::physical_plan::PhysicalPlan;
 
         let mut total = 0u64;
+        let batcher_clean = matches!(&stmt.ast, crate::sql::ast::Statement::Insert(ins)
+            if ins.on_conflict.is_none() && ins.returning.is_none() && ins.select.is_none());
         for params in params_batch {
             let plan = sql::planner::plan_with_params(stmt.ast.clone(), &self.db, params)?;
             let result = executor::execute(plan, &mut self.db)?;
             total += result.rows_affected;
+        }
+        // P0-2：批量执行结束冲刷攒批（RETURNING 语义 + 顺序保证）
+        if batcher_clean && !self.db.insert_batcher().is_empty() {
+            self.flush_batches()?;
         }
         Ok(total)
     }
 
     /// 开始事务
     pub fn begin(&mut self) -> Result<Transaction> {
+        self.flush_batches()?;
         Transaction::begin(&mut self.db, txn::IsolationLevel::default())
     }
 
@@ -222,11 +249,13 @@ impl Connection {
     /// 只读事务跳过 WAL 写入，避免不必要的 fsync 开销。
     /// 适用于只进行 SELECT 查询的场景。
     pub fn begin_readonly(&mut self) -> Result<Transaction> {
+        self.flush_batches()?;
         Transaction::begin_readonly(&mut self.db, txn::IsolationLevel::default())
     }
 
     /// 关闭数据库
     pub fn close(&mut self) -> Result<()> {
+        self.flush_batches()?;
         let result = self.db.close();
         self.closed = true;
         result
@@ -253,6 +282,9 @@ impl Connection {
     /// 性能：比 Prepared Statement 再快约 30-50%，因为完全跳过 SQL 层。
     pub fn import_columns(&mut self, table_name: &str, columns: Vec<Vec<Value>>) -> Result<u64> {
         use crate::common::error::EngramDbError;
+
+        // P0-2：先冲刷攒批，保证行序（缓冲行先入表）
+        self.flush_batches()?;
 
         let engine = self.db.get_engine_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
@@ -301,6 +333,7 @@ impl Connection {
 
     /// 手动触发 WAL fsync（用于 Periodic 模式下主动刷盘）
     pub fn sync_wal(&mut self) -> Result<()> {
+        self.flush_batches()?;
         self.db.sync_wal()
     }
 

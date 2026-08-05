@@ -12,10 +12,13 @@ use crate::txn::{ApplyOp, IsolationLevel};
 use crate::Value;
 
 /// 执行行式插入（根据配置选择事务/非事务路径）
+///
+/// `bypass_batch`：绕过 P0-2 攒批合并（INSERT ... RETURNING 需立即读回插入行）。
 pub fn execute(
     db: &mut Database,
     table_name: &str,
     rows: Vec<Vec<Value>>,
+    bypass_batch: bool,
 ) -> Result<u64> {
     trace!("insert::execute called: table_name={}, rows_count={}", table_name, rows.len());
     
@@ -49,10 +52,60 @@ pub fn execute(
     info!("Executing INSERT: table={}, rows={}, path={}", table_name, rows.len(), path);
     
     if db.config().enable_transaction {
+        // P0-2 攒批合并（autocommit 逐行 INSERT）：先入批，阈值触发才落盘。
+        // 约束门控：有 NOT NULL / 主键 / 唯一索引 / 自增 / TTL / 外键的表
+        // 绕过 batcher（约束检查在落盘时进行，错误需在该语句返回时暴露）
+        if !bypass_batch && db.batch_insert_enabled() && !db.in_explicit_txn() && !table_has_constraints(db, table_name) {
+            let n = rows.len();
+            let trigger = db.insert_batcher().push(table_name, rows);
+            if trigger {
+                let all = db.insert_batcher().drain(table_name);
+                return execute_with_txn(db, table_name, all);
+            }
+            // 已入批：事务语义等价于"已接受未提交"（WAL 组提交同款异步窗口）
+            return Ok(n as u64);
+        }
         execute_with_txn(db, table_name, rows)
     } else {
         execute_without_txn(db, table_name, rows)
     }
+}
+
+/// P0-2：表是否含需即时暴露错误的约束（有则绕过攒批合并）
+fn table_has_constraints(db: &Database, table_name: &str) -> bool {
+    let Some(table) = db.get_engine_table(table_name) else {
+        return false; // 表不存在由上层抛 TableNotFound
+    };
+    let def = table.def();
+    if !def.indexes.is_empty() {
+        return true;
+    }
+    if def.ttl_column.is_some() {
+        return true;
+    }
+    if !def.foreign_keys.is_empty() {
+        return true;
+    }
+    def.columns.iter().any(|c| {
+        !c.nullable || c.is_primary_key || c.auto_increment
+    })
+}
+
+/// P0-2：冲刷全部攒批缓冲（每表一个事务批量落盘）
+///
+/// 触发点：非裸 INSERT 语句执行前（读己之写）、显式事务开始前、
+/// `close` / `sync_wal` / `checkpoint` 前。
+pub fn flush_all_batched(db: &mut Database) -> Result<()> {
+    if db.insert_batcher().is_empty() {
+        return Ok(());
+    }
+    let pending = db.insert_batcher().drain_all();
+    for (table_name, rows) in pending {
+        if !rows.is_empty() {
+            execute_with_txn(db, &table_name, rows)?;
+        }
+    }
+    Ok(())
 }
 
 /// 事务路径执行：保证 ACID

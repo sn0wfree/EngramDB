@@ -61,13 +61,14 @@ impl TransactionManager {
     /// 创建事务管理器（带配置）
     pub fn new(db_path: &str, config: &Config) -> Result<Self> {
         let wal_path = format!("{}-wal", db_path);
-        let wal = WalWriter::with_config(
+        let mut wal = WalWriter::with_config(
             &wal_path,
             config.wal_flush_mode,
             config.wal_buffer_size,
             config.wal_group_commit_size,
             config.wal_group_commit_max_bytes,
         )?;
+        wal.set_max_sync_interval_ms(config.wal_group_commit_timeout_ms);
 
         Ok(Self {
             active_table: ActiveTxnTable::new(),
@@ -614,6 +615,14 @@ impl TransactionManager {
     /// 多条事务共享一次 fsync，写入吞吐可提升数倍至数十倍。
     pub fn set_wal_group_commit_size(&mut self, size: usize) {
         self.wal.set_group_commit_size(size);
+    }
+
+    /// P0-3 时间窗组提交：距上次 fsync 超时则下次 commit 强制 sync（0 = 禁用）
+    ///
+    /// 低流量场景下 count/bytes 阈值迟迟不触发，数据停留在 page cache 的
+    /// 时间被限定在约该毫秒数内（延迟有界）。
+    pub fn set_wal_group_commit_timeout_ms(&mut self, ms: u64) {
+        self.wal.set_max_sync_interval_ms(ms);
     }
 
     /// 获取当前待 fsync 的 commit 数量

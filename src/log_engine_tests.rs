@@ -131,3 +131,135 @@ fn test_log_engine_txn_append() {
     let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(2));
 }
+
+// ---------------------------------------------------------------------------
+// P0-2 INSERT 攒批合并（Batcher）测试
+// ---------------------------------------------------------------------------
+
+fn small_batcher_config() -> super::Config {
+    let mut cfg = super::Config::default();
+    cfg.wal_batch_insert = true;
+    cfg.insert_batch_rows = 16; // 小阈值便于触发
+    cfg.insert_batch_bytes = 0; // 不按字节
+    cfg.insert_batch_timeout_ms = 0; // 不按时间
+    cfg
+}
+
+#[test]
+fn test_batcher_flush_on_read() {
+    // 逐行 INSERT 攒批：未达阈值时行已"接受"，SELECT 前强制落盘（读己之写）
+    let mut conn = super::Connection::open_with_config(":memory:", small_batcher_config()).unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    for i in 0..5 {
+        let r = conn.execute(&format!("INSERT INTO t VALUES ({}, 'e{}')", i, i)).unwrap();
+        assert_eq!(r.rows_affected, 1, "攒批时 INSERT 仍返回行数");
+    }
+    // 未达阈值（5 < 16）：缓冲中，但 SELECT 触发 flush
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(5), "SELECT 前应自动冲刷攒批");
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_batcher_threshold_flush() {
+    let mut conn = super::Connection::open_with_config(":memory:", small_batcher_config()).unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    // 16 行触发一次 flush：20 行应产生 2 个事务（16 + 4）
+    for i in 0..20 {
+        conn.execute(&format!("INSERT INTO t VALUES ({}, 'e{}')", i, i)).unwrap();
+    }
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(20));
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_batcher_skips_constraint_tables() {
+    // 有约束表绕过 batcher：NOT NULL 错误必须在该语句返回时暴露
+    let mut conn = super::Connection::open_with_config(":memory:", small_batcher_config()).unwrap();
+    conn.execute("CREATE TABLE t (id INT NOT NULL, v TEXT)").unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (NULL, 'x')").unwrap_err();
+    assert!(err.to_string().contains("NOT NULL"), "got: {err}");
+    // UNIQUE 表同样即时报错
+    conn.execute("CREATE TABLE u (id INT UNIQUE)").unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    let err = conn.execute("INSERT INTO u VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "got: {err}");
+}
+
+#[test]
+fn test_batcher_skips_explicit_txn() {
+    // 显式事务内 INSERT 绕过 batcher：保持原语义
+    // （SQL 级 BEGIN 内 INSERT 为语句级提交：ROLLBACK 不撤回已落盘行；
+    //   batcher 不得引入额外缓冲窗口，行为与关闭 batcher 时一致）
+    let mut conn = super::Connection::open_with_config(":memory:", small_batcher_config()).unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..3 {
+        conn.execute(&format!("INSERT INTO t VALUES ({}, 'e{}')", i, i)).unwrap();
+    }
+    conn.execute("ROLLBACK").unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(3), "事务内行语句级落盘（与关闭 batcher 一致）");
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_batcher_close_flushes() {
+    let db_path = format!("/tmp/engramdb_batcher_close_{}.hdb", std::process::id());
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-wal", db_path));
+    {
+        let mut conn = super::Connection::open_with_config(&db_path, small_batcher_config()).unwrap();
+        conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+        for i in 0..5 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, 'e{}')", i, i)).unwrap();
+        }
+        // 不 flush 直接 close：close 兜底冲刷
+    }
+    let mut conn = super::Connection::open(&db_path).unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(5), "close 应冲刷攒批");
+    conn.close().unwrap();
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-wal", db_path));
+}
+
+// ---------------------------------------------------------------------------
+// P1-5 LogEngine 块行数可配置测试
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_log_block_rows_configurable() {
+    // 小块的持久化往返：切分、MinMax、typed 读取全路径
+    let db_path = format!("/tmp/engramdb_blockrows_{}.hdb", std::process::id());
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-wal", db_path));
+    {
+        let mut cfg = super::Config::default();
+        cfg.log_block_rows = 4; // 4 行/块
+        let mut conn = super::Connection::open_with_config(&db_path, cfg).unwrap();
+        conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+        for i in 0..20 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, 'e{}')", i, i)).unwrap();
+        }
+        conn.sync_wal().unwrap();
+        conn.close().unwrap();
+    }
+    {
+        let mut conn = super::Connection::open(&db_path).unwrap();
+        // 20 行 → 5 个块（4 行/块）；范围查询跨块 MinMax 跳读仍正确
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(20));
+        let r = conn.execute("SELECT COUNT(*) FROM t WHERE ts >= 18").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(2));
+        // 点查（typed 读取路径）
+        let table = conn.database_mut().get_engine_table_mut("t").unwrap();
+        assert_eq!(table.def().row_count, 20);
+        conn.close().unwrap();
+    }
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-wal", db_path));
+
+}

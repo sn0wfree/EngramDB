@@ -170,6 +170,25 @@ pub struct Config {
     /// 与 wal_group_commit_size 配合，任一条件满足即触发 fsync。
     /// 默认 64KB，平衡延迟与吞吐。
     pub wal_group_commit_max_bytes: usize,
+    /// WAL 组提交：距上次 fsync 超过该毫秒数后，下次 commit 强制 fsync（0 = 禁用）
+    ///
+    /// P0-3 时间窗兜底：低流量场景下 count/bytes 阈值迟迟不触发时，
+    /// 数据停留在 page cache 的时间被限定在约该毫秒数内（延迟有界）。
+    /// 默认 10ms：高吞吐时提交间隔远小于 10ms，不干扰 count/bytes 触发。
+    pub wal_group_commit_timeout_ms: u64,
+    /// P0-2 INSERT 攒批合并总开关（autocommit 逐行 INSERT 合批落盘）
+    pub wal_batch_insert: bool,
+    /// P0-2 Batcher：单表缓冲行数阈值（达到即 flush 该表）
+    pub insert_batch_rows: usize,
+    /// P0-2 Batcher：单表缓冲字节估算阈值（达到即 flush 该表）
+    pub insert_batch_bytes: usize,
+    /// P0-2 Batcher：时间窗（首行入批起算，达到即 flush 该表；0 = 禁用时间触发）
+    pub insert_batch_timeout_ms: u64,
+    /// P1-5 LogEngine 块行数（0 = 默认 8192；MinMax 跳读粒度 / 序列化块头摊销）
+    ///
+    /// 大块（32K/64K）减少冻结/序列化次数与块头开销，但时间范围跳读粒度变粗。
+    /// 注意：仅影响新建块；已落盘块按原格式读取，块大小不写入文件。
+    pub log_block_rows: usize,
     /// 默认压缩算法
     pub default_compression: CompressionType,
     /// 列存持久化时是否启用压缩（v0.12.x 压缩接线）
@@ -236,6 +255,12 @@ impl Default for Config {
             wal_compression: WalCompression::None,
             wal_group_commit_size: 16, // Perf04：默认组提交，吞吐提升 5~10×（可通过 0 关闭）
             wal_group_commit_max_bytes: 65536, // 64KB，按大小兜底
+            wal_group_commit_timeout_ms: 10, // P0-3：距上次 fsync 超 10ms 则下次 commit 强制 sync（低流量延迟有界）
+            wal_batch_insert: true, // P0-2：autocommit INSERT 攒批合并（可通过 0 关闭）
+            insert_batch_rows: 1024, // P0-2：满 1024 行 flush
+            insert_batch_bytes: 65536, // P0-2：满 64KB 估算字节 flush
+            insert_batch_timeout_ms: 10, // P0-2：首行入批 10ms 后 flush（低流量延迟有界）
+            log_block_rows: 0, // P1-5：0 = 默认 8192 行/块
             default_compression: CompressionType::Uncompressed,
             compress_on_persist: true,
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),

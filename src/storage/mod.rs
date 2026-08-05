@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod engine;
 pub mod bloom;
 pub mod capabilities;
+pub mod insert_batcher;
 mod log_engine;
 mod memory_engine;
 
@@ -46,6 +47,8 @@ pub struct Database {
     statistics_cache: std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
     /// KV 缓存引擎（v0.15.0 新增）
     pub kv_cache: crate::storage::cache::KVCache,
+    /// P0-2 INSERT 攒批合并器（autocommit 逐行 INSERT 合批落盘）
+    batcher: crate::storage::insert_batcher::InsertBatcher,
     /// 当前活跃事务 ID（v0.15.0 Txn05 新增）
     ///
     /// 由 BEGIN TRANSACTION 设置，COMMIT/ROLLBACK 后清除。
@@ -108,6 +111,8 @@ impl Database {
         // 初始化事务管理器
         let path_str = path.to_string_lossy().to_string();
         let txn_manager = TransactionManager::new(&path_str, &config)?;
+        let (ib_rows, ib_bytes, ib_timeout) =
+            (config.insert_batch_rows, config.insert_batch_bytes, config.insert_batch_timeout_ms);
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -121,6 +126,7 @@ impl Database {
             plan_cache: std::collections::HashMap::new(),
             statistics_cache: std::collections::HashMap::new(),
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024), // 默认 64MB
+            batcher: crate::storage::insert_batcher::InsertBatcher::new(ib_rows, ib_bytes, ib_timeout),
             current_txn_id: None,
         })
     }
@@ -142,6 +148,8 @@ impl Database {
         // 初始化事务管理器（会自动打开 WAL 并执行恢复）
         let path_str = path.to_string_lossy().to_string();
         let txn_manager = TransactionManager::new(&path_str, &config)?;
+        let (ib_rows, ib_bytes, ib_timeout) =
+            (config.insert_batch_rows, config.insert_batch_bytes, config.insert_batch_timeout_ms);
 
         let mut db = Self {
             path: path.to_path_buf(),
@@ -155,6 +163,7 @@ impl Database {
             plan_cache: std::collections::HashMap::new(),
             statistics_cache: std::collections::HashMap::new(),
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024),
+            batcher: crate::storage::insert_batcher::InsertBatcher::new(ib_rows, ib_bytes, ib_timeout),
             current_txn_id: None,
         };
 
@@ -190,7 +199,9 @@ impl Database {
                 EngineTable::Memory(memory_engine::MemoryTable::new(table_def.clone()))
             }
             crate::common::types::EngineType::Log => {
-                EngineTable::Log(log_engine::LogTable::new(table_def.clone()))
+                EngineTable::Log(log_engine::LogTable::with_block_rows(
+                    table_def.clone(), self.config.log_block_rows,
+                ))
             }
         };
         // M2：Memory 表标记为非持久化（事务跳过 WAL）
@@ -297,9 +308,27 @@ impl Database {
         &mut self.txn_manager
     }
 
+    /// P0-2 INSERT 攒批合并器（可变访问，executor 攒批/触发 flush）
+    pub fn insert_batcher(&mut self) -> &mut crate::storage::insert_batcher::InsertBatcher {
+        &mut self.batcher
+    }
+
+    /// P0-2 Batcher 是否启用（autocommit 攒批合并）
+    pub fn batch_insert_enabled(&self) -> bool {
+        self.config.wal_batch_insert
+    }
+
     /// 获取当前活跃事务 ID（v0.15.0 Txn05 新增）
     pub fn current_txn_id(&self) -> Option<u32> {
         self.current_txn_id
+    }
+
+    /// 是否处于显式事务内（SQL BEGIN/COMMIT 或 Transaction API）
+    ///
+    /// P0-2：batcher 必须跳过显式事务内的 INSERT（缓冲行脱离事务
+    /// MVCC 写集，ROLLBACK 将失效）。
+    pub fn in_explicit_txn(&self) -> bool {
+        self.current_txn_id.is_some() || self.txn_manager.active_count() > 0
     }
 
     /// 设置当前活跃事务 ID（v0.15.0 Txn05 新增）
@@ -342,6 +371,11 @@ impl Database {
     /// 崩溃时最多丢 group_commit_size 条未 fsync 的事务。
     pub fn set_wal_group_commit_size(&mut self, size: usize) {
         self.txn_manager.set_wal_group_commit_size(size);
+    }
+
+    /// P0-3 时间窗组提交：距上次 fsync 超时则下次 commit 强制 sync（0 = 禁用）
+    pub fn set_wal_group_commit_timeout_ms(&mut self, ms: u64) {
+        self.txn_manager.set_wal_group_commit_timeout_ms(ms);
     }
 
     /// 设置指定表的聚簇列（方案B：Delta 聚簇）
@@ -768,7 +802,9 @@ impl Database {
                     EngineTable::Memory(memory_engine::MemoryTable::new(mem_def))
                 }
                 crate::common::types::EngineType::Log => {
-                    EngineTable::Log(log_engine::LogTable::new(table_def.clone()))
+                    EngineTable::Log(log_engine::LogTable::with_block_rows(
+                        table_def.clone(), self.config.log_block_rows,
+                    ))
                 }
             };
             // M2：Memory 表标记为非持久化（事务跳过 WAL）
@@ -913,6 +949,9 @@ impl Database {
     /// **已知限制**：每次 checkpoint 追加写入文件末尾，旧段成为孤儿数据。
     /// 文件会持续增长，生产环境应定期 VACUUM 重建文件（待实现）。
     pub fn checkpoint(&mut self) -> Result<()> {
+        // 0. P0-2：冲刷攒批缓冲（存储层直接调用方，如测试，必须兜底）
+        crate::executor::operators::insert::flush_all_batched(self)?;
+
         // 1. 先把 Delta 合并到列存（确保数据完整）
         let _ = self.compact_all()?;
 

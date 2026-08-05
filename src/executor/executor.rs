@@ -290,7 +290,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                     row
                 })
                 .collect();
-            let count = crate::executor::operators::insert::execute(db, &name, rows)?;
+            let count = crate::executor::operators::insert::execute(db, &name, rows, false)?;
 
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
@@ -390,7 +390,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 0
             };
             let num_rows = rows.len();
-            let count = operators::insert::execute(db, &table_name, rows)?;
+            // RETURNING 需立即读回插入行：绕过攒批直接落盘
+            let count = operators::insert::execute(db, &table_name, rows, returning.is_some())?;
 
             // INSERT...RETURNING: 从表中读取实际插入的行（含 AUTO_INCREMENT 值）
             if let Some(returning_items) = returning {
@@ -485,7 +486,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows.push(full_row);
             }
 
-            let count = operators::insert::execute(db, &table_name, rows)?;
+            let count = operators::insert::execute(db, &table_name, rows, false)?;
 
             Ok(QueryResult {
                 columns: vec!["rows_inserted".to_string()],

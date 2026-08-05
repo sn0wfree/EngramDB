@@ -54,6 +54,8 @@ fn test_m4_redo_recovery_log_engine() {
         for i in 0..100 {
             conn.execute(&format!("INSERT INTO events VALUES ({}, 'e{}')", i, i)).unwrap();
         }
+        // P0-2 攒批：崩溃前强制刷盘（关键节点主动持久化语义）
+        conn.sync_wal().unwrap();
         simulate_crash(conn);
     }
     let mut conn = Connection::open(&path).unwrap();
@@ -76,6 +78,8 @@ fn test_m4_redo_skips_memory_engine() {
         conn.execute("CREATE TABLE mem (id INT, v TEXT) ENGINE = Memory").unwrap();
         conn.execute("INSERT INTO col VALUES (1, 'persist')").unwrap();
         conn.execute("INSERT INTO mem VALUES (1, 'transient')").unwrap();
+        // P0-2 攒批：崩溃前强制刷盘（Columnar 行需入 WAL 才能重放）
+        conn.sync_wal().unwrap();
         simulate_crash(conn);
     }
     let mut conn = Connection::open(&path).unwrap();
