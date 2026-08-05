@@ -43,6 +43,25 @@ pub enum PhysicalPlan {
         /// 输出列的索引（对应表定义中的列索引）
         output_column_indices: Vec<usize>,
     },
+    /// 索引范围扫描（①：IndexRangeScan）
+    ///
+    /// 当 WHERE 为索引键列的范围条件（col >/>=/</<= literal，可 AND 合并双边）时，
+    /// 用跳表的有序性 O(log n + k) 取 row_id 集合，再回表读取所需列。
+    /// 相比全表扫描 + Filter：只扫命中的有序段，避免全量扫描。
+    IndexRangeScan {
+        table_name: String,
+        index_name: String,
+        /// 下界（None 表示无下界）
+        low: Option<Value>,
+        /// 下界是否包含（> 为 false，>= 为 true）
+        low_inclusive: bool,
+        /// 上界（None 表示无上界）
+        high: Option<Value>,
+        /// 上界是否包含（< 为 false，<= 为 true）
+        high_inclusive: bool,
+        /// 输出列的索引（对应表定义中的列索引）
+        output_column_indices: Vec<usize>,
+    },
     /// 过滤
     Filter {
         input: Box<PhysicalPlan>,

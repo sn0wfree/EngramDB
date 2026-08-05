@@ -342,6 +342,46 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        PhysicalPlan::IndexRangeScan {
+            table_name, index_name,
+            low, low_inclusive, high, high_inclusive,
+            output_column_indices,
+        } => {
+            // ①：索引范围扫描 —— 跳表有序段取 row_id，回表读列
+            let (row_ids, columns): (Vec<u32>, Vec<String>) = {
+                let table = db.get_table(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                let cols: Vec<String> = output_column_indices.iter()
+                    .map(|&i| table.def.columns[i].name.clone())
+                    .collect();
+                let index = table.get_index(&index_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::Parse(
+                        format!("Index '{}' not found during execution", index_name)
+                    ))?;
+                let entries = index.range_bounded(
+                    low.as_ref(), low_inclusive,
+                    high.as_ref(), high_inclusive,
+                );
+                (entries.into_iter().map(|e| e.row_id).collect(), cols)
+            };
+
+            let mut rows: Vec<Vec<crate::Value>> = Vec::with_capacity(row_ids.len());
+            {
+                let table = db.get_table_mut(&table_name)
+                    .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
+                for row_id in row_ids {
+                    // 回表读取（列裁剪）
+                    rows.extend(table.get_row_by_id_columns(row_id, &output_column_indices)?);
+                }
+            }
+
+            Ok(QueryResult {
+                columns,
+                rows,
+                rows_affected: 0,
+            })
+        }
+
         PhysicalPlan::Filter { input, condition } => {
             // P2.4/P3.2：若输入是 TableScan 且条件为简单比较谓词（col OP literal），
             // 用 MinMax 跳过索引扫描 + 逐行求值，跳过 DataChunk 中间层
@@ -414,6 +454,34 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         PhysicalPlan::Projection { input, expressions, column_names } => {
             let input_result = execute(*input, db)?;
+
+            // ④：纯列引用投影 → rows 直排（跳过 DataChunk 往返 + 向量化求值）
+            // 覆盖 SELECT a, b / SELECT b, a（列子集 + 重排，非恒等投影）等常见场景
+            if !input_result.rows.is_empty()
+                && expressions.iter().all(|e| matches!(e, crate::sql::ast::Expression::ColumnRef { .. }))
+            {
+                let col_indices: Vec<Option<usize>> = expressions.iter().map(|e| match e {
+                    crate::sql::ast::Expression::ColumnRef { column, .. } => {
+                        input_result.columns.iter().position(|c| c == column)
+                    }
+                    _ => None,
+                }).collect();
+
+                if col_indices.iter().all(|i| i.is_some()) {
+                    let rows: Vec<Vec<crate::Value>> = input_result.rows.iter().map(|row| {
+                        col_indices.iter()
+                            .map(|&i| row[i.expect("checked above")].clone())
+                            .collect()
+                    }).collect();
+
+                    return Ok(QueryResult {
+                        columns: column_names,
+                        rows,
+                        rows_affected: 0,
+                    });
+                }
+            }
+
             let input_chunks = rows_to_chunks(&input_result.rows);
             let input_columns = input_result.columns.clone();
 
@@ -895,6 +963,7 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::TableScan { .. } => "TableScan",
         PhysicalPlan::IndexOnlyScan { .. } => "IndexOnlyScan",
         PhysicalPlan::IndexScan { .. } => "IndexScan",
+        PhysicalPlan::IndexRangeScan { .. } => "IndexRangeScan",
         PhysicalPlan::Filter { .. } => "Filter",
         PhysicalPlan::Projection { .. } => "Projection",
         PhysicalPlan::Aggregate { .. } => "Aggregate",

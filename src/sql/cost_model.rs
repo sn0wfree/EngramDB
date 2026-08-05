@@ -94,6 +94,10 @@ impl<'a> CostModel<'a> {
             PhysicalPlan::IndexScan { .. } => {
                 (PlanProperties { row_count: 10.0, num_columns: 1, row_size: 50 }, Cost { startup: 0.002, total: 0.02 })
             }
+            // 索引范围扫描（①）：O(log n + k) 有序段扫描 + 回表 k 行，代价与 IndexScan 同级
+            PhysicalPlan::IndexRangeScan { .. } => {
+                (PlanProperties { row_count: 100.0, num_columns: 1, row_size: 50 }, Cost { startup: 0.002, total: 0.03 })
+            }
             PhysicalPlan::Filter { input, condition } => {
                 self.cost_filter(input, condition)
             }

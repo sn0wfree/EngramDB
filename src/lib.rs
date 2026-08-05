@@ -952,6 +952,99 @@ mod value_tests {
         assert_eq!(result.rows.len(), 3);
     }
 
+    #[test]
+    fn test_index_range_scan() {
+        // ①：索引范围扫描 —— WHERE 范围条件（BETWEEN / 单边 / 双边开闭区间）走 IndexRangeScan
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE scores (id INT, score INT, name VARCHAR)").unwrap();
+        for i in 0..20 {
+            conn.execute(&format!(
+                "INSERT INTO scores VALUES ({}, {}, 'user{}')",
+                i, i * 5, i
+            )).unwrap();
+        }
+        conn.execute("CREATE INDEX idx_score ON scores (score)").unwrap();
+
+        // 双边闭区间（BETWEEN 被改写为 score >= a AND score <= b → 合并为闭区间）
+        let result = conn.execute(
+            "SELECT id, name FROM scores WHERE score BETWEEN 30 AND 60"
+        ).unwrap();
+        // score ∈ {30,35,40,45,50,55,60} → id = 6..12
+        assert_eq!(result.rows.len(), 7);
+        assert_eq!(result.rows[0][0], Value::Int64(6));
+        assert_eq!(result.rows[6][0], Value::Int64(12));
+
+        // 单边下界（开区间）
+        let result = conn.execute(
+            "SELECT id FROM scores WHERE score > 90"
+        ).unwrap();
+        // score ∈ {95} → id = 19
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(19));
+
+        // 单边上界（闭区间）
+        let result = conn.execute(
+            "SELECT id FROM scores WHERE score <= 10"
+        ).unwrap();
+        // score ∈ {0,5,10} → id = 0..2
+        assert_eq!(result.rows.len(), 3);
+
+        // 双边开闭混合：score >= 15 AND score < 25 → {15,20} → id 3,4
+        let result = conn.execute(
+            "SELECT id FROM scores WHERE score >= 15 AND score < 25"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], Value::Int64(3));
+        assert_eq!(result.rows[1][0], Value::Int64(4));
+
+        // 空范围（下界 > 上界）：退回 Filter 全表扫 → 空结果
+        let result = conn.execute(
+            "SELECT id FROM scores WHERE score > 60 AND score < 30"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 0);
+
+        // 范围 + 其他条件（无法完全用范围表示 → 全表 Filter，结果仍正确）
+        let result = conn.execute(
+            "SELECT id FROM scores WHERE score > 30 AND name = 'user10'"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(10));
+    }
+
+    #[test]
+    fn test_projection_column_reorder_fast_path() {
+        // ④：纯列引用投影（列子集/重排）走 rows 直排，结果与 schema 一致
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INT, b INT, c INT)").unwrap();
+        for i in 0..5 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i * 10, i * 100)).unwrap();
+        }
+
+        // 列子集：SELECT b, a（重排）
+        let result = conn.execute("SELECT b, a FROM t").unwrap();
+        assert_eq!(result.columns, vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(result.rows.len(), 5);
+        assert_eq!(result.rows[0], vec![Value::Int64(0), Value::Int64(0)]);
+        assert_eq!(result.rows[1], vec![Value::Int64(10), Value::Int64(1)]);
+        assert_eq!(result.rows[4], vec![Value::Int64(40), Value::Int64(4)]);
+
+        // 单列
+        let result = conn.execute("SELECT c FROM t").unwrap();
+        assert_eq!(result.columns, vec!["c".to_string()]);
+        assert_eq!(result.rows[0], vec![Value::Int64(0)]);
+        assert_eq!(result.rows[2], vec![Value::Int64(200)]);
+
+        // 混合表达式仍走常规路径，结果正确
+        let result = conn.execute("SELECT a, a * 2 AS double_a FROM t").unwrap();
+        assert_eq!(result.columns, vec!["a".to_string(), "double_a".to_string()]);
+        assert_eq!(result.rows[1], vec![Value::Int64(1), Value::Int64(2)]);
+
+        // Filter 之上的投影（Filter 快路径输出 rows 后再投影）
+        let result = conn.execute("SELECT b, c FROM t WHERE a > 2").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0], vec![Value::Int64(30), Value::Int64(300)]);
+    }
+
     // --- INCLUDE 子句 SQL 语法测试（v0.12.0 新增）---
 
     #[test]

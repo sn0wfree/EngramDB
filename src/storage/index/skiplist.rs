@@ -214,6 +214,71 @@ impl SkipListIndex {
         self.range_entries(low, high).into_iter().map(|e| e.row_id).collect()
     }
 
+    /// 有界范围查询（①：索引范围扫描）
+    ///
+    /// 支持单边/双边范围 + 开/闭区间：
+    /// - `low=None` 表示无下界（从头扫），`high=None` 表示无上界（扫到末尾）
+    /// - `low_inclusive=true` 表示 `col >= low`，`false` 表示 `col > low`
+    /// - `high_inclusive=true` 表示 `col <= high`，`false` 表示 `col < high`
+    ///
+    /// 返回条目列表（含覆盖列值），O(log n + k)。
+    pub fn range_bounded(
+        &self,
+        low: Option<&Value>,
+        low_inclusive: bool,
+        high: Option<&Value>,
+        high_inclusive: bool,
+    ) -> Vec<IndexEntry> {
+        let mut result = Vec::new();
+
+        // 定位起点：第一个满足下界的节点
+        let mut x = 0;
+        if let Some(low_val) = low {
+            for i in (0..=self.level as usize).rev() {
+                loop {
+                    match self.nodes[x].forward[i] {
+                        Some(next) => {
+                            let k = &self.nodes[next].key;
+                            // 开区间（> low）：跳过 k <= low；闭区间（>= low）：跳过 k < low
+                            let advance = if low_inclusive {
+                                self.key_less(k, low_val)
+                            } else {
+                                self.key_less(k, low_val) || k == low_val
+                            };
+                            if advance {
+                                x = next;
+                            } else {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // 顺序遍历直到越过上界
+        let mut current = self.nodes[x].forward[0];
+        while let Some(idx) = current {
+            let node = &self.nodes[idx];
+            if let Some(high_val) = high {
+                // 闭区间（<= high）：key > high 停止；开区间（< high）：key >= high 停止
+                let stop = if high_inclusive {
+                    self.key_greater(&node.key, high_val)
+                } else {
+                    !self.key_less(&node.key, high_val)
+                };
+                if stop {
+                    break;
+                }
+            }
+            result.extend(node.entries.iter().cloned());
+            current = node.forward[0];
+        }
+
+        result
+    }
+
     /// 范围查询：返回条目列表（含覆盖列值）
     pub fn range_entries(&self, low: &Value, high: &Value) -> Vec<IndexEntry> {
         let mut result = Vec::new();
@@ -1017,6 +1082,66 @@ mod tests {
         assert_eq!(entries[0].included[0], Value::Int64(100));
         assert_eq!(entries[2].row_id, 3);
         assert_eq!(entries[2].included[0], Value::Int64(300));
+    }
+
+    // --- 有界范围查询（①：索引范围扫描）测试 ---
+
+    fn make_bounded_index() -> SkipListIndex {
+        let mut sl = SkipListIndex::new(false);
+        // key: 0, 10, 20, ..., 90（row_id == key/10）
+        for i in 0..10u32 {
+            sl.insert(Value::Int64(i as i64 * 10), i);
+        }
+        sl
+    }
+
+    #[test]
+    fn test_range_bounded_closed_both() {
+        let sl = make_bounded_index();
+        let r = sl.range_bounded(Some(&Value::Int64(20)), true, Some(&Value::Int64(60)), true);
+        let ids: Vec<u32> = r.into_iter().map(|e| e.row_id).collect();
+        assert_eq!(ids, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_range_bounded_open_low() {
+        let sl = make_bounded_index();
+        // > 20：不含 20
+        let r = sl.range_bounded(Some(&Value::Int64(20)), false, None, true);
+        let ids: Vec<u32> = r.into_iter().map(|e| e.row_id).collect();
+        assert_eq!(ids, vec![3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_range_bounded_open_high() {
+        let sl = make_bounded_index();
+        // < 40：不含 40
+        let r = sl.range_bounded(None, true, Some(&Value::Int64(40)), false);
+        let ids: Vec<u32> = r.into_iter().map(|e| e.row_id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_range_bounded_no_bounds() {
+        let sl = make_bounded_index();
+        let r = sl.range_bounded(None, true, None, true);
+        assert_eq!(r.len(), 10);
+    }
+
+    #[test]
+    fn test_range_bounded_open_low_at_gap() {
+        let sl = make_bounded_index();
+        // > 25：无 25，应从 30 开始
+        let r = sl.range_bounded(Some(&Value::Int64(25)), false, Some(&Value::Int64(55)), false);
+        let ids: Vec<u32> = r.into_iter().map(|e| e.row_id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_range_bounded_empty() {
+        let sl = make_bounded_index();
+        let r = sl.range_bounded(Some(&Value::Int64(50)), true, Some(&Value::Int64(40)), true);
+        assert!(r.is_empty());
     }
 
     #[test]

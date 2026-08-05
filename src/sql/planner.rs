@@ -713,6 +713,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     } else if can_use_index_only {
         try_index_only_scan(&stmt, db, &table_name, &scan_column_indices)
             .or_else(|| try_index_scan(&stmt, db, &table_name, &scan_column_indices))
+            .or_else(|| try_index_range_scan(&stmt, db, &table_name, &scan_column_indices))
             .unwrap_or_else(|| PhysicalPlan::TableScan {
                 table_name: table_name.clone(),
                 column_indices: scan_column_indices.clone(),
@@ -1119,6 +1120,191 @@ fn extract_equality_condition(expr: &Expression) -> Option<(String, Value)> {
     } else {
         None
     }
+}
+
+/// 范围谓词（①：索引范围扫描）
+///
+/// 由 WHERE 中的 `col OP literal` 比较条件提取，可合并为单边/双边区间。
+#[derive(Debug, Clone)]
+struct RangePredicate {
+    /// 索引键列名
+    col_name: String,
+    /// 下界：(值, 是否包含)，None 表示无下界
+    low: Option<(Value, bool)>,
+    /// 上界：(值, 是否包含)，None 表示无上界
+    high: Option<(Value, bool)>,
+}
+
+/// 提取单边范围条件：`col OP literal`（OP ∈ Gt/GtEq/Lt/LtEq）
+fn extract_single_bound(expr: &Expression) -> Option<RangePredicate> {
+    let (col_name, op, lit) = match expr {
+        Expression::BinaryOp { left, op, right } => {
+            match (left.as_ref(), right.as_ref()) {
+                (Expression::ColumnRef { column, .. }, Expression::Literal(v)) => {
+                    (column.clone(), *op, v.clone())
+                }
+                (Expression::Literal(v), Expression::ColumnRef { column, .. }) => {
+                    (column.clone(), *op, v.clone())
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    match op {
+        BinaryOperator::Gt => Some(RangePredicate {
+            col_name,
+            low: Some((lit, false)),
+            high: None,
+        }),
+        BinaryOperator::GtEq => Some(RangePredicate {
+            col_name,
+            low: Some((lit, true)),
+            high: None,
+        }),
+        BinaryOperator::Lt => Some(RangePredicate {
+            col_name,
+            high: Some((lit, false)),
+            low: None,
+        }),
+        BinaryOperator::LtEq => Some(RangePredicate {
+            col_name,
+            high: Some((lit, true)),
+            low: None,
+        }),
+        _ => None,
+    }
+}
+
+/// 提取完整范围条件（①：索引范围扫描）
+///
+/// 支持：
+/// - 单边：`col > x` / `col >= x` / `col < y` / `col <= y`
+/// - 双边：`col > x AND col < y`（同一列的比较条件用 AND 合并）
+///
+/// 只有 WHERE 整体可被同一列的边界条件完全表示时才返回 Some
+/// （否则范围扫描不能覆盖全部谓词，退回全表扫描 + Filter）。
+fn extract_range_condition(expr: &Expression) -> Option<RangePredicate> {
+    // 双边合并：AND 左右两侧各提取边界
+    if let Expression::BinaryOp { left, op: BinaryOperator::And, right } = expr {
+        let left_pred = extract_single_bound(left)?;
+        let right_pred = extract_single_bound(right)?;
+        if left_pred.col_name != right_pred.col_name {
+            return None;
+        }
+        return merge_range_predicates(left_pred, right_pred);
+    }
+
+    extract_single_bound(expr)
+}
+
+/// 合并两个同列范围谓词（取更严格的边界）
+fn merge_range_predicates(a: RangePredicate, b: RangePredicate) -> Option<RangePredicate> {
+    // 下界：取更大的值；值相等时开区间（>）更严格
+    let low = match (a.low, b.low) {
+        (Some((v1, i1)), Some((v2, i2))) => {
+            match value_cmp_planner(&v1, &v2) {
+                std::cmp::Ordering::Greater => Some((v1, i1)),
+                std::cmp::Ordering::Less => Some((v2, i2)),
+                // 值相等：开区间更严格
+                std::cmp::Ordering::Equal => Some((v1, i1 && i2)),
+            }
+        }
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+
+    // 上界：取更小的值；值相等时开区间（<）更严格
+    let high = match (a.high, b.high) {
+        (Some((v1, i1)), Some((v2, i2))) => {
+            match value_cmp_planner(&v1, &v2) {
+                std::cmp::Ordering::Less => Some((v1, i1)),
+                std::cmp::Ordering::Greater => Some((v2, i2)),
+                std::cmp::Ordering::Equal => Some((v1, i1 && i2)),
+            }
+        }
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+
+    // 边界冲突（下界 > 上界）：空结果集，无法用范围扫描表示，退回全表扫描
+    if let (Some((lv, _)), Some((hv, _))) = (&low, &high) {
+        if value_cmp_planner(lv, hv) == std::cmp::Ordering::Greater {
+            return None;
+        }
+    }
+
+    Some(RangePredicate {
+        col_name: a.col_name,
+        low,
+        high,
+    })
+}
+
+/// 规划器内的 Value 比较（用于边界合并，与跳表 key_less 语义一致）
+fn value_cmp_planner(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Less,
+        (_, Value::Null) => std::cmp::Ordering::Greater,
+        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
+        (Value::Int32(x), Value::Int32(y)) => x.cmp(y),
+        (Value::Float64(x), Value::Float64(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
+        (Value::Boolean(x), Value::Boolean(y)) => (!x).cmp(&!y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// 尝试生成索引范围扫描计划（①：IndexRangeScan）
+///
+/// 条件：
+/// 1. WHERE 可被单列范围条件完全表示（col >/>=/</<= literal，AND 合并）
+/// 2. 该列是某个普通索引（SkipList）的首键列
+/// 3. 无 GROUP BY / HAVING / ORDER BY / 聚合（由调用方保证）
+fn try_index_range_scan(
+    stmt: &SelectStmt,
+    db: &Database,
+    table_name: &str,
+    scan_column_indices: &[usize],
+) -> Option<PhysicalPlan> {
+    // 必须有 WHERE 条件
+    let where_expr = stmt.where_clause.as_ref()?;
+
+    // 提取范围条件
+    let range = extract_range_condition(where_expr)?;
+    if range.low.is_none() && range.high.is_none() {
+        return None;
+    }
+
+    // 查找表和匹配的索引
+    let table = db.get_table(table_name)?;
+    let col_idx = table.def.column_index(&range.col_name)?;
+
+    for idx_def in &table.def.indexes {
+        // 只考虑普通跳表索引（位图/布隆/向量不走回表路径）
+        let is_skiplist = idx_def.index_type.is_empty()
+            || idx_def.index_type.eq_ignore_ascii_case("skiplist")
+            || idx_def.index_type.eq_ignore_ascii_case("btree")
+            || idx_def.index_type.eq_ignore_ascii_case("default");
+        if !is_skiplist {
+            continue;
+        }
+        if idx_def.key_columns.first() == Some(&col_idx) {
+            return Some(PhysicalPlan::IndexRangeScan {
+                table_name: table_name.to_string(),
+                index_name: idx_def.name.clone(),
+                low: range.low.as_ref().map(|(v, _)| v.clone()),
+                low_inclusive: range.low.map(|(_, inc)| inc).unwrap_or(false),
+                high: range.high.as_ref().map(|(v, _)| v.clone()),
+                high_inclusive: range.high.map(|(_, inc)| inc).unwrap_or(false),
+                output_column_indices: scan_column_indices.to_vec(),
+            });
+        }
+    }
+
+    None
 }
 
 /// 检查是否可以利用索引有序性跳过排序（v0.12.0 新增）
