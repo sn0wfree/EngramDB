@@ -3080,9 +3080,22 @@ fn eval_replace(str_vec: &Vector, from_vec: &Vector, to_vec: &Vector) -> Result<
 ///
 /// 用于 Filter 算子：将向量化条件求值结果转换为 SelectionVector。
 pub fn boolean_to_selection(bool_vec: &Vector) -> Vec<usize> {
-        let bool_vec = match bool_vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
-    match &bool_vec {
-        Vector::Typed(_) => unreachable!("typed column normalized to flat"),
+    use crate::common::column_data::ColumnValue;
+    // S2-M2：Typed 布尔列直接扫数组（NULL 位跳过，零 Value 构造）
+    if let Vector::Typed(d) = bool_vec {
+        if let ColumnValue::Boolean(vals) = &d.values {
+            let mut sel = Vec::new();
+            for (i, &b) in vals.iter().enumerate() {
+                let is_null = d.nulls.as_ref().map_or(false, |n| n.test(i));
+                if b && !is_null {
+                    sel.push(i);
+                }
+            }
+            return sel;
+        }
+        return Vec::new();
+    }
+    match bool_vec {
         Vector::Constant(Value::Boolean(true), n) => {
             (0..*n).collect()
         }
@@ -3096,6 +3109,7 @@ pub fn boolean_to_selection(bool_vec: &Vector) -> Vec<usize> {
                 .map(|(i, _)| i)
                 .collect()
         }
+        Vector::Typed(_) => unreachable!("handled above"),
     }
 }
 
