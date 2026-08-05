@@ -145,6 +145,10 @@ impl WalWriter {
     /// - Sync + 组提交: flush 到 page cache，累计达到 group_commit_size 或 group_commit_max_bytes 时才 fsync
     /// - BufferFull / Periodic: 只 flush 到 page cache
     pub fn commit_flush(&mut self) -> Result<()> {
+        // P1.4：缓冲区为空且无未同步数据时，没有任何可持久化的内容，直接跳过
+        if self.buffer.is_empty() && self.bytes_since_sync == 0 {
+            return Ok(());
+        }
         match self.flush_mode {
             WalFlushMode::Sync => {
                 if self.group_commit_size == 0 && self.group_commit_max_bytes == 0 {

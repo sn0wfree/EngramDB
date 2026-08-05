@@ -79,18 +79,19 @@ fn execute_with_txn(
     debug!("Inserting {} rows in transaction {}...", rows.len(), txn_id);
     let table_id = *db.table_names().get(table_name).unwrap();
     let base_row_id = db.get_table(table_name).unwrap().def.row_count as u32;
+    let rows_len = rows.len();
     
-    for (idx, row) in rows.iter().enumerate() {
+    for (idx, row) in rows.into_iter().enumerate() {
         let row_id = base_row_id + idx as u32;
         trace!("Inserting row {} (row_id={}): {:?}", idx, row_id, row);
         
-        db.txn_manager_mut().insert(txn_id, table_id, row_id as u64, row.clone())?;
+        db.txn_manager_mut().insert(txn_id, table_id, row_id as u64, row)?;
         
         if idx % 100 == 0 {
-            debug!("Inserted {}/{} rows in transaction {}", idx + 1, rows.len(), txn_id);
+            debug!("Inserted {}/{} rows in transaction {}", idx + 1, rows_len, txn_id);
         }
     }
-    debug!("✓ All {} rows inserted in transaction {}", rows.len(), txn_id);
+    debug!("✓ All {} rows inserted in transaction {}", rows_len, txn_id);
     
     // 3. 提交事务（会 fsync WAL）
     debug!("Committing transaction {}...", txn_id);
@@ -100,11 +101,12 @@ fn execute_with_txn(
     
     // 4. 应用到存储层
     debug!("Applying {} operations to storage...", result.apply_ops.len());
-    apply_to_storage(db, &result.apply_ops)?;
-    info!("✓ Applied {} operations to storage", result.apply_ops.len());
+    let applied_count = result.apply_ops.len();
+    apply_to_storage(db, result.apply_ops)?;
+    info!("✓ Applied {} operations to storage", applied_count);
     
-    info!("Transaction path completed: {} rows inserted", rows.len());
-    Ok(rows.len() as u64)
+    info!("Transaction path completed: {} rows inserted", rows_len);
+    Ok(rows_len as u64)
 }
 
 /// 非事务路径执行：高性能直接写入
@@ -132,7 +134,7 @@ fn execute_without_txn(
 /// M02 优化：将连续的同表 Insert 段打包走 `table.insert(batch_rows)`，
 /// 减少 N 次单条 insert_row 的方法调用与索引维护开销。
 /// Update/Delete 仍按原顺序逐行应用（保持操作顺序正确性）。
-pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
+pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> {
     trace!("apply_to_storage called with {} operations", ops.len());
 
     let mut idx = 0;
@@ -154,12 +156,12 @@ pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
 
             if run_len > 1 {
                 // M02：批量 Insert，尝试走 table.insert(rows) 接口
-                // 收集 rows 与预期 row_id 序列
+                // 收集 rows 与预期 row_id 序列（move 语义，避免每行克隆）
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(run_len);
                 let mut row_ids: Vec<u32> = Vec::with_capacity(run_len);
-                for op in &ops[idx..run_end] {
+                for op in &mut ops[idx..run_end] {
                     if let ApplyOp::Insert { table_id: _, row_id, row } = op {
-                        rows.push(row.clone());
+                        rows.push(std::mem::take(row));
                         row_ids.push(*row_id as u32);
                     }
                 }
@@ -194,8 +196,8 @@ pub fn apply_to_storage(db: &mut Database, ops: &[ApplyOp]) -> Result<()> {
         }
 
         // 非批量路径：单个操作
-        let op = &ops[idx];
-        trace!("Applying operation {}/{}: {:?}", idx + 1, ops.len(), op);
+        trace!("Applying operation {}/{}", idx + 1, ops.len());
+        let op = &mut ops[idx];
 
         match op {
             ApplyOp::Insert { table_id, row_id, row } => {

@@ -9,7 +9,10 @@
 //! txn.commit().unwrap();
 //! ```
 
+use std::collections::HashMap;
+
 use crate::common::error::{EngramDbError, Result};
+use crate::executor::operators::insert::apply_to_storage;
 use crate::storage::Database;
 use crate::Value;
 
@@ -23,19 +26,21 @@ pub struct Transaction<'a> {
     db: &'a mut Database,
     /// 是否只读事务（v0.15.0 Txn09）
     read_only: bool,
+    /// 每个表的 rowid 分配游标（事务内单调递增，避免 rowid 冲突/覆盖）
+    next_rowids: HashMap<u32, u64>,
 }
 
 impl<'a> Transaction<'a> {
     /// 开始一个新事务（由 Database 调用）
     pub(crate) fn begin(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
         let txn_id = db.txn_manager_mut().begin(isolation_level)?;
-        Ok(Self { id: txn_id, db, read_only: false })
+        Ok(Self { id: txn_id, db, read_only: false, next_rowids: HashMap::new() })
     }
 
     /// 开始一个只读事务（跳过 WAL，v0.15.0 Txn09）
     pub(crate) fn begin_readonly(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
         let txn_id = db.txn_manager_mut().begin_readonly(isolation_level)?;
-        Ok(Self { id: txn_id, db, read_only: true })
+        Ok(Self { id: txn_id, db, read_only: true, next_rowids: HashMap::new() })
     }
 
     /// 是否为只读事务
@@ -44,10 +49,14 @@ impl<'a> Transaction<'a> {
     }
 
     /// 提交事务
-    pub fn commit(self) -> Result<()> {
+    ///
+    /// 注意：commit 后事务状态变为 Committed，Drop 不会再回滚。
+    pub fn commit(&mut self) -> Result<()> {
         let txn_id = self.id;
-        let _result = self.db.txn_manager_mut().commit(txn_id)?;
-        // 忽略 CommitResult，apply_ops 将在其他路径处理
+        let result = self.db.txn_manager_mut().commit(txn_id)?;
+        // P1.5 修复：之前丢弃 apply_ops 导致数据只停留在 MVCC/WAL，
+        // 必须将写操作应用到存储层（否则读取路径看不到提交的数据）
+        apply_to_storage(self.db, result.apply_ops)?;
         Ok(())
     }
 
@@ -60,21 +69,29 @@ impl<'a> Transaction<'a> {
 
     /// 执行插入（在事务内）
     pub fn insert(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
-        let table_id = self.db.get_table(table_name)
-            .map(|t| t.def.id)
+        // 注意：表的权威 ID 在 table_names 映射中（TableDef.id 未由 create_table 回填）
+        let (table_id, base_row_count) = self.db.table_names().get(table_name)
+            .and_then(|id| self.db.get_table(table_name).map(|t| (*id, t.def.row_count)))
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
         let txn_id = self.id;
-        let mut rowid_start = 0u64;
+        // P1.5 修复：rowid 必须从表当前行数开始分配（原来固定从 1 开始，
+        // 会导致与已有行冲突，且多次 insert 之间互相覆盖成 Update）
+        let base = *self.next_rowids
+            .entry(table_id)
+            .or_insert(base_row_count);
+        let rows_len = rows.len();
 
-        // 逐行插入（MVP 简化，实际应该批量）
-        for (i, row) in rows.iter().enumerate() {
-            let rowid = (i + 1) as u64; // 简化 rowid 分配
-            if i == 0 { rowid_start = rowid; }
-            self.db.txn_manager_mut().insert(txn_id, table_id, rowid, row.clone())?;
+        for (i, row) in rows.into_iter().enumerate() {
+            let rowid = base + i as u64;
+            self.db.txn_manager_mut().insert(txn_id, table_id, rowid, row)?;
         }
 
-        Ok(rows.len() as u64)
+        if let Some(cursor) = self.next_rowids.get_mut(&table_id) {
+            *cursor = base + rows_len as u64;
+        }
+
+        Ok(rows_len as u64)
     }
 
     /// 获取事务 ID
@@ -96,5 +113,74 @@ impl<'a> Drop for Transaction<'a> {
         if matches!(self.db.txn_manager().state(self.id), Some(TxnState::Active)) {
             let _ = self.db.txn_manager_mut().rollback(self.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Connection;
+
+    #[test]
+    fn test_txn_insert_commit_persists() {
+        // P1.5 回归：commit 必须把 apply_ops 应用到存储层（之前数据只停留在 MVCC/WAL）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        txn.insert("t", vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]).unwrap();
+        txn.commit().unwrap();
+        drop(txn);
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(2));
+    }
+
+    #[test]
+    fn test_txn_multiple_inserts_no_overwrite() {
+        // P1.5 回归：同事务内多次 insert 不应互相覆盖（rowid 必须单调递增）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        txn.insert("t", vec![vec![Value::Int64(1)]]).unwrap();
+        txn.insert("t", vec![vec![Value::Int64(2)]]).unwrap();
+        txn.commit().unwrap();
+        drop(txn);
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(2));
+
+        let rows = conn.execute("SELECT id FROM t").unwrap();
+        assert_eq!(rows.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_txn_rowid_continues_after_commit() {
+        // P1.5 回归：新事务的 rowid 应从表当前行数继续，不与已有行冲突
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (100)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        txn.insert("t", vec![vec![Value::Int64(200)]]).unwrap();
+        txn.commit().unwrap();
+        drop(txn);
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(2));
+    }
+
+    #[test]
+    fn test_txn_rollback_discards() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        txn.insert("t", vec![vec![Value::Int64(1)]]).unwrap();
+        txn.rollback().unwrap();
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(0));
     }
 }

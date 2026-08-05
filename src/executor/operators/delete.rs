@@ -147,8 +147,9 @@ fn execute_with_txn(
     
     // 步骤 5：应用到存储层
     debug!("Applying {} operations to storage...", result.apply_ops.len());
-    operators::insert::apply_to_storage(db, &result.apply_ops)?;
-    info!("✓ Applied {} operations to storage", result.apply_ops.len());
+    let applied_count = result.apply_ops.len();
+    operators::insert::apply_to_storage(db, result.apply_ops)?;
+    info!("✓ Applied {} operations to storage", applied_count);
     
     info!("Transaction path completed: {} rows deleted", rows_to_delete.len());
     Ok(rows_to_delete.len())
