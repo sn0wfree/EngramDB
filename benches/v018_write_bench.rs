@@ -114,7 +114,7 @@ fn main() {
 // 对比组（均走 Batcher，仅差 parse+plan）：
 //  - 变值 SQL（缓存必然 miss）
 //  - 同值 SQL（execute 缓存命中）
-//  - 参数化 prepared（PreparedStatement 省 parse，但每次重跑 plan）
+//  - 参数化 prepared（裸 INSERT 直通路径：免 plan 结构直接 eval 绑定值）
 fn main_plan_cache() {
     println!("=== v0.18 P0-1 计划缓存基准（同 SQL 重复 20 万次）===");
     let n = 200_000usize;
@@ -158,7 +158,7 @@ fn main_plan_cache() {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(format!("{}-wal", path));
         }
-        // 参数化 prepared：省 parse，每次重跑 plan
+        // 参数化 prepared：裸 INSERT 走直通路径（免 plan 结构）
         {
             let path = format!("/tmp/v018_pc_prep_{}.hdb", std::process::id());
             let _ = std::fs::remove_file(&path);
@@ -172,7 +172,7 @@ fn main_plan_cache() {
             }
             conn.sync_wal().unwrap();
             prep_times.push(t0.elapsed());
-            println!("  参数化 prepared（重跑 plan）: {}", fmt_rate(t0.elapsed(), n));
+            println!("  参数化 prepared（直通路径）: {}", fmt_rate(t0.elapsed(), n));
             conn.close().unwrap();
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(format!("{}-wal", path));
@@ -183,5 +183,31 @@ fn main_plan_cache() {
     let prep = median(prep_times);
     println!("  [中位数] miss {} / hit {} / prepared {}", fmt_rate(miss, n), fmt_rate(hit, n), fmt_rate(prep, n));
     println!("  缓存收益: {:.1}x（同 SQL 场景）", miss.as_secs_f64() / hit.as_secs_f64());
-    println!("  prepared 重跑 plan 成本: {:.1}% 相对 miss 全解析", (prep.as_secs_f64() / miss.as_secs_f64()) * 100.0);
+    println!("  prepared（直通）成本: {:.1}% 相对 miss 全解析", (prep.as_secs_f64() / miss.as_secs_f64()) * 100.0);
+
+    // ---- 直通模拟：免 plan 固定开销的 INSERT 全链路 ----
+    // 对照 prepared（直通路径）。bench 内直接构造 rows + operators::insert::execute，
+    // 等价于直通路径（params 已知，eval 即取参）。零库改动，验证 plan 固定开销占比。
+    let mut direct_times = Vec::new();
+    for _ in 0..ITERS {
+        let path = format!("/tmp/v018_pc_direct_{}.hdb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path));
+        let mut conn = Connection::open_with_config(&path, new_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+        let t0 = Instant::now();
+        for i in 0..n {
+            let rows = vec![vec![Value::Int64(i as i64), Value::Varchar(format!("e{}", i))]];
+            engramdb::executor::operators::insert::execute(conn.database_mut(), "t", rows, false).unwrap();
+        }
+        conn.sync_wal().unwrap();
+        direct_times.push(t0.elapsed());
+        println!("  直通模拟（免 plan）: {}", fmt_rate(t0.elapsed(), n));
+        conn.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path));
+    }
+    let direct = median(direct_times);
+    println!("  [中位数] prepared {} / 直通 {}", fmt_rate(prep, n), fmt_rate(direct, n));
+    println!("  直通上界差距: {:.1}%（prepared 相对直通模拟）", (direct.as_secs_f64() / prep.as_secs_f64() - 1.0) * 100.0);
 }

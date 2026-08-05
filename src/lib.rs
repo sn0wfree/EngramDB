@@ -228,6 +228,45 @@ impl Connection {
         if !batcher_clean {
             self.flush_batches()?;
         }
+        // 直通路径：裸 INSERT（无 RETURNING / ON CONFLICT / SELECT）免计划结构，
+        // 直接求值绑定行走 insert 算子（等效 plan_insert 的 Insert 分支）
+        if batcher_clean {
+            if let crate::sql::ast::Statement::Insert(ins) = &stmt.ast {
+                // 参数个数一次性校验（count_placeholders = 最大占位符索引 + 1），
+                // 求值用直接索引省去逐列越界检查
+                if params.len() < stmt.param_count {
+                    return Err(crate::common::error::EngramDbError::Parse(format!(
+                        "Parameter index out of bounds ({} params provided)", params.len()
+                    )));
+                }
+                // 无列名：内联 eval 循环（免函数调用与表访问，insert 算子内部校验表存在）
+                let rows = if ins.columns.is_none() {
+                    let mut rows = Vec::with_capacity(ins.values.len());
+                    for value_row in &ins.values {
+                        let mut row = Vec::with_capacity(value_row.len());
+                        for expr in value_row {
+                            row.push(match expr {
+                                crate::sql::ast::Expression::Literal(v) => v.clone(),
+                                crate::sql::ast::Expression::Placeholder(idx) => params[*idx].clone(),
+                                _ => return Err(crate::common::error::EngramDbError::Parse(
+                                    "Non-constant expression in VALUES not supported".into()
+                                )),
+                            });
+                        }
+                        rows.push(row);
+                    }
+                    rows
+                } else {
+                    sql::planner::eval_insert_rows(ins, &self.db, params)?
+                };
+                let count = executor::operators::insert::execute(&mut self.db, &ins.table_name, rows, false)?;
+                return Ok(QueryResult {
+                    columns: vec!["rows_inserted".to_string()],
+                    rows: vec![vec![crate::Value::Int64(count as i64)]],
+                    rows_affected: count,
+                });
+            }
+        }
         let plan = sql::planner::plan_with_params(stmt.ast.clone(), &self.db, params)?;
 
         let needs_optimize = matches!(plan,
@@ -261,6 +300,19 @@ impl Connection {
         let mut total = 0u64;
         let batcher_clean = matches!(&stmt.ast, crate::sql::ast::Statement::Insert(ins)
             if ins.on_conflict.is_none() && ins.returning.is_none() && ins.select.is_none());
+        // 直通路径：批量裸 INSERT 免计划结构（逐行 eval + insert 算子）
+        if batcher_clean {
+            if let crate::sql::ast::Statement::Insert(ins) = &stmt.ast {
+                for params in params_batch {
+                    let rows = sql::planner::eval_insert_rows(ins, &self.db, params)?;
+                    total += executor::operators::insert::execute(&mut self.db, &ins.table_name, rows, false)?;
+                }
+                if !self.db.insert_batcher().is_empty() {
+                    self.flush_batches()?;
+                }
+                return Ok(total);
+            }
+        }
         for params in params_batch {
             let plan = sql::planner::plan_with_params(stmt.ast.clone(), &self.db, params)?;
             let result = executor::execute(plan, &mut self.db)?;

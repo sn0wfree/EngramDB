@@ -612,6 +612,47 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
     })
 }
 
+/// 直通路径：免计划结构，直接求值裸 INSERT 的绑定行（v0.18 P0-1 直通）
+///
+/// 语义与 `plan_insert` 的 Insert 分支完全等价（含列名映射、Null 填充、
+/// 参数越界/非常量表达式错误），仅省去 PhysicalPlan 结构构造与调度。
+/// 调用方（execute_prepared / execute_prepared_batch）确认 stmt 为裸 INSERT
+/// （无 returning / on_conflict / select）后才可进入此路径。
+#[inline]
+pub fn eval_insert_rows(stmt: &InsertStmt, db: &Database, params: &[Value]) -> Result<Vec<Vec<Value>>> {
+    // 无列名快速路径：免表访问（表存在性由 insert 算子内部校验，与计划路径错误等价；
+    // 列数语义与 plan_insert 的 None 分支一致——不校验行宽）
+    if stmt.columns.is_none() {
+        let mut rows = Vec::with_capacity(stmt.values.len());
+        for value_row in &stmt.values {
+            let mut row = Vec::with_capacity(value_row.len());
+            for expr in value_row {
+                row.push(eval_constant_expr(expr, params)?);
+            }
+            rows.push(row);
+        }
+        return Ok(rows);
+    }
+    let table = db.get_engine_table(&stmt.table_name)
+        .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
+    let num_cols = table.def().columns.len();
+    let col_names = stmt.columns.as_ref().unwrap();
+    let indices: Vec<usize> = col_names.iter()
+        .filter_map(|name| table.def().column_index(name))
+        .collect();
+    let mut rows = Vec::with_capacity(stmt.values.len());
+    for value_row in &stmt.values {
+        let mut full_row = vec![Value::Null; num_cols];
+        for (i, expr) in value_row.iter().enumerate() {
+            if let Some(&idx) = indices.get(i) {
+                full_row[idx] = eval_constant_expr(expr, params)?;
+            }
+        }
+        rows.push(full_row);
+    }
+    Ok(rows)
+}
+
 fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     // CTE 内联：将 WITH 子句中的 CTE 定义内联到查询中
     let stmt = inline_ctes(stmt, db);
@@ -2335,7 +2376,8 @@ fn plan_projection(
 }
 
 /// 求值常量表达式（支持参数占位符替换）
-fn eval_constant_expr(expr: &Expression, params: &[Value]) -> Result<Value> {
+#[inline]
+pub(crate) fn eval_constant_expr(expr: &Expression, params: &[Value]) -> Result<Value> {
     match expr {
         Expression::Literal(v) => Ok(v.clone()),
         Expression::Placeholder(idx) => {

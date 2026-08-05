@@ -320,3 +320,77 @@ fn test_plan_cache_countstar_not_cached() {
     assert_eq!(r.rows[0][0], Value::Int64(2), "CountStar 快照不得被缓存");
     conn.close().unwrap();
 }
+
+// ============================================================
+// v0.18 P0-1 prepared 直通路径（免 plan 结构）测试
+// ============================================================
+
+#[test]
+fn test_prepared_direct_plain_insert() {
+    // 无列名裸 INSERT：直通分支（内联 eval + 直接索引），行/值正确
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    let r = conn.execute_prepared(&stmt, &[Value::Int64(1), Value::Varchar("a".into())]).unwrap();
+    assert_eq!(r.rows_affected, 1);
+    conn.execute_prepared(&stmt, &[Value::Int64(2), Value::Varchar("b".into())]).unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT ts, v FROM t ORDER BY ts").unwrap();
+    assert_eq!(r.rows, vec![
+        vec![Value::Int64(1), Value::Varchar("a".into())],
+        vec![Value::Int64(2), Value::Varchar("b".into())],
+    ]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_column_subset() {
+    // 有列名（子集 + 重排）：走 eval_insert_rows 列映射 + Null 填充
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (a INT64, b TEXT, c DOUBLE) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t (c, a) VALUES (?, ?)").unwrap();
+    conn.execute_prepared(&stmt, &[Value::Float64(1.5), Value::Int64(7)]).unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT a, b, c FROM t").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int64(7), Value::Null, Value::Float64(1.5)]]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_param_underflow() {
+    // 参数个数不足：入口一次性校验报 Parse 错误
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    let err = conn.execute_prepared(&stmt, &[Value::Int64(1)]).unwrap_err();
+    assert!(matches!(err, crate::common::error::EngramDbError::Parse(_)));
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_fallback_returning() {
+    // 非裸 INSERT（RETURNING）：跳过直通，走原计划路径行为不变
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (?, ?) RETURNING ts").unwrap();
+    let r = conn.execute_prepared(&stmt, &[Value::Int64(42), Value::Varchar("x".into())]).unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int64(42)]]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_batch() {
+    // execute_prepared_batch 直通：批量参数逐行入批，末尾冲刷
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    let batch: Vec<Vec<Value>> = (0..10)
+        .map(|i| vec![Value::Int64(i as i64), Value::Varchar(format!("e{}", i))])
+        .collect();
+    let n = conn.execute_prepared_batch(&stmt, &batch).unwrap();
+    assert_eq!(n, 10);
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(10));
+    conn.close().unwrap();
+}
