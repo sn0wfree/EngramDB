@@ -13,7 +13,8 @@ pub mod rate_limiter;
 pub mod index;
 pub mod catalog;
 pub mod engine;
-pub mod log_engine;
+pub mod bloom;
+mod log_engine;
 mod memory_engine;
 
 use std::collections::HashMap;

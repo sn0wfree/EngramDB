@@ -80,6 +80,10 @@ name = "m3_log_bench"
 harness = false
 
 [[bench]]
+name = "p35_bloom_bench"
+harness = false
+
+[[bench]]
 name = "bench_main"
 harness = false
 

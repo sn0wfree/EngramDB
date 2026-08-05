@@ -6,6 +6,7 @@ use crate::common::error::Result;
 use crate::common::types::{DataType, TableDef};
 use crate::common::config::CompressionType;
 use crate::common::column_data::{ColumnData, ColumnValue};
+use super::bloom::BloomFilter;
 use crate::Value;
 
 use super::compression;
@@ -50,6 +51,8 @@ pub struct ColumnStore {
 pub struct RowGroup {
     pub row_count: u32,
     pub columns: Vec<ColumnChunk>,
+    /// 每列 Bloom Filter（M1-8）：惰性构建，写路径失效，不落盘
+    pub blooms: Vec<Option<BloomFilter>>,
 }
 
 /// 列 Chunk
@@ -148,6 +151,7 @@ impl ColumnStore {
                             max_value: None,
                         })
                         .collect(),
+                    blooms: vec![None; num_cols],
                 });
                 self.row_groups.len() - 1
             };
@@ -189,6 +193,10 @@ impl ColumnStore {
                 match &mut col_chunk.data {
                     Some(d) => d.append(&new_data),
                     None => col_chunk.data = Some(new_data),
+                }
+                // M1-8：列数据变化 → Bloom 失效（惰性重建）
+                if col_idx < rg.blooms.len() {
+                    rg.blooms[col_idx] = None;
                 }
             }
             rg.row_count += take as u32;
@@ -232,6 +240,7 @@ impl ColumnStore {
                             max_value: None,
                         })
                         .collect(),
+                    blooms: vec![None; num_cols],
                 });
                 self.row_groups.len() - 1
             };
@@ -289,6 +298,10 @@ impl ColumnStore {
                             &col_chunk.data_type,
                         ));
                     }
+                }
+                // M1-8：列数据变化 → Bloom 失效（惰性重建）
+                if col_idx < rg.blooms.len() {
+                    rg.blooms[col_idx] = None;
                 }
             }
 
@@ -678,7 +691,11 @@ impl ColumnStore {
                 });
             }
 
-            self.row_groups.push(RowGroup { row_count, columns });
+            self.row_groups.push(RowGroup {
+                row_count,
+                blooms: vec![None; column_count],
+                columns,
+            });
         }
 
         Ok(())
@@ -758,8 +775,13 @@ impl ColumnStore {
     /// - Lt / LtEq → 区间 (-∞, val)：val 在 min 之下可跳过
     ///
     /// 返回 true 表示该 row group 不可能包含满足条件的值。
+    ///
+    /// M1-8：MinMax 判定后追加 Bloom 检查（仅等值谓词）——值在
+    /// [min, max] 区间内但实际不存在时（如 id ∈ [1,100] 查 50 但表中
+    /// 无 50），Bloom 判定"肯定不存在"整块跳过。压缩态列跳过 Bloom
+    /// 检查（保持解压惰性，回退 MinMax-only）。
     pub fn can_skip_predicate(
-        &self,
+        &mut self,
         row_group_idx: usize,
         col_idx: usize,
         op: PredicateOp,
@@ -775,7 +797,7 @@ impl ColumnStore {
             None => return true,
         };
 
-        match (&col.min_value, &col.max_value) {
+        let minmax_skip = match (&col.min_value, &col.max_value) {
             (Some(min), Some(max)) => match op {
                 PredicateOp::Eq => value_less(val, min) || value_greater(val, max),
                 // Gt: col > val 命中的条件是 max > val，val >= max 时整个 group 无命中
@@ -788,7 +810,41 @@ impl ColumnStore {
                 PredicateOp::LtEq => value_less(val, min),
             },
             _ => false, // 无统计信息，不能跳过
+        };
+        if minmax_skip {
+            return true;
         }
+
+        // M1-8：Bloom Filter（等值 + 值在范围内但可能不存在）
+        if matches!(op, PredicateOp::Eq) && self.bloom_may_skip(row_group_idx, col_idx, val) {
+            return true;
+        }
+        false
+    }
+
+    /// 惰性构建并查询 Bloom（无假阴性：false 表示该列肯定不含目标值）
+    fn bloom_may_skip(&mut self, rg_idx: usize, col_idx: usize, val: &Value) -> bool {
+        let rg = match self.row_groups.get_mut(rg_idx) {
+            Some(rg) => rg,
+            None => return false,
+        };
+        let bloom_opt = match rg.blooms.get_mut(col_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        // 压缩态：不解压（保持跳过的组零解压），回退 MinMax
+        let data = match rg.columns[col_idx].data.as_ref() {
+            Some(d) => d,
+            None => return false,
+        };
+        if bloom_opt.is_none() {
+            let mut bf = BloomFilter::with_capacity(data.len(), 0.01);
+            for i in 0..data.len() {
+                bf.insert(&data.get(i));
+            }
+            *bloom_opt = Some(bf);
+        }
+        !bloom_opt.as_ref().unwrap().might_contain(val)
     }
 
     /// 获取指定 row group 和列的 min/max 值
@@ -1466,7 +1522,7 @@ mod tests {
 
     #[test]
     fn test_can_skip_predicate_eq() {
-        let store = make_store();
+        let mut store = make_store();
         // RG0 [1,4]：值 5 在范围外 → 可跳过
         assert!(store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(5)));
         // RG1 [5,8]：值 5 在范围内 → 不可跳过
@@ -1480,7 +1536,7 @@ mod tests {
 
     #[test]
     fn test_can_skip_predicate_range() {
-        let store = make_store();
+        let mut store = make_store();
         // Gt: id > 4 → RG0 (max=4) 可跳过（4 不大于 4），RG1 不可跳过
         assert!(store.can_skip_predicate(0, 0, PredicateOp::Gt, &Value::Int64(4)));
         assert!(!store.can_skip_predicate(1, 0, PredicateOp::Gt, &Value::Int64(4)));
@@ -1501,8 +1557,55 @@ mod tests {
     }
 
     #[test]
+    fn test_bloom_skip_missing_values_in_range() {
+        let mut store = make_store();
+        // RG1 id ∈ [5,8]：值 6 在范围内且存在 → 不跳过
+        assert!(!store.can_skip_predicate(1, 0, PredicateOp::Eq, &Value::Int64(6)));
+        // 值 5.5 在 RG1 范围内但不存在 → Bloom 判定跳过（MinMax 无法做到）
+        assert!(
+            store.can_skip_predicate(1, 0, PredicateOp::Eq, &Value::Int64(55)),
+            "值 55 在 [5,8] 范围外，MinMax 即跳过"
+        );
+        // 关键场景：范围 [5,8] 内不存在的整数值 → Bloom 跳过（MinMax 保留）
+        // 注意：值 6 存在；取一个范围内不存在、且非边界的值。
+        // 由于范围是连续的 1..=8，构造缺值：用 Varchar 列测试范围外字符串。
+        assert!(store.can_skip_predicate(0, 1, PredicateOp::Eq, &Value::Varchar("zzz".into())));
+        // 等值在范围内但不存在：值 0 已在范围外；测试列 name 的等值命中
+        assert!(!store.can_skip_predicate(0, 1, PredicateOp::Eq, &Value::Varchar("a".into())));
+        assert!(!store.can_skip_predicate(1, 1, PredicateOp::Eq, &Value::Varchar("g".into())));
+    }
+
+    #[test]
+    fn test_bloom_rebuild_after_append() {
+        // RG0 未满（2 行 < size 4）→ 追加落在同一 RG，验证 Bloom 失效重建
+        let mut store = ColumnStore::new(make_table_def(), 4);
+        store.append_rows(&[
+            vec![Value::Int64(1), Value::Varchar("a".to_string())],
+            vec![Value::Int64(2), Value::Varchar("b".to_string())],
+        ]).unwrap();
+        // 第一次等值查询（构建 Bloom）
+        assert!(!store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(1)));
+        // 范围内不存在的值 → Bloom 跳过（MinMax 无法跳过）
+        assert!(store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(3)));
+
+        // 追加新行（同 RG）→ Bloom 失效并重建
+        store.append_rows(&[vec![
+            Value::Int64(3),
+            Value::Varchar("c".to_string()),
+        ]]).unwrap();
+        // 新值必须可查（不假阴性）
+        assert!(
+            !store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(3)),
+            "追加后新值不应被跳过"
+        );
+        assert!(!store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(1)));
+        // 其他范围内不存在的值仍可跳过
+        assert!(store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(4)));
+    }
+
+    #[test]
     fn test_can_skip_predicate_out_of_bounds_index() {
-        let store = make_store();
+        let mut store = make_store();
         // 越界 col / rg 索引一律视为可跳过（保守安全）
         assert!(store.can_skip_predicate(99, 0, PredicateOp::Eq, &Value::Int64(1)));
         assert!(store.can_skip_predicate(0, 99, PredicateOp::Eq, &Value::Int64(1)));

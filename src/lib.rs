@@ -3302,6 +3302,7 @@ mod multi_engine_tests {
 
     include!("memory_engine_tests.rs");
     include!("log_engine_tests.rs");
+    include!("bloom_tests.rs");
 
 
     #[test]
