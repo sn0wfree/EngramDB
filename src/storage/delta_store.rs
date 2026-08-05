@@ -8,6 +8,17 @@ use crate::common::error::Result;
 use crate::common::types::TableDef;
 use crate::Value;
 
+/// 连续 rowid 区间（S1.4）
+///
+/// 批量插入时 rowid 连续（start_rowid + i），无需逐个维护 HashMap 映射。
+/// 区间按 base_rowid 升序存储；命中区间时 idx = base_idx + (rowid - base_rowid)。
+#[derive(Debug, Clone, Copy)]
+struct SparseRun {
+    base_rowid: u64,
+    base_idx: usize,
+    count: u32,
+}
+
 /// Delta 层（列式内存存储，写入优化 + 快速合并）
 pub struct DeltaStore {
     #[allow(dead_code)]
@@ -16,8 +27,10 @@ pub struct DeltaStore {
     columns: Vec<Vec<Value>>,
     row_count: usize,
     next_rowid: u64,
-    /// row_id -> 位置索引的映射（支持基于 row_id 的操作）
+    /// row_id -> 位置索引的映射（散插行 / 已展开的区间行）
     row_id_to_idx: HashMap<u64, usize>,
+    /// 连续 rowid 区间（批量插入，O(1) 记录；删除不展开——get 时跳过 deleted_ids）
+    sparse_runs: Vec<SparseRun>,
     /// 已删除的 row_id 集合（tombstone 标记）
     deleted_ids: std::collections::HashSet<u64>,
 }
@@ -32,8 +45,42 @@ impl DeltaStore {
             row_count: 0,
             next_rowid: 0,
             row_id_to_idx: HashMap::new(),
+            sparse_runs: Vec::new(),
             deleted_ids: std::collections::HashSet::new(),
         }
+    }
+
+    /// 二分查找包含 rowid 的连续区间
+    fn find_run(&self, rowid: u64) -> Option<usize> {
+        let pos = self.sparse_runs.partition_point(|r| r.base_rowid <= rowid);
+        if pos == 0 {
+            return None;
+        }
+        let idx = pos - 1;
+        let run = &self.sparse_runs[idx];
+        if rowid < run.base_rowid + run.count as u64 {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// 将区间行全部搬入 HashMap（insert_row 落在区间内时保持映射一致）
+    fn expand_run(&mut self, run_idx: usize) {
+        let run = self.sparse_runs.remove(run_idx);
+        for i in 0..run.count as usize {
+            self.row_id_to_idx
+                .insert(run.base_rowid + i as u64, run.base_idx + i);
+        }
+    }
+
+    /// row_id → 位置索引：先查连续区间（O(log N) 二分），再查 HashMap
+    fn idx_lookup(&self, rowid: u64) -> Option<usize> {
+        if let Some(run_idx) = self.find_run(rowid) {
+            let run = &self.sparse_runs[run_idx];
+            return Some(run.base_idx + (rowid - run.base_rowid) as usize);
+        }
+        self.row_id_to_idx.get(&rowid).copied()
     }
 
     /// 插入一行，返回 rowid
@@ -67,8 +114,20 @@ impl DeltaStore {
             }
         }
 
-        // 维护 row_id -> idx 映射
-        self.row_id_to_idx.insert(rowid, idx);
+        // S1.4：连续 rowid 并入末尾区间（O(1)）；无可并入区间时创建新区间
+        match self.sparse_runs.last_mut() {
+            Some(last) if last.base_rowid + last.count as u64 == rowid => {
+                last.count += 1;
+            }
+            _ => {
+                // 单行 insert 的 rowid 来自 next_rowid 递增，与既有区间无重叠
+                self.sparse_runs.push(SparseRun {
+                    base_rowid: rowid,
+                    base_idx: idx,
+                    count: 1,
+                });
+            }
+        }
         self.row_count += 1;
         Ok(rowid)
     }
@@ -106,6 +165,11 @@ impl DeltaStore {
             }
         }
 
+        // S1.4：rowid 可能落在既有连续区间内（事务乱序分配）→ 展开该区间，
+        // 保持区间映射与 HashMap 一致
+        if let Some(run_idx) = self.find_run(rowid as u64) {
+            self.expand_run(run_idx);
+        }
         // 维护 row_id -> idx 映射
         self.row_id_to_idx.insert(rowid as u64, idx);
         
@@ -140,13 +204,12 @@ impl DeltaStore {
             ));
         }
         
-        // 获取位置索引
-        let idx = self.row_id_to_idx.get(&rowid_64).copied()
-            .ok_or_else(|| {
-                crate::common::error::EngramDbError::InvalidFormat(
-                    format!("row {} not found in delta store", rowid)
-                )
-            })?;
+        // 获取位置索引（区间二分 / HashMap）
+        let idx = self.idx_lookup(rowid_64).ok_or_else(|| {
+            crate::common::error::EngramDbError::InvalidFormat(
+                format!("row {} not found in delta store", rowid)
+            )
+        })?;
         
         let num_table_cols = self.table_def.columns.len();
         let row_len = new_row.len();
@@ -197,12 +260,12 @@ impl DeltaStore {
             }
         }
 
-        // 维护 row_id -> idx 映射
-        for i in 0..new_rows {
-            let rowid = start_rowid + i as u64;
-            let idx = start_idx + i;
-            self.row_id_to_idx.insert(rowid, idx);
-        }
+        // S1.4：连续 rowid → O(1) 区间记录（替代逐个 HashMap insert）
+        self.sparse_runs.push(SparseRun {
+            base_rowid: start_rowid,
+            base_idx: start_idx,
+            count: new_rows as u32,
+        });
 
         self.row_count += new_rows;
         self.next_rowid += count;
@@ -262,12 +325,12 @@ impl DeltaStore {
             }
         }
 
-        // 维护 row_id -> idx 映射
-        for i in 0..num_rows {
-            let rowid = start_rowid + i as u64;
-            let idx = start_idx + i;
-            self.row_id_to_idx.insert(rowid, idx);
-        }
+        // S1.4：连续 rowid → O(1) 区间记录（替代逐个 HashMap insert）
+        self.sparse_runs.push(SparseRun {
+            base_rowid: start_rowid,
+            base_idx: start_idx,
+            count: num_rows as u32,
+        });
 
         self.row_count += num_rows;
         self.next_rowid += num_rows as u64;
@@ -276,16 +339,16 @@ impl DeltaStore {
 
     /// 按 rowid 查找
     ///
-    /// 使用 row_id_to_idx 映射定位行，跳过已删除的行
+    /// 先查连续区间（二分），再查 HashMap，跳过已删除的行
     pub fn get(&self, rowid: u64) -> Option<Vec<Value>> {
         // 检查是否已删除
         if self.deleted_ids.contains(&rowid) {
             return None;
         }
-        
-        // 使用映射获取位置索引
-        let idx = self.row_id_to_idx.get(&rowid).copied()?;
-        
+
+        // 获取位置索引（区间二分 / HashMap）
+        let idx = self.idx_lookup(rowid)?;
+
         if idx < self.row_count {
             let row: Vec<Value> = self.columns.iter()
                 .map(|col| col[idx].clone())
@@ -298,20 +361,40 @@ impl DeltaStore {
 
     /// 获取所有行（按 rowid 排序，跳过已删除的行）
     pub fn all_rows(&self) -> Vec<(u64, Vec<Value>)> {
-        let mut rows = Vec::new();
-        
-        for (rowid, idx) in &self.row_id_to_idx {
-            if !self.deleted_ids.contains(rowid) && *idx < self.row_count {
-                let row: Vec<Value> = self.columns.iter()
-                    .map(|col| col[*idx].clone())
-                    .collect();
-                rows.push((*rowid, row));
+        let mut entries: Vec<(u64, usize)> = Vec::with_capacity(self.row_count);
+
+        // S1.4：连续区间（有序），跳过已删除
+        for run in &self.sparse_runs {
+            for i in 0..run.count as usize {
+                let rid = run.base_rowid + i as u64;
+                if self.deleted_ids.contains(&rid) {
+                    continue;
+                }
+                let idx = run.base_idx + i;
+                if idx < self.row_count {
+                    entries.push((rid, idx));
+                }
             }
         }
-        
+
+        // HashMap 散行
+        for (rowid, idx) in &self.row_id_to_idx {
+            if !self.deleted_ids.contains(rowid) && *idx < self.row_count {
+                entries.push((*rowid, *idx));
+            }
+        }
+
         // 按 rowid 排序
-        rows.sort_by_key(|(rowid, _)| *rowid);
-        rows
+        entries.sort_by_key(|(rowid, _)| *rowid);
+        entries
+            .into_iter()
+            .map(|(rowid, idx)| {
+                let row: Vec<Value> = self.columns.iter()
+                    .map(|col| col[idx].clone())
+                    .collect();
+                (rowid, row)
+            })
+            .collect()
     }
 
     /// 行数（包括已删除的行，用于位置索引计算）
@@ -336,6 +419,7 @@ impl DeltaStore {
         self.row_count = 0;
         self.next_rowid = 1;
         self.row_id_to_idx.clear();
+        self.sparse_runs.clear();
         self.deleted_ids.clear();
     }
 
@@ -510,5 +594,167 @@ impl DeltaStore {
         }
 
         Some(old_row)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{ColumnDef, DataType, TableDef};
+
+    fn make_table_def() -> TableDef {
+        TableDef {
+            id: 1,
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("name", DataType::Varchar),
+            ],
+            row_count: 0,
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+        }
+    }
+
+    fn row(id: i64, name: &str) -> Vec<Value> {
+        vec![Value::Int64(id), Value::Varchar(name.to_string())]
+    }
+
+    #[test]
+    fn test_insert_batch_uses_sparse_runs() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..1000 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+
+        // 区间记录：O(1) 一条，而非 1000 条 HashMap
+        assert_eq!(ds.sparse_runs.len(), 1);
+        assert_eq!(ds.sparse_runs[0].base_rowid, 0);
+        assert_eq!(ds.sparse_runs[0].count, 1000);
+        assert!(ds.row_id_to_idx.is_empty());
+
+        // get 命中区间
+        let r = ds.get(500).unwrap();
+        assert_eq!(r[0], Value::Int64(500));
+        assert_eq!(r[1], Value::Varchar("r500".into()));
+
+        // 不存在
+        assert!(ds.get(1000).is_none());
+
+        // 批量 + 批量：两个区间
+        let mut batch2 = Vec::new();
+        for i in 1000..1500 {
+            batch2.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch2).unwrap();
+        assert_eq!(ds.sparse_runs.len(), 2);
+        assert_eq!(ds.get(1200).unwrap()[0], Value::Int64(1200));
+    }
+
+    #[test]
+    fn test_single_insert_extends_last_run() {
+        let mut ds = DeltaStore::new(make_table_def());
+        ds.insert(row(0, "a")).unwrap();
+        ds.insert(row(1, "b")).unwrap();
+        ds.insert(row(2, "c")).unwrap();
+        // 连续单行并入区间
+        assert_eq!(ds.sparse_runs.len(), 1);
+        assert_eq!(ds.sparse_runs[0].count, 3);
+        assert_eq!(ds.get(1).unwrap()[1], Value::Varchar("b".into()));
+    }
+
+    #[test]
+    fn test_insert_row_collides_with_run() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..100 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+
+        // 事务乱序插入 rowid=50（落在区间内）→ 区间展开，get 仍正确
+        ds.insert_row(50, row(999, "txn")).unwrap();
+        assert_eq!(ds.get(50).unwrap()[0], Value::Int64(999));
+        assert_eq!(ds.get(49).unwrap()[0], Value::Int64(49));
+        assert_eq!(ds.get(51).unwrap()[0], Value::Int64(51));
+        // 唯一区间被展开 → 全部搬入 HashMap
+        assert!(ds.sparse_runs.is_empty());
+        assert_eq!(ds.row_id_to_idx.len(), 100);
+    }
+
+    #[test]
+    fn test_delete_row_in_run() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..100 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+
+        ds.delete_row(30).unwrap();
+        assert!(ds.get(30).is_none());
+        assert_eq!(ds.get(31).unwrap()[0], Value::Int64(31));
+        assert_eq!(ds.active_len(), 99);
+
+        // all_rows 跳过已删除
+        let all = ds.all_rows();
+        assert_eq!(all.len(), 99);
+        assert!(all.iter().all(|(rid, _)| *rid != 30));
+        // 排序
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn test_all_rows_merges_runs_and_hashmap() {
+        let mut ds = DeltaStore::new(make_table_def());
+        // 批量区间 + 散行（insert_row 乱序）
+        let mut batch = Vec::new();
+        for i in 0..50 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+        ds.insert_row(200, row(200, "scattered")).unwrap(); // next_rowid → 201
+        ds.insert(row(50, "after")).unwrap();               // rowid = 201
+
+        let all = ds.all_rows();
+        assert_eq!(all.len(), 52);
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(all[0].1[1], Value::Varchar("r0".into()));
+        assert_eq!(all[50].1[1], Value::Varchar("scattered".into())); // rowid 200
+        assert_eq!(all[51].1[1], Value::Varchar("after".into()));    // rowid 201
+    }
+
+    #[test]
+    fn test_update_row_by_id_in_run() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..100 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+
+        ds.update_row_by_id(42, row(42, "updated")).unwrap();
+        assert_eq!(ds.get(42).unwrap()[1], Value::Varchar("updated".into()));
+        assert_eq!(ds.get(43).unwrap()[1], Value::Varchar("r43".into()));
+    }
+
+    #[test]
+    fn test_clear_resets_runs() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..100 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+        ds.clear();
+        assert!(ds.sparse_runs.is_empty());
+        assert!(ds.row_id_to_idx.is_empty());
+        assert_eq!(ds.len(), 0);
     }
 }
