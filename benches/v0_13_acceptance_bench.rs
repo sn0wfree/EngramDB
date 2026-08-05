@@ -22,6 +22,8 @@ use engramdb::{Connection, Config, Value};
 const ITERS: usize = 5;
 const HDB_PATH: &str = "/tmp/v0.13_acceptance.hdb";
 const SQLITE_PATH: &str = "/tmp/v0.13_acceptance.sqlite";
+/// B-4 排序微基准：无序整数键排序行数
+const B4_TABLE_SIZE: usize = 100_000;
 
 /// 打开 EngramDB 连接（关闭 checkpoint 时的列存压缩，避免下一轮 reopen 后首次查询触发惰性解压）
 fn open_hdb() -> Connection {
@@ -340,6 +342,106 @@ fn debug_eq_i64(actual: i64, expected: i64) {
 }
 
 // ============================================================
+// B-4: 单列整数全排序（S1.1 Radix Sort 验收）
+// s 表: id 有序主键 + k 无序整数键（无索引）+ payload
+// ============================================================
+
+fn b4_setup_engramdb() {
+    let mut conn = open_hdb();
+    conn.execute("CREATE TABLE s (id INT PRIMARY KEY, k INT, payload VARCHAR)")
+        .unwrap();
+
+    let mut rng = SimpleRng::new(7);
+    const BATCH: usize = 50_000;
+    for chunk_start in (0..B4_TABLE_SIZE).step_by(BATCH) {
+        let end = (chunk_start + BATCH).min(B4_TABLE_SIZE);
+        let count = end - chunk_start;
+        let mut col_id = Vec::with_capacity(count);
+        let mut col_k = Vec::with_capacity(count);
+        let mut col_p = Vec::with_capacity(count);
+        for i in chunk_start..end {
+            col_id.push(Value::Int64(i as i64));
+            col_k.push(Value::Int64(rng.gen_range(0..i64::MAX)));
+            col_p.push(Value::Varchar(format!("payload_{}", i)));
+        }
+        conn.import_columns("s", vec![col_id, col_k, col_p]).unwrap();
+    }
+    conn.close().unwrap();
+}
+
+fn b4_setup_sqlite() {
+    let _ = std::fs::remove_file(SQLITE_PATH);
+    let _ = std::fs::remove_file(format!("{}-wal", SQLITE_PATH));
+    let _ = std::fs::remove_file(format!("{}-shm", SQLITE_PATH));
+    let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA cache_size = -20000;
+         PRAGMA temp_store = MEMORY;",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT)",
+        [],
+    )
+    .unwrap();
+
+    let mut rng = SimpleRng::new(7);
+    const BATCH: usize = 50_000;
+    let tx = conn.unchecked_transaction().unwrap();
+    for chunk_start in (0..B4_TABLE_SIZE).step_by(BATCH) {
+        let end = (chunk_start + BATCH).min(B4_TABLE_SIZE);
+        let mut sql = String::with_capacity(end - chunk_start);
+        for i in chunk_start..end {
+            if i > chunk_start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({}, {}, 'payload_{}')", i, rng.gen_range(0..i64::MAX), i));
+        }
+        tx.execute(&format!("INSERT INTO s VALUES {}", sql), []).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+}
+
+fn b4_engramdb() -> Duration {
+    let mut conn = open_hdb();
+    let start = Instant::now();
+    let r = conn.execute("SELECT id, k, payload FROM s ORDER BY k").unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(r.rows.len(), B4_TABLE_SIZE);
+    // 验证结果有序
+    for w in r.rows.windows(2) {
+        match (&w[0][1], &w[1][1]) {
+            (Value::Int64(a), Value::Int64(b)) => assert!(a <= b, "not sorted"),
+            _ => panic!("expected Int64 key"),
+        }
+    }
+    conn.close().unwrap();
+    elapsed
+}
+
+fn b4_sqlite() -> Duration {
+    let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
+    let start = Instant::now();
+    let mut stmt = conn.prepare("SELECT id, k, payload FROM s ORDER BY k").unwrap();
+    let count = stmt
+        .query_map([], |row| row.get::<_, i64>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<i64>>>()
+        .unwrap();
+    let elapsed = start.elapsed();
+    drop(stmt);
+    assert_eq!(count.len(), B4_TABLE_SIZE);
+    for w in count.windows(2) {
+        assert!(w[0] <= w[1], "not sorted");
+    }
+    drop(conn);
+    elapsed
+}
+
+// ============================================================
 // 简易确定性 RNG（避免引入 rand 依赖）
 // ============================================================
 
@@ -445,6 +547,24 @@ fn main() {
 
     // A-3: COUNT(*)
     run_scenario("A-3: COUNT(*) (1M 行, 无 WHERE)", 1.05, a3_engramdb, a3_sqlite);
+
+    // B-4: 单列整数全排序（S1.1 Radix Sort 验收）
+    // s 表：k 为无序整数键（双方均无索引 → 真实排序）
+    println!("\n--- 设置 B-4 测试数据 ({} 行, 无序整数键) ---", B4_TABLE_SIZE);
+    println!("  EngramDB setup...");
+    let t0 = Instant::now();
+    b4_setup_engramdb();
+    println!("  EngramDB setup done in {}", fmt_ms(t0.elapsed()));
+    println!("  SQLite setup...");
+    let t0 = Instant::now();
+    b4_setup_sqlite();
+    println!("  SQLite setup done in {}", fmt_ms(t0.elapsed()));
+    run_scenario(
+        "B-4: ORDER BY k 全排序 (100K 行, 单列整数)",
+        8.0,
+        b4_engramdb,
+        b4_sqlite,
+    );
 
     // A-4: WHERE 1% 选择性过滤（P-W1 PREWHERE 验收）
     // 验证 v0.16 P-W1: MinMax + PREWHERE 真接通

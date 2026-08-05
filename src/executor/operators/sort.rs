@@ -562,4 +562,36 @@ mod tests {
         assert_eq!(rows[1][1], Value::Int64(1));
         assert_eq!(rows[2][1], Value::Int64(2));
     }
+
+    /// 排序核心对比（radix vs sort_by），仅手动运行：cargo test --release --lib -- --ignored radix
+    #[test]
+    #[ignore]
+    fn bench_radix_vs_compare() {
+        use std::time::Instant;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let n = 1_000_000usize;
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(vec![
+                Value::Int64(rng.gen_range(-1_000_000..1_000_000)),
+                Value::Int64(i as i64),
+            ]);
+        }
+        let key = SortKey { column_index: 0, direction: SortDirection::Asc };
+
+        let mut r1 = rows.clone();
+        let t0 = Instant::now();
+        assert!(try_radix_sort(&mut r1, &key));
+        let radix_time = t0.elapsed();
+
+        let mut r2 = rows;
+        let t0 = Instant::now();
+        r2.sort_by(|a, b| cmp_rows(a, b, &[key.clone()]));
+        let cmp_time = t0.elapsed();
+
+        println!("1M 行: radix = {:?}, sort_by = {:?}, radix 快 {}x",
+                 radix_time, cmp_time,
+                 cmp_time.as_nanos() as f64 / radix_time.as_nanos() as f64);
+    }
 }
