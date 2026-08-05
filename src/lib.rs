@@ -1095,6 +1095,128 @@ mod value_tests {
         assert_eq!(result.rows[0][0], Value::Int64(1000));
     }
 
+    // --- JOIN 测试（②）---
+
+    fn setup_join_tables(conn: &mut Connection) {
+        conn.execute("CREATE TABLE users (id INT, name VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE orders (oid INT, uid INT, amount INT)").unwrap();
+        conn.execute("CREATE TABLE items (iid INT, label VARCHAR)").unwrap();
+        for i in 1..=4 {
+            conn.execute(&format!("INSERT INTO users VALUES ({}, 'user{}')", i, i)).unwrap();
+        }
+        conn.execute("INSERT INTO orders VALUES (101, 1, 50), (102, 2, 30), (103, 2, 80), (104, 99, 10)").unwrap();
+        conn.execute("INSERT INTO items VALUES (101, 'apple'), (103, 'pear'), (999, 'ghost')").unwrap();
+    }
+
+    #[test]
+    fn test_inner_join() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&mut conn);
+
+        let r = conn.execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.uid ORDER BY orders.amount"
+        ).unwrap();
+        assert_eq!(r.columns, vec!["name".to_string(), "amount".to_string()]);
+        assert_eq!(r.rows.len(), 3);
+        // amount 升序：30(user2), 50(user1), 80(user2)
+        assert_eq!(r.rows[0], vec![Value::Varchar("user2".into()), Value::Int64(30)]);
+        assert_eq!(r.rows[1], vec![Value::Varchar("user1".into()), Value::Int64(50)]);
+        assert_eq!(r.rows[2], vec![Value::Varchar("user2".into()), Value::Int64(80)]);
+    }
+
+    #[test]
+    fn test_left_join() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&mut conn);
+
+        // LEFT JOIN：无匹配的右表列补 NULL（user3/user4 无订单）
+        let r = conn.execute(
+            "SELECT users.name, orders.amount FROM users LEFT JOIN orders ON users.id = orders.uid ORDER BY users.id"
+        ).unwrap();
+        assert_eq!(r.rows.len(), 5);
+        assert_eq!(r.rows[0], vec![Value::Varchar("user1".into()), Value::Int64(50)]);
+        assert_eq!(r.rows[1], vec![Value::Varchar("user2".into()), Value::Int64(30)]);
+        assert_eq!(r.rows[2], vec![Value::Varchar("user2".into()), Value::Int64(80)]);
+        assert_eq!(r.rows[3], vec![Value::Varchar("user3".into()), Value::Null]);
+        assert_eq!(r.rows[4], vec![Value::Varchar("user4".into()), Value::Null]);
+    }
+
+    #[test]
+    fn test_three_way_join() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&mut conn);
+
+        // 三表链式 JOIN + 跨表重名列消歧（users.name vs orders 无同名）
+        let r = conn.execute(
+            "SELECT users.name, items.label FROM users JOIN orders ON users.id = orders.uid JOIN items ON orders.oid = items.iid"
+        ).unwrap();
+        assert_eq!(r.columns, vec!["name".to_string(), "label".to_string()]);
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0], vec![Value::Varchar("user1".into()), Value::Varchar("apple".into())]);
+        assert_eq!(r.rows[1], vec![Value::Varchar("user2".into()), Value::Varchar("pear".into())]);
+    }
+
+    #[test]
+    fn test_join_group_by_aggregate() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&mut conn);
+
+        // JOIN + GROUP BY + 聚合 + ORDER BY 别名
+        let r = conn.execute(
+            "SELECT users.name, SUM(orders.amount) AS total FROM users JOIN orders ON users.id = orders.uid GROUP BY users.name ORDER BY total DESC"
+        ).unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0], vec![Value::Varchar("user2".into()), Value::Float64(110.0)]);
+        assert_eq!(r.rows[1], vec![Value::Varchar("user1".into()), Value::Float64(50.0)]);
+
+        // JOIN + COUNT(*)
+        let r = conn.execute(
+            "SELECT COUNT(*) FROM users JOIN orders ON users.id = orders.uid"
+        ).unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(3));
+    }
+
+    #[test]
+    fn test_join_where_limit() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&mut conn);
+
+        // JOIN + WHERE + LIMIT
+        let r = conn.execute(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.uid WHERE orders.amount > 40 LIMIT 5"
+        ).unwrap();
+        assert_eq!(r.rows.len(), 2);
+
+        // LEFT JOIN + WHERE（谓词不得下推破坏 NULL 补行语义）
+        let r = conn.execute(
+            "SELECT users.name FROM users LEFT JOIN orders ON users.id = orders.uid WHERE orders.amount > 50"
+        ).unwrap();
+        // 只有 user2 的 amount=80 满足
+        assert_eq!(r.rows, vec![vec![Value::Varchar("user2".into())]]);
+
+        // 无匹配 LEFT JOIN + WHERE：全 NULL 右列行应被过滤
+        let r = conn.execute(
+            "SELECT users.name FROM users LEFT JOIN orders ON users.id = orders.uid WHERE orders.amount < 15"
+        ).unwrap();
+        // orders 有 amount=10（uid=99 无匹配左表）→ 无结果
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[test]
+    fn test_cross_join_pipeline() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&mut conn);
+
+        // CROSS JOIN + WHERE + 投影（此前 CrossJoin 直接返回、WHERE 被忽略）
+        let r = conn.execute(
+            "SELECT users.name, items.label FROM users CROSS JOIN items WHERE items.iid = 101"
+        ).unwrap();
+        assert_eq!(r.rows.len(), 4);
+        for row in &r.rows {
+            assert_eq!(row[1], Value::Varchar("apple".into()));
+        }
+    }
+
     // --- INCLUDE 子句 SQL 语法测试（v0.12.0 新增）---
 
     #[test]

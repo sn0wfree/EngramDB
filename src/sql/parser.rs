@@ -994,22 +994,40 @@ fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>>
                                 right: Box::new(right),
                             };
                         }
-                        sqlast::JoinOperator::Inner(constraint) => {
-                            if let Some(expr) = constraint_to_expression(constraint) {
-                                // 有 ON 条件的 INNER JOIN 暂不支持（需要更复杂的 JOIN 规划）
-                                return Err(EngramDbError::Parse(
-                                    "INNER JOIN with ON clause not yet supported, use comma-separated FROM or CROSS JOIN".into()
-                                ));
-                            }
-                            // 无 ON 条件 = CROSS JOIN
-                            result = TableRef::CrossJoin {
+                        sqlast::JoinOperator::Inner(constraint)
+                        | sqlast::JoinOperator::LeftOuter(constraint)
+                        | sqlast::JoinOperator::RightOuter(constraint)
+                        | sqlast::JoinOperator::FullOuter(constraint) => {
+                            // ②：INNER / LEFT / RIGHT / FULL JOIN
+                            let join_type = match &join.join_operator {
+                                sqlast::JoinOperator::LeftOuter(_) => {
+                                    crate::executor::physical_plan::JoinType::Left
+                                }
+                                sqlast::JoinOperator::RightOuter(_) => {
+                                    crate::executor::physical_plan::JoinType::Right
+                                }
+                                sqlast::JoinOperator::FullOuter(_) => {
+                                    crate::executor::physical_plan::JoinType::Full
+                                }
+                                _ => crate::executor::physical_plan::JoinType::Inner,
+                            };
+                            // ON 条件（None = 无 ON，等价 CROSS JOIN）
+                            let on = match constraint {
+                                sqlast::JoinConstraint::On(expr) => {
+                                    Some(convert_expression(expr)?)
+                                }
+                                _ => None,
+                            };
+                            result = TableRef::Join {
                                 left: Box::new(result),
                                 right: Box::new(right),
+                                join_type,
+                                on,
                             };
                         }
                         _ => {
                             return Err(EngramDbError::Parse(format!(
-                                "Unsupported join type: {:?} (only CROSS JOIN supported)",
+                                "Unsupported join type: {:?} (supported: INNER/LEFT/RIGHT/FULL JOIN)",
                                 join.join_operator
                             )));
                         }
@@ -1088,17 +1106,6 @@ fn convert_table_factor(factor: &sqlast::TableFactor) -> Result<Option<TableRef>
             Ok(Some(TableRef::TableFunction { name, args, alias }))
         }
         _ => Ok(None),
-    }
-}
-
-/// 将 JOIN 约束转换为表达式（目前仅用于检测是否有 ON 条件）
-fn constraint_to_expression(constraint: &sqlast::JoinConstraint) -> Option<Expression> {
-    match constraint {
-        sqlast::JoinConstraint::On(_) => {
-            // 有 ON 条件，标记为 Some
-            Some(Expression::Literal(Value::Int64(1)))
-        }
-        _ => None,
     }
 }
 

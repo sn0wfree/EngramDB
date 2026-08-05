@@ -225,6 +225,15 @@ pub enum TableRef {
     TableFunction { name: String, args: Vec<Expression>, alias: Option<String> },
     /// 交叉连接（CROSS JOIN）
     CrossJoin { left: Box<TableRef>, right: Box<TableRef> },
+    /// 连接（②：INNER / LEFT / RIGHT / FULL JOIN）
+    ///
+    /// `on=None` 时等价于 CROSS JOIN。
+    Join {
+        left: Box<TableRef>,
+        right: Box<TableRef>,
+        join_type: crate::executor::physical_plan::JoinType,
+        on: Option<Expression>,
+    },
 }
 
 /// ORDER BY 项

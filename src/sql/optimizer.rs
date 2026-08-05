@@ -729,6 +729,58 @@ fn pushdown_predicates(plan: PhysicalPlan, pending_predicates: Vec<Expression>) 
             Ok(result)
         }
 
+        // HashJoin: 谓词不能下推穿过 JOIN（② 修复）
+        //
+        // WHERE 谓词语义在 JOIN 之后过滤；若下推到 JOIN 一侧（尤其
+        // LEFT/RIGHT/FULL 的非保留侧），会把本应 NULL 补齐的行提前过滤，
+        // 改变结果集。因此 JOIN 之上的谓词原样保留为 JOIN 之上的 Filter，
+        // 仅递归处理两侧内部的谓词。
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            join_type,
+            left_keys,
+            right_keys,
+        } => {
+            let opt_left = pushdown_predicates(*left, Vec::new())?;
+            let opt_right = pushdown_predicates(*right, Vec::new())?;
+            let mut result = PhysicalPlan::HashJoin {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+                join_type,
+                left_keys,
+                right_keys,
+            };
+            if !pending_predicates.is_empty() {
+                let combined = combine_predicates(pending_predicates);
+                result = PhysicalPlan::Filter {
+                    input: Box::new(result),
+                    condition: combined,
+                };
+            }
+            Ok(result)
+        }
+
+        // CrossJoin: 与 HashJoin 相同，谓词保留在 JOIN 之上
+        // （下推会改变笛卡尔积 → 过滤的语义顺序；且 WHERE 引用任一
+        // 侧列，直接透传会丢失过滤）
+        PhysicalPlan::CrossJoin { left, right } => {
+            let opt_left = pushdown_predicates(*left, Vec::new())?;
+            let opt_right = pushdown_predicates(*right, Vec::new())?;
+            let mut result = PhysicalPlan::CrossJoin {
+                left: Box::new(opt_left),
+                right: Box::new(opt_right),
+            };
+            if !pending_predicates.is_empty() {
+                let combined = combine_predicates(pending_predicates);
+                result = PhysicalPlan::Filter {
+                    input: Box::new(result),
+                    condition: combined,
+                };
+            }
+            Ok(result)
+        }
+
         // 其他节点直接递归
         other => Ok(other),
     }

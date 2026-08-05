@@ -599,19 +599,18 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                         && (args.is_empty()
                             || matches!(args.as_slice(), [Expression::Literal(_)])));
                 if name.eq_ignore_ascii_case("COUNT") && is_count_star {
-                    let table_name = stmt.from
-                        .as_ref()
-                        .and_then(|t| match t {
-                            TableRef::Table { table_name, .. } => Some(table_name.clone()),
-                            _ => None,
-                        })
-                        .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
-                    let table = db.get_table(&table_name)
-                        .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
-                    let count = table.row_count() as i64;
-                    let output_name = alias.clone().unwrap_or_else(|| "count(*)".to_string());
-                    trace!("Perf01: COUNT(*) fast-path for '{}' => {}", table_name, count);
-                    return Ok(PhysicalPlan::CountStar { output_name, count });
+                    // 仅单表时走元数据短路；JOIN/CROSS JOIN 跳过（走连接计划）
+                    if let Some(table_name) = stmt.from.as_ref().and_then(|t| match t {
+                        TableRef::Table { table_name, .. } => Some(table_name.clone()),
+                        _ => None,
+                    }) {
+                        let table = db.get_table(&table_name)
+                            .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+                        let count = table.row_count() as i64;
+                        let output_name = alias.clone().unwrap_or_else(|| "count(*)".to_string());
+                        trace!("Perf01: COUNT(*) fast-path for '{}' => {}", table_name, count);
+                        return Ok(PhysicalPlan::CountStar { output_name, count });
+                    }
                 }
             }
         }
@@ -634,14 +633,12 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         });
     }
 
-    // ===== CROSS JOIN =====
-    if let Some(TableRef::CrossJoin { left, right }) = &stmt.from {
-        let left_plan = plan_table_ref(left, db, &stmt)?;
-        let right_plan = plan_table_ref(right, db, &stmt)?;
-        return Ok(PhysicalPlan::CrossJoin {
-            left: Box::new(left_plan),
-            right: Box::new(right_plan),
-        });
+    // ===== JOIN / CROSS JOIN（②）=====
+    // 连接查询走完整流水线（WHERE/聚合/投影/排序/LIMIT）：
+    // plan_join_tree 构建连接树（HashJoin/CrossJoin），随后与单表
+    // 相同的通用阶段叠加。
+    if matches!(&stmt.from, Some(TableRef::Join { .. }) | Some(TableRef::CrossJoin { .. })) {
+        return plan_select_join(&stmt, db);
     }
 
     let table_name = stmt.from
@@ -980,9 +977,558 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     Ok(plan)
 }
 
+/// 规划连接查询（②：INNER / LEFT / RIGHT / FULL JOIN、CROSS JOIN）
+///
+/// 与单表路径的差异仅在于扫描层：`plan_join_tree` 构建连接树，
+/// 随后叠加与单表相同的通用阶段（Filter / Aggregate / HAVING /
+/// Projection / Sort / Limit）。
+fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
+    // 构建连接树计划 + 组合输出列名（左表列 ++ 右表列）
+    let from_ref = stmt.from.as_ref()
+        .ok_or_else(|| EngramDbError::Parse("JOIN without FROM".into()))?;
+    let (mut plan, scan_column_names) = plan_join_tree(from_ref, db, stmt)?;
+
+    // Filter（WHERE）
+    // 列引用带表前缀时重写为前缀列名（匹配 join 输出的 "users.name" 列名）
+    if let Some(where_expr) = &stmt.where_clause {
+        plan = PhysicalPlan::Filter {
+            input: Box::new(plan),
+            condition: qualify_column_refs(where_expr),
+        };
+    }
+
+    // 聚合（GROUP BY / SELECT 聚合函数 / HAVING）
+    let has_group_by = !stmt.group_by.is_empty();
+    let has_agg_in_select = select_list_has_aggregates(&stmt.select_list);
+    let has_having = stmt.having.is_some();
+    let needs_aggregate = has_group_by || has_agg_in_select || has_having;
+
+    // SELECT 列表列引用重写为前缀列名（供聚合提取 / 投影共用）
+    let qualified_select: Vec<SelectItem> = stmt.select_list.iter()
+        .map(|item| match item {
+            SelectItem::Wildcard => SelectItem::Wildcard,
+            SelectItem::Expression(expr, alias) => {
+                SelectItem::Expression(qualify_column_refs(expr), alias.clone())
+            }
+        })
+        .collect();
+
+    let mut group_by_indices: Vec<usize> = Vec::new();
+    let mut aggregates: Vec<AggregateExpr> = Vec::new();
+
+    if needs_aggregate {
+        group_by_indices = stmt.group_by.iter()
+            .filter_map(|expr| {
+                if let Expression::ColumnRef { table, column } = expr {
+                    find_join_column(&scan_column_names, table.as_deref(), column)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let (agg_exprs, _non_agg_exprs) = extract_aggregates_from_select(&qualified_select);
+        aggregates = agg_exprs.iter()
+            .filter_map(|(func_name, arg_expr, distinct)| {
+                let input_col = match arg_expr {
+                    Expression::ColumnRef { column, .. } => {
+                        scan_column_names.iter().position(|c| c == column)?
+                    }
+                    _ => 0,
+                };
+                let func = match func_name.to_uppercase().as_str() {
+                    "COUNT" => AggregateFunc::Count,
+                    "SUM" => AggregateFunc::Sum,
+                    "AVG" => AggregateFunc::Avg,
+                    "MIN" => AggregateFunc::Min,
+                    "MAX" => AggregateFunc::Max,
+                    _ => return None,
+                };
+                Some(AggregateExpr { func, input: input_col, distinct: *distinct })
+            })
+            .collect();
+
+        plan = PhysicalPlan::Aggregate {
+            input: Box::new(plan),
+            group_by: group_by_indices.clone(),
+            aggregates: aggregates.clone(),
+        };
+    }
+
+    // HAVING（聚合之上 Filter）
+    if let Some(having_expr) = &stmt.having {
+        if needs_aggregate {
+            let qualified = qualify_column_refs(having_expr);
+            let rewritten = rewrite_having_aggregates(
+                &qualified,
+                &group_by_indices,
+                &aggregates,
+                &scan_column_names,
+            );
+            plan = PhysicalPlan::Filter {
+                input: Box::new(plan),
+                condition: rewritten,
+            };
+        }
+    }
+
+    // 窗口函数：JOIN 查询暂不支持
+    let has_window = stmt.select_list.iter().any(|item| {
+        if let SelectItem::Expression(expr, _) = item {
+            expr_has_window(expr)
+        } else {
+            false
+        }
+    });
+    if has_window {
+        return Err(EngramDbError::Parse(
+            "Window functions are not supported in JOIN queries".into()
+        ));
+    }
+
+    // Projection（SELECT 列表已在聚合提取前重写为前缀列名）
+    let (proj_expressions, proj_names) = plan_projection(
+        &qualified_select,
+        &scan_column_names,
+        needs_aggregate,
+        &[],
+    )?;
+    // 投影输出列名还原为裸名（用户可见 API；求值用表达式中的前缀名匹配输入列）
+    let proj_names: Vec<String> = proj_names.iter()
+        .map(|n| n.rsplit('.').next().unwrap_or(n).to_string())
+        .collect();
+
+    if needs_aggregate {
+        // 聚合结果直接输出（列顺序由聚合执行器保证）
+    } else if !proj_expressions.is_empty() {
+        plan = PhysicalPlan::Projection {
+            input: Box::new(plan),
+            expressions: proj_expressions.clone(),
+            column_names: proj_names.clone(),
+        };
+    }
+
+    // ORDER BY
+    if !stmt.order_by.is_empty() {
+        let output_columns = if needs_aggregate {
+            // group_by 列名（裸名）+ 聚合列输出名（SELECT 别名优先，与
+            // Aggregate 输出列顺序一致：group_by 列在前，聚合列在后）
+            let mut cols: Vec<String> = group_by_indices.iter()
+                .map(|&i| scan_column_names.get(i)
+                    .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+                    .unwrap_or_else(|| format!("group_{}", i)))
+                .collect();
+            let agg_out_names: Vec<String> = qualified_select.iter().filter_map(|item| {
+                if let SelectItem::Expression(expr, alias) = item {
+                    if let Expression::Function { name, .. } = expr {
+                        if matches!(name.to_uppercase().as_str(),
+                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                        {
+                            return Some(alias.clone().unwrap_or_else(|| name.to_lowercase()));
+                        }
+                    }
+                }
+                None
+            }).collect();
+            cols.extend(agg_out_names);
+            cols
+        } else if !proj_expressions.is_empty() {
+            proj_names.clone()
+        } else {
+            scan_column_names.clone()
+        };
+
+        let mut sort_keys = Vec::new();
+        for item in &stmt.order_by {
+            if let Expression::ColumnRef { table, column } = &item.expr {
+                // 前缀列名（"users.name"）或裸列名匹配输出列
+                let idx = output_columns.iter().position(|c| {
+                    let prefixed = table.as_ref()
+                        .map(|t| c == &format!("{}.{}", t, column))
+                        .unwrap_or(false);
+                    prefixed || c == column
+                });
+                if let Some(idx) = idx {
+                    sort_keys.push(crate::executor::physical_plan::SortKey {
+                        column_index: idx,
+                        direction: if item.ascending {
+                            crate::executor::physical_plan::SortDirection::Asc
+                        } else {
+                            crate::executor::physical_plan::SortDirection::Desc
+                        },
+                    });
+                }
+            }
+        }
+
+        if !sort_keys.is_empty() {
+            plan = PhysicalPlan::Sort {
+                input: Box::new(plan),
+                sort_keys,
+                limit: stmt.limit,
+            };
+        }
+    }
+
+    // Limit
+    if let Some(limit) = stmt.limit {
+        plan = PhysicalPlan::Limit {
+            input: Box::new(plan),
+            limit,
+        };
+    }
+
+    // DISTINCT
+    if stmt.distinct {
+        plan = PhysicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+
+    Ok(plan)
+}
+
+/// 构建连接树物理计划（②）
+///
+/// 返回 (计划, 输出列名)。输出列名 = 左子树列名 ++ 右子树列名。
+///
+/// - `Table`：TableScan，扫描列 = stmt 引用的列 ∪ 整棵树 ON 条件引用的列
+/// - `Join`：递归构建两侧 → 解析 ON 等值键 → HashJoin（无等值键时
+///   CrossJoin + 残留 Filter；非等值 ON 且 LEFT/RIGHT/FULL 时报错）
+/// - `CrossJoin`：递归构建两侧 → CrossJoin
+fn plan_join_tree(
+    table_ref: &TableRef,
+    db: &Database,
+    stmt: &SelectStmt,
+) -> Result<(PhysicalPlan, Vec<String>)> {
+    let all_on_columns = collect_join_on_columns(table_ref);
+    plan_join_tree_inner(table_ref, db, stmt, &all_on_columns)
+}
+
+/// 连接树构建（内部递归）
+fn plan_join_tree_inner(
+    table_ref: &TableRef,
+    db: &Database,
+    stmt: &SelectStmt,
+    all_on_columns: &[String],
+) -> Result<(PhysicalPlan, Vec<String>)> {
+    match table_ref {
+        TableRef::Table { table_name, .. } => {
+            let table = db.get_table(table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+
+            // 扫描列 = stmt 引用列（仅本表）∪ 所有 ON 引用列（仅本表）
+            // 注意：collect_referenced_columns 收集的是裸列名，JOIN 场景下
+            // 包含属于其他表的列，必须按本表 schema 过滤后再用。
+            // 输出列名带表前缀（"users.name"），消除跨表重名列歧义。
+            let mut names: Vec<String> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for name in collect_referenced_columns(stmt, &table.def.columns) {
+                if table.def.column_index(&name).is_some() && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    names.push(format!("{}.{}", table_name, name));
+                }
+            }
+            for col in all_on_columns {
+                if table.def.column_index(col).is_some() && !seen.contains(col) {
+                    seen.insert(col.clone());
+                    names.push(format!("{}.{}", table_name, col));
+                }
+            }
+
+            let indices: Vec<usize> = names.iter()
+                .filter_map(|n| table.def.column_index(n.rsplit('.').next().unwrap_or(n)))
+                .collect();
+            let indices = if indices.is_empty() && !table.def.columns.is_empty() {
+                // 无引用列时扫描第一列（与单表路径一致）
+                if !names.contains(&format!("{}.{}", table_name, table.def.columns[0].name)) {
+                    names.push(format!("{}.{}", table_name, table.def.columns[0].name));
+                }
+                vec![0]
+            } else {
+                indices
+            };
+
+            // 列名规范化投影：TableScan 执行器输出裸名列名，JOIN 上下文
+            // 需要前缀列名（"users.name"）供 ON/WHERE/SELECT 消歧解析。
+            // 表达式用裸名列引用（匹配 TableScan 输出），输出列名用前缀名。
+            // 注意：恒等投影消除要求 expressions[i].column == column_names[i]，
+            // 此处二者不同（裸名 vs 前缀名），不会被消除。
+            let expressions: Vec<Expression> = indices.iter()
+                .map(|&i| Expression::ColumnRef {
+                    table: None,
+                    column: table.def.columns[i].name.clone(),
+                })
+                .collect();
+            let plan = PhysicalPlan::Projection {
+                input: Box::new(PhysicalPlan::TableScan {
+                    table_name: table_name.clone(),
+                    column_indices: indices,
+                }),
+                expressions,
+                column_names: names.clone(),
+            };
+
+            Ok((plan, names))
+        }
+        TableRef::Join { left, right, join_type, on } => {
+            let left_side = plan_join_tree_inner(left, db, stmt, all_on_columns)?;
+            let right_side = plan_join_tree_inner(right, db, stmt, all_on_columns)?;
+
+            let (mut plan, left_names) = if let Some(on_expr) = on {
+                let (left_keys, right_keys, residual) =
+                    resolve_join_on(on_expr, &left_side.1, &right_side.1)?;
+
+                let mut p = if left_keys.is_empty() {
+                    // 无等值键：INNER 用 CrossJoin + 残留 Filter
+                    if *join_type != crate::executor::physical_plan::JoinType::Inner {
+                        return Err(EngramDbError::Parse(format!(
+                            "Non-equi {:?} JOIN is not supported (needs an equality condition in ON)",
+                            join_type
+                        )));
+                    }
+                    PhysicalPlan::CrossJoin {
+                        left: Box::new(left_side.0),
+                        right: Box::new(right_side.0),
+                    }
+                } else {
+                    PhysicalPlan::HashJoin {
+                        left: Box::new(left_side.0),
+                        right: Box::new(right_side.0),
+                        join_type: *join_type,
+                        left_keys,
+                        right_keys,
+                    }
+                };
+
+                if let Some(residual_cond) = residual {
+                    p = PhysicalPlan::Filter {
+                        input: Box::new(p),
+                        condition: qualify_column_refs(&residual_cond),
+                    };
+                }
+                (p, left_side.1)
+            } else {
+                // 无 ON：CROSS JOIN
+                (
+                    PhysicalPlan::CrossJoin {
+                        left: Box::new(left_side.0),
+                        right: Box::new(right_side.0),
+                    },
+                    left_side.1,
+                )
+            };
+
+            let mut columns = left_names;
+            columns.extend(right_side.1);
+            Ok((plan, columns))
+        }
+        TableRef::CrossJoin { left, right } => {
+            let left_side = plan_join_tree_inner(left, db, stmt, all_on_columns)?;
+            let right_side = plan_join_tree_inner(right, db, stmt, all_on_columns)?;
+
+            let mut columns = left_side.1;
+            columns.extend(right_side.1);
+            Ok((
+                PhysicalPlan::CrossJoin {
+                    left: Box::new(left_side.0),
+                    right: Box::new(right_side.0),
+                },
+                columns,
+            ))
+        }
+        TableRef::Derived { .. } => Err(EngramDbError::Parse(
+            "Derived tables are not supported in JOIN queries".into()
+        )),
+        TableRef::TableFunction { .. } => Err(EngramDbError::Parse(
+            "Table functions are not supported in JOIN queries".into()
+        )),
+    }
+}
+
+/// 解析 ON 条件为等值连接键 + 残留条件（②）
+///
+/// 将 ON 拆分为顶层 AND 子句；形如 `col = col`（分属左右两侧）的子句
+/// 提取为连接键，其余子句合并为残留 Filter 条件。
+///
+/// 返回 (left_keys, right_keys, residual)：
+/// - left_keys[i] / right_keys[i]：键在左/右输出列名列表中的位置
+/// - residual：未消费子句的 AND 合并（None 表示无残留）
+fn resolve_join_on(
+    on: &Expression,
+    left_names: &[String],
+    right_names: &[String],
+) -> Result<(Vec<usize>, Vec<usize>, Option<Expression>)> {
+    let conjuncts = split_and_conjuncts(on);
+    let mut left_keys: Vec<usize> = Vec::new();
+    let mut right_keys: Vec<usize> = Vec::new();
+    let mut residual: Vec<Expression> = Vec::new();
+
+    for conj in conjuncts {
+        if let Expression::BinaryOp { left, op: BinaryOperator::Eq, right } = conj {
+            let lref = column_ref_name(left.as_ref());
+            let rref = column_ref_name(right.as_ref());
+            if let (Some((lt, lc)), Some((rt, rc))) = (lref, rref) {
+                let lpos = find_join_column(&left_names, lt, lc);
+                let rpos = find_join_column(&right_names, rt, rc);
+                let lpos2 = find_join_column(&right_names, lt, lc);
+                let rpos2 = find_join_column(&left_names, rt, rc);
+                if let (Some(l), Some(r)) = (lpos, rpos) {
+                    left_keys.push(l);
+                    right_keys.push(r);
+                    continue;
+                }
+                if let (Some(l), Some(r)) = (lpos2, rpos2) {
+                    left_keys.push(l);
+                    right_keys.push(r);
+                    continue;
+                }
+            }
+        }
+        residual.push(conj.clone());
+    }
+
+    let residual_expr = match residual.len() {
+        0 => None,
+        1 => Some(residual.pop().unwrap()),
+        _ => Some(residual.into_iter().reduce(|acc, e| Expression::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOperator::And,
+            right: Box::new(e),
+        }).unwrap()),
+    };
+
+    Ok((left_keys, right_keys, residual_expr))
+}
+
+/// 若表达式是 ColumnRef，返回 (表前缀, 列名)（②）
+fn column_ref_name(expr: &Expression) -> Option<(Option<&str>, &str)> {
+    if let Expression::ColumnRef { table, column } = expr {
+        Some((table.as_deref(), column.as_str()))
+    } else {
+        None
+    }
+}
+
+/// 在 JOIN 侧输出列名列表中查找列（②）
+///
+/// 优先按表前缀精确匹配（"users.id"），再回退裸列名匹配
+/// （无重名歧义时 WHERE/ON 中的裸列引用仍可用）。
+fn find_join_column(names: &[String], table: Option<&str>, column: &str) -> Option<usize> {
+    if let Some(t) = table {
+        let prefixed = format!("{}.{}", t, column);
+        if let Some(i) = names.iter().position(|c| c == &prefixed) {
+            return Some(i);
+        }
+    }
+    names.iter().position(|c| c == column)
+}
+
+/// 将表达式拆分为顶层 AND 子句
+fn split_and_conjuncts(expr: &Expression) -> Vec<&Expression> {
+    fn rec<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
+        if let Expression::BinaryOp { left, op: BinaryOperator::And, right } = expr {
+            rec(left, out);
+            rec(right, out);
+        } else {
+            out.push(expr);
+        }
+    }
+    let mut out = Vec::new();
+    rec(expr, &mut out);
+    out
+}
+
+/// 收集整棵 FROM 树中所有 ON 条件引用的列名（②）
+fn collect_join_on_columns(table_ref: &TableRef) -> Vec<String> {
+    let mut cols: Vec<String> = Vec::new();
+    fn rec(table_ref: &TableRef, out: &mut Vec<String>) {
+        match table_ref {
+            TableRef::Join { left, right, on, .. } => {
+                if let Some(on) = on {
+                    collect_expr_columns_ordered(
+                        on, out,
+                        &mut std::collections::HashSet::new(),
+                    );
+                }
+                rec(left, out);
+                rec(right, out);
+            }
+            TableRef::CrossJoin { left, right } => {
+                rec(left, out);
+                rec(right, out);
+            }
+            _ => {}
+        }
+    }
+    rec(table_ref, &mut cols);
+    cols
+}
+
+/// 将表达式中的表前缀列引用（ColumnRef{table: Some("t"), column: "c"}）
+/// 重写为前缀列名（ColumnRef{table: None, column: "t.c"}），与 JOIN 输出
+/// 列名（"t.c"）匹配，并消除跨表重名列歧义（②）。
+fn qualify_column_refs(expr: &Expression) -> Expression {
+    match expr {
+        Expression::ColumnRef { table: Some(t), column } => Expression::ColumnRef {
+            table: None,
+            column: format!("{}.{}", t, column),
+        },
+        Expression::ColumnRef { table: None, column } => {
+            Expression::ColumnRef { table: None, column: column.clone() }
+        }
+        Expression::Literal(_) | Expression::Placeholder(_) => expr.clone(),
+        Expression::BinaryOp { left, op, right } => Expression::BinaryOp {
+            left: Box::new(qualify_column_refs(left)),
+            op: *op,
+            right: Box::new(qualify_column_refs(right)),
+        },
+        Expression::UnaryOp { op, expr: inner } => Expression::UnaryOp {
+            op: *op,
+            expr: Box::new(qualify_column_refs(inner)),
+        },
+        Expression::Function { name, args, distinct, count_star, over } => Expression::Function {
+            name: name.clone(),
+            args: args.iter().map(qualify_column_refs).collect(),
+            distinct: *distinct,
+            count_star: *count_star,
+            over: over.clone(),
+        },
+        Expression::Cast { expr: inner, data_type } => Expression::Cast {
+            expr: Box::new(qualify_column_refs(inner)),
+            data_type: data_type.clone(),
+        },
+        Expression::IsNull(inner) => Expression::IsNull(Box::new(qualify_column_refs(inner))),
+        Expression::IsNotNull(inner) => Expression::IsNotNull(Box::new(qualify_column_refs(inner))),
+        Expression::InList { expr: inner, list } => Expression::InList {
+            expr: Box::new(qualify_column_refs(inner)),
+            list: list.iter().map(qualify_column_refs).collect(),
+        },
+        Expression::Like { expr: inner, pattern } => Expression::Like {
+            expr: Box::new(qualify_column_refs(inner)),
+            pattern: Box::new(qualify_column_refs(pattern)),
+        },
+        Expression::Case { when_then, else_expr } => Expression::Case {
+            when_then: when_then.iter()
+                .map(|(w, t)| (qualify_column_refs(w), qualify_column_refs(t)))
+                .collect(),
+            else_expr: else_expr.as_ref().map(|e| Box::new(qualify_column_refs(e))),
+        },
+        Expression::Subquery(_) | Expression::Exists { .. } | Expression::InSubquery { .. } => {
+            expr.clone()
+        }
+    }
+}
+
 /// 规划单个表引用（用于 CROSS JOIN 等场景）
 fn plan_table_ref(table_ref: &TableRef, db: &Database, stmt: &SelectStmt) -> Result<PhysicalPlan> {
     match table_ref {
+        TableRef::Join { left, right, on, .. } => {
+            // ②：连接树（此函数不再被顶层 JOIN 路径使用，保留以支持嵌套引用）
+            let (plan, _) = plan_join_tree(table_ref, db, stmt)?;
+            let _ = (left, right, on);
+            Ok(plan)
+        }
         TableRef::Table { table_name, .. } => {
             let table = db.get_table(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
