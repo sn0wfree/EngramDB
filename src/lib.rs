@@ -214,6 +214,14 @@ impl Connection {
         Transaction::begin(&mut self.db, txn::IsolationLevel::default())
     }
 
+    /// 开始一个只读事务（v0.15.0 Txn09）
+    ///
+    /// 只读事务跳过 WAL 写入，避免不必要的 fsync 开销。
+    /// 适用于只进行 SELECT 查询的场景。
+    pub fn begin_readonly(&mut self) -> Result<Transaction> {
+        Transaction::begin_readonly(&mut self.db, txn::IsolationLevel::default())
+    }
+
     /// 关闭数据库
     pub fn close(&mut self) -> Result<()> {
         let result = self.db.close();
@@ -2223,6 +2231,28 @@ mod value_tests {
 
         let result = conn.execute("SELECT INSTR(s, 'xyz') FROM t WHERE s = 'hello'").unwrap();
         assert_eq!(result.rows[0][0], Value::Int64(0), "未找到应返回 0");
+    }
+
+    #[test]
+    fn test_split_part() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (s VARCHAR)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('a,b,c'), ('hello.world.test'), ('single')").unwrap();
+
+        // SPLIT_PART(str, delimiter, part): 1-based
+        let result = conn.execute("SELECT SPLIT_PART(s, ',', 2) FROM t WHERE s = 'a,b,c'").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("b".into()));
+
+        let result = conn.execute("SELECT SPLIT_PART(s, '.', 3) FROM t WHERE s = 'hello.world.test'").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("test".into()));
+
+        // out of range returns empty string
+        let result = conn.execute("SELECT SPLIT_PART(s, ',', 5) FROM t WHERE s = 'a,b,c'").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("".into()));
+
+        // part < 1 returns empty string
+        let result = conn.execute("SELECT SPLIT_PART(s, ',', 0) FROM t WHERE s = 'a,b,c'").unwrap();
+        assert_eq!(result.rows[0][0], Value::Varchar("".into()));
     }
 
     #[test]

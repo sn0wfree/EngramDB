@@ -21,13 +21,26 @@ use super::{TxnState, IsolationLevel, TxnId};
 pub struct Transaction<'a> {
     id: TxnId,
     db: &'a mut Database,
+    /// 是否只读事务（v0.15.0 Txn09）
+    read_only: bool,
 }
 
 impl<'a> Transaction<'a> {
     /// 开始一个新事务（由 Database 调用）
     pub(crate) fn begin(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
         let txn_id = db.txn_manager_mut().begin(isolation_level)?;
-        Ok(Self { id: txn_id, db })
+        Ok(Self { id: txn_id, db, read_only: false })
+    }
+
+    /// 开始一个只读事务（跳过 WAL，v0.15.0 Txn09）
+    pub(crate) fn begin_readonly(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
+        let txn_id = db.txn_manager_mut().begin_readonly(isolation_level)?;
+        Ok(Self { id: txn_id, db, read_only: true })
+    }
+
+    /// 是否为只读事务
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// 提交事务

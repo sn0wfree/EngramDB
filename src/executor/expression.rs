@@ -829,6 +829,16 @@ fn eval_function(
             let needle_vec = eval_vectorized(&args[1], chunk, column_names)?;
             eval_instr(&haystack_vec, &needle_vec)
         }
+        "SPLIT_PART" => {
+            // SPLIT_PART(str, delimiter, part): 按 delimiter 分割字符串，返回第 part 段（1-based）
+            if args.len() != 3 {
+                return Err(EngramDbError::Parse("SPLIT_PART requires 3 arguments".into()));
+            }
+            let str_vec = eval_vectorized(&args[0], chunk, column_names)?;
+            let delim_vec = eval_vectorized(&args[1], chunk, column_names)?;
+            let part_vec = eval_vectorized(&args[2], chunk, column_names)?;
+            eval_split_part(&str_vec, &delim_vec, &part_vec)
+        }
         "CEIL" | "CEILING" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("CEIL requires 1 argument".into()));
@@ -1800,6 +1810,45 @@ fn eval_instr(haystack_vec: &Vector, needle_vec: &Vector) -> Result<Vector> {
             })
             .unwrap_or(0);
         result.push(Value::Int64(pos));
+    }
+    Ok(Vector::Flat(result))
+}
+
+fn eval_split_part(str_vec: &Vector, delim_vec: &Vector, part_vec: &Vector) -> Result<Vector> {
+    let len = str_vec.len();
+    let mut result = Vec::with_capacity(len);
+    for i in 0..len {
+        let s = str_vec.get(i);
+        let d = delim_vec.get(i);
+        let p = part_vec.get(i);
+        if s.is_null() || d.is_null() || p.is_null() {
+            result.push(Value::Null);
+            continue;
+        }
+        let s_str = match s.as_str() {
+            Some(v) => v,
+            None => { result.push(Value::Null); continue; }
+        };
+        let d_str = match d.as_str() {
+            Some(v) => v,
+            None => { result.push(Value::Null); continue; }
+        };
+        let part = match p.as_i64() {
+            Some(v) => v,
+            None => { result.push(Value::Null); continue; }
+        };
+        // 1-based part index; empty string if out of range
+        if part < 1 {
+            result.push(Value::Varchar("".into()));
+            continue;
+        }
+        let parts: Vec<&str> = s_str.split(d_str).collect();
+        let idx = (part - 1) as usize;
+        if idx >= parts.len() {
+            result.push(Value::Varchar("".into()));
+        } else {
+            result.push(Value::Varchar(parts[idx].to_string()));
+        }
     }
     Ok(Vector::Flat(result))
 }

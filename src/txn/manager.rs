@@ -23,6 +23,8 @@ struct TxnContext {
     state: TxnState,
     isolation_level: IsolationLevel,
     start_ts: Timestamp,
+    /// 该事务是否只读（只读事务跳过 WAL，v0.15.0 Txn09）
+    read_only: bool,
     /// 该事务写入的 key 列表（用于提交/回滚时处理）
     /// (table_id, rowid)
     write_set: Vec<(u32, u64)>,
@@ -72,16 +74,30 @@ impl TransactionManager {
 
     /// 开始一个新事务
     pub fn begin(&mut self, isolation_level: IsolationLevel) -> Result<TxnId> {
+        self.begin_with_flags(isolation_level, false)
+    }
+
+    /// 开始一个新事务（可指定只读标志）
+    ///
+    /// 只读事务跳过 WAL 写入，避免不必要的 fsync 开销（v0.15.0 Txn09）。
+    pub fn begin_readonly(&mut self, isolation_level: IsolationLevel) -> Result<TxnId> {
+        self.begin_with_flags(isolation_level, true)
+    }
+
+    fn begin_with_flags(&mut self, isolation_level: IsolationLevel, read_only: bool) -> Result<TxnId> {
         let (txn_id, start_ts) = self.active_table.begin_txn();
 
-        // 写入 WAL BEGIN 记录
-        self.wal.write_record(WalRecordType::Begin, txn_id, 0, &[])?;
+        // 只读事务跳过 WAL BEGIN 记录（v0.15.0 Txn09）
+        if !read_only {
+            self.wal.write_record(WalRecordType::Begin, txn_id, 0, &[])?;
+        }
 
         let ctx = TxnContext {
             id: txn_id,
             state: TxnState::Active,
             isolation_level,
             start_ts,
+            read_only,
             write_set: Vec::new(),
             savepoints: Vec::new(),
         };
@@ -107,9 +123,11 @@ impl TransactionManager {
         let write_set = ctx.write_set.clone();
         let _dropped = std::mem::take(&mut ctx.write_set);
 
-        // 写入 WAL COMMIT 记录并刷盘（根据配置的刷盘策略）
-        self.wal.write_record(WalRecordType::Commit, txn_id, 0, &[])?;
-        self.wal.commit_flush()?;
+        // 只读事务跳过 WAL COMMIT 记录和 fsync（v0.15.0 Txn09）
+        if !ctx.read_only {
+            self.wal.write_record(WalRecordType::Commit, txn_id, 0, &[])?;
+            self.wal.commit_flush()?;
+        }
 
         // 获取 commit_ts
         let commit_ts = self.active_table.commit_txn(txn_id);
@@ -206,9 +224,11 @@ impl TransactionManager {
         // 同时清空 savepoint 栈（事务回滚后所有 savepoint 失效）
         let _ = std::mem::take(&mut ctx.savepoints);
 
-        // 写入 WAL ROLLBACK 记录
-        self.wal.write_record(WalRecordType::Rollback, txn_id, 0, &[])?;
-        self.wal.commit_flush()?;
+        // 只读事务跳过 WAL ROLLBACK 记录（v0.15.0 Txn09）
+        if !ctx.read_only {
+            self.wal.write_record(WalRecordType::Rollback, txn_id, 0, &[])?;
+            self.wal.commit_flush()?;
+        }
 
         // 回滚 MVCC 版本（移除未提交版本）
         for (table_id, _rowid) in &write_set {
