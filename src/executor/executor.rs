@@ -233,6 +233,61 @@ fn try_execute_chunks(
             chunks.extend(rchunks);
             Ok(Some((lcols, chunks)))
         }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            join_type,
+            left_keys,
+            right_keys,
+        } => {
+            // 列式 HashJoin：两侧直接 chunks 输入，避免左/右 rows↔chunks 转换
+            let (lcols, lchunks) = match try_execute_chunks(left, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let (rcols, rchunks) = match try_execute_chunks(right, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let joined = operators::hash_join::execute(
+                &lchunks, &rchunks, left_keys, right_keys, *join_type,
+            )?;
+            let mut columns = lcols;
+            columns.extend(rcols);
+            Ok(Some((columns, joined)))
+        }
+        PhysicalPlan::CrossJoin { left, right } => {
+            // 列式笛卡尔积：左右 chunks 直接拼接，避免行级 clone
+            let (lcols, lchunks) = match try_execute_chunks(left, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let (rcols, rchunks) = match try_execute_chunks(right, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let joined = cross_join_chunks(&lchunks, &rchunks)?;
+            let mut columns = lcols;
+            columns.extend(rcols);
+            Ok(Some((columns, joined)))
+        }
+        PhysicalPlan::Window {
+            input,
+            window_functions,
+            column_names,
+        } => {
+            // 列式 Window：上游 chunks 直接传给 window operator
+            let (cols, chunks) = match try_execute_chunks(input, db)? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            let result = operators::window::execute(&chunks, window_functions, column_names)?;
+            let mut columns = cols;
+            for wf in window_functions {
+                columns.push(wf.output_name.clone());
+            }
+            Ok(Some((columns, result)))
+        }
         PhysicalPlan::SubqueryScan { plan } => try_execute_chunks(plan, db),
         _ => Ok(None),
     }
@@ -258,6 +313,36 @@ fn truncate_chunk(chunk: &DataChunk, n: usize) -> DataChunk {
         columns,
         count: n,
     }
+}
+
+/// 列式笛卡尔积：左 chunks × 右 chunks
+///
+/// 内部实现用行级 cross product（简单可读）+ 末尾批量转 chunks；
+/// 优势是上游（左侧输入/右侧输入）保持 DataChunk 形式，无需 rows 物化。
+fn cross_join_chunks(left: &[DataChunk], right: &[DataChunk]) -> Result<Vec<DataChunk>> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(Vec::new());
+    }
+    let left_cols = left[0].num_columns();
+    let right_cols = right[0].num_columns();
+    let mut out_rows: Vec<Vec<crate::Value>> = Vec::new();
+    for lc in left {
+        let l_rows = lc.to_rows();
+        for rc in right {
+            let r_rows = rc.to_rows();
+            for lr in &l_rows {
+                let cap = lr.len() + right_cols;
+                for rr in &r_rows {
+                    let mut row = Vec::with_capacity(cap);
+                    row.extend_from_slice(lr);
+                    row.extend_from_slice(rr);
+                    out_rows.push(row);
+                }
+            }
+        }
+    }
+    let _ = left_cols; // 保留语义注释
+    Ok(super::vector::from_rows_batched(&out_rows))
 }
 
 /// 执行物理计划
@@ -746,22 +831,31 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::HashJoin { left, right, join_type, left_keys, right_keys } => {
-            let left_result = execute(*left, db)?;
-            let right_result = execute(*right, db)?;
-
-            let left_chunks = rows_to_chunks(&left_result.rows);
-            let right_chunks = rows_to_chunks(&right_result.rows);
-
+            // 列式优先：两侧分别 try_execute_chunks 直接给 chunks，省 rows↔chunks 转换
+            let (lcols, lchunks) = match try_execute_chunks(left.as_ref(), db)? {
+                Some(x) => x,
+                None => {
+                    let left_result = execute(*left.clone(), db)?;
+                    let columns = left_result.columns.clone();
+                    let chunks = rows_to_chunks(&left_result.rows);
+                    (columns, chunks)
+                }
+            };
+            let (rcols, rchunks) = match try_execute_chunks(right.as_ref(), db)? {
+                Some(x) => x,
+                None => {
+                    let right_result = execute(*right.clone(), db)?;
+                    let columns = right_result.columns.clone();
+                    let chunks = rows_to_chunks(&right_result.rows);
+                    (columns, chunks)
+                }
+            };
             let joined = operators::hash_join::execute(
-                &left_chunks, &right_chunks, &left_keys, &right_keys, join_type
+                &lchunks, &rchunks, &left_keys[..], &right_keys[..], join_type,
             )?;
-
             let rows = chunks_to_rows(&joined);
-
-            // 列名：左表列 + 右表列
-            let mut columns = left_result.columns.clone();
-            columns.extend(right_result.columns.clone());
-
+            let mut columns = lcols;
+            columns.extend(rcols);
             Ok(QueryResult {
                 columns,
                 rows,
@@ -770,23 +864,29 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::CrossJoin { left, right } => {
-            let left_result = execute(*left, db)?;
-            let right_result = execute(*right, db)?;
-
-            // 笛卡尔积：左表每行 × 右表所有行
-            let mut rows = Vec::new();
-            let left_cols = left_result.columns.len();
-            for lr in &left_result.rows {
-                for rr in &right_result.rows {
-                    let mut row = lr.clone();
-                    row.extend(rr.clone());
-                    rows.push(row);
+            // 列式优先：两侧取 chunks 后笛卡尔积
+            let (lcols, lchunks) = match try_execute_chunks(left.as_ref(), db)? {
+                Some(x) => x,
+                None => {
+                    let left_result = execute(*left.clone(), db)?;
+                    let columns = left_result.columns.clone();
+                    let chunks = rows_to_chunks(&left_result.rows);
+                    (columns, chunks)
                 }
-            }
-
-            let mut columns = left_result.columns.clone();
-            columns.extend(right_result.columns.clone());
-
+            };
+            let (rcols, rchunks) = match try_execute_chunks(right.as_ref(), db)? {
+                Some(x) => x,
+                None => {
+                    let right_result = execute(*right.clone(), db)?;
+                    let columns = right_result.columns.clone();
+                    let chunks = rows_to_chunks(&right_result.rows);
+                    (columns, chunks)
+                }
+            };
+            let joined = cross_join_chunks(&lchunks, &rchunks)?;
+            let rows = chunks_to_rows(&joined);
+            let mut columns = lcols;
+            columns.extend(rcols);
             Ok(QueryResult {
                 columns,
                 rows,
@@ -892,6 +992,31 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::Limit { input, limit } => {
+            // 列式优先：上游 chunks 直接取前 N 行，无需全表物化
+            if let Some((columns, in_chunks)) = try_execute_chunks(input.as_ref(), db)? {
+                let mut remaining = limit;
+                let mut out: Vec<DataChunk> = Vec::new();
+                for ch in in_chunks {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = ch.count.min(remaining);
+                    let cols: Vec<Vector> = ch.columns.iter().map(|c| match c {
+                        Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
+                        Vector::Typed(d) => {
+                            let mut d = d.clone();
+                            Vector::Typed(d.take_front(take))
+                        }
+                        Vector::Flat(rows) => {
+                            Vector::Flat(rows.iter().take(take).cloned().collect())
+                        }
+                    }).collect();
+                    out.push(DataChunk { columns: cols, count: take });
+                    remaining -= take;
+                }
+                let rows = chunks_to_rows(&out);
+                return Ok(QueryResult { columns, rows, rows_affected: 0 });
+            }
             let input_result = execute(*input, db)?;
             let limited_rows: Vec<_> = input_result.rows.into_iter().take(limit).collect();
 
@@ -1226,11 +1351,19 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             }
         }
         PhysicalPlan::Window { input, window_functions, column_names } => {
-            let input_result = execute(*input, db)?;
-            let input_chunks = rows_to_chunks(&input_result.rows);
-            let result = operators::window::execute(&input_chunks, &window_functions, &column_names)?;
-            let mut columns = input_result.columns.clone();
-            for wf in &window_functions {
+            // 列式优先：上游 chunks 直接传给 window operator
+            let (cols, chunks) = match try_execute_chunks(input.as_ref(), db)? {
+                Some(x) => x,
+                None => {
+                    let input_result = execute(*input.clone(), db)?;
+                    let columns = input_result.columns.clone();
+                    let chunks = rows_to_chunks(&input_result.rows);
+                    (columns, chunks)
+                }
+            };
+            let result = operators::window::execute(&chunks, &window_functions[..], &column_names[..])?;
+            let mut columns = cols;
+            for wf in window_functions {
                 columns.push(wf.output_name.clone());
             }
             let rows = chunks_to_rows(&result);
