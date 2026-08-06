@@ -132,7 +132,23 @@ impl Connection {
     /// Batcher 自行攒批/触发，其余语句（SELECT/UPDATE/DELETE/DDL/CTAS/
     /// InsertSelect/UPSERT/INSERT...RETURNING）必须先落盘缓冲行。
     fn flush_batches(&mut self) -> Result<()> {
-        crate::executor::operators::insert::flush_all_batched(&mut self.db)
+        crate::executor::operators::insert::flush_all_batched(&mut self.db)?;
+        // P0-2 事务级 Batcher：显式事务内 buffer 同样遵守冲刷语义
+        // （非裸 INSERT 语句执行前读己之写）
+        if self.db.in_explicit_txn() {
+            self.db.flush_txn_buffer()?;
+        }
+        Ok(())
+    }
+
+    /// P0-2 事务级 Batcher：回滚语句不得触发 flush（应丢弃事务 buffer）
+    ///
+    /// ROLLBACK / ROLLBACK TO SAVEPOINT 前的"非裸 INSERT 前置冲刷"会把
+    /// 事务 buffer 落盘成内部事务，导致回滚失效。
+    fn is_txn_rollback_stmt(ast: &crate::sql::ast::Statement) -> bool {
+        matches!(ast,
+            crate::sql::ast::Statement::Rollback
+            | crate::sql::ast::Statement::RollbackToSavepoint { .. })
     }
 
     /// 执行 SQL 语句
@@ -146,13 +162,14 @@ impl Connection {
              }
              return executor::execute(cached, &mut self.db);
          }
-         let ast = sql::parser::parse(sql)?;
-         // P0-2：非裸 INSERT 语句前置冲刷攒批
-         let batcher_clean = matches!(&ast, crate::sql::ast::Statement::Insert(stmt)
-             if stmt.on_conflict.is_none() && stmt.returning.is_none() && stmt.select.is_none());
-         if !batcher_clean {
-             self.flush_batches()?;
-         }
+        let ast = sql::parser::parse(sql)?;
+        // P0-2：非裸 INSERT 语句前置冲刷攒批
+        //（ROLLBACK / ROLLBACK TO SAVEPOINT 除外：应丢弃事务 buffer 而非 flush）
+        let batcher_clean = matches!(&ast, crate::sql::ast::Statement::Insert(stmt)
+            if stmt.on_conflict.is_none() && stmt.returning.is_none() && stmt.select.is_none());
+        if !batcher_clean && !Self::is_txn_rollback_stmt(&ast) {
+            self.flush_batches()?;
+        }
          // 结构性 DDL / ANALYZE：不缓存，执行后清空缓存（计划依赖表结构与统计）
          let is_ddl = matches!(&ast,
              crate::sql::ast::Statement::CreateTable(_)
@@ -163,9 +180,14 @@ impl Connection {
              | crate::sql::ast::Statement::CreateMaterializedView(_)
              | crate::sql::ast::Statement::DropMaterializedView(_)
              | crate::sql::ast::Statement::RefreshMaterializedView(_));
-         let plan = sql::planner::plan(ast, &self.db)?;
-         // CountStar 是行数快照（Perf01 元数据短路），缓存即过期 → 不缓存
-         let cacheable = !matches!(plan, PhysicalPlan::CountStar { .. });
+        let plan = sql::planner::plan(ast, &self.db)?;
+        // CountStar 是行数快照（Perf01 元数据短路），缓存即过期 → 不缓存
+        // Rollback/RollbackToSavepoint：不缓存（缓存命中路径会前置 flush
+        // 事务 buffer，破坏回滚语义；且回滚语句无重复执行价值）
+        let cacheable = !matches!(plan,
+            PhysicalPlan::CountStar { .. }
+            | PhysicalPlan::Rollback
+            | PhysicalPlan::RollbackToSavepoint { .. });
          // INSERT / CREATE TABLE 等 DDL/DML 语句不需要查询优化，直接执行
          // 避免对包含大量数据的计划做无谓的 clone 和优化规则遍历
          let needs_optimize = matches!(plan,
@@ -225,7 +247,7 @@ impl Connection {
         use executor::physical_plan::PhysicalPlan;
         let batcher_clean = matches!(&stmt.ast, crate::sql::ast::Statement::Insert(ins)
             if ins.on_conflict.is_none() && ins.returning.is_none() && ins.select.is_none());
-        if !batcher_clean {
+        if !batcher_clean && !Self::is_txn_rollback_stmt(&stmt.ast) {
             self.flush_batches()?;
         }
         // 直通路径：裸 INSERT（无 RETURNING / ON CONFLICT / SELECT）免计划结构，
@@ -2253,6 +2275,228 @@ mod value_tests {
         // 回滚到 sp2，应撤销 (4) 但保留 (3)
         conn.execute("ROLLBACK TO SAVEPOINT sp2").unwrap();
         conn.execute("COMMIT").unwrap();
+    }
+
+    // ========================================================================
+    // P0-2 事务级 Batcher：显式事务内攒批语义
+    // ========================================================================
+
+    fn row_ids(conn: &mut Connection, table: &str, col: &str) -> Vec<crate::Value> {
+        let r = conn.execute(&format!("SELECT {col} FROM {table} ORDER BY {col}")).unwrap();
+        r.rows.into_iter().map(|mut row| row.remove(0)).collect()
+    }
+
+    #[test]
+    fn test_txn_batch_commit_persists() {
+        // 显式事务内多条 INSERT 攒批 → COMMIT 后全部可见
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64, v INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        let ids = row_ids(&mut conn, "t", "id");
+        assert_eq!(ids, vec![
+            crate::Value::Int64(1),
+            crate::Value::Int64(2),
+            crate::Value::Int64(3),
+        ]);
+    }
+
+    #[test]
+    fn test_txn_batch_rollback_discards_unread() {
+        // 关键修复：ROLLBACK 撤销未读过的写入段（此前事务内 INSERT
+        // 各自内部事务提交，ROLLBACK 无效）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(0));
+    }
+
+    #[test]
+    fn test_txn_batch_read_your_writes() {
+        // 事务内读己之写：INSERT 后 SELECT 立即可见（读触发 flush）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(1));
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(2));
+        conn.execute("COMMIT").unwrap();
+
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(2));
+    }
+
+    #[test]
+    fn test_txn_batch_rollback_after_read_keeps_flushed() {
+        // 读触发 flush 后：已 flush 的数据保留（内部事务已落盘），
+        // 未 flush 的写入段可回滚
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        // SELECT 触发 flush（1、2 落盘）
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(2));
+        conn.execute("INSERT INTO t VALUES (3)").unwrap();
+        // ROLLBACK：3 被撤销，1、2 保留（与 flush-on-read 语义一致）
+        conn.execute("ROLLBACK").unwrap();
+
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(2));
+    }
+
+    #[test]
+    fn test_txn_batch_savepoint_partial_rollback() {
+        // 关键修复：SAVEPOINT 部分回滚（此前无效）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("SAVEPOINT sp1").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3)").unwrap();
+        conn.execute("ROLLBACK TO SAVEPOINT sp1").unwrap();
+        conn.execute("INSERT INTO t VALUES (4)").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        // 2、3 被撤销，1（savepoint 前）与 4（回滚后）保留
+        let ids = row_ids(&mut conn, "t", "id");
+        assert_eq!(ids, vec![
+            crate::Value::Int64(1),
+            crate::Value::Int64(4),
+        ]);
+    }
+
+    #[test]
+    fn test_txn_batch_savepoint_before_flush() {
+        // SAVEPOINT 前写入被 flush（保存点前数据落盘），savepoint 后
+        // 写入可被 ROLLBACK TO 撤销
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("SAVEPOINT sp1").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("ROLLBACK TO SAVEPOINT sp1").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        let ids = row_ids(&mut conn, "t", "id");
+        assert_eq!(ids, vec![crate::Value::Int64(1)]);
+    }
+
+    #[test]
+    fn test_txn_batch_constraint_table_bypass() {
+        // 有约束的表（主键）跳过攒批：PK 冲突在语句时即时暴露
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        // 冲突：攒批路径下会延迟到 flush；约束门控下语句时即报错
+        let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "expected ConstraintViolation at statement time, got {err:?}");
+        conn.execute("COMMIT").unwrap();
+
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(1));
+    }
+
+    #[test]
+    fn test_txn_batch_threshold_flushes_early() {
+        // 阈值（txn_batch_rows）触发提前 flush：大事务不爆内存且正确落盘
+        let mut cfg = crate::common::config::Config::default();
+        cfg.txn_batch_rows = 4;
+        let mut conn = Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        for i in 0..10 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        // 未提交前阈值已触发多次 flush（数据已落盘但事务仍活跃）
+        conn.execute("COMMIT").unwrap();
+
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(10));
+    }
+
+    #[test]
+    fn test_txn_batch_disabled_falls_back() {
+        // txn_batch_enabled=false：事务内 INSERT 逐条内部事务（旧行为），
+        // ROLLBACK 不撤销（保持兼容）
+        let mut cfg = crate::common::config::Config::default();
+        cfg.txn_batch_enabled = false;
+        let mut conn = Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+
+        // 旧行为：内部事务已提交，数据保留
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(1));
+    }
+
+    #[test]
+    fn test_txn_batch_constraint_bypass_configurable() {
+        // txn_batch_bypass_constraint_tables=false：约束表也攒批，
+        // PK 冲突延迟到 COMMIT/flush 时暴露
+        let mut cfg = crate::common::config::Config::default();
+        cfg.txn_batch_bypass_constraint_tables = false;
+        let mut conn = Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        // 攒批路径：语句时不报错
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        // COMMIT 时 flush → 约束错误此时暴露
+        let err = conn.execute("COMMIT").unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "expected ConstraintViolation at COMMIT, got {err:?}");
+    }
+
+    #[test]
+    fn test_txn_batch_wal_amortized() {
+        // 性能验证：事务内多条 INSERT 攒批期间零 WAL 记录，
+        // COMMIT 时一次性写入（N 条语句 → 1 次落盘）
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT64)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        let lsn_before = conn.database_mut().txn_manager().current_wal_lsn();
+        for i in 0..5 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        let lsn_after_inserts = conn.database_mut().txn_manager().current_wal_lsn();
+        assert_eq!(lsn_before, lsn_after_inserts, "攒批期间不得产生 WAL 记录");
+        conn.execute("COMMIT").unwrap();
+        let lsn_after_commit = conn.database_mut().txn_manager().current_wal_lsn();
+        assert!(lsn_after_commit > lsn_after_inserts, "COMMIT 时一次性 flush WAL");
+
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(5));
     }
 
     #[test]

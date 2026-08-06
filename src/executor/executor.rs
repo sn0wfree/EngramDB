@@ -977,6 +977,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let txn_id = db.txn_manager_mut().begin(
                 crate::common::config::IsolationLevel::SnapshotIsolation
             )?;
+            // P0-2 事务级 Batcher：防御性清空（异常残留时避免跨事务串数据）
+            db.discard_txn_buffer();
             db.set_current_txn_id(Some(txn_id));
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
@@ -987,8 +989,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         PhysicalPlan::Commit => {
             // 实际提交事务（v0.15.0 Txn05 新增）
+            // P0-2 事务级 Batcher：先 flush 事务 buffer（读己之写 + 提交落盘）
             let result = if let Some(txn_id) = db.current_txn_id() {
+                db.flush_txn_buffer()?;
                 let r = db.txn_manager_mut().commit(txn_id)?;
+                db.discard_txn_buffer();
                 db.set_current_txn_id(None);
                 Ok(r)
             } else {
@@ -1005,8 +1010,10 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         PhysicalPlan::Rollback => {
             // 实际回滚事务（v0.15.0 Txn05 新增）
+            // P0-2 事务级 Batcher：丢弃 buffer（撤销未 flush 的写入段）
             let result = if let Some(txn_id) = db.current_txn_id() {
                 db.txn_manager_mut().rollback(txn_id)?;
+                db.discard_txn_buffer();
                 db.set_current_txn_id(None);
                 Ok(())
             } else {
@@ -1023,7 +1030,10 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         PhysicalPlan::Savepoint { name } => {
             // SAVEPOINT name（v0.15.0 Txn05 新增）
+            // P0-2 事务级 Batcher：保存点前 flush（此后攒批归保存点后段，
+            // ROLLBACK TO SAVEPOINT 丢弃之）
             let result = if let Some(txn_id) = db.current_txn_id() {
+                db.flush_txn_buffer()?;
                 db.txn_manager_mut().savepoint(txn_id, name.as_str())?;
                 Ok(())
             } else {
@@ -1057,7 +1067,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         PhysicalPlan::RollbackToSavepoint { name } => {
             // ROLLBACK TO SAVEPOINT name（v0.15.0 Txn05 新增）
+            // P0-2 事务级 Batcher：丢弃保存点后攒入 buffer 的写入段
             let result = if let Some(txn_id) = db.current_txn_id() {
+                db.discard_txn_buffer();
                 db.txn_manager_mut().rollback_to_savepoint(txn_id, name.as_str())?;
                 Ok(())
             } else {

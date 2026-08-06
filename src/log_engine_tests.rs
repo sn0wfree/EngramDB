@@ -190,9 +190,8 @@ fn test_batcher_skips_constraint_tables() {
 
 #[test]
 fn test_batcher_skips_explicit_txn() {
-    // 显式事务内 INSERT 绕过 batcher：保持原语义
-    // （SQL 级 BEGIN 内 INSERT 为语句级提交：ROLLBACK 不撤回已落盘行；
-    //   batcher 不得引入额外缓冲窗口，行为与关闭 batcher 时一致）
+    // 显式事务内 INSERT 走事务级攒批（P0-2）：未读过的写入段
+    // ROLLBACK 可撤销（v0.18 前为语句级提交，ROLLBACK 无效）。
     let mut conn = super::Connection::open_with_config(":memory:", small_batcher_config()).unwrap();
     conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
     conn.execute("BEGIN").unwrap();
@@ -201,7 +200,7 @@ fn test_batcher_skips_explicit_txn() {
     }
     conn.execute("ROLLBACK").unwrap();
     let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
-    assert_eq!(r.rows[0][0], Value::Int64(3), "事务内行语句级落盘（与关闭 batcher 一致）");
+    assert_eq!(r.rows[0][0], Value::Int64(0), "ROLLBACK 撤销未读写入段（事务级攒批）");
     conn.close().unwrap();
 }
 

@@ -65,6 +65,22 @@ pub fn execute(
             // 已入批：事务语义等价于"已接受未提交"（WAL 组提交同款异步窗口）
             return Ok(n as u64);
         }
+        // P0-2 事务级 Batcher：显式事务内 INSERT 攒入事务私有 buffer，
+        // 在非裸 INSERT 语句 / SAVEPOINT / COMMIT 前一次性 flush 为单个
+        // 内部批量事务。约束表跳过攒批（错误语句时即时暴露），除非配置
+        // txn_batch_bypass_constraint_tables = false。
+        if !bypass_batch
+            && db.in_explicit_txn()
+            && db.config().txn_batch_enabled
+            && (!db.config().txn_batch_bypass_constraint_tables || !table_has_constraints(db, table_name))
+        {
+            let n = rows.len();
+            let trigger = db.txn_buffer_push(table_name, rows)?;
+            if trigger {
+                db.flush_txn_buffer()?;
+            }
+            return Ok(n as u64);
+        }
         execute_with_txn(db, table_name, rows)
     } else {
         execute_without_txn(db, table_name, rows)
@@ -112,10 +128,13 @@ pub fn flush_all_batched(db: &mut Database) -> Result<()> {
 ///
 /// 流程：
 /// 1. 开启事务
-/// 2. 事务内逐行插入（写 WAL + MVCC）
+/// 2. 事务内批量插入（写 WAL + MVCC）
 /// 3. 提交事务（fsync WAL）
 /// 4. 将 apply_ops 应用到存储层
-fn execute_with_txn(
+///
+/// `pub(crate)`：事务级 Batcher（`Database::flush_txn_buffer`）复用此路径
+/// 将事务 buffer 一次性落盘。
+pub(crate) fn execute_with_txn(
     db: &mut Database,
     table_name: &str,
     rows: Vec<Vec<Value>>,

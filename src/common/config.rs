@@ -184,6 +184,22 @@ pub struct Config {
     pub insert_batch_bytes: usize,
     /// P0-2 Batcher：时间窗（首行入批起算，达到即 flush 该表；0 = 禁用时间触发）
     pub insert_batch_timeout_ms: u64,
+    /// P0-2 事务级 Batcher 总开关（显式事务内 INSERT 攒批，COMMIT/读时 flush）
+    ///
+    /// 开启后：显式事务内连续 INSERT 攒入事务私有 buffer（零 WAL/MVCC/Delta
+    /// 开销），在非裸 INSERT 语句 / SAVEPOINT / COMMIT 前一次性 flush 为
+    /// 单个内部批量事务（1 条 WAL InsertBatch + 1 次 MVCC batch_write）。
+    /// ROLLBACK / ROLLBACK TO SAVEPOINT 直接丢弃 buffer（未读过的写入段可回滚）。
+    /// 关闭后：事务内每条 INSERT 各自走内部事务（v0.18 前行为）。
+    pub txn_batch_enabled: bool,
+    /// 事务级 Batcher：事务 buffer 总行数阈值（达到即提前 flush，防内存无界）
+    pub txn_batch_rows: usize,
+    /// 事务级 Batcher：有约束的表（NOT NULL / 主键 / 唯一索引 / 自增 /
+    /// TTL / 外键）是否跳过攒批（true = 跳过，约束错误在语句时即时暴露）
+    ///
+    /// 约束错误（如 PK 冲突）在攒批路径下会推迟到 flush 时暴露；
+    /// 需要语句时即时报错的应用应保持 true。
+    pub txn_batch_bypass_constraint_tables: bool,
     /// P1-5 LogEngine 块行数（0 = 默认 8192；MinMax 跳读粒度 / 序列化块头摊销）
     ///
     /// 大块（32K/64K）减少冻结/序列化次数与块头开销，但时间范围跳读粒度变粗。
@@ -260,6 +276,9 @@ impl Default for Config {
             insert_batch_rows: 1024, // P0-2：满 1024 行 flush
             insert_batch_bytes: 65536, // P0-2：满 64KB 估算字节 flush
             insert_batch_timeout_ms: 10, // P0-2：首行入批 10ms 后 flush（低流量延迟有界）
+            txn_batch_enabled: true, // P0-2 事务级 Batcher：默认开启
+            txn_batch_rows: 8192, // 事务 buffer 满 8192 行提前 flush（内存保护）
+            txn_batch_bypass_constraint_tables: true, // 有约束的表跳过攒批（错误即时暴露）
             log_block_rows: 0, // P1-5：0 = 默认 8192 行/块
             default_compression: CompressionType::Uncompressed,
             compress_on_persist: true,
@@ -289,6 +308,9 @@ mod tests {
         assert!(cfg.wal_batch_insert);
         assert_eq!(cfg.insert_batch_rows, 1024);
         assert_eq!(cfg.insert_batch_timeout_ms, 10);
+        assert!(cfg.txn_batch_enabled);
+        assert_eq!(cfg.txn_batch_rows, 8192);
+        assert!(cfg.txn_batch_bypass_constraint_tables);
         assert_eq!(cfg.log_block_rows, 0);
         assert_eq!(cfg.default_compression, CompressionType::Uncompressed);
         assert!(cfg.compress_on_persist);
@@ -302,11 +324,17 @@ mod tests {
         cfg.wal_batch_insert = false;
         cfg.insert_batch_rows = 4096;
         cfg.insert_batch_timeout_ms = 0;
+        cfg.txn_batch_enabled = false;
+        cfg.txn_batch_rows = 512;
+        cfg.txn_batch_bypass_constraint_tables = false;
         cfg.log_block_rows = 32768;
         cfg.wal_group_commit_size = 0;
         assert!(!cfg.wal_batch_insert);
         assert_eq!(cfg.insert_batch_rows, 4096);
         assert_eq!(cfg.insert_batch_timeout_ms, 0);
+        assert!(!cfg.txn_batch_enabled);
+        assert_eq!(cfg.txn_batch_rows, 512);
+        assert!(!cfg.txn_batch_bypass_constraint_tables);
         assert_eq!(cfg.log_block_rows, 32768);
         assert_eq!(cfg.wal_group_commit_size, 0);
         // clone 后修改不影响原配置

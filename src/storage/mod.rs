@@ -29,6 +29,7 @@ use crate::common::config::Config;
 use crate::txn::TransactionManager;
 use file_format::FileHeader;
 use table::Table;
+use crate::Value;
 
 /// 数据库实例
 pub struct Database {
@@ -56,6 +57,15 @@ pub struct Database {
     /// 由 BEGIN TRANSACTION 设置，COMMIT/ROLLBACK 后清除。
     /// SAVEPOINT/RELEASE/ROLLBACK TO SAVEPOINT 基于此事务 ID。
     current_txn_id: Option<u32>,
+    /// P0-2 事务级 Batcher：显式事务内 INSERT 攒批缓冲（表名 → 行）
+    ///
+    /// 仅 current_txn_id 存在时有效（单线程 &mut 模型无需 txn_id 键）。
+    /// 事务内连续 INSERT 先攒入此 buffer（零 WAL/MVCC/Delta 开销），
+    /// 在非裸 INSERT 语句 / SAVEPOINT / COMMIT 前一次性 flush 为单个
+    /// 内部批量事务；ROLLBACK / ROLLBACK TO SAVEPOINT 直接丢弃。
+    txn_buffer: HashMap<String, Vec<Vec<Value>>>,
+    /// 事务 buffer 当前总行数（阈值检查：config.txn_batch_rows）
+    txn_buffer_rows: usize,
 }
 
 impl Database {
@@ -130,6 +140,8 @@ impl Database {
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024), // 默认 64MB
             batcher: crate::storage::insert_batcher::InsertBatcher::new(ib_rows, ib_bytes, ib_timeout),
             current_txn_id: None,
+            txn_buffer: HashMap::new(),
+            txn_buffer_rows: 0,
         })
     }
 
@@ -167,6 +179,8 @@ impl Database {
             kv_cache: crate::storage::cache::KVCache::new(64 * 1024 * 1024),
             batcher: crate::storage::insert_batcher::InsertBatcher::new(ib_rows, ib_bytes, ib_timeout),
             current_txn_id: None,
+            txn_buffer: HashMap::new(),
+            txn_buffer_rows: 0,
         };
 
         // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
@@ -354,6 +368,61 @@ impl Database {
     /// 设置当前活跃事务 ID（v0.15.0 Txn05 新增）
     pub fn set_current_txn_id(&mut self, txn_id: Option<u32>) {
         self.current_txn_id = txn_id;
+    }
+
+    /// P0-2 事务级 Batcher：将行攒入显式事务 buffer（零 WAL/MVCC/Delta 开销）
+    ///
+    /// 返回 true 表示已达阈值（config.txn_batch_rows），调用方应随即
+    /// `flush_txn_buffer`（防内存无界）。仅在显式事务内调用。
+    pub fn txn_buffer_push(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<bool> {
+        let n = rows.len();
+        if n == 0 {
+            return Ok(false);
+        }
+        let entry = self.txn_buffer.entry(table_name.to_string()).or_default();
+        entry.extend(rows);
+        self.txn_buffer_rows += n;
+        Ok(self.txn_buffer_rows >= self.config.txn_batch_rows)
+    }
+
+    /// 事务 buffer 当前总行数（监控用）
+    pub fn txn_buffer_pending(&self) -> usize {
+        self.txn_buffer_rows
+    }
+
+    /// 事务 buffer 是否为空
+    pub fn txn_buffer_is_empty(&self) -> bool {
+        self.txn_buffer.is_empty()
+    }
+
+    /// P0-2 事务级 Batcher：清空 buffer（ROLLBACK / ROLLBACK TO SAVEPOINT）
+    ///
+    /// 丢弃未 flush 的写入段 = 撤销事务内尚未可见的写入。
+    pub fn discard_txn_buffer(&mut self) {
+        self.txn_buffer.clear();
+        self.txn_buffer_rows = 0;
+    }
+
+    /// P0-2 事务级 Batcher：将 buffer 一次性 flush 为单个内部批量事务
+    ///
+    /// 每表一个 `execute_with_txn`（begin → batch_insert → commit → apply）：
+    /// N 条事务内 INSERT 语句合并为 N 个内部事务（表数），每个事务
+    /// 1 条 WAL InsertBatch + 1 次 MVCC batch_write + 1 次 apply。
+    /// flush 后数据进 Delta，事务内/外读均可见（读己之写）。
+    pub fn flush_txn_buffer(&mut self) -> Result<()> {
+        if self.txn_buffer.is_empty() {
+            return Ok(());
+        }
+        let pending: Vec<(String, Vec<Vec<Value>>)> = std::mem::take(&mut self.txn_buffer)
+            .into_iter()
+            .collect();
+        self.txn_buffer_rows = 0;
+        for (table_name, rows) in pending {
+            if !rows.is_empty() {
+                crate::executor::operators::insert::execute_with_txn(self, &table_name, rows)?;
+            }
+        }
+        Ok(())
     }
 
     /// 手动触发 WAL fsync（用于 Periodic 刷盘模式）
@@ -2029,5 +2098,90 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         }
 
         cleanup_db(&path);
+    }
+
+    // ============ P0-2 事务级 Batcher 单测 ============
+
+    #[test]
+    fn test_txn_buffer_push_and_pending() {
+        let mut db = Database::open(":memory:").unwrap();
+        assert!(db.txn_buffer_is_empty());
+        assert_eq!(db.txn_buffer_pending(), 0);
+        let rows = vec![vec![crate::Value::Int64(1)], vec![crate::Value::Int64(2)]];
+        assert!(!db.txn_buffer_push("t", rows).unwrap());
+        assert_eq!(db.txn_buffer_pending(), 2);
+        assert!(!db.txn_buffer_is_empty());
+        // 空行集不改变状态
+        assert!(!db.txn_buffer_push("t", Vec::new()).unwrap());
+        assert_eq!(db.txn_buffer_pending(), 2);
+    }
+
+    #[test]
+    fn test_txn_buffer_threshold_triggers_flush_flag() {
+        let mut cfg = crate::common::config::Config::default();
+        cfg.txn_batch_rows = 3;
+        let mut db = Database::open_with_config(":memory:", cfg).unwrap();
+        assert!(!db.txn_buffer_push("t", vec![vec![crate::Value::Int64(1)]]).unwrap());
+        assert!(!db.txn_buffer_push("t", vec![vec![crate::Value::Int64(2)]]).unwrap());
+        // 跨表累计达到阈值
+        assert!(db.txn_buffer_push("u", vec![vec![crate::Value::Int64(3)]]).unwrap());
+        assert_eq!(db.txn_buffer_pending(), 3);
+    }
+
+    #[test]
+    fn test_txn_buffer_discard() {
+        let mut db = Database::open(":memory:").unwrap();
+        db.txn_buffer_push("t", vec![vec![crate::Value::Int64(1)]]).unwrap();
+        db.txn_buffer_push("u", vec![vec![crate::Value::Int64(2)]]).unwrap();
+        db.discard_txn_buffer();
+        assert!(db.txn_buffer_is_empty());
+        assert_eq!(db.txn_buffer_pending(), 0);
+        // 幂等
+        db.discard_txn_buffer();
+        assert!(db.txn_buffer_is_empty());
+    }
+
+    #[test]
+    fn test_txn_buffer_flush_empty_noop() {
+        let mut db = Database::open(":memory:").unwrap();
+        db.flush_txn_buffer().unwrap();
+        assert!(db.txn_buffer_is_empty());
+    }
+
+    #[test]
+    fn test_txn_buffer_flush_persists() {
+        let mut db = Database::open(":memory:").unwrap();
+        db.create_table(TableDef::new(0, "t", vec![
+            crate::common::types::ColumnDef::new("id", crate::common::types::DataType::Int64),
+        ])).unwrap();
+        db.txn_buffer_push("t", vec![vec![crate::Value::Int64(1)], vec![crate::Value::Int64(2)]]).unwrap();
+        db.flush_txn_buffer().unwrap();
+        assert!(db.txn_buffer_is_empty());
+        // 数据已落 Delta（读己之写）
+        let t = db.get_engine_table_mut("t").unwrap();
+        let chunks = t.scan_to_chunks(&[0], None).unwrap();
+        let total: usize = chunks.iter().map(|c| c.count).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn test_txn_buffer_flush_multi_table() {
+        let mut db = Database::open(":memory:").unwrap();
+        db.create_table(TableDef::new(0, "a", vec![
+            crate::common::types::ColumnDef::new("id", crate::common::types::DataType::Int64),
+        ])).unwrap();
+        db.create_table(TableDef::new(1, "b", vec![
+            crate::common::types::ColumnDef::new("id", crate::common::types::DataType::Int64),
+        ])).unwrap();
+        db.txn_buffer_push("a", vec![vec![crate::Value::Int64(1)]]).unwrap();
+        db.txn_buffer_push("b", vec![vec![crate::Value::Int64(2)]]).unwrap();
+        db.flush_txn_buffer().unwrap();
+        assert!(db.txn_buffer_is_empty());
+        let a = db.get_engine_table_mut("a").unwrap();
+        let ca: usize = a.scan_to_chunks(&[0], None).unwrap().iter().map(|c| c.count).sum();
+        assert_eq!(ca, 1);
+        let b = db.get_engine_table_mut("b").unwrap();
+        let cb: usize = b.scan_to_chunks(&[0], None).unwrap().iter().map(|c| c.count).sum();
+        assert_eq!(cb, 1);
     }
 }

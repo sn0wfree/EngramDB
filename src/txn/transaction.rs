@@ -9,8 +9,6 @@
 //! txn.commit().unwrap();
 //! ```
 
-use std::collections::HashMap;
-
 use crate::common::error::{EngramDbError, Result};
 use crate::executor::operators::insert::apply_to_storage;
 use crate::storage::Database;
@@ -26,21 +24,19 @@ pub struct Transaction<'a> {
     db: &'a mut Database,
     /// 是否只读事务（v0.15.0 Txn09）
     read_only: bool,
-    /// 每个表的 rowid 分配游标（事务内单调递增，避免 rowid 冲突/覆盖）
-    next_rowids: HashMap<u32, u64>,
 }
 
 impl<'a> Transaction<'a> {
     /// 开始一个新事务（由 Database 调用）
     pub(crate) fn begin(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
         let txn_id = db.txn_manager_mut().begin(isolation_level)?;
-        Ok(Self { id: txn_id, db, read_only: false, next_rowids: HashMap::new() })
+        Ok(Self { id: txn_id, db, read_only: false })
     }
 
     /// 开始一个只读事务（跳过 WAL，v0.15.0 Txn09）
     pub(crate) fn begin_readonly(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
         let txn_id = db.txn_manager_mut().begin_readonly(isolation_level)?;
-        Ok(Self { id: txn_id, db, read_only: true, next_rowids: HashMap::new() })
+        Ok(Self { id: txn_id, db, read_only: true })
     }
 
     /// 是否为只读事务
@@ -51,8 +47,13 @@ impl<'a> Transaction<'a> {
     /// 提交事务
     ///
     /// 注意：commit 后事务状态变为 Committed，Drop 不会再回滚。
+    ///
+    /// P0-2 事务级 Batcher：先 flush 事务 buffer（攒批行走单个内部批量
+    /// 事务落盘），再提交外层事务。
     pub fn commit(&mut self) -> Result<()> {
         let txn_id = self.id;
+        self.db.flush_txn_buffer()?;
+        self.db.discard_txn_buffer();
         let result = self.db.txn_manager_mut().commit(txn_id)?;
         // P1.5 修复：之前丢弃 apply_ops 导致数据只停留在 MVCC/WAL，
         // 必须将写操作应用到存储层（否则读取路径看不到提交的数据）
@@ -61,37 +62,45 @@ impl<'a> Transaction<'a> {
     }
 
     /// 回滚事务
-    pub fn rollback(self) -> Result<()> {
+    ///
+    /// P0-2 事务级 Batcher：丢弃事务 buffer（撤销未 flush 的写入段）。
+    pub fn rollback(mut self) -> Result<()> {
         let txn_id = self.id;
+        self.db.discard_txn_buffer();
         self.db.txn_manager_mut().rollback(txn_id)?;
         Ok(())
     }
 
     /// 执行插入（在事务内）
+    ///
+    /// P0-2 事务级 Batcher：行攒入事务私有 buffer（零 WAL/MVCC/Delta
+    /// 开销），commit 或事务内读时一次性批量落盘。rowid 在 flush 时
+    /// 按表当前行数连续分配，多次 insert 天然不覆盖。
     pub fn insert(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
-        // 注意：表的权威 ID 在 table_names 映射中（TableDef.id 未由 create_table 回填）
-        let (table_id, base_row_count) = self.db.table_names().get(table_name)
-            .and_then(|id| self.db.get_engine_table(table_name).map(|t| (*id, t.def().row_count)))
+        let rows_len = rows.len() as u64;
+        if rows_len == 0 {
+            return Ok(0);
+        }
+        // 表存在性校验（攒批不落盘，表不存在在此尽早暴露）
+        let _ = self.db.get_engine_table(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
-
-        let txn_id = self.id;
-        // P1.5 修复：rowid 必须从表当前行数开始分配（原来固定从 1 开始，
-        // 会导致与已有行冲突，且多次 insert 之间互相覆盖成 Update）
-        let base = *self.next_rowids
-            .entry(table_id)
-            .or_insert(base_row_count);
-        let rows_len = rows.len();
-
-        for (i, row) in rows.into_iter().enumerate() {
-            let rowid = base + i as u64;
-            self.db.txn_manager_mut().insert(txn_id, table_id, rowid, row)?;
+        let trigger = self.db.txn_buffer_push(table_name, rows)?;
+        if trigger {
+            self.db.flush_txn_buffer()?;
         }
+        Ok(rows_len)
+    }
 
-        if let Some(cursor) = self.next_rowids.get_mut(&table_id) {
-            *cursor = base + rows_len as u64;
-        }
-
-        Ok(rows_len as u64)
+    /// 事务内读一行（先 flush buffer 保证读己之写）
+    ///
+    /// P0-2 方案 A 语义：flush 走单个内部批量事务（数据落 Delta），
+    /// 读与 SQL SELECT 同源（引擎读），不做 MVCC 快照隔离。
+    pub fn read(&mut self, table_id: u32, rowid: u64) -> Option<Vec<Value>> {
+        self.db.flush_txn_buffer().ok()?;
+        self.db.get_engine_table_mut_by_id(table_id)?
+            .get_row_by_id(rowid as u32)
+            .ok()
+            .flatten()
     }
 
     /// 获取事务 ID
@@ -111,6 +120,7 @@ impl<'a> Drop for Transaction<'a> {
         // 如果事务还在活跃状态，自动回滚
         // 注意：drop 中不能保证成功，但尽量回滚
         if matches!(self.db.txn_manager().state(self.id), Some(TxnState::Active)) {
+            self.db.discard_txn_buffer();
             let _ = self.db.txn_manager_mut().rollback(self.id);
         }
     }
@@ -292,5 +302,75 @@ mod tests {
         let r = conn.execute("SELECT val FROM t WHERE id = 7").unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], Value::Int64(21));
+    }
+
+    #[test]
+    fn test_txn_api_many_small_inserts_batched() {
+        // P0-2 事务级 Batcher：逐行 insert 循环攒批 → commit 一次性落盘
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT, val INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        for i in 0..50 {
+            txn.insert("t", vec![vec![Value::Int64(i), Value::Int64(i * 2)]]).unwrap();
+        }
+        txn.commit().unwrap();
+        drop(txn);
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(50));
+        let r = conn.execute("SELECT val FROM t WHERE id = 49").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(98));
+    }
+
+    #[test]
+    fn test_txn_api_rollback_discards_batched() {
+        // P0-2 事务级 Batcher：编程 API 回滚丢弃未 flush 的写入段
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT)").unwrap();
+
+        let mut txn = conn.begin().unwrap();
+        for i in 0..10 {
+            txn.insert("t", vec![vec![Value::Int64(i)]]).unwrap();
+        }
+        txn.rollback().unwrap();
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(0));
+    }
+
+    #[test]
+    fn test_txn_api_read_sees_own_writes() {
+        // P0-2 事务级 Batcher：事务内 read 触发 flush，读己之写
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        conn.execute("INSERT INTO t VALUES (100)").unwrap();
+
+        let tid = *conn.database_mut().table_names().get("t").unwrap();
+        let mut txn = conn.begin().unwrap();
+        txn.insert("t", vec![vec![Value::Int64(200)]]).unwrap();
+        // read 触发 flush 后可见（rowid = 表当前行数 = 1）
+        let row = txn.read(tid, 1);
+        assert_eq!(row, Some(vec![Value::Int64(200)]));
+        txn.commit().unwrap();
+        drop(txn);
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(2));
+    }
+
+    #[test]
+    fn test_txn_api_drop_rolls_back_batched() {
+        // P0-2 事务级 Batcher：Drop 自动回滚丢弃 buffer
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT)").unwrap();
+
+        {
+            let mut txn = conn.begin().unwrap();
+            txn.insert("t", vec![vec![Value::Int64(1)]]).unwrap();
+        } // drop → 自动回滚
+
+        let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0][0], Value::Int64(0));
     }
 }
