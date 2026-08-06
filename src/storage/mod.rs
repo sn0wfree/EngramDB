@@ -275,6 +275,24 @@ impl Database {
         table.create_index(index_name, key_cols, included_cols, unique)
     }
 
+    /// 重命名表：同步表定义与 `table_names` 名称映射
+    pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        let table_id = self.table_names.get(old_name)
+            .copied()
+            .ok_or_else(|| EngramDbError::TableNotFound(old_name.to_string()))?;
+        if self.table_names.contains_key(new_name) {
+            return Err(EngramDbError::ConstraintViolation(
+                format!("Table '{}' already exists", new_name)
+            ));
+        }
+        self.table_names.remove(old_name);
+        self.table_names.insert(new_name.to_string(), table_id);
+        if let Some(table) = self.tables.get_mut(&table_id) {
+            table.def_mut().name = new_name.to_string();
+        }
+        Ok(())
+    }
+
     /// 获取表名到 ID 的映射（只读）
     pub fn table_names(&self) -> &HashMap<String, u32> {
         &self.table_names

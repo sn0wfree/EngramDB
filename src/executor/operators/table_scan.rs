@@ -38,16 +38,14 @@ pub fn execute_with_filter_pushdown(
     db: &mut Database,
     table_name: &str,
     column_indices: &[usize],
-    _filter_expr: &Expression,
+    filter_expr: &Expression,
     _column_names: &[String],
 ) -> Result<Vec<DataChunk>> {
     // MVP 简化版：先用 MinMax 索引跳过 Row Group，再走正常扫描
-    let table = db.get_table_mut(table_name)
-        .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     // 提取过滤条件中的列和值（用于 MinMax 跳过）
     // 实际实现中应由优化器做谓词下推
-    let _filter_info = extract_filter_info(_filter_expr, _column_names);
+    let _filter_info = extract_filter_info(filter_expr, _column_names);
 
     // TODO: 完整 PREWHERE 实现
     // 1. 读取过滤列（filter columns）
@@ -107,4 +105,123 @@ pub fn estimate_skipping(
     // MVP：返回占位值
     // 实际实现应遍历所有 Row Group，调用 column_store.can_skip_range
     Ok((0, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::ast::Expression;
+    use crate::Value;
+
+    fn setup() -> crate::Connection {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_scan_basic() {
+        let mut conn = setup();
+        let db = conn.database_mut();
+        let chunks = execute(db, "t", &[0, 1]).unwrap();
+        let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Int64(1), Value::Int64(10)]);
+    }
+
+    #[test]
+    fn test_scan_projection() {
+        let mut conn = setup();
+        let db = conn.database_mut();
+        let chunks = execute(db, "t", &[1]).unwrap();
+        let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Value::Int64(10)]);
+    }
+
+    #[test]
+    fn test_scan_table_not_found() {
+        let mut conn = setup();
+        let db = conn.database_mut();
+        let err = execute(db, "nope", &[0]).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::TableNotFound(_)));
+    }
+
+    #[test]
+    fn test_scan_with_filter_pushdown() {
+        let mut conn = setup();
+        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(db).unwrap();
+        let chunks = execute_with_filter_pushdown(
+            db, "t", &[0, 1],
+            &Expression::Literal(Value::Int64(1)),
+            &["id".into(), "v".into()],
+        ).unwrap();
+        let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_scan_pushdown_memory_engine() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory").unwrap();
+        conn.execute("INSERT INTO mem VALUES (1, 10)").unwrap();
+        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(db).unwrap();
+        let chunks = execute_with_filter_pushdown(db, "mem", &[0, 1], &Expression::Literal(Value::Int64(1)), &["id".into(), "v".into()]).unwrap();
+        let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_pushdown_log_engine() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE lg (ts INT64, v INT64) ENGINE = Log").unwrap();
+        conn.execute("INSERT INTO lg VALUES (1, 10)").unwrap();
+        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(db).unwrap();
+        let chunks = execute_with_filter_pushdown(db, "lg", &[0, 1], &Expression::Literal(Value::Int64(1)), &["ts".into(), "v".into()]).unwrap();
+        let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_filter_info() {
+        let names = vec!["id".to_string(), "v".to_string()];
+        // 左列右常量
+        let expr = Expression::BinaryOp {
+            left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+            op: crate::sql::ast::BinaryOperator::Gt,
+            right: Box::new(Expression::Literal(Value::Int64(5))),
+        };
+        let info = extract_filter_info(&expr, &names).unwrap();
+        assert_eq!(info.0, 0);
+        assert_eq!(info.1, crate::sql::ast::BinaryOperator::Gt);
+        assert_eq!(info.2, Value::Int64(5));
+        // 列不在列表中
+        let expr2 = Expression::BinaryOp {
+            left: Box::new(Expression::ColumnRef { table: None, column: "zzz".into() }),
+            op: crate::sql::ast::BinaryOperator::Eq,
+            right: Box::new(Expression::Literal(Value::Int64(1))),
+        };
+        assert!(extract_filter_info(&expr2, &names).is_none());
+        // 右值非字面量
+        let expr3 = Expression::BinaryOp {
+            left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+            op: crate::sql::ast::BinaryOperator::Eq,
+            right: Box::new(Expression::ColumnRef { table: None, column: "v".into() }),
+        };
+        assert!(extract_filter_info(&expr3, &names).is_none());
+        // 非 BinaryOp
+        assert!(extract_filter_info(&Expression::Literal(Value::Int64(1)), &names).is_none());
+    }
+
+    #[test]
+    fn test_estimate_skipping_placeholder() {
+        let mut conn = setup();
+        let db = conn.database_mut();
+        let (total, skipped) = estimate_skipping(db, "t", 0, &Value::Int64(0), &Value::Int64(100)).unwrap();
+        assert_eq!((total, skipped), (0, 0));
+    }
 }

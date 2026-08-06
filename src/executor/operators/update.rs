@@ -322,3 +322,117 @@ fn rows_to_chunks(rows: &[Vec<Value>]) -> Vec<DataChunk> {
     }
     chunks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::config::Config;
+    use crate::sql::ast::{BinaryOperator, Expression};
+    use crate::Value;
+
+    fn gt_id(n: i64) -> Expression {
+        Expression::BinaryOp {
+            left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expression::Literal(Value::Int64(n))),
+        }
+    }
+
+    fn rows(db: &mut crate::storage::Database) -> Vec<Vec<Value>> {
+        db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap()
+    }
+
+    #[test]
+    fn test_update_with_condition_direct() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = false;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        let db = conn.database_mut();
+
+        // v = v + 1 WHERE id > 1
+        let assign = vec![(1usize, Expression::BinaryOp {
+            left: Box::new(Expression::ColumnRef { table: None, column: "v".into() }),
+            op: BinaryOperator::Plus,
+            right: Box::new(Expression::Literal(Value::Int64(1))),
+        })];
+        assert_eq!(execute(db, "t", &assign, Some(gt_id(1))).unwrap(), 2);
+        let after = rows(db);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0][1], Value::Int64(10));
+        assert_eq!(after[1][1], Value::Int64(21));
+        assert_eq!(after[2][1], Value::Int64(31));
+    }
+
+    #[test]
+    fn test_update_literal_assign() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = false;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        let db = conn.database_mut();
+
+        let assign = vec![(1usize, Expression::Literal(Value::Int64(99)))];
+        assert_eq!(execute(db, "t", &assign, None).unwrap(), 2);
+        let after = rows(db);
+        assert_eq!(after[0][1], Value::Int64(99));
+        assert_eq!(after[1][1], Value::Int64(99));
+    }
+
+    #[test]
+    fn test_update_table_not_found() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = false;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let err = execute(db, "nope", &[(0usize, Expression::Literal(Value::Int64(1)))], None).unwrap_err();
+        assert!(matches!(err, EngramDbError::TableNotFound(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn test_update_log_engine_not_supported() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = false;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE log_t (ts INT64, v INT64) ENGINE = Log").unwrap();
+        conn.execute("INSERT INTO log_t VALUES (1, 10)").unwrap();
+        let db = conn.database_mut();
+        let err = execute(db, "log_t", &[(1usize, Expression::Literal(Value::Int64(99)))], None).unwrap_err();
+        assert!(matches!(err, EngramDbError::NotSupported(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn test_update_memory_engine() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = false;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory").unwrap();
+        conn.execute("INSERT INTO mem VALUES (1, 10), (2, 20)").unwrap();
+        let db = conn.database_mut();
+        let assign = vec![(1usize, Expression::Literal(Value::Int64(7)))];
+        assert_eq!(execute(db, "mem", &assign, Some(gt_id(1))).unwrap(), 1);
+        let remaining = db.get_engine_table_mut("mem").unwrap().as_memory_mut().unwrap()
+            .scan_to_rows_direct(&[0, 1], None).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0][1], Value::Int64(10));
+        assert_eq!(remaining[1][1], Value::Int64(7));
+    }
+
+    #[test]
+    fn test_update_with_txn() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        let db = conn.database_mut();
+        let assign = vec![(1usize, Expression::Literal(Value::Int64(5)))];
+        assert_eq!(execute(db, "t", &assign, Some(gt_id(1))).unwrap(), 2);
+        let after = rows(db);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0][1], Value::Int64(10));
+        assert_eq!(after[1][1], Value::Int64(5));
+        assert_eq!(after[2][1], Value::Int64(5));
+    }
+}

@@ -1886,4 +1886,288 @@ fn resolve_subqueries_in_expr(expr: Expression, db: &mut Database) -> Result<Exp
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::physical_plan::PhysicalPlan;
+    use crate::executor::vector::VECTOR_SIZE;
+    use crate::sql::ast::{BinaryOperator, Expression, OnConflictClause};
+    use crate::Value;
+
+    fn col(name: &str) -> Expression {
+        Expression::ColumnRef { table: None, column: name.into() }
+    }
+
+    fn lit(v: Value) -> Expression {
+        Expression::Literal(v)
+    }
+
+    fn plan_scan() -> PhysicalPlan {
+        PhysicalPlan::TableScan { table_name: "t".into(), column_indices: vec![0, 1] }
+    }
+
+    fn plan_filter() -> PhysicalPlan {
+        PhysicalPlan::Filter {
+            input: Box::new(plan_scan()),
+            condition: Expression::BinaryOp {
+                left: Box::new(col("id")),
+                op: BinaryOperator::Gt,
+                right: Box::new(lit(Value::Int64(1))),
+            },
+        }
+    }
+
+    #[test]
+    fn test_plan_node_name() {
+        assert_eq!(plan_node_name(&plan_scan()), "TableScan");
+        assert_eq!(plan_node_name(&plan_filter()), "Filter");
+        assert_eq!(plan_node_name(&PhysicalPlan::BeginTransaction), "BeginTransaction");
+        assert_eq!(plan_node_name(&PhysicalPlan::Commit), "Commit");
+        assert_eq!(plan_node_name(&PhysicalPlan::Rollback), "Rollback");
+        assert_eq!(plan_node_name(&PhysicalPlan::Distinct { input: Box::new(plan_scan()) }), "Distinct");
+        assert_eq!(plan_node_name(&PhysicalPlan::Window { input: Box::new(plan_scan()), window_functions: vec![], column_names: vec![] }), "Window");
+        assert_eq!(plan_node_name(&PhysicalPlan::TruncateTable { table_name: "t".into() }), "TruncateTable");
+        assert_eq!(plan_node_name(&PhysicalPlan::Savepoint { name: "sp".into() }), "Savepoint");
+        assert_eq!(plan_node_name(&PhysicalPlan::ReleaseSavepoint { name: "sp".into() }), "ReleaseSavepoint");
+        assert_eq!(plan_node_name(&PhysicalPlan::RollbackToSavepoint { name: "sp".into() }), "RollbackToSavepoint");
+    }
+
+    #[test]
+    fn test_format_plan_tree_nested() {
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(plan_filter()),
+            expressions: vec![col("id")],
+            column_names: vec!["id".into()],
+        };
+        let tree = format_plan_tree(&plan, 0);
+        let lines: Vec<&str> = tree.trim().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "Projection [id]");
+        assert_eq!(lines[1], "  Filter");
+        assert_eq!(lines[2], "    TableScan [t.2 cols]");
+    }
+
+    #[test]
+    fn test_format_plan_tree_detail_variants() {
+        let cases: Vec<PhysicalPlan> = vec![
+            PhysicalPlan::Insert { table_name: "t".into(), rows: vec![], returning: None, on_conflict: None },
+            PhysicalPlan::InsertColumns { table_name: "t".into(), columns: vec![] },
+            PhysicalPlan::Delete { table_name: "t".into(), condition: None },
+            PhysicalPlan::Update { table_name: "t".into(), assignments: vec![], condition: None },
+            PhysicalPlan::PrimaryKeyLookup { table_name: "t".into(), pk_value: Value::Int64(1), output_column_indices: vec![0] },
+            PhysicalPlan::CountStar { output_name: "count(*)".into(), count: 42 },
+            PhysicalPlan::Limit { input: Box::new(plan_scan()), limit: 5 },
+            PhysicalPlan::Pragma(crate::sql::ast::PragmaStmt { name: "table_info".into(), arg: Some("t".into()) }),
+            PhysicalPlan::AlterTable(crate::sql::ast::AlterTableStmt {
+                table_name: "t".into(),
+                operation: crate::sql::ast::AlterTableOp::RenameTable { new_name: "t2".into() },
+            }),
+            PhysicalPlan::BeginTransaction,
+            PhysicalPlan::Commit,
+            PhysicalPlan::Rollback,
+        ];
+        for plan in &cases {
+            let tree = format_plan_tree(plan, 0);
+            assert!(!tree.is_empty(), "{plan:?}");
+        }
+        let tree = format_plan_tree(&cases[0], 0);
+        assert!(tree.contains("Insert [table: t]"), "{tree}");
+        let tree = format_plan_tree(&cases[5], 0);
+        assert!(tree.contains("CountStar [count(*): 42]"), "{tree}");
+        let tree = format_plan_tree(&cases[6], 0);
+        assert!(tree.contains("Limit [limit: 5]"), "{tree}");
+    }
+
+    #[test]
+    fn test_format_plan_tree_joins_and_union() {
+        let plan = PhysicalPlan::SetUnion {
+            op: crate::executor::physical_plan::SetUnionOp::UnionAll,
+            left: Box::new(plan_scan()),
+            right: Box::new(plan_scan()),
+        };
+        let tree = format_plan_tree(&plan, 0);
+        let lines: Vec<&str> = tree.trim().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "SetUnion");
+        assert_eq!(lines[1], "  TableScan [t.2 cols]");
+        assert_eq!(lines[2], "  TableScan [t.2 cols]");
+    }
+
+    #[test]
+    fn test_chunks_roundtrip() {
+        let rows: Vec<Vec<Value>> = (0..(VECTOR_SIZE + 3))
+            .map(|i| vec![Value::Int64(i as i64), Value::Varchar(format!("v{i}"))])
+            .collect();
+        let chunks = rows_to_chunks(&rows);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].count, VECTOR_SIZE);
+        assert_eq!(chunks[1].count, 3);
+        let back = debug_chunks_to_rows(&chunks);
+        assert_eq!(back.len(), rows.len());
+        assert_eq!(back, rows);
+        assert!(rows_to_chunks(&[]).is_empty());
+        assert!(debug_chunks_to_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_truncate_chunk() {
+        use crate::executor::vector::{DataChunk, Vector};
+        let chunk = DataChunk {
+            columns: vec![
+                Vector::Flat(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]),
+                Vector::Constant(Value::Int64(9), 3),
+            ],
+            count: 3,
+        };
+        let t = truncate_chunk(&chunk, 2);
+        assert_eq!(t.count, 2);
+        assert!(matches!(&t.columns[0], Vector::Flat(v) if v.len() == 2));
+        let t = truncate_chunk(&chunk, 10);
+        assert_eq!(t.count, 3);
+        assert!(matches!(&t.columns[1], Vector::Constant(v, n) if *n == 3));
+    }
+
+    #[test]
+    fn test_extract_skip_predicate() {
+        use crate::storage::column_store::PredicateOp;
+        let e = Expression::BinaryOp {
+            left: Box::new(col("v")), op: BinaryOperator::Gt, right: Box::new(lit(Value::Int64(5))),
+        };
+        let (name, op, val) = extract_skip_predicate(&e).unwrap();
+        assert_eq!(name, "v");
+        assert_eq!(op, PredicateOp::Gt);
+        assert_eq!(val, Value::Int64(5));
+        let e = Expression::BinaryOp {
+            left: Box::new(lit(Value::Int64(5))), op: BinaryOperator::Lt, right: Box::new(col("v")),
+        };
+        let (name, op, _) = extract_skip_predicate(&e).unwrap();
+        assert_eq!(name, "v");
+        assert_eq!(op, PredicateOp::Lt);
+        let e = Expression::BinaryOp {
+            left: Box::new(col("id")), op: BinaryOperator::Eq, right: Box::new(lit(Value::Int64(1))),
+        };
+        assert_eq!(extract_skip_predicate(&e).unwrap().1, PredicateOp::Eq);
+        let e = Expression::BinaryOp {
+            left: Box::new(col("v")), op: BinaryOperator::Plus, right: Box::new(lit(Value::Int64(1))),
+        };
+        assert!(extract_skip_predicate(&e).is_none());
+        let e = Expression::BinaryOp {
+            left: Box::new(col("a")), op: BinaryOperator::Eq, right: Box::new(col("b")),
+        };
+        assert!(extract_skip_predicate(&e).is_none());
+        assert!(extract_skip_predicate(&lit(Value::Int64(1))).is_none());
+    }
+
+    #[test]
+    fn test_execute_explain_plan() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let r = execute_explain(plan_filter(), db).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        let text = match &r.rows[0][0] { Value::Varchar(s) => s.clone(), other => panic!("{other:?}") };
+        assert!(text.contains("Filter"), "{text}");
+        assert!(text.contains("TableScan"), "{text}");
+    }
+
+    #[test]
+    fn test_execute_create_table_plan() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        let db = conn.database_mut();
+        let def = crate::common::types::TableDef {
+            id: 0,
+            name: "newt".into(),
+            columns: vec![crate::common::types::ColumnDef {
+                name: "id".into(), data_type: crate::common::types::DataType::Int64,
+                nullable: false, is_primary_key: true, default_value: None, auto_increment: false,
+            }],
+            row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
+            engine: crate::common::types::EngineType::Columnar,
+            next_auto_increment_id: 0, ttl_seconds: None, ttl_column: None,
+        };
+        let r = execute(PhysicalPlan::CreateTable { table_def: def.clone() }, db).unwrap();
+        assert!(r.rows[0][0] == Value::Varchar("Table 'newt' created".into()));
+        assert!(db.get_table("newt").is_some());
+        let err = execute(PhysicalPlan::CreateTable { table_def: def }, db).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+    }
+
+    #[test]
+    fn test_execute_insert_and_countstar() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let r = execute(PhysicalPlan::Insert {
+            table_name: "t".into(),
+            rows: vec![vec![Value::Int64(1), Value::Int64(10)], vec![Value::Int64(2), Value::Int64(20)]],
+            returning: None,
+            on_conflict: None,
+        }, db).unwrap();
+        assert_eq!(r.rows_affected, 2);
+        let r = execute(PhysicalPlan::CountStar { output_name: "count(*)".into(), count: 2 }, db).unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(2));
+        let err = execute(PhysicalPlan::Insert {
+            table_name: "t".into(),
+            rows: vec![vec![Value::Int64(1), Value::Int64(99)]],
+            returning: None,
+            on_conflict: None,
+        }, db).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+    }
+
+    #[test]
+    fn test_execute_delete_update_plans() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        let db = conn.database_mut();
+        let r = execute(PhysicalPlan::Update { table_name: "t".into(), assignments: vec![], condition: None }, db).unwrap();
+        assert_eq!(r.rows_affected, 0);
+        let r = execute(PhysicalPlan::Delete { table_name: "t".into(), condition: None }, db).unwrap();
+        assert_eq!(r.rows_affected, 3);
+        let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_execute_begin_commit_rollback_plans() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        let db = conn.database_mut();
+        execute(PhysicalPlan::BeginTransaction, db).unwrap();
+        execute(PhysicalPlan::Commit, db).unwrap();
+        execute(PhysicalPlan::BeginTransaction, db).unwrap();
+        execute(PhysicalPlan::Rollback, db).unwrap();
+    }
+
+    #[test]
+    fn test_execute_subquery_scan() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        let db = conn.database_mut();
+        let r = execute(PhysicalPlan::SubqueryScan { plan: Box::new(plan_scan()) }, db).unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_upsert_on_conflict_do_nothing() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        let db = conn.database_mut();
+        let r = execute(PhysicalPlan::Insert {
+            table_name: "t".into(),
+            rows: vec![vec![Value::Int64(1), Value::Int64(99)], vec![Value::Int64(2), Value::Int64(20)]],
+            returning: None,
+            on_conflict: Some(OnConflictClause {
+                conflict_columns: vec![],
+                action: crate::sql::ast::OnConflictAction::DoNothing,
+            }),
+        }, db).unwrap();
+        let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1], Value::Int64(10));
+    }
+}
+
 

@@ -396,6 +396,114 @@ fn insert_columns_direct(
 ) -> Result<u64> {
     let table = db.get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
-
     table.insert_columns(columns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::config::Config;
+    use crate::Value;
+
+    #[test]
+    fn test_insert_direct_txn_path() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let n = execute(db, "t", vec![
+            vec![Value::Int64(1), Value::Int64(10)],
+            vec![Value::Int64(2), Value::Int64(20)],
+        ], true).unwrap();
+        assert_eq!(n, 2);
+        let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Int64(1));
+    }
+
+    #[test]
+    fn test_insert_without_txn() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = false;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let n = execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(10)]], false).unwrap();
+        assert_eq!(n, 1);
+        let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_insert_empty_rows() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let n = execute(db, "t", vec![], true).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_insert_table_not_found() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let err = execute(db, "nope", vec![vec![Value::Int64(1)]], true).unwrap_err();
+        assert!(matches!(err, EngramDbError::TableNotFound(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn test_insert_duplicate_pk_rejected() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(10)]], true).unwrap();
+        let err = execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(99)]], true).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)), "got: {err:?}");
+        // 失败无副作用：行数不变
+        assert_eq!(db.get_table("t").unwrap().def().row_count, 1);
+    }
+
+    #[test]
+    fn test_insert_columns_direct() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = false;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let n = execute_columns(db, "t", vec![
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(10), Value::Int64(20)],
+        ]).unwrap();
+        assert_eq!(n, 2);
+        let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1][1], Value::Int64(20));
+    }
+
+    #[test]
+    fn test_insert_columns_empty() {
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        let n = execute_columns(db, "t", vec![]).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_flush_all_batched() {
+        let mut cfg = Config::default();
+        cfg.enable_transaction = true;
+        let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let db = conn.database_mut();
+        // 无挂起批次 → 空操作
+        flush_all_batched(db).unwrap();
+        // 有挂起批次（小批入 batcher）
+        let n = execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(10)]], false).unwrap();
+        assert_eq!(n, 1);
+        flush_all_batched(db).unwrap();
+        assert!(db.insert_batcher().is_empty());
+        let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
 }
