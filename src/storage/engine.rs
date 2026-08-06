@@ -177,6 +177,23 @@ impl EngineTable {
         }
     }
 
+    /// 行式扫描（统一 3 引擎入口；Columnar/Memory/Log 都支持 skip_pred）
+    ///
+    /// 消除 executor.rs / table_scan.rs 等下游代码里的 3-arm match
+    pub fn scan_to_rows_direct(
+        &mut self,
+        column_indices: &[usize],
+        skip_pred: Option<(usize, PredicateOp, Value)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        match self {
+            EngineTable::Columnar(t) => {
+                t.scan_to_rows_direct_with_skip(column_indices, skip_pred)
+            }
+            EngineTable::Memory(t) => t.scan_to_rows_direct(column_indices, skip_pred),
+            EngineTable::Log(t) => t.scan_to_rows_direct(column_indices, skip_pred),
+        }
+    }
+
     /// 插入（引擎分派入口）
     pub fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
         match self {
@@ -311,7 +328,7 @@ impl EngineTable {
         }
     }
 
-    /// 批量行插入（引擎分派入口，事务 apply 路径）
+    /// 批量行插入（与 `insert_rows` 同语义；别名保留以避免改动现有调用方）
     pub fn insert(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
         match self {
             EngineTable::Columnar(t) => t.insert(rows),

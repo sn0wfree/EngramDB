@@ -505,17 +505,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 let columns: Vec<String> = column_indices.iter()
                     .map(|&i| table.def().columns[i].name.clone())
                     .collect();
-                let rows = match table {
-                    crate::storage::engine::EngineTable::Columnar(t) => {
-                        t.scan_to_rows_direct(&column_indices)?
-                    }
-                    crate::storage::engine::EngineTable::Memory(t) => {
-                        t.scan_to_rows_direct(&column_indices, None)?
-                    }
-                    crate::storage::engine::EngineTable::Log(t) => {
-                        t.scan_to_rows_direct(&column_indices, None)?
-                    }
-                };
+                let rows = table.scan_to_rows_direct(&column_indices, None)?;
                 (columns, rows)
             };
             Ok(QueryResult {
@@ -657,17 +647,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                             .map(|&i| table.def().columns[i].name.clone())
                             .collect();
                         let skip = pred_col_idx.map(|ci| (ci, pred_op, pred_val.clone()));
-                        let scanned = match table {
-                            crate::storage::engine::EngineTable::Columnar(t) => {
-                                t.scan_to_rows_direct_with_skip(column_indices, skip)?
-                            }
-                            crate::storage::engine::EngineTable::Memory(t) => {
-                                t.scan_to_rows_direct(column_indices, skip)?
-                            }
-                            crate::storage::engine::EngineTable::Log(t) => {
-                                t.scan_to_rows_direct(column_indices, skip)?
-                            }
-                        };
+                        let scanned = table.scan_to_rows_direct(column_indices, skip)?;
 
                         // 逐行精确过滤（复用向量化求值的标量语义）
                         let rows: Vec<Vec<crate::Value>> = match pred_pos {

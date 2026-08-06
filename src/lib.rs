@@ -429,11 +429,9 @@ impl Connection {
                     table.def_mut().row_count += num_rows as u64;
                 }
             }
-            crate::storage::engine::EngineTable::Memory(table) => {
-                table.insert_columns(columns)?;
-            }
-            crate::storage::engine::EngineTable::Log(table) => {
-                table.insert_columns(columns)?;
+            // Memory/Log 走通用 insert_columns 入口
+            other => {
+                other.insert_columns(columns)?;
             }
         }
 
