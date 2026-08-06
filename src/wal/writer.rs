@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use crate::common::config::{WalFlushMode, WalCompression};
 use crate::common::error::Result;
 
-use super::{WalRecord, WalRecordType, WAL_RECORD_HEADER_SIZE};
+use super::{WalRecord, WalRecordType, WAL_MAGIC, WAL_RECORD_HEADER_SIZE};
 
 /// WAL 写入器
 pub struct WalWriter {
@@ -87,6 +87,10 @@ impl WalWriter {
 
     /// 写入一条记录，返回 LSN
     /// 记录先写入缓冲区，缓冲区满或调用 flush 时才真正写盘
+    ///
+    /// 性能优化：直接序列化到 `self.buffer`，不再构造中间 `WalRecord` + `to_bytes()`。
+    /// payload 只拷贝 1 次（到 buffer），省去 `payload.to_vec()` + `to_bytes()` 内部
+    /// `extend_from_slice(&self.payload)` 的两次冗余拷贝。
     pub fn write_record(
         &mut self,
         record_type: WalRecordType,
@@ -95,45 +99,60 @@ impl WalWriter {
         engine_type: crate::common::types::EngineType,
         payload: &[u8],
     ) -> Result<u64> {
-        let record = WalRecord {
-            lsn: self.offset + self.buffer.len() as u64,
-            record_type,
-            txn_id,
-            table_id,
-            engine_type,
-            payload: payload.to_vec(),
-        };
-
-        let lsn = record.lsn;
-        let bytes = record.to_bytes();
+        let total_size = WAL_RECORD_HEADER_SIZE + payload.len();
 
         // 检查是否需要先刷缓冲区
-        if self.buffer.len() + bytes.len() > self.buffer_size {
+        if self.buffer.len() + total_size > self.buffer_size {
             self.flush()?;
         }
 
-        self.buffer.extend_from_slice(&bytes);
+        let lsn = self.offset + self.buffer.len() as u64;
+        let crc_start = self.buffer.len();
+
+        // magic
+        self.buffer.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        // type
+        self.buffer.push(record_type as u8);
+        // txn_id
+        self.buffer.extend_from_slice(&txn_id.to_le_bytes());
+        // table_id
+        self.buffer.extend_from_slice(&table_id.to_le_bytes());
+        // engine_type（M4）
+        self.buffer.push(engine_type as u8);
+        // payload_len
+        self.buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        // payload（直接借用，零拷贝）
+        self.buffer.extend_from_slice(payload);
+
+        // crc32（覆盖 magic 到 payload 全部内容）
+        let crc = super::crc32(&self.buffer[crc_start..]);
+        self.buffer.extend_from_slice(&crc.to_le_bytes());
+
         Ok(lsn)
     }
 
-    /// 批量写入多条记录（更高效）
+    /// 批量写入多条记录：单次 reserve 容量，避免 N 次重新分配
+    ///
+    /// 性能优化：先计算总大小并 reserve 一次，再循环逐条写入。批量 N 条记录的
+    /// 写入成本从 O(N) 次 Vec 容量重分配降到 O(1) 次。
     pub fn write_batch(
         &mut self,
-        records: &[(WalRecordType, u32, u32, &[u8])],
+        records: &[(WalRecordType, u32, u32, crate::common::types::EngineType, &[u8])],
     ) -> Result<Vec<u64>> {
-        let mut lsns = Vec::with_capacity(records.len());
+        let total: usize = records
+            .iter()
+            .map(|(_, _, _, _, payload)| WAL_RECORD_HEADER_SIZE + payload.len())
+            .sum();
 
-        for (rec_type, txn_id, table_id, payload) in records {
-            let lsn = self.write_record(
-                *rec_type,
-                *txn_id,
-                *table_id,
-                crate::common::types::EngineType::Columnar,
-                payload,
-            )?;
-            lsns.push(lsn);
+        if self.buffer.len() + total > self.buffer_size {
+            self.flush()?;
         }
+        self.buffer.reserve(total);
 
+        let mut lsns = Vec::with_capacity(records.len());
+        for (rec_type, txn_id, table_id, engine, payload) in records {
+            lsns.push(self.write_record(*rec_type, *txn_id, *table_id, *engine, payload)?);
+        }
         Ok(lsns)
     }
 

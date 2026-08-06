@@ -299,20 +299,11 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 fn chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<Value>> {
-    let mut all_rows = Vec::new();
-    for chunk in chunks {
-        all_rows.extend(chunk.to_rows());
-    }
-    all_rows
+    crate::executor::vector::flatten_to_rows(chunks)
 }
 
 fn rows_to_chunks(rows: &[Vec<Value>]) -> Vec<DataChunk> {
-    const BATCH_SIZE: usize = 1024;
-    let mut chunks = Vec::new();
-    for batch in rows.chunks(BATCH_SIZE) {
-        chunks.push(DataChunk::from_rows(batch));
-    }
-    chunks
+    crate::executor::vector::from_rows_batched(rows)
 }
 
 #[cfg(test)]

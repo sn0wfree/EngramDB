@@ -1461,20 +1461,11 @@ pub fn debug_chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {
 }
 
 fn chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {
-    let mut all_rows = Vec::new();
-    for chunk in chunks {
-        all_rows.extend(chunk.to_rows());
-    }
-    all_rows
+    super::vector::flatten_to_rows(chunks)
 }
 
 fn rows_to_chunks(rows: &[Vec<crate::Value>]) -> Vec<DataChunk> {
-    let batch_size = super::vector::VECTOR_SIZE;
-    let mut chunks = Vec::new();
-    for batch in rows.chunks(batch_size) {
-        chunks.push(DataChunk::from_rows(batch));
-    }
-    chunks
+    super::vector::from_rows_batched(rows)
 }
 
 /// 从过滤表达式中提取可下推的比较谓词（P2.4 MinMax 跳过）

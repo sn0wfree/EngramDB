@@ -281,7 +281,7 @@ fn count_distinct(values: &[&Value]) -> u64 {
     // 上面的方法不对，改用值比较
     let mut unique: Vec<&Value> = Vec::new();
     for v in values {
-        if !unique.iter().any(|u| value_eq(u, v)) {
+        if !unique.iter().any(|u| **u == **v) {
             unique.push(v);
         }
         // 限制计算量：超过 1000 个不同值就停止精确计数
@@ -290,10 +290,6 @@ fn count_distinct(values: &[&Value]) -> u64 {
         }
     }
     unique.len() as u64
-}
-
-fn value_eq(a: &Value, b: &Value) -> bool {
-    a == b
 }
 
 fn value_less(a: &Value, b: &Value) -> bool {

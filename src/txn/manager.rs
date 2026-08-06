@@ -142,9 +142,9 @@ impl TransactionManager {
 
         ctx.state = TxnState::Committed;
         let read_only = ctx.read_only;
-        // 注意：必须在 take 之前克隆 write_set，因为 collect_apply_ops 需要它
-        let write_set = ctx.write_set.clone();
-        let _dropped = std::mem::take(&mut ctx.write_set);
+        // take 而非 clone：直接 move 出 ctx.write_set，后续 &write_set 只读借用即可。
+        // 函数结束时 write_set drop，ctx.write_set 保持空。
+        let write_set = std::mem::take(&mut ctx.write_set);
 
         // 只读事务跳过 WAL COMMIT 记录和 fsync（v0.15.0 Txn09）；
         // 全部写入仅涉及非持久化表（MemoryEngine）时同样跳过（M2）

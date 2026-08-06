@@ -165,6 +165,10 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
     }
 
     use crate::wal::{parse_delete_payload, parse_insert_batch_payload, parse_insert_payload, parse_update_payload};
+    // 幂等优化：维护已重放的 (table_id, row_id) 集合，避免每次调 get_row_by_id
+    // 做 O(log n) 索引查找（双崩溃窗口防护）。Update/Delete 不需要幂等检查
+    // （update 重复应用相同值幂等；delete 删不存在的行也无副作用）。
+    let mut replayed: HashSet<(u32, u32)> = HashSet::new();
     for rec in &redo {
         let Some(table) = db.tables_mut().get_mut(&rec.table_id) else {
             continue; // schema 已删
@@ -172,18 +176,23 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
         match rec.record_type {
             WalRecordType::Insert => {
                 let Some((rowid, row)) = parse_insert_payload(&rec.payload) else { continue };
-                // 幂等：row 已存在则跳过（双崩溃窗口）
-                if table.get_row_by_id(rowid as u32)?.is_none() {
-                    table.insert_row(rowid as u32, &row)?;
+                let rid = rowid as u32;
+                if replayed.insert((rec.table_id, rid)) {
+                    // 首次见到：表中可能已存在（部分落盘）→ O(1) HashSet 探测
+                    if table.get_row_by_id(rid)?.is_none() {
+                        table.insert_row(rid, &row)?;
+                    }
                 }
                 result.records_redone += 1;
             }
             WalRecordType::InsertBatch => {
                 let Some((base, rows)) = parse_insert_batch_payload(&rec.payload) else { continue };
                 for (i, row) in rows.iter().enumerate() {
-                    let rid = base + i as u64;
-                    if table.get_row_by_id(rid as u32)?.is_none() {
-                        table.insert_row(rid as u32, row)?;
+                    let rid = (base + i as u64) as u32;
+                    if replayed.insert((rec.table_id, rid)) {
+                        if table.get_row_by_id(rid)?.is_none() {
+                            table.insert_row(rid, row)?;
+                        }
                     }
                 }
                 result.records_redone += 1;

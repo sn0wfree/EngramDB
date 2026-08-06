@@ -174,6 +174,31 @@ impl DataChunk {
     }
 }
 
+/// 按 `VECTOR_SIZE` 批量将行转成 `DataChunk`（统一各算子边界转换逻辑）
+///
+/// 各算子（Filter/Projection/Sort/Aggregate 等）输入侧原本各写一份相同循环，
+/// 现在统一调用此处。调用方拿到 `Vec<DataChunk>` 后再传入算子。
+pub fn from_rows_batched(rows: &[Vec<Value>]) -> Vec<DataChunk> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    rows.chunks(VECTOR_SIZE)
+        .map(DataChunk::from_rows)
+        .collect()
+}
+
+/// 将多个 `DataChunk` 扁平化为 `Vec<Vec<Value>>`（统一各算子输出边界）
+///
+/// 各算子输出侧原本各写一份相同循环，现在统一调用此处。
+pub fn flatten_to_rows(chunks: &[DataChunk]) -> Vec<Vec<Value>> {
+    let total: usize = chunks.iter().map(|c| c.count).sum();
+    let mut all_rows = Vec::with_capacity(total);
+    for chunk in chunks {
+        all_rows.extend(chunk.to_rows());
+    }
+    all_rows
+}
+
 
 // ============================================================================
 // 选择向量 (Selection Vector)

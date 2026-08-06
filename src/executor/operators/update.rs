@@ -317,12 +317,7 @@ fn execute_without_txn(
 
 /// 将行数据转换为 DataChunk
 fn rows_to_chunks(rows: &[Vec<Value>]) -> Vec<DataChunk> {
-    let batch_size = crate::executor::vector::VECTOR_SIZE;
-    let mut chunks = Vec::new();
-    for batch in rows.chunks(batch_size) {
-        chunks.push(DataChunk::from_rows(batch));
-    }
-    chunks
+    crate::executor::vector::from_rows_batched(rows)
 }
 
 #[cfg(test)]
