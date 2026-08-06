@@ -375,4 +375,95 @@ mod tests {
         cache.set_max_memory(1);
         assert_eq!(cache.entries.len(), 0);
     }
+
+    fn insert(c: &mut KVCache, k: u64, size: usize) {
+        c.insert(k, vec![0u8; size], None);
+    }
+
+    #[test]
+    fn test_remove_and_overwrite() {
+        let mut c = KVCache::new(1 << 20);
+        insert(&mut c, 1, 100);
+        c.remove(&1);
+        assert!(c.get(&1).is_none());
+        assert_eq!(c.memory_usage(), 0);
+        // 覆盖已有键：旧条目替换
+        insert(&mut c, 1, 100);
+        c.insert(1, vec![1u8; 200], None);
+        assert_eq!(c.memory_usage(), 200, "覆盖应替换而非累积");
+        assert_eq!(c.get(&1).unwrap().value.len(), 200);
+    }
+
+    #[test]
+    fn test_ttl_expired_get_none() {
+        let mut c = KVCache::new(1 << 20);
+        c.insert(1, vec![0u8; 10], Some(1));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(c.get(&1).is_none(), "TTL 过期后 get 返回 None");
+        assert!(!c.entries.contains_key(&1), "过期条目被清除");
+        assert_eq!(c.stats().misses, 1);
+    }
+
+    #[test]
+    fn test_evict_expired_removes_and_counts() {
+        let mut c = KVCache::new(1 << 20);
+        c.insert(1, vec![0u8; 10], Some(1));
+        c.insert(2, vec![0u8; 10], None);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let n = c.evict_expired();
+        assert_eq!(n, 1);
+        assert!(!c.entries.contains_key(&1));
+        assert!(c.entries.contains_key(&2), "无 TTL 条目不受影响");
+    }
+
+    #[test]
+    fn test_hit_rate() {
+        let mut c = KVCache::new(1 << 20);
+        insert(&mut c, 1, 100);
+        insert(&mut c, 2, 100);
+        let _ = c.get(&1);
+        let _ = c.get(&1);
+        let _ = c.get(&2);
+        let _ = c.get(&99); // miss
+        assert_eq!(c.stats().hits, 3);
+        assert_eq!(c.stats().misses, 1);
+        assert!((c.hit_rate() - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_set_max_memory_triggers_eviction() {
+        let mut c = KVCache::new(1 << 20);
+        insert(&mut c, 1, 100);
+        insert(&mut c, 2, 100);
+        c.set_max_memory(150);
+        assert!(c.memory_usage() <= 150, "降低预算应触发逐出");
+        assert!(c.entries.len() < 2);
+        // 再插入超出预算的大条目：被逐出
+        c.set_max_memory(1 << 20);
+        insert(&mut c, 3, 5000);
+        assert!(c.memory_usage() <= c.max_memory);
+    }
+
+    #[test]
+    fn test_promotion_to_protected() {
+        let mut c = KVCache::new(1 << 20);
+        insert(&mut c, 1, 100);
+        // 首次访问晋升 protected
+        let _ = c.get(&1);
+        assert!(c.protected_lookup.contains(&1));
+        assert!(c.probation.iter().all(|k| *k != 1));
+    }
+
+    #[test]
+    fn test_insert_large_entry_evicts_others() {
+        let mut c = KVCache::new(1024);
+        insert(&mut c, 1, 200);
+        insert(&mut c, 2, 200);
+        insert(&mut c, 3, 200);
+        // 大条目超过预算：其他条目被逐出
+        c.insert(4, vec![0u8; 900], None);
+        assert!(!c.entries.contains_key(&1));
+        assert!(c.memory_usage() <= 1024);
+    }
+
 }

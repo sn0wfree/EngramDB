@@ -61,11 +61,12 @@ impl MemoryTable {
         if n == 0 {
             return Ok(0);
         }
-        // 主键冲突检查（含批量内重复）
+        // 主键冲突检查（含批量内重复：局部 seen 集合检出同批自重复）
         if let Some(pk) = self.pk_col() {
+            let mut seen = std::collections::HashSet::new();
             for row in &rows {
                 if let Some(cell) = row.get(pk) {
-                    if self.primary.contains_key(cell) {
+                    if self.primary.contains_key(cell) || !seen.insert(cell.clone()) {
                         return Err(EngramDbError::ConstraintViolation(format!(
                             "UNIQUE constraint failed: {}={:?}",
                             self.def.columns[pk].name, cell
@@ -341,5 +342,169 @@ impl crate::storage::engine::EngineTableOps for MemoryTable {
 
     fn lookup_primary_key(&self, pk: &Value) -> Option<u32> {
         self.lookup_primary_key(pk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{ColumnDef, DataType};
+
+    fn make_def(pk: bool) -> TableDef {
+        TableDef {
+            id: 1,
+            engine: EngineType::Memory,
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Int64,
+                    nullable: !pk,
+                    is_primary_key: pk,
+                    default_value: None,
+                    auto_increment: false,
+                },
+                ColumnDef::new("v", DataType::Varchar),
+            ],
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+            row_count: 0,
+        }
+    }
+
+    fn row(id: i64, v: &str) -> Vec<Value> {
+        vec![Value::Int64(id), Value::Varchar(v.to_string())]
+    }
+
+    #[test]
+    fn test_insert_get_roundtrip() {
+        let mut t = MemoryTable::new(make_def(false));
+        t.insert(vec![row(1, "a"), row(2, "b")]).unwrap();
+        assert_eq!(t.row_count(), 2);
+        assert_eq!(t.get_row_by_id(0).unwrap().unwrap(), row(1, "a"));
+        assert_eq!(t.get_row_by_id_columns(1, &[1]).unwrap().unwrap(), vec![Value::Varchar("b".into())]);
+        assert!(t.get_row_by_id(9).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_pk_conflict_rejected() {
+        let mut t = MemoryTable::new(make_def(true));
+        t.insert(vec![row(1, "a")]).unwrap();
+        let err = t.insert(vec![row(1, "dup")]).unwrap_err();
+        assert!(matches!(err, EngramDbError::ConstraintViolation(_)));
+        // 批量内自重复也拒绝
+        let err2 = t.insert(vec![row(2, "x"), row(2, "y")]).unwrap_err();
+        assert!(matches!(err2, EngramDbError::ConstraintViolation(_)));
+        assert_eq!(t.row_count(), 1, "失败时零副作用");
+    }
+
+    #[test]
+    fn test_pk_lookup_and_normalization() {
+        let mut t = MemoryTable::new(make_def(true));
+        t.insert(vec![row(1, "a"), row(2, "b")]).unwrap();
+        assert_eq!(t.lookup_primary_key(&Value::Int64(2)), Some(1));
+        // 数值归一化：Int32/Timestamp 互查 Int64 主键
+        assert_eq!(t.lookup_primary_key(&Value::Int32(1)), Some(0));
+        assert_eq!(t.lookup_primary_key(&Value::Timestamp(1)), Some(0));
+        assert_eq!(t.lookup_primary_key(&Value::Int64(99)), None);
+        assert_eq!(t.pk_row_id(&row(1, "a")), Some(0));
+    }
+
+    #[test]
+    fn test_insert_row_out_of_order() {
+        let mut t = MemoryTable::new(make_def(false));
+        t.insert_row(5, &row(5, "e")).unwrap();
+        assert_eq!(t.next_row_id, 6, "乱序插入推进 next_row_id");
+        assert!(t.get_row_by_id(0).unwrap().is_none(), "间隙为 tombstone");
+        assert_eq!(t.get_row_by_id(5).unwrap().unwrap(), row(5, "e"));
+        assert_eq!(t.row_count(), 1);
+        // 覆盖已有位置
+        t.insert_row(5, &row(5, "f")).unwrap();
+        assert_eq!(t.get_row_by_id(5).unwrap().unwrap()[1], Value::Varchar("f".into()));
+    }
+
+    #[test]
+    fn test_insert_columns_transpose() {
+        let mut t = MemoryTable::new(make_def(false));
+        let cols = vec![
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Varchar("a".into()), Value::Varchar("b".into())],
+        ];
+        t.insert_columns(cols).unwrap();
+        assert_eq!(t.get_row_by_id(1).unwrap().unwrap(), row(2, "b"));
+    }
+
+    #[test]
+    fn test_delete_tombstone() {
+        let mut t = MemoryTable::new(make_def(true));
+        t.insert(vec![row(1, "a"), row(2, "b")]).unwrap();
+        t.delete_row(0).unwrap();
+        assert!(t.get_row_by_id(0).unwrap().is_none());
+        assert_eq!(t.row_count(), 1);
+        assert_eq!(t.lookup_primary_key(&Value::Int64(1)), None, "删除后主键清除");
+        assert_eq!(t.lookup_primary_key(&Value::Int64(2)), Some(1));
+        // row_id 不复用：新插入在尾部
+        t.insert(vec![row(3, "c")]).unwrap();
+        assert_eq!(t.get_row_by_id(2).unwrap().unwrap(), row(3, "c"));
+        assert!(t.get_row_by_id(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_update_row_pk_migration() {
+        let mut t = MemoryTable::new(make_def(true));
+        t.insert(vec![row(1, "a"), row(2, "b")]).unwrap();
+        t.update_row(0, &row(10, "a2")).unwrap();
+        assert_eq!(t.lookup_primary_key(&Value::Int64(1)), None, "旧主键清除");
+        assert_eq!(t.lookup_primary_key(&Value::Int64(10)), Some(0), "新主键生效");
+        assert_eq!(t.get_row_by_id(0).unwrap().unwrap()[1], Value::Varchar("a2".into()));
+        // 更新到已存在主键 → 冲突
+        let err = t.update_row(0, &row(2, "x")).unwrap_err();
+        assert!(matches!(err, EngramDbError::ConstraintViolation(_)));
+    }
+
+    #[test]
+    fn test_truncate_resets() {
+        let mut t = MemoryTable::new(make_def(true));
+        t.insert(vec![row(1, "a")]).unwrap();
+        t.truncate().unwrap();
+        assert_eq!(t.row_count(), 0);
+        assert!(t.is_empty());
+        assert_eq!(t.lookup_primary_key(&Value::Int64(1)), None);
+        t.insert(vec![row(9, "z")]).unwrap();
+        assert_eq!(t.get_row_by_id(0).unwrap().unwrap()[0], Value::Int64(9), "truncate 后 row_id 重置");
+    }
+
+    #[test]
+    fn test_scan_predicate_and_columns() {
+        let mut t = MemoryTable::new(make_def(false));
+        let mut rows = Vec::new();
+        for i in 0..10 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        t.delete_row(3).unwrap(); // tombstone 跳过
+        let out = t.scan_to_rows_direct(&[1], Some((0, PredicateOp::GtEq, Value::Int64(7)))).unwrap();
+        assert_eq!(out, vec![vec![Value::Varchar("r7".into())], vec![Value::Varchar("r8".into())], vec![Value::Varchar("r9".into())]]);
+        // 全列 + 谓词命中 tombstone 区域
+        let out2 = t.scan_to_rows_direct(&[0, 1], None).unwrap();
+        assert_eq!(out2.len(), 9, "tombstone 行不计入");
+        // 块输出 Typed 保真
+        let chunks = t.scan_to_chunks(&[0], None).unwrap();
+        assert!(chunks[0].columns[0].is_typed());
+    }
+
+    #[test]
+    fn test_all_rows_with_ids() {
+        let mut t = MemoryTable::new(make_def(false));
+        t.insert(vec![row(1, "a"), row(2, "b"), row(3, "c")]).unwrap();
+        t.delete_row(1).unwrap();
+        let all = t.all_rows_with_ids().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0], (0, row(1, "a")));
+        assert_eq!(all[1], (2, row(3, "c")));
     }
 }

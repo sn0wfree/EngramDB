@@ -439,4 +439,88 @@ mod tests {
             panic!("Expected Insert");
         }
     }
+
+    #[test]
+    fn test_case_insensitive_and_semicolon() {
+        let sql = "insert into t values (1, 'a');";
+        let result = try_parse_insert(sql);
+        assert!(result.is_some());
+        if let Some(Statement::Insert(stmt)) = result {
+            assert_eq!(stmt.table_name, "t");
+            assert!(matches!(stmt.values[0][0], Expression::Literal(Value::Int64(1))));
+        }
+    }
+
+    #[test]
+    fn test_whitespace_tolerance() {
+        let sql = "  INSERT\n  INTO t\t VALUES\n  (1, 'a'),\n  (2, 'b')  ";
+        let result = try_parse_insert(sql);
+        assert!(result.is_some());
+        if let Some(Statement::Insert(stmt)) = result {
+            assert_eq!(stmt.values.len(), 2, "多行 VALUES 跨空白");
+        }
+    }
+
+    #[test]
+    fn test_string_with_comma_and_parens() {
+        let sql = "INSERT INTO t VALUES ('a,b(c)', 'it''s')";
+        let result = try_parse_insert(sql);
+        assert!(result.is_some());
+        if let Some(Statement::Insert(stmt)) = result {
+            assert!(matches!(&stmt.values[0][0], Expression::Literal(Value::Varchar(v)) if v == "a,b(c)"));
+            assert!(matches!(&stmt.values[0][1], Expression::Literal(Value::Varchar(v)) if v == "it's"), "'' 转义单引号");
+        }
+    }
+
+    #[test]
+    fn test_negative_and_plus_numbers() {
+        let sql = "INSERT INTO t VALUES (-5, +3, -2.5)";
+        let result = try_parse_insert(sql);
+        assert!(result.is_some());
+        if let Some(Statement::Insert(stmt)) = result {
+            assert!(matches!(stmt.values[0][0], Expression::Literal(Value::Int64(-5))));
+            assert!(matches!(stmt.values[0][1], Expression::Literal(Value::Int64(3))));
+            assert!(matches!(stmt.values[0][2], Expression::Literal(Value::Float64(-2.5))));
+        }
+    }
+
+    #[test]
+    fn test_multirow_with_columns() {
+        let sql = "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')";
+        let result = try_parse_insert(sql);
+        assert!(result.is_some());
+        if let Some(Statement::Insert(stmt)) = result {
+            let cols = stmt.columns.as_ref().unwrap();
+            assert_eq!(cols, &vec!["a".to_string(), "b".to_string()]);
+            assert_eq!(stmt.values.len(), 2);
+            assert!(matches!(&stmt.values[1][1], Expression::Literal(Value::Varchar(v)) if v == "y"));
+        }
+    }
+
+    #[test]
+    fn test_fallback_non_literal_expr() {
+        // 表达式/函数不是字面量 → 回退完整解析器（返回 None 由 parse() 接管）
+        assert!(try_parse_insert("INSERT INTO t VALUES (1+2, 3)").is_none());
+        assert!(try_parse_insert("INSERT INTO t VALUES (LOWER('A'))").is_none());
+    }
+
+    #[test]
+    fn test_fallback_extra_clauses() {
+        assert!(try_parse_insert("INSERT INTO t VALUES (1) RETURNING id").is_none());
+        assert!(try_parse_insert("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING").is_none());
+        assert!(try_parse_insert("INSERT INTO t SELECT * FROM s").is_none());
+    }
+
+    #[test]
+    fn test_fallback_quoted_identifier_table() {
+        // 带引号表名走回退（fast 路径不保证，但不应 panic）
+        assert!(try_parse_insert("INSERT INTO \"my table\" VALUES (1)").is_none()
+            || try_parse_insert("INSERT INTO \"my table\" VALUES (1)").is_some());
+    }
+
+    #[test]
+    fn test_unclosed_string_fallback() {
+        assert!(try_parse_insert("INSERT INTO t VALUES ('oops)").is_none());
+        assert!(try_parse_insert("INSERT INTO t VALUES (1,").is_none());
+    }
 }

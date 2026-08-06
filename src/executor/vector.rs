@@ -379,3 +379,183 @@ impl LazyDataChunk {
         (&self.chunk.columns[col_idx], self.selection.as_ref())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::column_data::ColumnData;
+    use crate::common::types::DataType;
+
+    fn typed_int64(vals: &[i64]) -> ColumnData {
+        let v: Vec<Value> = vals.iter().map(|&x| Value::Int64(x)).collect();
+        ColumnData::from_values_typed(&v, &DataType::Int64)
+    }
+
+    #[test]
+    fn test_vector_flat_basics() {
+        let mut v = Vector::from_values(vec![Value::Int64(1), Value::Int64(2)]);
+        assert_eq!(v.len(), 2);
+        assert!(!v.is_empty());
+        assert_eq!(v.get(0), Value::Int64(1));
+        v.push(Value::Int64(3));
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.to_flat(), vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]);
+        assert!(!v.is_typed());
+        assert!(v.as_typed().is_none());
+    }
+
+    #[test]
+    fn test_vector_constant() {
+        let mut v = Vector::Constant(Value::Int64(7), 0);
+        v.push(Value::Int64(9)); // push 对 Constant 只增计数
+        assert_eq!(v.len(), 1);
+        assert_eq!(v.get(0), Value::Int64(7), "Constant 任意位置返回同一值");
+        assert_eq!(v.get(100), Value::Int64(7));
+        assert_eq!(v.to_flat(), vec![Value::Int64(7)]);
+        // all(5) 场景
+        let c = Vector::Constant(Value::Varchar("x".into()), 5);
+        assert_eq!(c.len(), 5);
+        assert_eq!(c.to_flat().len(), 5);
+    }
+
+    #[test]
+    fn test_vector_typed() {
+        let d = typed_int64(&[10, 20, 30]);
+        let v = Vector::from_typed(d);
+        assert_eq!(v.len(), 3);
+        assert!(v.is_typed());
+        assert_eq!(v.get(1), Value::Int64(20));
+        assert_eq!(v.to_flat(), vec![Value::Int64(10), Value::Int64(20), Value::Int64(30)]);
+        assert!(v.as_typed().is_some());
+    }
+
+    #[test]
+    fn test_try_typed_conversion() {
+        // 纯类型列 → Typed
+        let flat = Vector::from_values(vec![Value::Int64(1), Value::Int64(2)]);
+        assert!(flat.try_typed().is_typed());
+        // 混合列保持 Flat
+        let mixed = Vector::from_values(vec![Value::Int64(1), Value::Varchar("a".into())]);
+        assert!(!mixed.try_typed().is_typed());
+        // Typed 幂等
+        let typed = Vector::from_typed(typed_int64(&[1]));
+        assert!(typed.try_typed().is_typed());
+    }
+
+    #[test]
+    fn test_data_chunk_roundtrip() {
+        let rows = vec![
+            vec![Value::Int64(1), Value::Varchar("a".into())],
+            vec![Value::Int64(2), Value::Varchar("b".into())],
+        ];
+        let chunk = DataChunk::from_rows(&rows);
+        assert_eq!(chunk.len(), 2);
+        assert_eq!(chunk.num_columns(), 2);
+        assert_eq!(chunk.to_rows(), rows, "列式转置回行式必须无损");
+        assert!(DataChunk::from_rows(&[]).is_empty());
+        assert_eq!(DataChunk::new(3).num_columns(), 3);
+    }
+
+    #[test]
+    fn test_selection_vector_basics() {
+        let sel = SelectionVector::all(5);
+        assert_eq!(sel.len(), 5);
+        assert_eq!(sel.index(3), 3);
+        assert_eq!(sel.indices(), &[0, 1, 2, 3, 4]);
+        let sel2 = SelectionVector::from_indices(vec![2, 4]);
+        assert_eq!(sel2.len(), 2);
+        assert_eq!(sel2.index(0), 2);
+        assert_eq!(sel2.index(1), 4);
+        let mut s = SelectionVector::new();
+        assert!(s.is_empty());
+        s.push(9);
+        s.push(11);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.index(1), 11);
+    }
+
+    #[test]
+    fn test_selection_apply_flat_and_constant() {
+        let flat = Vector::from_values(vec![Value::Int64(10), Value::Int64(20), Value::Int64(30)]);
+        let sel = SelectionVector::from_indices(vec![0, 2]);
+        let filtered = sel.apply_to_vector(&flat);
+        assert_eq!(filtered.to_flat(), vec![Value::Int64(10), Value::Int64(30)]);
+
+        let c = Vector::Constant(Value::Int64(5), 100);
+        let fc = sel.apply_to_vector(&c);
+        assert_eq!(fc.len(), 2, "Constant 过滤后只保留选中数");
+        assert_eq!(fc.get(0), Value::Int64(5));
+    }
+
+    #[test]
+    fn test_selection_apply_typed_gather() {
+        let typed = Vector::from_typed(typed_int64(&[1, 2, 3, 4]));
+        let sel = SelectionVector::from_indices(vec![3, 0]);
+        let filtered = sel.apply_to_vector(&typed);
+        assert!(filtered.is_typed(), "Typed gather 保持 Typed");
+        assert_eq!(filtered.to_flat(), vec![Value::Int64(4), Value::Int64(1)]);
+    }
+
+    #[test]
+    fn test_selection_apply_chunk_full_clone() {
+        let chunk = DataChunk::from_rows(&[
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(3), Value::Int64(4)],
+        ]);
+        let sel = SelectionVector::all(2);
+        let out = sel.apply_to_chunk(&chunk);
+        assert_eq!(out.len(), 2, "全选直接克隆");
+        assert_eq!(out.to_rows(), chunk.to_rows());
+    }
+
+    #[test]
+    fn test_lazy_chunk_filter_and_materialize() {
+        let chunk = DataChunk::from_rows(&[
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+        ]);
+        let mut lazy = LazyDataChunk::new(chunk.clone());
+        assert_eq!(lazy.len(), 4, "无 selection 默认全选");
+        lazy.filter(|i| i % 2 == 0);
+        assert_eq!(lazy.len(), 2);
+        // 二次过滤：在既有 selection 上累积
+        lazy.filter(|i| i != 0);
+        assert_eq!(lazy.len(), 1);
+        let out = lazy.materialize();
+        assert_eq!(out.to_rows(), vec![vec![Value::Int64(3)]]);
+    }
+
+    #[test]
+    fn test_lazy_chunk_all_pass_keeps_none() {
+        let chunk = DataChunk::from_rows(&[
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+        ]);
+        let mut lazy = LazyDataChunk::new(chunk);
+        lazy.filter(|_| true);
+        assert!(lazy.selection.is_none(), "全通过保持 None（全选优化）");
+        assert_eq!(lazy.len(), 2);
+        let out = lazy.materialize();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn test_lazy_chunk_column_with_selection() {
+        let chunk = DataChunk::from_rows(&[
+            vec![Value::Int64(1), Value::Varchar("a".into())],
+            vec![Value::Int64(2), Value::Varchar("b".into())],
+            vec![Value::Int64(3), Value::Varchar("c".into())],
+        ]);
+        let mut lazy = LazyDataChunk::new(chunk);
+        lazy.filter(|i| i != 1);
+        let (col, sel) = lazy.column_with_selection(0);
+        assert_eq!(col.len(), 3);
+        let sel = sel.unwrap();
+        assert_eq!(sel.len(), 2);
+        // 通过 selection 索引访问原列
+        assert_eq!(col.get(sel.index(0)), Value::Int64(1));
+        assert_eq!(col.get(sel.index(1)), Value::Int64(3));
+    }
+}
