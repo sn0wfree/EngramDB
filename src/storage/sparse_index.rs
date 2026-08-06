@@ -147,7 +147,18 @@ fn value_gt(a: &Value, b: &Value) -> bool {
         (Int64(x), Int64(y)) => x > y,
         (Int32(x), Int64(y)) => (*x as i64) > *y,
         (Int64(x), Int32(y)) => *x > (*y as i64),
+        (Int32(x), Float64(y)) => (*x as f64) > *y,
+        (Float64(x), Int32(y)) => *x > (*y as f64),
+        (Int64(x), Float64(y)) => (*x as f64) > *y,
+        (Float64(x), Int64(y)) => *x > (*y as f64),
         (Float64(x), Float64(y)) => x > y,
+        (Timestamp(x), Timestamp(y)) => x > y,
+        (Timestamp(x), Int32(y)) => *x > (*y as i64),
+        (Timestamp(x), Int64(y)) => *x > *y,
+        (Int32(x), Timestamp(y)) => (*x as i64) > *y,
+        (Int64(x), Timestamp(y)) => *x > *y,
+        (Timestamp(x), Float64(y)) => (*x as f64) > *y,
+        (Float64(x), Timestamp(y)) => *x > (*y as f64),
         (Varchar(x), Varchar(y)) => x > y,
         (Boolean(x), Boolean(y)) => x > y,
         (Null, _) => false,
@@ -377,5 +388,72 @@ mod tests {
         let keys2: Vec<Value> = (1..=3u32).map(|i| Value::Int32(i as i32)).collect();
         idx.build_from_keys(&keys2);
         assert_eq!(idx.granule_count(), 1);
+    }
+
+    #[test]
+    fn test_sparse_index_mixed_numeric_types() {
+        // value_gt 跨 Int32/Int64/Float64 比较
+        let mut idx = SparseIndex::new(3);
+        let keys = vec![
+            Value::Int32(1),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Float64(4.5),
+            Value::Int64(10),
+        ];
+        idx.build_from_keys(&keys);
+        assert_eq!(idx.granule_count(), 2);
+        assert_eq!(idx.locate_eq(&Value::Int32(2)), Some(0));
+        assert_eq!(idx.locate_eq(&Value::Int64(4)), Some(0), "4 < 4.5，落在 granule 0");
+        assert_eq!(idx.locate_eq(&Value::Int64(10)), Some(1));
+        // 范围跨类型
+        let range = idx.locate_range(&Value::Int32(1), &Value::Float64(4.5));
+        assert_eq!(range, 0..2);
+    }
+
+    #[test]
+    fn test_sparse_index_locate_eq_missing_key() {
+        // 等值查找不存在的键：返回最后一个 first_key <= key 的 granule（上界语义，
+        // 稀疏索引只能回答"可能包含"，不能回答"不存在"）
+        let mut idx = SparseIndex::new(4);
+        let keys: Vec<Value> = (1..=10u32).map(|i| Value::Int32(i as i32)).collect();
+        idx.build_from_keys(&keys);
+        // 5 不存在于 first_key（first_keys = 1,5,9），但可能存在于 granule 0..=1
+        assert_eq!(idx.locate_eq(&Value::Int32(5)), Some(1));
+        // 介于 first_key 之间的值：落在前一 granule
+        assert_eq!(idx.locate_eq(&Value::Int32(6)), Some(1));
+        assert_eq!(idx.locate_eq(&Value::Int32(8)), Some(1));
+        // 小于所有 first_key：granule 0
+        assert_eq!(idx.locate_eq(&Value::Int32(0)), Some(0));
+    }
+
+    #[test]
+    fn test_sparse_index_range_inside_gap() {
+        // 范围完全落在区间间隙（[5-8] 之后、[9-10] 之前不存在）：返回空范围的相邻区间
+        let mut idx = SparseIndex::new(4);
+        let keys: Vec<Value> = (1..=10u32).map(|i| Value::Int32(i as i32)).collect();
+        idx.build_from_keys(&keys);
+        // first_keys = 1, 5, 9
+        let range = idx.locate_range(&Value::Int32(6), &Value::Int32(8));
+        assert_eq!(range, 1..2, "间隙范围应收缩到相邻 granule 1");
+        let range = idx.locate_range(&Value::Int32(8), &Value::Int32(9));
+        assert_eq!(range, 1..3, "high=9 与 first_key=9 相等：保守包含该 granule");
+    }
+
+    #[test]
+    fn test_sparse_index_duplicate_first_keys() {
+        // 重复键：find_first_gt 二分在全部相等时正确
+        let mut idx = SparseIndex::new(2);
+        let keys = vec![
+            Value::Int32(7), Value::Int32(7),
+            Value::Int32(7), Value::Int32(8),
+            Value::Int32(8),
+        ];
+        idx.build_from_keys(&keys);
+        assert_eq!(idx.granule_count(), 3);
+        assert_eq!(idx.locate_eq(&Value::Int32(7)), Some(1), "最后一个 first_key<=7 的 granule");
+        assert_eq!(idx.locate_eq(&Value::Int32(8)), Some(2));
+        // 全部键都小于 target：返回最后一个 granule
+        assert_eq!(idx.locate_eq(&Value::Int32(100)), Some(2));
     }
 }

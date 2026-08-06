@@ -578,4 +578,80 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[test]
+    fn test_group_commit_timeout_trigger() {
+        let tmp = tmp("writer_timeout");
+        let _ = std::fs::remove_file(&tmp);
+
+        // 大 group size 不触发 + 时间窗 1ms：sleep 后 commit 强制 fsync
+        let mut writer = WalWriter::with_config(
+            &tmp,
+            WalFlushMode::Sync,
+            65536,
+            1000, // 不按次数触发
+            0,
+        ).unwrap();
+        writer.set_max_sync_interval_ms(1);
+        writer.write_record(WalRecordType::Commit, 0, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        writer.commit_flush().unwrap();
+        assert_eq!(writer.pending_commits(), 1, "时间未到不应触发");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        writer.commit_flush().unwrap();
+        assert_eq!(writer.pending_commits(), 0, "时间窗到期应强制 fsync");
+        assert_eq!(writer.bytes_since_sync(), 0);
+
+        writer.sync().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_group_commit_timeout_zero_disabled() {
+        let tmp = tmp("writer_timeout_disabled");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut writer = WalWriter::with_config(
+            &tmp,
+            WalFlushMode::Sync,
+            65536,
+            1000,
+            0,
+        ).unwrap();
+        // 默认禁用（None）；显式设 0 = 禁用
+        writer.set_max_sync_interval_ms(0);
+        for i in 0..3 {
+            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.commit_flush().unwrap();
+        }
+        assert_eq!(writer.pending_commits(), 3, "禁用时间窗时不应触发");
+
+        writer.sync().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_group_commit_timeout_then_size_still_triggers() {
+        let tmp = tmp("writer_timeout_size");
+        let _ = std::fs::remove_file(&tmp);
+
+        // 时间窗未到期时，size 阈值仍正常工作
+        let mut writer = WalWriter::with_config(
+            &tmp,
+            WalFlushMode::Sync,
+            65536,
+            3,
+            0,
+        ).unwrap();
+        writer.set_max_sync_interval_ms(10_000);
+        for i in 0..3 {
+            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer.commit_flush().unwrap();
+        }
+        assert_eq!(writer.pending_commits(), 0, "size 阈值 3 应触发 fsync");
+
+        writer.sync().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

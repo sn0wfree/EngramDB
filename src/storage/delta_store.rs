@@ -525,6 +525,38 @@ impl DeltaStore {
         }
 
         self.row_count -= n;
+
+        // 同步稀疏区间：剩余行列位置整体前移 n；被取走行从区间头部剔除
+        let mut taken = 0usize;
+        let mut new_runs = Vec::with_capacity(self.sparse_runs.len());
+        for mut run in std::mem::take(&mut self.sparse_runs) {
+            if taken >= n {
+                // 整个 run 保留：仅列位置前移
+                run.base_idx = run.base_idx.saturating_sub(n);
+                new_runs.push(run);
+                continue;
+            }
+            let take = (n - taken).min(run.count as usize);
+            taken += take;
+            run.count -= take as u32;
+            if run.count > 0 {
+                // 区间头部 take 行被取走：首行 rowid 后移，列位置前移
+                run.base_rowid += take as u64;
+                run.base_idx = run.base_idx.saturating_sub(n);
+                new_runs.push(run);
+            }
+        }
+        self.sparse_runs = new_runs;
+
+        // 同步散行映射：被取走位置删除，剩余位置前移
+        if !self.row_id_to_idx.is_empty() {
+            self.row_id_to_idx = self.row_id_to_idx
+                .drain()
+                .filter(|(_, idx)| *idx >= n)
+                .map(|(rid, idx)| (rid, idx - n))
+                .collect();
+        }
+
         result
     }
 
@@ -757,5 +789,118 @@ mod tests {
         assert!(ds.sparse_runs.is_empty());
         assert!(ds.row_id_to_idx.is_empty());
         assert_eq!(ds.len(), 0);
+    }
+
+    #[test]
+    fn test_insert_columns_sparse_run() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let cols = vec![
+            (0..1000i64).collect::<Vec<_>>().into_iter().map(Value::Int64).collect(),
+            (0..1000i64).map(|i| Value::Varchar(format!("r{}", i))).collect(),
+        ];
+        ds.insert_columns(cols).unwrap();
+        // 列式直写：单条稀疏区间 + 零 HashMap
+        assert_eq!(ds.sparse_runs.len(), 1);
+        assert_eq!(ds.sparse_runs[0].count, 1000);
+        assert!(ds.row_id_to_idx.is_empty());
+        assert_eq!(ds.get(500).unwrap()[0], Value::Int64(500));
+        assert_eq!(ds.get(500).unwrap()[1], Value::Varchar("r500".into()));
+        assert_eq!(ds.len(), 1000);
+    }
+
+    #[test]
+    fn test_insert_columns_pad_and_extend() {
+        let mut ds = DeltaStore::new(make_table_def());
+        // 输入只有 1 列：第 2 列补 NULL
+        let cols = vec![vec![Value::Int64(1), Value::Int64(2)]];
+        ds.insert_columns(cols).unwrap();
+        assert_eq!(ds.get(0).unwrap(), vec![Value::Int64(1), Value::Null]);
+        assert_eq!(ds.get(1).unwrap(), vec![Value::Int64(2), Value::Null]);
+
+        // 输入 3 列（超出表定义 2 列）：扩展列
+        let mut ds2 = DeltaStore::new(make_table_def());
+        let cols3 = vec![
+            vec![Value::Int64(1)],
+            vec![Value::Varchar("a".into())],
+            vec![Value::Float64(1.5)],
+        ];
+        ds2.insert_columns(cols3).unwrap();
+        assert_eq!(ds2.num_columns(), 3);
+        assert_eq!(ds2.get(0).unwrap(), vec![Value::Int64(1), Value::Varchar("a".into()), Value::Float64(1.5)]);
+    }
+
+    #[test]
+    fn test_insert_columns_length_mismatch() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let cols = vec![
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(1)], // 长度不一致
+        ];
+        assert!(ds.insert_columns(cols).is_err());
+        assert_eq!(ds.len(), 0, "失败时零副作用");
+    }
+
+    #[test]
+    fn test_drain_front_columns() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..100 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+
+        let front = ds.drain_front(30);
+        assert_eq!(front.len(), 2, "列式返回：每列一个 Vec");
+        assert_eq!(front[0].len(), 30);
+        assert_eq!(front[0][0], Value::Int64(0));
+        assert_eq!(front[0][29], Value::Int64(29));
+        assert_eq!(ds.len(), 70);
+        assert_eq!(ds.get(30).unwrap()[0], Value::Int64(30), "剩余行 rowid 语义保持");
+
+        // drain_front 超过行数：取全部
+        let rest = ds.drain_front(999);
+        assert_eq!(rest[0].len(), 70);
+        assert_eq!(ds.len(), 0);
+        assert!(ds.is_empty());
+    }
+
+    #[test]
+    fn test_delete_rows_and_update_row() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..10 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+
+        // delete_rows：按位置批量删除（乱序索引），返回被删行（位置语义 API）
+        let deleted = ds.delete_rows(&[0, 5, 9]);
+        assert_eq!(deleted.len(), 3);
+        assert_eq!(deleted[0][0], Value::Int64(0));
+        assert_eq!(deleted[1][0], Value::Int64(5));
+        assert_eq!(ds.len(), 7);
+
+        // update_row：按位置更新，返回旧行（删除 0 后位置 2 = 原行 3）
+        let old = ds.update_row(2, &[(1, Value::Varchar("updated".into()))]);
+        assert_eq!(old.unwrap()[1], Value::Varchar("r3".into()));
+        assert_eq!(ds.get(2).unwrap()[1], Value::Varchar("updated".into()));
+        // 越界更新返回 None
+        assert!(ds.update_row(999, &[]).is_none());
+    }
+
+    #[test]
+    fn test_drain_all_rows_transposes_and_clears() {
+        let mut ds = DeltaStore::new(make_table_def());
+        let mut batch = Vec::new();
+        for i in 0..5 {
+            batch.push(row(i, &format!("r{}", i)));
+        }
+        ds.insert_batch(batch).unwrap();
+
+        let all = ds.drain_all_rows();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[3], vec![Value::Int64(3), Value::Varchar("r3".into())]);
+        assert!(ds.is_empty());
+        assert!(ds.drain_all_rows().is_empty(), "重复 drain 得空");
     }
 }
