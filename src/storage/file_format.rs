@@ -230,3 +230,111 @@ impl ColumnChunkHeader {
         buf
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn test_header_roundtrip() {
+        let mut cfg = test_config();
+        cfg.default_compression = CompressionType::Rle;
+        let h = FileHeader::new(&cfg);
+        let bytes = h.to_bytes().unwrap();
+        assert_eq!(bytes.len(), cfg.page_size as usize, "头部应填满一页");
+        let back = FileHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(back.magic, *MAGIC);
+        assert_eq!(back.version, 1);
+        assert_eq!(back.page_size, cfg.page_size);
+        assert_eq!(back.block_size, cfg.block_size);
+        assert_eq!(back.total_rows, 0);
+        assert_eq!(back.schema_cookie, 0);
+        assert_eq!(back.checkpoint_lsn, 0);
+        assert_eq!(back.uuid, h.uuid, "UUID 往返一致");
+        assert_eq!(back.compression_default, CompressionType::Rle);
+        assert_eq!(back.index_root, 0);
+        assert_eq!(back.catalog_root, 0);
+        assert_eq!(back.data_root, 0);
+    }
+
+    #[test]
+    fn test_header_fields_survive() {
+        let mut h = FileHeader::new(&test_config());
+        h.version = 3;
+        h.meta_root = 42;
+        h.total_rows = 1_000_000;
+        h.total_data_blocks = 999;
+        h.schema_cookie = 7;
+        h.checkpoint_lsn = 123456;
+        h.index_root = 100;
+        h.index_size = 2048;
+        h.catalog_root = 4096;
+        h.catalog_size = 65536;
+        h.data_root = 69632;
+        h.data_size = 1048576;
+        h.compression_default = CompressionType::Zstd;
+        let back = FileHeader::from_bytes(&h.to_bytes().unwrap()).unwrap();
+        assert_eq!(back.version, 3);
+        assert_eq!(back.meta_root, 42);
+        assert_eq!(back.total_rows, 1_000_000);
+        assert_eq!(back.total_data_blocks, 999);
+        assert_eq!(back.schema_cookie, 7);
+        assert_eq!(back.checkpoint_lsn, 123456);
+        assert_eq!(back.index_root, 100);
+        assert_eq!(back.index_size, 2048);
+        assert_eq!(back.catalog_root, 4096);
+        assert_eq!(back.catalog_size, 65536);
+        assert_eq!(back.data_root, 69632);
+        assert_eq!(back.data_size, 1048576);
+        assert_eq!(back.compression_default, CompressionType::Zstd);
+    }
+
+    #[test]
+    fn test_header_short_data_rejected() {
+        assert!(FileHeader::from_bytes(&[0u8; 10]).is_err(), "短头应报错");
+    }
+
+    #[test]
+    fn test_header_bad_magic_rejected() {
+        let mut bytes = FileHeader::new(&test_config()).to_bytes().unwrap();
+        bytes[0] = b'X';
+        let err = FileHeader::from_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("magic"));
+    }
+
+    #[test]
+    fn test_header_bad_compression_rejected() {
+        let mut bytes = FileHeader::new(&test_config()).to_bytes().unwrap();
+        let magic_len = MAGIC.len();
+        bytes[magic_len + 58] = 99; // 非法压缩类型
+        assert!(FileHeader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_column_chunk_header_roundtrip() {
+        let h = ColumnChunkHeader {
+            compression_type: CompressionType::For,
+            uncompressed_size: 100,
+            compressed_size: 40,
+            null_count: 3,
+            min_value: vec![1, 2, 3],
+            max_value: vec![9, 9],
+        };
+        let bytes = h.to_bytes();
+        assert_eq!(bytes.len(), h.serialized_size());
+        // 手拆验证布局：type(1) + u32*3(12) + len+min(4+3) + len+max(4+2) = 26
+        assert_eq!(bytes.len(), 1 + 12 + 4 + 3 + 4 + 2);
+        assert_eq!(bytes[0], CompressionType::For as u8);
+        assert_eq!(u32::from_le_bytes(bytes[1..5].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(bytes[5..9].try_into().unwrap()), 40);
+        assert_eq!(u32::from_le_bytes(bytes[9..13].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[13..17].try_into().unwrap()), 3, "min 长度前缀");
+        assert_eq!(&bytes[17..20], &[1, 2, 3]);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 2, "max 长度前缀");
+        assert_eq!(&bytes[24..26], &[9, 9]);
+    }
+}

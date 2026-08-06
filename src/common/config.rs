@@ -270,3 +270,71 @@ impl Default for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_values() {
+        let cfg = Config::default();
+        assert_eq!(cfg.page_size, 4096);
+        assert_eq!(cfg.block_size, 262_144);
+        assert_eq!(cfg.buffer_pool_size, 1024);
+        assert_eq!(cfg.row_group_size, 122_880);
+        assert_eq!(cfg.wal_flush_mode, WalFlushMode::Sync);
+        assert_eq!(cfg.wal_group_commit_size, 16);
+        assert_eq!(cfg.wal_group_commit_max_bytes, 65536);
+        assert_eq!(cfg.wal_group_commit_timeout_ms, 10);
+        assert!(cfg.wal_batch_insert);
+        assert_eq!(cfg.insert_batch_rows, 1024);
+        assert_eq!(cfg.insert_batch_timeout_ms, 10);
+        assert_eq!(cfg.log_block_rows, 0);
+        assert_eq!(cfg.default_compression, CompressionType::Uncompressed);
+        assert!(cfg.compress_on_persist);
+        assert!(cfg.enable_transaction);
+        assert_eq!(cfg.default_isolation_level, IsolationLevel::SnapshotIsolation);
+    }
+
+    #[test]
+    fn test_config_custom_values_applied() {
+        let mut cfg = Config::default();
+        cfg.wal_batch_insert = false;
+        cfg.insert_batch_rows = 4096;
+        cfg.insert_batch_timeout_ms = 0;
+        cfg.log_block_rows = 32768;
+        cfg.wal_group_commit_size = 0;
+        assert!(!cfg.wal_batch_insert);
+        assert_eq!(cfg.insert_batch_rows, 4096);
+        assert_eq!(cfg.insert_batch_timeout_ms, 0);
+        assert_eq!(cfg.log_block_rows, 32768);
+        assert_eq!(cfg.wal_group_commit_size, 0);
+        // clone 后修改不影响原配置
+        let mut cloned = cfg.clone();
+        cloned.wal_batch_insert = true;
+        assert!(!cfg.wal_batch_insert);
+        assert!(cloned.wal_batch_insert);
+    }
+
+    #[test]
+    fn test_isolation_level_default() {
+        assert_eq!(IsolationLevel::default(), IsolationLevel::SnapshotIsolation);
+    }
+
+    #[test]
+    fn test_compact_strategy_constructors() {
+        let adaptive = CompactStrategy::default_adaptive(8192);
+        match adaptive {
+            CompactStrategy::Adaptive { min_threshold, max_threshold, pct_of_table, batch_size } => {
+                assert_eq!(min_threshold, 10_000);
+                assert_eq!(max_threshold, 8192);
+                assert!((pct_of_table - 0.10).abs() < 1e-9);
+                assert_eq!(batch_size, 8192);
+            }
+            _ => panic!("default 应为 Adaptive"),
+        }
+        assert!(matches!(CompactStrategy::manual(), CompactStrategy::Manual));
+        assert!(matches!(CompactStrategy::full(100), CompactStrategy::Full { threshold: 100 }));
+        assert!(matches!(CompactStrategy::incremental(100, 10), CompactStrategy::Incremental { threshold: 100, batch_size: 10 }));
+    }
+}

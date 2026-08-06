@@ -559,3 +559,141 @@ impl crate::storage::engine::EngineTableOps for LogTable {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{ColumnDef, DataType, TableDef};
+    use crate::storage::column_store::PredicateOp;
+
+    fn make_def(name: &str) -> TableDef {
+        TableDef {
+            id: 1,
+            engine: EngineType::Log,
+            name: name.to_string(),
+            columns: vec![
+                ColumnDef::new("ts", DataType::Int64),
+                ColumnDef::new("v", DataType::Varchar),
+            ],
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+            row_count: 0,
+        }
+    }
+
+    fn row(ts: i64, v: &str) -> Vec<Value> {
+        vec![Value::Int64(ts), Value::Varchar(v.to_string())]
+    }
+
+    #[test]
+    fn test_insert_and_get_roundtrip() {
+        let mut t = LogTable::new(make_def("t1"));
+        t.insert(vec![row(1, "a"), row(2, "b")]).unwrap();
+        assert_eq!(t.row_count(), 2);
+        assert_eq!(t.get_row_by_id(0).unwrap().unwrap(), row(1, "a"));
+        assert_eq!(t.get_row_by_id(1).unwrap().unwrap(), row(2, "b"));
+        assert!(t.get_row_by_id(2).unwrap().is_none(), "越界行应返回 None");
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn test_block_boundary_and_row_id_base() {
+        // 小块（4 行）：多块 row_id_base 递增，二分定位正确
+        let mut t = LogTable::with_block_rows(make_def("t2"), 4);
+        let mut rows = Vec::new();
+        for i in 0..10 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        assert_eq!(t.blocks.len(), 3, "10 行 / 4 行块 = 3 块");
+        assert_eq!(t.blocks[0].row_id_base, 0);
+        assert_eq!(t.blocks[1].row_id_base, 4);
+        assert_eq!(t.blocks[2].row_id_base, 8);
+        assert_eq!(t.blocks[2].rows, 2, "末块 2 行");
+        // 跨块读取
+        for i in 0..10 {
+            assert_eq!(t.get_row_by_id(i).unwrap().unwrap()[0], Value::Int64(i as i64));
+        }
+    }
+
+    #[test]
+    fn test_minmax_maintained_per_block() {
+        let mut t = LogTable::with_block_rows(make_def("t3"), 4);
+        let mut rows = Vec::new();
+        for i in (0..8).rev() {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        // 块 0：ts 7..4 → min 4 max 7；块 1：ts 3..0 → min 0 max 3
+        assert_eq!(t.blocks[0].min[0], Value::Int64(4));
+        assert_eq!(t.blocks[0].max[0], Value::Int64(7));
+        assert_eq!(t.blocks[1].min[0], Value::Int64(0));
+        assert_eq!(t.blocks[1].max[0], Value::Int64(3));
+        // 未写入的列索引无 MinMax
+        assert!(t.blocks[0].min.get(5).is_none());
+    }
+
+    #[test]
+    fn test_block_can_skip_predicates() {
+        let mut t = LogTable::with_block_rows(make_def("t4"), 4);
+        let mut rows = Vec::new();
+        for i in 0..8 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        // 块 0：ts 0..3；块 1：ts 4..7
+        assert!(block_can_skip(&t.blocks[0], 0, PredicateOp::Gt, &Value::Int64(5)), "ts>5 跳过块 0");
+        assert!(!block_can_skip(&t.blocks[1], 0, PredicateOp::Gt, &Value::Int64(5)), "块 1 含 ts>5");
+        assert!(block_can_skip(&t.blocks[1], 0, PredicateOp::Lt, &Value::Int64(4)), "ts<4 跳过块 1");
+        assert!(block_can_skip(&t.blocks[0], 0, PredicateOp::Eq, &Value::Int64(10)), "ts=10 跳过块 0");
+        assert!(!block_can_skip(&t.blocks[1], 0, PredicateOp::Eq, &Value::Int64(4)), "块 1 含 ts=4");
+        assert!(!block_can_skip(&t.blocks[0], 0, PredicateOp::LtEq, &Value::Int64(0)), "块 0 含 ts=0 满足 ts<=0，不得跳过");
+        assert!(block_can_skip(&t.blocks[0], 0, PredicateOp::LtEq, &Value::Int64(-1)), "ts<=-1 全部大于，跳过块 0");
+    }
+
+    #[test]
+    fn test_insert_columns_segments() {
+        let mut t = LogTable::with_block_rows(make_def("t5"), 4);
+        let cols = vec![
+            (0..10i64).map(Value::Int64).collect(),
+            (0..10i64).map(|i| Value::Varchar(format!("r{}", i))).collect(),
+        ];
+        t.insert_columns(cols).unwrap();
+        assert_eq!(t.blocks.len(), 3);
+        // 段写：每个块 columns 长度 == 块行数
+        assert_eq!(t.blocks[0].columns[0].len(), 4);
+        assert_eq!(t.blocks[1].columns[0].len(), 4);
+        assert_eq!(t.blocks[2].columns[0].len(), 2);
+        // MinMax 也按段维护
+        assert_eq!(t.blocks[0].min[0], Value::Int64(0));
+        assert_eq!(t.blocks[2].max[0], Value::Int64(9));
+        assert_eq!(t.get_row_by_id(9).unwrap().unwrap()[0], Value::Int64(9));
+    }
+
+    #[test]
+    fn test_truncate_and_reuse() {
+        let mut t = LogTable::new(make_def("t6"));
+        t.insert(vec![row(1, "a")]).unwrap();
+        t.truncate().unwrap();
+        assert_eq!(t.row_count(), 0);
+        assert!(t.blocks.is_empty());
+        assert_eq!(t.next_row_id, 0);
+        t.insert(vec![row(5, "b")]).unwrap();
+        assert_eq!(t.get_row_by_id(0).unwrap().unwrap(), row(5, "b"), "truncate 后 row_id 重置");
+    }
+
+    #[test]
+    fn test_append_rejects_non_contiguous_row_id() {
+        let mut t = LogTable::new(make_def("t7"));
+        t.insert(vec![row(1, "a")]).unwrap();
+        let err = t.insert_row(5, &row(2, "b")).unwrap_err();
+        assert!(matches!(err, EngramDbError::NotSupported(_)), "非连续 row_id 应拒绝");
+        // 连续 row_id 允许（事务 apply 路径）
+        t.insert_row(1, &row(2, "b")).unwrap();
+        assert_eq!(t.get_row_by_id(1).unwrap().unwrap()[0], Value::Int64(2));
+    }
+}

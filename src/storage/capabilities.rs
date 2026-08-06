@@ -106,3 +106,55 @@ impl EngineCapabilities {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_columnar_capabilities() {
+        let cap = EngineCapabilities::for_engine(EngineType::Columnar);
+        assert!(cap.supports_index && cap.supports_vector_index && cap.supports_fts);
+        assert!(cap.supports_alter && cap.supports_pragma && cap.supports_ttl);
+        assert!(cap.supports_update && cap.supports_delete && cap.supports_pk_lookup);
+        assert!(cap.persistent);
+        assert_eq!(cap.scan_cost_weight, 1.0);
+        assert!(cap.ensure("索引", true, "t").is_ok());
+        assert!(cap.ensure("索引", false, "t").is_err());
+    }
+
+    #[test]
+    fn test_memory_capabilities() {
+        let cap = EngineCapabilities::for_engine(EngineType::Memory);
+        assert!(!cap.supports_index && !cap.supports_vector_index && !cap.supports_fts);
+        assert!(!cap.supports_alter && !cap.supports_pragma && !cap.supports_ttl);
+        assert!(cap.supports_update && cap.supports_delete && cap.supports_pk_lookup);
+        assert!(!cap.persistent, "Memory 不持久化");
+        assert_eq!(cap.scan_cost_weight, 0.1, "Memory 扫描最便宜");
+    }
+
+    #[test]
+    fn test_log_capabilities() {
+        let cap = EngineCapabilities::for_engine(EngineType::Log);
+        assert!(!cap.supports_index && !cap.supports_alter && !cap.supports_ttl);
+        assert!(!cap.supports_update && !cap.supports_delete && !cap.supports_pk_lookup);
+        assert!(cap.persistent, "Log 持久化");
+        assert_eq!(cap.scan_cost_weight, 0.5);
+    }
+
+    #[test]
+    fn test_ensure_error_message() {
+        let cap = EngineCapabilities::for_engine(EngineType::Log);
+        let err = cap.ensure("UPDATE", false, "events").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Log"), "错误应包含引擎名: {msg}");
+        assert!(msg.contains("UPDATE") && msg.contains("events"), "错误应包含能力与表名: {msg}");
+    }
+
+    #[test]
+    fn test_ensure_enabled_is_ok() {
+        let cap = EngineCapabilities::for_engine(EngineType::Log);
+        assert!(cap.ensure("UPDATE", false, "t").is_err());
+        assert!(cap.ensure("UPDATE", true, "t").is_ok(), "已启用能力不报错");
+    }
+}

@@ -42,6 +42,15 @@ pub struct BufferPool {
 
 impl BufferPool {
     pub fn new(page_size: usize, capacity: usize, file_path: &Path) -> Self {
+        // 确保数据文件存在（flush/load 依赖；创建不写任何内容）
+        if let Some(parent) = file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(file_path);
         Self {
             page_size,
             capacity,
@@ -176,5 +185,173 @@ impl BufferPool {
         // 移到末尾（最近访问）
         self.access_order.retain(|&x| x != page_id);
         self.access_order.push(page_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("engramdb_bp_{}_{}.bin", name, std::process::id()));
+        p
+    }
+
+    #[test]
+    fn test_new_page_get_roundtrip() {
+        let path = tmp("roundtrip");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut bp = BufferPool::new(64, 8, &path);
+            let page = bp.new_page(1).unwrap();
+            page.data[0..5].copy_from_slice(b"hello");
+            let p2 = bp.get_page(1).unwrap();
+            assert_eq!(&p2.data[..5], b"hello");
+            assert_eq!(p2.id, 1);
+            assert!(!p2.is_dirty, "new_page 不标脏");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_get_page_mut_marks_dirty() {
+        let path = tmp("dirty");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut bp = BufferPool::new(64, 8, &path);
+            bp.new_page(1).unwrap();
+            let p = bp.get_page_mut(1).unwrap();
+            p.data[0] = 42;
+            assert!(p.is_dirty);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_persist_and_reload() {
+        let path = tmp("persist");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut bp = BufferPool::new(64, 8, &path);
+            bp.new_page(3).unwrap();
+            {
+                let p = bp.get_page_mut(3).unwrap();
+                p.data[0..4].copy_from_slice(&[9, 8, 7, 6]);
+            }
+            bp.flush_all().unwrap();
+        }
+        // 新缓冲池从磁盘加载
+        {
+            let mut bp2 = BufferPool::new(64, 8, &path);
+            let p = bp2.get_page(3).unwrap();
+            assert_eq!(&p.data[..4], &[9, 8, 7, 6], "脏页应已落盘");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_page_offset_correctness() {
+        // page_id 偏移：page_id * page_size
+        let path = tmp("offset");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut bp = BufferPool::new(64, 8, &path);
+            bp.new_page(0).unwrap();
+            bp.new_page(1).unwrap();
+            bp.new_page(2).unwrap();
+            {
+                let p = bp.get_page_mut(2).unwrap();
+                p.data[0..3].copy_from_slice(b"p2!");
+            }
+            bp.flush_all().unwrap();
+        }
+        {
+            let mut bp2 = BufferPool::new(64, 8, &path);
+            let p2 = bp2.get_page(2).unwrap();
+            assert_eq!(&p2.data[..3], b"p2!", "页 2 应从偏移 128 读取");
+            let p0 = bp2.get_page(0).unwrap();
+            assert_eq!(&p0.data[..3], b"\0\0\0", "页 0 未写数据应为零");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        let path = tmp("lru");
+        let _ = std::fs::remove_file(&path);
+        let mut bp = BufferPool::new(64, 3, &path);
+        bp.new_page(1).unwrap();
+        bp.new_page(2).unwrap();
+        bp.new_page(3).unwrap();
+        // 访问 1、2（3 是最久未访问）
+        bp.get_page(1).unwrap();
+        bp.get_page(2).unwrap();
+        // 新页 4 → 驱逐 3
+        bp.new_page(4).unwrap();
+        assert!(!bp.pages.contains_key(&3), "LRU 应驱逐最久未访问的页 3");
+        assert!(bp.pages.contains_key(&1) && bp.pages.contains_key(&2) && bp.pages.contains_key(&4));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_pin_prevents_eviction() {
+        let path = tmp("pin");
+        let _ = std::fs::remove_file(&path);
+        let mut bp = BufferPool::new(64, 3, &path);
+        bp.new_page(1).unwrap();
+        bp.new_page(2).unwrap();
+        bp.new_page(3).unwrap();
+        bp.pin(3);
+        bp.new_page(4).unwrap(); // 3 被 pin：驱逐最老的 1
+        assert!(bp.pages.contains_key(&3), "pin 的页不得被驱逐");
+        assert!(!bp.pages.contains_key(&1));
+        // unpin 后 3 变为可驱逐：后续填充时被逐出
+        bp.unpin(3);
+        bp.new_page(5).unwrap(); // 驱逐 2
+        bp.new_page(6).unwrap(); // 驱逐 3
+        assert!(!bp.pages.contains_key(&3), "unpin 后可被驱逐");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_unpin_never_negative() {
+        let path = tmp("unpin");
+        let _ = std::fs::remove_file(&path);
+        let mut bp = BufferPool::new(64, 8, &path);
+        bp.new_page(1).unwrap();
+        bp.pin(1);
+        bp.pin(1);
+        bp.unpin(1);
+        bp.unpin(1);
+        assert_eq!(bp.pages[&1].pin_count, 0);
+        bp.unpin(1); // 过量 unpin 不产生负数
+        assert_eq!(bp.pages[&1].pin_count, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_missing_page_loads_from_disk() {
+        let path = tmp("load");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut bp = BufferPool::new(64, 8, &path);
+            bp.new_page(7).unwrap();
+            {
+                let p = bp.get_page_mut(7).unwrap();
+                p.data[0] = 77;
+            }
+            bp.flush_all().unwrap();
+        }
+        // 完全新的缓冲池：get_page 触发磁盘加载
+        {
+            let mut bp = BufferPool::new(64, 8, &path);
+            let p = bp.get_page(7).unwrap();
+            assert_eq!(p.data[0], 77);
+            // 不存在的页：加载零页
+            let p9 = bp.get_page(9).unwrap();
+            assert!(p9.data.iter().all(|&b| b == 0));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
