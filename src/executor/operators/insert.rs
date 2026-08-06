@@ -140,6 +140,42 @@ pub(crate) fn execute_with_txn(
     rows: Vec<Vec<Value>>,
 ) -> Result<u64> {
     debug!("Starting transaction path execution...");
+
+    // 0. 冲突预检（PK / 唯一索引；失败零副作用，事务未开启）
+    //    防止 apply 阶段失败导致 MVCC 已提交版本残留（rowid 复用误判 Update）
+    if !rows.is_empty() {
+        let table_def = db.get_engine_table(table_name)
+            .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?
+            .def()
+            .clone();
+        let conflict_indices: Vec<usize> = table_def.primary_key_index()
+            .map(|pk| vec![pk])
+            .unwrap_or_default();
+        if !conflict_indices.is_empty() {
+            let pk_name = table_def.columns[conflict_indices[0]].name.clone();
+            let mut seen = std::collections::HashSet::new();
+            for row in &rows {
+                if let Some(cell) = conflict_indices.first().and_then(|&i| row.get(i)) {
+                    // auto_increment 列在分配前为 Null → 跳过（由 insert 后检查兜底）
+                    if cell.is_null() {
+                        continue;
+                    }
+                    if !seen.insert(cell.clone()) {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: {}={:?}", pk_name, cell
+                        )));
+                    }
+                    let conflict = db.get_engine_table_mut(table_name)
+                        .and_then(|t| t.lookup_primary_key(cell));
+                    if conflict.is_some() {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: {}={:?}", pk_name, cell
+                        )));
+                    }
+                }
+            }
+        }
+    }
     
     // 1. 开启事务
     debug!("Beginning transaction...");
@@ -165,11 +201,14 @@ pub(crate) fn execute_with_txn(
     info!("Transaction {} committed: commit_ts={}, apply_ops_count={}",
           txn_id, result.commit_ts, result.apply_ops.len());
     
-    // 4. 应用到存储层
+    // 4. 应用到存储层；失败必须 abort 事务（清理 MVCC 残留版本，
+    //    否则失败事务占用的 rowid 会残留版本链，导致后续语句被误判为 Update）
     debug!("Applying {} operations to storage...", result.apply_ops.len());
-    let applied_count = result.apply_ops.len();
-    apply_to_storage(db, result.apply_ops)?;
-    info!("✓ Applied {} operations to storage", applied_count);
+    if let Err(e) = apply_to_storage(db, result.apply_ops) {
+        let _ = db.txn_manager_mut().rollback(txn_id);
+        return Err(e);
+    }
+    info!("✓ Applied {} operations to storage", rows_len);
     
     info!("Transaction path completed: {} rows inserted", rows_len);
     Ok(rows_len as u64)

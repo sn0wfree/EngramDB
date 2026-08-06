@@ -340,8 +340,8 @@ impl crate::storage::engine::EngineTableOps for MemoryTable {
         self.get_row_by_id(row_id)
     }
 
-    fn lookup_primary_key(&self, pk: &Value) -> Option<u32> {
-        self.lookup_primary_key(pk)
+    fn lookup_primary_key(&mut self, pk: &Value) -> Option<u32> {
+        MemoryTable::lookup_primary_key(self, pk)
     }
 }
 

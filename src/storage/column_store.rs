@@ -7,6 +7,7 @@ use crate::common::types::{DataType, TableDef};
 use crate::common::config::CompressionType;
 use crate::common::column_data::{ColumnData, ColumnValue};
 use super::bloom::BloomFilter;
+use super::sparse_index::SparseIndex;
 use crate::Value;
 
 use super::compression;
@@ -44,6 +45,15 @@ pub struct ColumnStore {
     table_def: TableDef,
     row_groups: Vec<RowGroup>,
     row_group_size: u32,
+    /// 分层索引：列存稀疏主键索引（有主键表，每 granule_rows 行一条）
+    ///
+    /// 只覆盖列存段（Delta 层由稠密索引负责）。compact 增量维护；
+    /// 定位 = granule 粗路由 + 段内确认（有序段二分 / 无序段线性）。
+    sparse_primary: Option<SparseIndex>,
+    /// 稀疏索引主键列下标（表有主键时 Some）
+    sparse_pk_col: Option<usize>,
+    /// 稀疏索引是否保持全局有序（true → granule 二分；append 乱序时降级 false → 线性扫）
+    sparse_sorted: bool,
 }
 
 /// Row Group（行组）
@@ -114,12 +124,78 @@ impl ColumnStore {
             table_def,
             row_groups: Vec::new(),
             row_group_size,
+            sparse_primary: None,
+            sparse_pk_col: None,
+            sparse_sorted: false,
+        }
+    }
+
+    /// 创建列存并启用稀疏主键索引（分层索引：有主键表）
+    pub fn new_with_sparse(table_def: TableDef, row_group_size: u32, granule_rows: u32) -> Self {
+        let pk_col = table_def.primary_key_index();
+        let sparse = if pk_col.is_some() {
+            Some(SparseIndex::new(granule_rows.max(1)))
+        } else {
+            None
+        };
+        Self {
+            table_def,
+            row_groups: Vec::new(),
+            row_group_size,
+            sparse_primary: sparse,
+            sparse_pk_col: pk_col,
+            sparse_sorted: false,
         }
     }
 
     /// 清空所有数据（v0.15.0 TRUNCATE TABLE 支持）
     pub fn clear(&mut self) {
         self.row_groups.clear();
+        if let Some(sparse) = self.sparse_primary.as_mut() {
+            sparse.clear_index();
+        }
+        self.sparse_sorted = false;
+    }
+
+    /// 稀疏索引是否启用（有主键且已接线）
+    pub fn sparse_enabled(&self) -> bool {
+        self.sparse_primary.is_some()
+    }
+
+    /// 稀疏索引 granule 数（统计/测试用）
+    pub fn sparse_granule_count(&self) -> usize {
+        self.sparse_primary.as_ref().map(|s| s.granule_count()).unwrap_or(0)
+    }
+
+    /// 稀疏索引是否全局有序（测试用）
+    pub fn sparse_sorted(&self) -> bool {
+        self.sparse_sorted
+    }
+
+    /// 应用 granule 大小（空表时生效；已有数据保持不变）
+    pub fn set_sparse_granule(&mut self, granule_rows: u32) {
+        if self.total_rows() != 0 {
+            return;
+        }
+        let Some(sparse) = self.sparse_primary.as_mut() else { return };
+        *sparse = SparseIndex::new(granule_rows.max(1));
+    }
+
+    /// 稀疏索引序列化状态（持久化用）：(bincode 字节, 全局有序标志)
+    pub fn sparse_state(&self) -> Option<(Vec<u8>, bool)> {
+        self.sparse_primary
+            .as_ref()
+            .map(|s| (s.to_bytes(), self.sparse_sorted))
+    }
+
+    /// 恢复稀疏索引（load 用）；失败返回 false
+    pub fn sparse_restore(&mut self, bytes: &[u8], sorted: bool) -> bool {
+        let Some(sparse) = SparseIndex::from_bytes(bytes) else {
+            return false;
+        };
+        self.sparse_primary = Some(sparse);
+        self.sparse_sorted = sorted;
+        true
     }
 
     /// 追加行数据
@@ -212,12 +288,24 @@ impl ColumnStore {
     /// 输入是已经按列组织好的数据（每列一个 Vec<Value>），
     /// 避免了行式→列式的转置开销，比 append_rows 快约 2x。
     pub fn append_columns(&mut self, columns: &[Vec<Value>]) -> Result<()> {
+        self.append_columns_inner(columns, false)
+    }
+
+    /// 追加列式数据（调用方已按主键排序，段内有序 → 稀疏索引可二分）
+    ///
+    /// 仅用于 compact 路径（Table 层排序后调用）。
+    pub fn append_columns_sorted(&mut self, columns: &[Vec<Value>]) -> Result<()> {
+        self.append_columns_inner(columns, true)
+    }
+
+    fn append_columns_inner(&mut self, columns: &[Vec<Value>], sorted: bool) -> Result<()> {
         if columns.is_empty() || columns[0].is_empty() {
             return Ok(());
         }
 
         let num_cols = self.table_def.columns.len();
         let total_rows = columns[0].len();
+        let start_total = self.total_rows();
         let mut remaining_rows = total_rows;
         let mut offset = 0usize;
 
@@ -310,7 +398,43 @@ impl ColumnStore {
             remaining_rows -= take;
         }
 
+        // 分层索引：增量维护稀疏主键索引
+        self.sparse_append(columns, start_total, sorted);
+
         Ok(())
+    }
+
+    /// 稀疏索引增量维护：从本次 append 的主键列追加 granule
+    ///
+    /// - 段内有序（sorted=true，compact 路径）→ granule 段内可二分
+    /// - 新段首键 < 末 granule 首键 → 全局有序性破坏 → 降级线性扫模式
+    fn sparse_append(&mut self, columns: &[Vec<Value>], start_total: u64, sorted: bool) {
+        let Some(pk_col) = self.sparse_pk_col else { return };
+        let Some(sparse) = self.sparse_primary.as_mut() else { return };
+        let Some(pk_values) = columns.get(pk_col) else { return };
+        if pk_values.is_empty() || start_total > u32::MAX as u64 {
+            return;
+        }
+
+        if self.sparse_sorted {
+            if sorted {
+                // 段间单调性检查：新段首键 < 末 granule 首键 → 全局有序破坏
+                if let Some(last) = sparse.last_granule() {
+                    match cmp_values(&pk_values[0], &last.first_key) {
+                        Some(std::cmp::Ordering::Less) => self.sparse_sorted = false,
+                        _ => {}
+                    }
+                }
+            } else {
+                // 乱序段追加 → 降级线性扫
+                self.sparse_sorted = false;
+            }
+        } else if sparse.granule_count() == 0 {
+            // 首个段决定初始模式
+            self.sparse_sorted = sorted;
+        }
+
+        sparse.append_sorted_keys(pk_values, start_total as u32);
     }
 
     /// 确保指定 RowGroup 的所有列处于解压态（data 非空）
@@ -359,6 +483,161 @@ impl ColumnStore {
     /// 获取 row group 数量
     pub fn row_group_count(&self) -> usize {
         self.row_groups.len()
+    }
+
+    /// 分层索引：稀疏主键点查（列存段内）
+    ///
+    /// 定位 = granule 粗路由（有序二分 / 无序线性扫）+ 段内确认
+    /// （有序段二分 / 无序段线性）。数值类型归一化：Int32/Int64/Timestamp 互查。
+    /// 返回全局行序（= row_id，与 table.rs get_row_by_id 对齐）。
+    pub fn locate_pk(&mut self, key: &Value) -> Result<Option<u32>> {
+        let Some(pk_col) = self.sparse_pk_col else { return Ok(None) };
+        let sorted = self.sparse_sorted;
+        if sorted {
+            // 全局有序：borrow 内二分定位候选 granule（不克隆全部），段内二分确认
+            let candidates = {
+                let Some(sparse) = self.sparse_primary.as_ref() else { return Ok(None) };
+                if sparse.granule_count() == 0 {
+                    None
+                } else {
+                    let mut lo = 0usize;
+                    let mut hi = sparse.granule_count();
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        match cmp_values(&sparse.get_granule(mid).unwrap().first_key, key) {
+                            Some(std::cmp::Ordering::Greater) => hi = mid,
+                            _ => lo = mid + 1,
+                        }
+                    }
+                    let idx = lo.saturating_sub(1);
+                    if idx >= sparse.granule_count() {
+                        None
+                    } else {
+                        let g = sparse.get_granule(idx).unwrap();
+                        let c = (g.row_offset, g.row_count);
+                        if idx + 1 < sparse.granule_count() {
+                            let n = sparse.get_granule(idx + 1).unwrap();
+                            Some(vec![c, (n.row_offset, n.row_count)])
+                        } else {
+                            Some(vec![c])
+                        }
+                    }
+                }
+            };
+            let Some(candidates) = candidates else { return Ok(None) };
+            for (offset, count) in candidates {
+                if let Some(v) = self.granule_confirm_range(key, pk_col, offset, count)? {
+                    return Ok(Some(v));
+                }
+            }
+            return Ok(None);
+        }
+
+        // 全局无序（或未知）：轻量拷贝 (offset, count) 列表，逐个段内确认
+        let ranges = {
+            let Some(sparse) = self.sparse_primary.as_ref() else { return Ok(None) };
+            if sparse.granule_count() == 0 {
+                return Ok(None);
+            }
+            (0..sparse.granule_count())
+                .filter_map(|i| sparse.get_granule(i))
+                .map(|g| (g.row_offset, g.row_count))
+                .collect::<Vec<(u32, u32)>>()
+        };
+        for (offset, count) in ranges {
+            if let Some(v) = self.granule_confirm_range(key, pk_col, offset, count)? {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 单个 granule 段内确认：二分（段内有序）或线性（段内无序）
+    fn granule_confirm_range(
+        &mut self,
+        key: &Value,
+        pk_col: usize,
+        start: u32,
+        count: u32,
+    ) -> Result<Option<u32>> {
+        let end = start + count;
+        if self.sparse_sorted {
+            // 段内必有序（compact 排序保证）→ 二分
+            let (mut lo, mut hi) = (start as usize, end as usize);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let v = self.get_value_at(pk_col, mid as u32)?;
+                match cmp_values(&v, key) {
+                    Some(std::cmp::Ordering::Less) => lo = mid + 1,
+                    Some(std::cmp::Ordering::Greater) => hi = mid,
+                    _ => return Ok(Some(mid as u32)),
+                }
+            }
+            return Ok(None);
+        }
+
+        // 无序段：线性确认
+        for i in start as usize..end as usize {
+            let v = self.get_value_at(pk_col, i as u32)?;
+            match cmp_values(&v, key) {
+                Some(std::cmp::Ordering::Equal) => return Ok(Some(i as u32)),
+                None => {
+                    // 类型不可比（如 Varchar vs Int）→ 按 Value 精确相等兜底
+                    if v == *key {
+                        return Ok(Some(i as u32));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// 按全局行序读取单值（稀疏索引段内确认用；压缩态惰性解压）
+    fn get_value_at(&mut self, col_idx: usize, row_idx: u32) -> Result<Value> {
+        let rg_size = self.row_group_size as usize;
+        if rg_size == 0 {
+            return Ok(Value::Null);
+        }
+        let rg_idx = (row_idx as usize / rg_size).min(self.row_groups.len().saturating_sub(1));
+        let data = self.read_column(rg_idx, col_idx)?;
+        let in_rg = (row_idx as usize % rg_size).min(data.len().saturating_sub(1));
+        Ok(data.get(in_rg))
+    }
+
+    /// 分层索引：从列存全量重建稀疏主键索引（load/导入兜底）
+    ///
+    /// 顺带验证全局有序性（有序 → 后续可二分定位）。
+    pub fn rebuild_sparse(&mut self) -> Result<()> {
+        let Some(pk_col) = self.sparse_pk_col else { return Ok(()) };
+
+        // 先收集主键列值（读列需要 &mut self；随后再重建索引）
+        let total = self.total_rows() as usize;
+        let mut sorted = true;
+        let mut values: Vec<Value> = Vec::with_capacity(total);
+        for rg in 0..self.row_groups.len() {
+            let data = self.read_column(rg, pk_col)?;
+            for i in 0..data.len() {
+                let v = data.get(i);
+                if let Some(prev) = values.last() {
+                    if let Some(ord) = cmp_values(prev, &v) {
+                        if ord == std::cmp::Ordering::Greater {
+                            sorted = false;
+                        }
+                    }
+                }
+                values.push(v);
+            }
+        }
+
+        if let Some(sparse) = self.sparse_primary.as_mut() {
+            let granule_rows = sparse.granule_size();
+            let mut rebuilt = SparseIndex::new(granule_rows);
+            rebuilt.build_from_keys(&values);
+            *sparse = rebuilt;
+        }
+        self.sparse_sorted = sorted;
+        Ok(())
     }
 
     /// 只读访问所有 row groups（用于扫描定位 row_id）

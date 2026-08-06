@@ -209,7 +209,13 @@ impl Database {
 
         let table = match table_def.engine {
             crate::common::types::EngineType::Columnar => {
-                EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy))
+                let mut t = Table::new(table_def.clone(), self.config.compact_strategy);
+                t.set_index_config(
+                    self.config.sort_compact_by_pk,
+                    self.config.primary_index_legacy,
+                    self.config.sparse_index_granule_rows,
+                );
+                EngineTable::Columnar(t)
             }
             crate::common::types::EngineType::Memory => {
                 EngineTable::Memory(memory_engine::MemoryTable::new(table_def.clone()))
@@ -807,20 +813,29 @@ impl Database {
         Ok(total_indexes)
     }
 
-    /// 主键 Mark Index 兜底重建（v0.17.0 M1-7）
+    /// 主键索引兜底重建（v0.17.0 M1-7）
     ///
     /// 持久化主键段不存在（旧文件 / 无索引段）时全量重建；
     /// 已从索引段恢复的表跳过。幂等：多次调用无副作用。
+    /// 分层索引（v0.19）：表级 legacy 模式重建 BTreeMap，否则重建列存稀疏索引。
     fn rebuild_missing_primary_indexes(&mut self) -> Result<()> {
         let mut rebuilt = 0u32;
         for engine in self.tables.values_mut() {
             let EngineTable::Columnar(table) = engine else {
                 continue;
             };
-            if table.def.primary_key_index().is_some()
-                && table.primary_index().map_or(true, |i| i.is_empty())
+            if table.def.primary_key_index().is_none() {
+                continue;
+            }
+            if table.primary_index_legacy_enabled() {
+                if table.primary_index().map_or(true, |i| i.is_empty()) {
+                    table.rebuild_primary_index()?;
+                    rebuilt += 1;
+                }
+            } else if table.column_store().sparse_granule_count() == 0
+                && table.column_store().total_rows() > 0
             {
-                table.rebuild_primary_index()?;
+                table.column_store_mut().rebuild_sparse()?;
                 rebuilt += 1;
             }
         }
@@ -899,7 +914,13 @@ impl Database {
             // 按引擎构造（M2：Memory 表重建为空白内存表，数据不恢复）
             let table = match table_def.engine {
                 crate::common::types::EngineType::Columnar => {
-                    EngineTable::Columnar(Table::new(table_def.clone(), self.config.compact_strategy))
+                    let mut t = Table::new(table_def.clone(), self.config.compact_strategy);
+                    t.set_index_config(
+                        self.config.sort_compact_by_pk,
+                        self.config.primary_index_legacy,
+                        self.config.sparse_index_granule_rows,
+                    );
+                    EngineTable::Columnar(t)
                 }
                 crate::common::types::EngineType::Memory => {
                     // 内存表数据不恢复：行数统计清零（catalog 中的 row_count 是上次会话的）
@@ -1029,8 +1050,12 @@ impl Database {
                     table.column_store_mut().data_from_bytes(&data[offset..offset + data_len])?;
                     // 同步列的 data_type（修正 Vector dim 等）
                     table.sync_column_data_types();
-                    // 重建主键索引（重启后恢复）
-                    table.rebuild_primary_index()?;
+                    // 重建主键索引（重启后恢复；按表级 legacy 开关分流）
+                    if table.primary_index_legacy_enabled() {
+                        table.rebuild_primary_index()?;
+                    } else {
+                        table.column_store_mut().rebuild_sparse()?;
+                    }
                     loaded += 1;
                 }
                 Some(EngineTable::Log(table)) => {
@@ -1168,9 +1193,10 @@ mod tests {
     fn test_table_empty_indexes() {
         let table = make_test_table();
         let bytes = table.indexes_to_bytes();
-        // skip_count(4B) = 0 + vec_count(4B) = 0 + mark_len(4B) = 0 = 12 bytes
+        // skip_count(4B) = 0 + vec_count(4B) = 0 + mark_len(4B) = 0 + sparse_len(4B) = 0 = 16 bytes
         // （v0.17.0 M1-7：尾部追加主键 Mark Index 长度字段）
-        assert_eq!(bytes.len(), 12);
+        // （v0.19 分层索引：再追加稀疏索引段长度字段）
+        assert_eq!(bytes.len(), 16);
 
         let mut table2 = make_test_table();
         table2.indexes_from_bytes(&bytes).unwrap();

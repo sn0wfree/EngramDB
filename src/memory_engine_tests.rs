@@ -134,10 +134,9 @@ fn test_mark_index_persistence() {
         // 重启后主键点查命中（索引从持久化段恢复）
         let r = conn.execute("SELECT v FROM t WHERE id = 4321").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(8642));
-        // 持久化段恢复的索引应为完整大小（5000 条）
+        // 分层索引：列存稀疏索引应从持久化段完整恢复（granule 数 = ceil(5000/8192)）
         let table = conn.database_mut().get_table("t").unwrap();
-        let idx_len = table.primary_index().map(|i| i.len()).unwrap_or(0);
-        assert_eq!(idx_len, 5000, "主键索引应从持久化段完整恢复");
+        assert!(table.column_store().sparse_granule_count() >= 1, "稀疏索引应从持久化段恢复");
         conn.close().unwrap();
     }
     std::fs::remove_file(&path).ok();
@@ -153,6 +152,9 @@ fn test_mark_index_rebuild_fallback() {
     let (idx_count, point_hit) = {
         let mut conn = super::Connection::open(&path).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        // 显式启用 legacy 全表 BTreeMap 主键索引（测试 legacy 兜底语义）
+        conn.database_mut().get_table_mut("t").unwrap()
+            .set_index_config(true, true, 8192);
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
         // 模拟旧文件：清空内存主键索引后重新加载索引段（索引段无主键段时触发兜底重建）
         {

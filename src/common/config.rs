@@ -223,6 +223,18 @@ pub struct Config {
     /// 仅在 wal_flush_mode = Periodic 时生效。
     /// 开启后，sync_wal() 会在刷盘后检查所有表是否需要合并。
     pub sync_wal_compact: bool,
+    /// 分层索引：compact 时是否按主键排序写入列存（默认 true）
+    ///
+    /// 开启后固化段内主键有序，稀疏索引段内可二分定位（点查 ~100ns 级）；
+    /// 关闭后段内无序，稀疏索引段内线性确认（点查 ~2-5µs，但 compact 零排序开销）。
+    pub sort_compact_by_pk: bool,
+    /// 分层索引：保留旧的全表稠密 BTreeMap 主键索引（默认 false）
+    ///
+    /// false（默认）：主键点查走「Delta 稠密 + 列存稀疏」分层索引，内存节省 ~99.9%
+    /// （1 亿行主键索引 4.6GB → <1MB）；true：额外维护全表 BTreeMap（向后兼容/回退用）。
+    pub primary_index_legacy: bool,
+    /// 分层索引：列存稀疏索引 granule 行数（默认 8192，与 ClickHouse 一致）
+    pub sparse_index_granule_rows: u32,
     
     /// 是否启用事务支持（默认 true）
     ///
@@ -284,6 +296,9 @@ impl Default for Config {
             compress_on_persist: true,
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
+            sort_compact_by_pk: true,
+            primary_index_legacy: false,
+            sparse_index_granule_rows: 8192,
             enable_transaction: true,
             default_isolation_level: IsolationLevel::default(),
         }

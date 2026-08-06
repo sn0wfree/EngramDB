@@ -145,11 +145,13 @@ fn execute_with_txn(
     info!("Transaction {} committed: commit_ts={}, apply_ops_count={}",
           txn_id, result.commit_ts, result.apply_ops.len());
     
-    // 步骤 5：应用到存储层
+    // 步骤 5：应用到存储层；失败必须 abort 事务（清理 MVCC 残留）
     debug!("Applying {} operations to storage...", result.apply_ops.len());
-    let applied_count = result.apply_ops.len();
-    operators::insert::apply_to_storage(db, result.apply_ops)?;
-    info!("✓ Applied {} operations to storage", applied_count);
+    if let Err(e) = operators::insert::apply_to_storage(db, result.apply_ops) {
+        let _ = db.txn_manager_mut().rollback(txn_id);
+        return Err(e);
+    }
+    info!("✓ Applied {} operations to storage", rows_to_delete.len());
     
     info!("Transaction path completed: {} rows deleted", rows_to_delete.len());
     Ok(rows_to_delete.len())

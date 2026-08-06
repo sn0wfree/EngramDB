@@ -80,7 +80,8 @@ pub trait EngineTableOps {
         skip_pred: Option<(usize, PredicateOp, Value)>,
     ) -> Result<Vec<DataChunk>>;
     fn get_row_by_id(&mut self, row_id: u32) -> Result<Option<Vec<Value>>>;
-    fn lookup_primary_key(&self, pk: &Value) -> Option<u32>;
+    /// 主键点查（&mut：列存稀疏确认可能触发惰性解压）
+    fn lookup_primary_key(&mut self, pk: &Value) -> Option<u32>;
 }
 
 /// 引擎表的运行时持有枚举（ADR-1）
@@ -214,7 +215,7 @@ impl EngineTable {
     }
 
     /// 按主键查 row_id（引擎分派入口）
-    pub fn lookup_primary_key(&self, pk: &Value) -> Option<u32> {
+    pub fn lookup_primary_key(&mut self, pk: &Value) -> Option<u32> {
         match self {
             EngineTable::Columnar(t) => t.lookup_primary_key(pk),
             EngineTable::Memory(t) => t.lookup_primary_key(pk),

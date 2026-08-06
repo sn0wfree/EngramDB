@@ -555,7 +555,7 @@ impl crate::storage::engine::EngineTableOps for LogTable {
         self.get_row_by_id(row_id)
     }
 
-    fn lookup_primary_key(&self, _pk: &Value) -> Option<u32> {
+    fn lookup_primary_key(&mut self, _pk: &Value) -> Option<u32> {
         None
     }
 }

@@ -60,6 +60,49 @@ fn cluster_columns(columns: &[Vec<Value>], cluster_col_idx: usize) -> Vec<Vec<Va
     result
 }
 
+/// 按主键列对列式数据做全排序（分层索引：compact 排序，段内有序 → 稀疏二分）
+///
+/// 排序键 = 主键列（数值按数值语义：Int32/Int64/Timestamp 互比）。
+fn sort_columns_by_key(columns: &mut [Vec<Value>], pk_idx: usize) {
+    let num_rows = columns.first().map(|c| c.len()).unwrap_or(0);
+    if num_rows == 0 || pk_idx >= columns.len() {
+        return;
+    }
+    let mut perm: Vec<usize> = (0..num_rows).collect();
+    perm.sort_unstable_by(|&a, &b| cmp_values_for_sort(&columns[pk_idx][a], &columns[pk_idx][b]));
+    let reordered: Vec<Vec<Value>> = columns
+        .iter()
+        .map(|col| perm.iter().map(|&i| col[i].clone()).collect())
+        .collect();
+    for (col, new_col) in columns.iter_mut().zip(reordered) {
+        *col = new_col;
+    }
+}
+
+/// Value 全序比较（排序用；数值按数值语义，Varchar/Json 字典序，Boolean 布尔序，
+/// 不可比类型按调试表示兜底）
+fn cmp_values_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return x.cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
+        return x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
+    }
+    if let (Value::Varchar(x), Value::Varchar(y)) = (a, b) {
+        return x.cmp(y);
+    }
+    if let (Value::Json(x), Value::Json(y)) = (a, b) {
+        return x.cmp(y);
+    }
+    if let (Value::Boolean(x), Value::Boolean(y)) = (a, b) {
+        return x.cmp(y);
+    }
+    if let (Value::Null, Value::Null) = (a, b) {
+        return std::cmp::Ordering::Equal;
+    }
+    format!("{:?}", a).cmp(&format!("{:?}", b))
+}
+
 /// 将行列表转置为列格式（行 -> 列式存储）
 fn transpose_rows(rows: &[Vec<Value>], num_cols: usize) -> Vec<Vec<Value>> {
     let num_rows = rows.len();
@@ -100,14 +143,18 @@ pub struct Table {
     /// key 为列名，value 为对应列的倒排索引。
     /// 通过 CREATE INDEX ... USING fts(column) 创建。
     fts_indexes: std::collections::HashMap<String, InvertedIndex>,
-    /// Perf03：主键索引（BTreeMap<主键值, row_id>）
+    /// 分层索引：全表稠密 BTreeMap 主键索引（legacy 模式，默认关闭）
     ///
-    /// 第一阶段用 `std::collections::BTreeMap` 快速接线（O(log n) 点查），
-    /// 后续升级为页式持久化 B+Tree。
-    /// - 表定义中包含 PRIMARY KEY 列时自动启用
-    /// - INSERT/UPDATE/DELETE 所有写路径均维护
-    /// - WHERE pk=? 查询短路直接命中
+    /// - false（默认）：主键点查走「Delta 稠密 + 列存稀疏」分层索引，内存节省 ~99.9%
+    /// - true：额外维护全表 BTreeMap（v0.17.0 前行为，向后兼容/回退）
+    /// 无论开关如何，`lookup_primary_key` 语义完全一致。
     primary_index: Option<std::collections::BTreeMap<crate::Value, u32>>,
+    /// 分层索引：compact 时按主键排序写入列存（段内有序 → 稀疏索引二分）
+    sort_compact_by_pk: bool,
+    /// 分层索引：旧全表 BTreeMap 是否启用
+    primary_index_legacy: bool,
+    /// 分层索引：列存稀疏索引 granule 行数
+    sparse_granule_rows: u32,
 }
 
 impl Table {
@@ -130,8 +177,7 @@ impl Table {
             CompactStrategy::Adaptive { max_threshold, .. } => max_threshold as u32,
             _ => 122_880,
         };
-        let has_pk = def.primary_key_index().is_some();
-        let cs = ColumnStore::new(def.clone(), row_group_size);
+        let cs = ColumnStore::new_with_sparse(def.clone(), row_group_size, 8192);
         let ds = DeltaStore::new(def.clone());
         Self {
             def,
@@ -141,14 +187,43 @@ impl Table {
             indexes: std::collections::HashMap::new(),
             vector_indexes: std::collections::HashMap::new(),
             fts_indexes: std::collections::HashMap::new(),
-            primary_index: if has_pk { Some(std::collections::BTreeMap::new()) } else { None },
+            primary_index: None,
+            sort_compact_by_pk: true,
+            primary_index_legacy: false,
+            sparse_granule_rows: 8192,
         }
+    }
+
+    /// 分层索引配置（Database 创建表后调用，从 Config 注入）
+    ///
+    /// - `sort_compact_by_pk`：compact 时按主键排序写入列存（段内有序 → 稀疏二分）
+    /// - `legacy`：启用旧全表稠密 BTreeMap（向后兼容/回退）
+    /// - `granule_rows`：稀疏索引 granule 行数
+    pub fn set_index_config(&mut self, sort_compact_by_pk: bool, legacy: bool, granule_rows: u32) {
+        self.sort_compact_by_pk = sort_compact_by_pk;
+        self.primary_index_legacy = legacy;
+        self.sparse_granule_rows = granule_rows;
+        if self.def.primary_key_index().is_some() {
+            if legacy && self.primary_index.is_none() {
+                self.primary_index = Some(std::collections::BTreeMap::new());
+            } else if !legacy {
+                self.primary_index = None;
+            }
+        }
+        // 应用 granule 大小（仅在列存为空时生效；已有数据保持原粒度）
+        self.column_store.set_sparse_granule(granule_rows);
     }
 
     /// 是否启用了主键索引
     #[inline]
     pub fn has_primary_index(&self) -> bool {
-        self.primary_index.is_some()
+        self.def.primary_key_index().is_some()
+    }
+
+    /// legacy 全表 BTreeMap 主键索引是否启用（表级状态）
+    #[inline]
+    pub fn primary_index_legacy_enabled(&self) -> bool {
+        self.primary_index_legacy
     }
 
     /// Perf03：通过全局 row_id 读取完整行（用于 PrimaryKeyLookup 命中后回表）
@@ -311,44 +386,67 @@ impl Table {
         }
     }
 
-    /// 通过主键值查找 row_id（O(log n)）
-    pub fn lookup_primary_key(&self, key: &crate::Value) -> Option<u32> {
-        let idx = self.primary_index.as_ref()?;
-        if let Some(v) = idx.get(key) {
-            return Some(*v);
+    /// 通过主键值查找 row_id（分层索引三段查）
+    ///
+    /// ① legacy 全表 BTreeMap（primary_index_legacy=true 时）
+    /// ② Delta 层稠密索引（新数据热命中）
+    /// ③ 列存层稀疏索引（granule 路由 + 段内确认）
+    /// 数值主键类型归一化兜底（Int32/Int64/Timestamp 互查）每段都生效。
+    pub fn lookup_primary_key(&mut self, key: &crate::Value) -> Option<u32> {
+        let pk_idx = self.def.primary_key_index()?;
+
+        // ① legacy 全表 BTreeMap
+        if self.primary_index_legacy {
+            if let Some(idx) = self.primary_index.as_ref() {
+                if let Some(v) = idx.get(key) {
+                    return Some(*v);
+                }
+                // 数值归一化
+                use crate::Value::*;
+                match key {
+                    Int32(v) => idx.get(&Int64(*v as i64)).copied()
+                        .or_else(|| idx.get(&Timestamp(*v as i64)).copied())
+                        .or_else(|| self.lookup_primary_key_layered(key, pk_idx)),
+                    Int64(v) => idx.get(&Int32(*v as i32)).copied()
+                        .or_else(|| idx.get(&Timestamp(*v)).copied())
+                        .or_else(|| self.lookup_primary_key_layered(key, pk_idx)),
+                    Timestamp(v) => idx.get(&Int64(*v)).copied()
+                        .or_else(|| idx.get(&Int32(*v as i32)).copied())
+                        .or_else(|| self.lookup_primary_key_layered(key, pk_idx)),
+                    _ => self.lookup_primary_key_layered(key, pk_idx),
+                }
+            } else {
+                self.lookup_primary_key_layered(key, pk_idx)
+            }
+        } else {
+            self.lookup_primary_key_layered(key, pk_idx)
         }
-        // 数值主键类型归一化兜底（v0.17.0 M1-7）：
-        // INSERT 参数类型（Int32/Int64/Timestamp）与查询字面量类型可能不同，
-        // 按数值语义互查（如 Int32 主键 + Int64 字面量）。
+    }
+
+    /// 分层主键点查：Delta 稠密 → 列存稀疏（各含数值归一化）
+    fn lookup_primary_key_layered(&mut self, key: &crate::Value, pk_idx: usize) -> Option<u32> {
+        // ② Delta 层稠密索引（含数值归一化）
+        if let Some(rid) = self.delta_store.pk_lookup_normalized(key) {
+            return Some(rid);
+        }
+        // ③ 列存层稀疏索引
+        if let Ok(Some(rid)) = self.column_store.locate_pk(key) {
+            return Some(rid);
+        }
+        // 列存稀疏：数值类型归一化展开（Int32/Int64/Timestamp 互查）
         use crate::Value::*;
         match key {
-            Int32(v) => {
-                if let Some(r) = idx.get(&Int64(*v as i64)) {
-                    return Some(*r);
-                }
-                if let Some(r) = idx.get(&Timestamp(*v as i64)) {
-                    return Some(*r);
-                }
+            Int32(v) => [Int64(*v as i64), Timestamp(*v as i64)]
+                .iter().find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
+            Int64(v) => [Int32(*v as i32), Timestamp(*v)]
+                .iter().find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
+            Timestamp(v) => [Int64(*v), Int32(*v as i32)]
+                .iter().find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
+            _ => {
+                let _ = pk_idx;
+                None
             }
-            Int64(v) => {
-                if let Some(r) = idx.get(&Int32(*v as i32)) {
-                    return Some(*r);
-                }
-                if let Some(r) = idx.get(&Timestamp(*v)) {
-                    return Some(*r);
-                }
-            }
-            Timestamp(v) => {
-                if let Some(r) = idx.get(&Int64(*v)) {
-                    return Some(*r);
-                }
-                if let Some(r) = idx.get(&Int32(*v as i32)) {
-                    return Some(*r);
-                }
-            }
-            _ => {}
         }
-        None
     }
 
     /// 获取主键索引引用（用于 planner/executor 检测）
@@ -748,6 +846,7 @@ impl Table {
         // --- 主键 Mark Index 段（v0.17.0 M1-7 新增）---
         // 完整主键索引持久化（mark 间隔=1）：重启免全行扫描重建，
         // 点查保持 O(log N) 二分精确定位。旧文件无此段 → 读取时重建兜底。
+        // 分层索引：仅 legacy 模式（primary_index_legacy=true）写入；
         // 格式：[mark_len:u32][bincode(BTreeMap<Value, u32>)]
         match &self.primary_index {
             Some(idx) => {
@@ -755,6 +854,18 @@ impl Table {
                     .expect("BTreeMap<Value, u32> serialization cannot fail");
                 buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&bytes);
+            }
+            None => buf.extend_from_slice(&0u32.to_le_bytes()),
+        }
+
+        // --- 稀疏主键索引段（分层索引 v0.19 新增）---
+        // 格式：[sparse_len:u32][bincode((Vec<IndexGranule>, sorted))]
+        match self.column_store.sparse_state() {
+            Some((bytes, sorted)) => {
+                let payload = bincode::serialize(&(bytes, sorted))
+                    .expect("sparse index serialization cannot fail");
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&payload);
             }
             None => buf.extend_from_slice(&0u32.to_le_bytes()),
         }
@@ -877,6 +988,27 @@ impl Table {
             self.primary_index = Some(idx);
         }
         // 注意：mark_len == 0 表示表无主键索引（primary_index 保持 None）
+        offset += mark_len;
+
+        // --- 稀疏主键索引段（分层索引 v0.19 新增，可选）---
+        // v0.19 之前文件无此段 → 剩余 0 字节 → 由调用方重建兜底。
+        if offset + 4 > data.len() {
+            return Ok(()); // 旧格式，无稀疏段
+        }
+        let sparse_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4;
+        if sparse_len > 0 {
+            if offset + sparse_len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated sparse index".into()));
+            }
+            let (bytes, sorted): (Vec<u8>, bool) =
+                bincode::deserialize(&data[offset..offset+sparse_len]).map_err(|e| {
+                    crate::common::error::EngramDbError::Serialization(e.to_string())
+                })?;
+            if !self.column_store.sparse_restore(&bytes, sorted) {
+                return Err(EngramDbError::InvalidFormat("invalid sparse index data".into()));
+            }
+        }
 
         Ok(())
     }
@@ -959,15 +1091,17 @@ impl Table {
     /// 主键唯一性检查（对齐 MemoryEngine 语义；无主键表零开销）
     ///
     /// 检查已存在主键 + 同批内自重复。位于落盘前，失败时零副作用。
+    /// 分层模式：Delta 稠密 + 列存稀疏跨层检查（legacy BTreeMap 开关兼容）。
     #[inline]
-    fn check_pk_uniqueness(&self, rows: &[Vec<crate::Value>]) -> Result<()> {
-        let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_ref()) else {
+    fn check_pk_uniqueness(&mut self, rows: &[Vec<crate::Value>]) -> Result<()> {
+        let Some(pk_idx) = self.def.primary_key_index() else {
             return Ok(());
         };
         let mut seen = std::collections::HashSet::new();
         for row in rows {
             if let Some(cell) = row.get(pk_idx) {
-                if idx.contains_key(cell) || !seen.insert(cell.clone()) {
+                let exists = self.pk_exists(cell)?;
+                if exists || !seen.insert(cell.clone()) {
                     return Err(EngramDbError::ConstraintViolation(format!(
                         "UNIQUE constraint failed: {}={:?}",
                         self.def.columns[pk_idx].name, cell
@@ -980,12 +1114,12 @@ impl Table {
 
     /// 主键唯一性检查（单行版，insert_row apply 路径用）
     #[inline]
-    fn check_pk_uniqueness_one(&self, row: &[crate::Value]) -> Result<()> {
-        let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_ref()) else {
+    fn check_pk_uniqueness_one(&mut self, row: &[crate::Value]) -> Result<()> {
+        let Some(pk_idx) = self.def.primary_key_index() else {
             return Ok(());
         };
         if let Some(cell) = row.get(pk_idx) {
-            if idx.contains_key(cell) {
+            if self.pk_exists(cell)? {
                 return Err(EngramDbError::ConstraintViolation(format!(
                     "UNIQUE constraint failed: {}={:?}",
                     self.def.columns[pk_idx].name, cell
@@ -993,6 +1127,47 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    /// 跨层主键存在性检查（分层索引）
+    #[inline]
+    fn pk_exists(&mut self, cell: &crate::Value) -> Result<bool> {
+        if self.primary_index_legacy {
+            if let Some(idx) = self.primary_index.as_ref() {
+                if idx.contains_key(cell) {
+                    return Ok(true);
+                }
+            }
+        }
+        if self.delta_store.pk_lookup_normalized(cell).is_some() {
+            return Ok(true);
+        }
+        Ok(self.column_store.locate_pk(cell)?.is_some())
+    }
+
+    /// 跨层主键占用检查（排除自身 row_id；UPDATE 主键迁移用）
+    #[inline]
+    fn pk_occupied_by_other(&mut self, cell: &crate::Value, self_row_id: u32) -> Result<bool> {
+        if self.primary_index_legacy {
+            if let Some(idx) = self.primary_index.as_ref() {
+                if let Some(&r) = idx.get(cell) {
+                    if r != self_row_id {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        if let Some(r) = self.delta_store.pk_lookup_normalized(cell) {
+            if r != self_row_id {
+                return Ok(true);
+            }
+        }
+        if let Some(r) = self.column_store.locate_pk(cell)? {
+            if r != self_row_id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn insert(&mut self, mut rows: Vec<Vec<Value>>) -> Result<u64> {
@@ -1209,7 +1384,7 @@ impl Table {
         }
 
         // 主键唯一性检查（列式：转置为行后检查，语义与 insert() 一致）
-        if self.primary_index.is_some() {
+        if self.def.primary_key_index().is_some() {
             let rows = transpose_columns_to_rows(&columns, num_rows);
             self.check_pk_uniqueness(&rows)?;
         }
@@ -1229,9 +1404,9 @@ impl Table {
         self.def.row_count += num_rows as u64;
 
         // 索引维护（与 insert() 一致；仅在需要时才转置为行）
-        if self.primary_index.is_some() || !self.indexes.is_empty() || !self.vector_indexes.is_empty() {
+        if self.def.primary_key_index().is_some() || !self.indexes.is_empty() || !self.vector_indexes.is_empty() {
             let rows = transpose_columns_to_rows(&columns, num_rows);
-            if self.primary_index.is_some() {
+            if self.primary_index_legacy {
                 self.primary_index_insert_batch(&rows, base_row_id);
             }
             if !self.indexes.is_empty() {
@@ -2018,21 +2193,32 @@ impl Table {
             // 重新插入未过期的行作为列式数据
             let alive_count = alive_rows.len();
             if alive_count > 0 {
-                let columns = transpose_rows(&alive_rows, self.def.columns.len());
-                self.column_store.append_columns(&columns)?;
+                let mut columns = transpose_rows(&alive_rows, self.def.columns.len());
+                if self.sort_compact_by_pk {
+                    if let Some(pk_idx) = self.def.primary_key_index() {
+                        sort_columns_by_key(&mut columns, pk_idx);
+                    }
+                }
+                self.column_store.append_columns_sorted(&columns)?;
             }
             // 只减去被 TTL 淘汰的行数（存活行仍计入总数）
             self.def.row_count = self.def.row_count.saturating_sub(row_count - alive_count as u64);
             return Ok(());
         }
 
-        // 根据是否有聚簇键选择写入方式
-        let columns_to_write: Vec<Vec<Value>> = match self.def.cluster_key {
+        // 根据是否有聚簇键选择写入方式；分层索引：有主键时优先按主键排序
+        // （段内有序 → 稀疏索引二分定位；聚簇键排序仅在无主键时保留）
+        let mut columns_to_write: Vec<Vec<Value>> = match self.def.cluster_key {
             Some(cluster_idx) => self.delta_store.clustered_column_data(cluster_idx),
             None => self.delta_store.column_data().to_vec(),
         };
+        if self.sort_compact_by_pk {
+            if let Some(pk_idx) = self.def.primary_key_index() {
+                sort_columns_by_key(&mut columns_to_write, pk_idx);
+            }
+        }
 
-        self.column_store.append_columns(&columns_to_write)?;
+        self.column_store.append_columns_sorted(&columns_to_write)?;
         self.delta_store.clear();
         // 注意：不更新 row_count —— Delta → 列存只是数据迁移，总行数不变。
         // 行数在 insert/insert_row/execute_columns 写入 Delta 时已累加。
@@ -2060,13 +2246,18 @@ impl Table {
         // 从 Delta 头部取出数据
         let mut columns = self.delta_store.drain_front(actual_rows);
 
-        // 如果有聚簇键，对取出的数据做聚簇重排
-        if let Some(cluster_idx) = self.def.cluster_key {
+        // 分层索引：有主键时优先按主键排序（段内有序 → 稀疏二分）
+        if self.sort_compact_by_pk {
+            if let Some(pk_idx) = self.def.primary_key_index() {
+                sort_columns_by_key(&mut columns, pk_idx);
+            }
+        } else if let Some(cluster_idx) = self.def.cluster_key {
+            // 无主键排序时保留聚簇重排
             columns = cluster_columns(&columns, cluster_idx);
         }
 
         // 合并到列存
-        self.column_store.append_columns(&columns)?;
+        self.column_store.append_columns_sorted(&columns)?;
         // 注意：不更新 row_count —— Delta → 列存只是数据迁移，总行数不变。
 
         Ok(actual_rows)
@@ -2162,6 +2353,25 @@ impl Table {
         // 计算 Delta 行的全局 row_id 基准
         let delta_base_row_id = (self.def.row_count - self.delta_store.len() as u64) as u32;
 
+        // 主键迁移冲突前置检查（更新应用前，基于旧索引状态；含同批自重复）
+        if let Some(pk_idx) = self.def.primary_key_index() {
+            let mut seen = std::collections::HashSet::new();
+            for &(row_idx, ref new_vals) in updates {
+                let self_rid = delta_base_row_id + row_idx as u32;
+                for &(col_idx, ref new_val) in new_vals {
+                    if col_idx == pk_idx {
+                        let occupied = self.pk_occupied_by_other(new_val, self_rid)?;
+                        if occupied || !seen.insert(new_val.clone()) {
+                            return Err(EngramDbError::ConstraintViolation(format!(
+                                "UNIQUE constraint failed: {}={:?}",
+                                self.def.columns[pk_idx].name, new_val
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut count = 0;
         let mut old_rows: Vec<Vec<Value>> = Vec::new();
         let mut new_rows: Vec<Vec<Value>> = Vec::new();
@@ -2179,27 +2389,9 @@ impl Table {
             }
         }
 
-        // 更新索引：先删旧条目，再插新条目
-        if self.primary_index.is_some() && !old_rows.is_empty() {
-            // 主键迁移冲突检查：新主键已存在且非自身行 → 报错（对齐 insert 语义）
-            if let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_ref()) {
-                let mut seen = std::collections::HashSet::new();
-                for (i, new_row) in new_rows.iter().enumerate() {
-                    if let Some(cell) = new_row.get(pk_idx) {
-                        let occupied = match idx.get(cell) {
-                            Some(&existing_rid) => existing_rid != row_ids[i],
-                            None => false,
-                        };
-                        if occupied || !seen.insert(cell.clone()) {
-                            return Err(EngramDbError::ConstraintViolation(format!(
-                                "UNIQUE constraint failed: {}={:?}",
-                                self.def.columns[pk_idx].name, cell
-                            )));
-                        }
-                    }
-                }
-            }
-            // Perf03：先删旧主键索引，再插新主键索引
+        // 更新索引：先删旧条目，再插新条目（delta 层 pk_index 已由 update_row 内部维护）
+        if !old_rows.is_empty() {
+            // 先删旧主键索引，再插新主键索引
             self.primary_index_remove_batch(&old_rows);
             for (i, new_row) in new_rows.iter().enumerate() {
                 self.primary_index_insert(new_row, row_ids[i]);
@@ -2439,8 +2631,8 @@ impl crate::storage::engine::EngineTableOps for Table {
         self.get_row_by_id(row_id)
     }
 
-    fn lookup_primary_key(&self, pk: &crate::Value) -> Option<u32> {
-        self.lookup_primary_key(pk)
+    fn lookup_primary_key(&mut self, pk: &crate::Value) -> Option<u32> {
+        Table::lookup_primary_key(self, pk)
     }
 }
 

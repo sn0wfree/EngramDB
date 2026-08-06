@@ -33,12 +33,18 @@ pub struct DeltaStore {
     sparse_runs: Vec<SparseRun>,
     /// 已删除的 row_id 集合（tombstone 标记）
     deleted_ids: std::collections::HashSet<u64>,
+    /// 分层索引：Delta 层稠密主键索引（主键值 -> row_id）
+    ///
+    /// 只覆盖 Delta 层内的行（列存行由稀疏索引负责），行数受 compact
+    /// 阈值约束，内存有界；compact 合并后随 clear() 一起清空。
+    pk_index: Option<std::collections::BTreeMap<crate::Value, u32>>,
 }
 
 impl DeltaStore {
     pub fn new(table_def: TableDef) -> Self {
         let num_cols = table_def.columns.len();
         let columns = (0..num_cols).map(|_| Vec::with_capacity(1024)).collect();
+        let has_pk = table_def.primary_key_index().is_some();
         Self {
             table_def,
             columns,
@@ -47,7 +53,61 @@ impl DeltaStore {
             row_id_to_idx: HashMap::new(),
             sparse_runs: Vec::new(),
             deleted_ids: std::collections::HashSet::new(),
+            pk_index: if has_pk { Some(std::collections::BTreeMap::new()) } else { None },
         }
+    }
+
+    /// 主键列索引（有主键时 Some）
+    fn pk_col_idx(&self) -> Option<usize> {
+        self.table_def.primary_key_index()
+    }
+
+    /// 向稠密主键索引插入 (pk_value, row_id)
+    #[inline]
+    fn pk_insert(&mut self, row: &[crate::Value], row_id: u32) {
+        if let (Some(pk_idx), Some(idx)) = (self.pk_col_idx(), self.pk_index.as_mut()) {
+            if let Some(v) = row.get(pk_idx).cloned() {
+                idx.insert(v, row_id);
+            }
+        }
+    }
+
+    /// 从稠密主键索引移除 (pk_value, _)
+    #[inline]
+    fn pk_remove(&mut self, row: &[crate::Value]) {
+        if let (Some(pk_idx), Some(idx)) = (self.pk_col_idx(), self.pk_index.as_mut()) {
+            if let Some(v) = row.get(pk_idx) {
+                idx.remove(v);
+            }
+        }
+    }
+
+    /// 稠密主键索引精确点查（只查 Delta 层内的行）
+    pub fn pk_lookup(&self, key: &crate::Value) -> Option<u32> {
+        self.pk_index.as_ref()?.get(key).copied()
+    }
+
+    /// 稠密主键索引点查（数值类型归一化：Int32/Int64/Timestamp 互查）
+    pub fn pk_lookup_normalized(&self, key: &crate::Value) -> Option<u32> {
+        if let Some(v) = self.pk_lookup(key) {
+            return Some(v);
+        }
+        let idx = self.pk_index.as_ref()?;
+        use crate::Value::*;
+        match key {
+            Int32(v) => idx.get(&Int64(*v as i64)).copied()
+                .or_else(|| idx.get(&Timestamp(*v as i64)).copied()),
+            Int64(v) => idx.get(&Int32(*v as i32)).copied()
+                .or_else(|| idx.get(&Timestamp(*v)).copied()),
+            Timestamp(v) => idx.get(&Int64(*v)).copied()
+                .or_else(|| idx.get(&Int32(*v as i32)).copied()),
+            _ => None,
+        }
+    }
+
+    /// 稠密主键索引行数（统计用）
+    pub fn pk_index_len(&self) -> usize {
+        self.pk_index.as_ref().map(|m| m.len()).unwrap_or(0)
     }
 
     /// 二分查找包含 rowid 的连续区间
@@ -90,6 +150,9 @@ impl DeltaStore {
         let row_len = row.len();
         let num_table_cols = self.table_def.columns.len();
         let idx = self.row_count;
+
+        // 分层索引：稠密主键索引先维护（row 即将被消费）
+        self.pk_insert(&row, rowid as u32);
 
         // 按列追加
         for (col_idx, val) in row.into_iter().enumerate() {
@@ -142,6 +205,9 @@ impl DeltaStore {
         let num_table_cols = self.table_def.columns.len();
         let idx = self.row_count;
 
+        // 分层索引：稠密主键索引先维护（row 即将被消费）
+        self.pk_insert(&row, rowid);
+
         // 按列追加（rowid 由事务管理器保证唯一）
         for (col_idx, val) in row.into_iter().enumerate() {
             if col_idx < self.columns.len() {
@@ -184,6 +250,15 @@ impl DeltaStore {
     /// 用于事务路径提交后的应用阶段
     pub fn delete_row(&mut self, rowid: u32) -> Result<()> {
         let rowid_64 = rowid as u64;
+        // 分层索引：先读旧主键值移除（此时映射尚未移除）
+        if let Some(pk_idx) = self.pk_col_idx() {
+            if let Some(idx) = self.idx_lookup(rowid_64) {
+                let old_pk = self.columns[pk_idx][idx].clone();
+                if let Some(m) = self.pk_index.as_mut() {
+                    m.remove(&old_pk);
+                }
+            }
+        }
         // 标记为已删除
         self.deleted_ids.insert(rowid_64);
         // 从映射中移除
@@ -213,7 +288,15 @@ impl DeltaStore {
         
         let num_table_cols = self.table_def.columns.len();
         let row_len = new_row.len();
-        
+
+        // 分层索引：记录旧主键值（更新后可能变化）
+        let old_pk = match self.pk_col_idx() {
+            Some(pk_idx) if idx < self.columns[pk_idx].len() => {
+                Some(self.columns[pk_idx][idx].clone())
+            }
+            _ => None,
+        };
+
         // 更新各列
         for (col_idx, val) in new_row.into_iter().enumerate() {
             if col_idx < self.columns.len() && idx < self.columns[col_idx].len() {
@@ -225,6 +308,17 @@ impl DeltaStore {
         for col_idx in row_len..num_table_cols {
             if col_idx < self.columns.len() && idx < self.columns[col_idx].len() {
                 self.columns[col_idx][idx] = Value::Null;
+            }
+        }
+
+        // 分层索引：主键值变化时更新映射
+        if let (Some(pk_idx), Some(m)) = (self.pk_col_idx(), self.pk_index.as_mut()) {
+            if let Some(old) = old_pk {
+                let cur = self.columns[pk_idx][idx].clone();
+                if cur != old {
+                    m.remove(&old);
+                    m.insert(cur, rowid);
+                }
             }
         }
         
@@ -267,6 +361,19 @@ impl DeltaStore {
             count: new_rows as u32,
         });
 
+        // 分层索引：逐行维护稠密主键索引
+        if self.pk_index.is_some() {
+            if let Some(pk_idx) = self.pk_col_idx() {
+                if let Some(m) = self.pk_index.as_mut() {
+                    for (i, row) in batch.iter().enumerate() {
+                        if let Some(v) = row.get(pk_idx) {
+                            m.insert(v.clone(), (start_rowid + i as u64) as u32);
+                        }
+                    }
+                }
+            }
+        }
+
         self.row_count += new_rows;
         self.next_rowid += count;
         Ok(count)
@@ -308,6 +415,20 @@ impl DeltaStore {
                     new_col.push(Value::Null);
                 }
                 self.columns.push(new_col);
+            }
+        }
+
+        // 分层索引：主键列整列逐行维护稠密主键索引（columns 消费前）
+        if self.pk_index.is_some() {
+            if let Some(pk_idx) = self.pk_col_idx() {
+                let pk_col: Vec<Value> = columns.get(pk_idx)
+                    .map(|c| c.clone())
+                    .unwrap_or_else(|| vec![Value::Null; num_rows]);
+                if let Some(m) = self.pk_index.as_mut() {
+                    for (i, v) in pk_col.iter().enumerate() {
+                        m.insert(v.clone(), (start_rowid + i as u64) as u32);
+                    }
+                }
             }
         }
 
@@ -421,6 +542,9 @@ impl DeltaStore {
         self.row_id_to_idx.clear();
         self.sparse_runs.clear();
         self.deleted_ids.clear();
+        if let Some(m) = self.pk_index.as_mut() {
+            m.clear();
+        }
     }
 
     /// 取出所有行数据（行式，用于兼容旧接口）
@@ -571,6 +695,22 @@ impl DeltaStore {
     /// 采用从后往前删除的方式，避免索引偏移问题。
     ///
     /// 返回被删除的行（按原始顺序），用于索引维护。
+    /// 位置索引 → 全局 row_id 反查（位置语义 API 维护 pk_index 用）
+    fn rowid_for_idx(&self, idx: usize) -> Option<u32> {
+        for run in &self.sparse_runs {
+            let base = run.base_idx as usize;
+            if idx >= base && idx < base + run.count as usize {
+                return Some((run.base_rowid + (idx - base) as u64) as u32);
+            }
+        }
+        for (rowid, &i) in &self.row_id_to_idx {
+            if i == idx {
+                return Some(*rowid as u32);
+            }
+        }
+        None
+    }
+
     pub fn delete_rows(&mut self, indices: &[usize]) -> Vec<Vec<Value>> {
         if indices.is_empty() || self.row_count == 0 {
             return Vec::new();
@@ -586,6 +726,15 @@ impl DeltaStore {
                     .map(|col| col[idx].clone())
                     .collect();
                 deleted_rows.push(row);
+            }
+        }
+
+        // 分层索引：先移除被删行的主键（主键值唯一，按值删除；列尚未删）
+        if let (Some(pk_idx), Some(m)) = (self.pk_col_idx(), self.pk_index.as_mut()) {
+            for row in &deleted_rows {
+                if let Some(v) = row.get(pk_idx) {
+                    m.remove(v);
+                }
             }
         }
 
@@ -622,6 +771,23 @@ impl DeltaStore {
         for &(col_idx, ref new_val) in new_values {
             if col_idx < self.columns.len() {
                 self.columns[col_idx][idx] = new_val.clone();
+            }
+        }
+
+        // 分层索引：主键值变化时更新映射（rowid 用位置反查，与调用方语义一致）
+        if let Some(pk_idx) = self.pk_col_idx() {
+            let old_pk = old_row.get(pk_idx).cloned();
+            let new_pk = self.columns.get(pk_idx).and_then(|c| c.get(idx)).cloned();
+            if old_pk != new_pk {
+                if let Some(new) = new_pk {
+                    let rid = self.rowid_for_idx(idx).unwrap_or(idx as u32);
+                    if let Some(m) = self.pk_index.as_mut() {
+                        if let Some(old) = old_pk {
+                            m.remove(&old);
+                        }
+                        m.insert(new, rid);
+                    }
+                }
             }
         }
 

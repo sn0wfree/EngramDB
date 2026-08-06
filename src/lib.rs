@@ -804,8 +804,7 @@ impl std::fmt::Display for Value {
 }
 
 #[cfg(test)]
-mod value_tests {
-    use super::*;
+mod value_tests {    use super::*;
 
 
 
@@ -3672,6 +3671,7 @@ mod multi_engine_tests {
     include!("bloom_tests.rs");
     include!("m4_tests.rs");
     include!("p5_tests.rs");
+    include!("layered_index_tests.rs");
 
 
     #[test]

@@ -1127,9 +1127,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         // Perf03：主键点查短路（WHERE pk = Literal）
         PhysicalPlan::PrimaryKeyLookup { table_name, pk_value, output_column_indices } => {
-            // Phase 1：不可变借 -> 查主键索引拿 row_id + 列名（引擎分派）
+            // Phase 1：可变借 -> 查主键索引拿 row_id + 列名（引擎分派）
             let (row_id_opt, columns): (Option<u32>, Vec<String>) = {
-                let table = db.get_engine_table(&table_name)
+                let table = db.get_engine_table_mut(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 let cols: Vec<String> = if output_column_indices.is_empty() {
                     table.def().columns.iter().map(|c| c.name.clone()).collect()

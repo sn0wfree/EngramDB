@@ -12,7 +12,7 @@ use crate::Value;
 pub const DEFAULT_GRANULE_SIZE: u32 = 8192;
 
 /// 稀疏索引条目
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexGranule {
     /// 该 granule 的首行主键值（用于范围定位）
     pub first_key: Value,
@@ -65,6 +65,38 @@ impl SparseIndex {
             });
 
             offset += row_count;
+        }
+    }
+
+    /// 追加一个 granule（列存 compact 增量维护用）
+    ///
+    /// `row_offset` 为全局行序偏移（与 row_id 对齐）。
+    /// 调用方需保证同一索引内 row_offset + row_count 单调不重叠。
+    pub fn append_granule(&mut self, first_key: Value, row_offset: u32, row_count: u32) {
+        self.granules.push(IndexGranule {
+            first_key,
+            row_offset,
+            row_count,
+        });
+    }
+
+    /// 追加一段有序数据（compact 增量路径）：按 granule 切分并追加
+    ///
+    /// `keys` 为新增段的主键列（段内有序），`base_offset` 为该段起始全局行偏移。
+    /// 最后一个不足 granule 大小的片段也强制成条（append 边界处切 granule）。
+    pub fn append_sorted_keys(&mut self, keys: &[Value], base_offset: u32) {
+        if keys.is_empty() {
+            return;
+        }
+        let gs = self.granule_size as usize;
+        let mut offset = base_offset;
+        for chunk in keys.chunks(gs) {
+            self.granules.push(IndexGranule {
+                first_key: chunk[0].clone(),
+                row_offset: offset,
+                row_count: chunk.len() as u32,
+            });
+            offset += chunk.len() as u32;
         }
     }
 
@@ -122,6 +154,16 @@ impl SparseIndex {
         self.granules.len()
     }
 
+    /// 清空全部 granule
+    pub fn clear_index(&mut self) {
+        self.granules.clear();
+    }
+
+    /// 最后一个 granule（追加式维护用）
+    pub fn last_granule(&self) -> Option<&IndexGranule> {
+        self.granules.last()
+    }
+
     /// 获取指定索引的 granule
     pub fn get_granule(&self, idx: usize) -> Option<&IndexGranule> {
         self.granules.get(idx)
@@ -136,6 +178,19 @@ impl SparseIndex {
     pub fn estimated_memory_size(&self) -> usize {
         // 每个 granule 约 32 字节（Value 引用 + u32 + u32 + 开销）
         self.granules.len() * 32
+    }
+
+    /// 序列化（bincode：granules + granule_size）
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(&(&self.granules, self.granule_size))
+            .unwrap_or_default()
+    }
+
+    /// 反序列化（失败返回 None）
+    pub fn from_bytes(data: &[u8]) -> Option<SparseIndex> {
+        let (granules, granule_size): (Vec<IndexGranule>, u32) =
+            bincode::deserialize(data).ok()?;
+        Some(SparseIndex { granules, granule_size })
     }
 }
 
