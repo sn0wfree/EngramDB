@@ -477,3 +477,57 @@ fn test_prepared_direct_guard_column_vs_plain() {
     }
     conn.close().unwrap();
 }
+
+#[test]
+fn test_prepared_direct_literal_only() {
+    // 无占位符 VALUES（param_count=0）：入口校验 0<=0 通过，直通 eval 纯字面量
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (5, 'lit')").unwrap();
+    conn.execute_prepared(&stmt, &[]).unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT ts, v FROM t").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int64(5), Value::Varchar("lit".into())]]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_extra_params_ignored() {
+    // 参数多于占位符：多余参数被忽略（语义与计划路径一致）
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    conn.execute_prepared(&stmt, &[Value::Int64(3), Value::Varchar("ok".into()), Value::Int64(999)]).unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT ts, v FROM t").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int64(3), Value::Varchar("ok".into())]]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_constraint_table() {
+    // 有主键/约束的表绕过 batcher（约束即时暴露），直通路径仍正确落盘
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    conn.execute_prepared(&stmt, &[Value::Int64(1), Value::Varchar("a".into())]).unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT id, v FROM t").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int64(1), Value::Varchar("a".into())]]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_batch_param_underflow() {
+    // execute_prepared_batch：其中一行参数不足 → Parse 错误
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    let batch = vec![
+        vec![Value::Int64(1), Value::Varchar("a".into())],
+        vec![Value::Int64(2)], // 不足
+    ];
+    let err = conn.execute_prepared_batch(&stmt, &batch).unwrap_err();
+    assert!(matches!(err, crate::common::error::EngramDbError::Parse(_)));
+    conn.close().unwrap();
+}

@@ -88,3 +88,109 @@ impl InsertBatcher {
         self.buffers.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(v: i64) -> Vec<Vec<Value>> {
+        vec![vec![Value::Int64(v)]]
+    }
+
+    #[test]
+    fn push_row_threshold_trigger() {
+        // 行阈值：total >= max_rows 时触发（max_rows=4）
+        let mut b = InsertBatcher::new(4, 1024, 10_000);
+        assert!(!b.push("t", row(1)));
+        assert!(!b.push("t", row(2)));
+        assert!(!b.push("t", row(3)));
+        assert!(b.push("t", row(4)), "累计行数达到阈值应触发");
+        assert_eq!(b.pending(), 4, "触发后缓冲仍保留（drain 前）");
+    }
+
+    #[test]
+    fn push_batch_spans_threshold() {
+        // 单次 push 多行跨过阈值：立即触发（4 行 > max_rows=3）
+        let mut b = InsertBatcher::new(3, 1024, 10_000);
+        let rows = vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+        ];
+        assert!(b.push("t", rows));
+    }
+
+    #[test]
+    fn push_empty_no_op() {
+        let mut b = InsertBatcher::new(1, 1, 1);
+        assert!(!b.push("t", Vec::new()), "空行集不得触发");
+        assert!(b.is_empty(), "空行集不得改变状态");
+    }
+
+    #[test]
+    fn push_byte_threshold_trigger() {
+        // 字节阈值：值为个数（每行 2 值），max_bytes=3 时两行触发
+        let mut b = InsertBatcher::new(1000, 3, 10_000);
+        let two = vec![vec![Value::Int64(1), Value::Int64(2)]];
+        assert!(!b.push("t", two));
+        assert!(b.push("t", row(3)), "字节累计达到阈值应触发");
+    }
+
+    #[test]
+    fn push_timeout_trigger() {
+        // 时间阈值：窗口从首行起算，sleep 后任意 push 触发
+        let mut b = InsertBatcher::new(1000, 1024, 1);
+        assert!(!b.push("t", row(1)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(b.push("t", row(2)), "时间窗到期后应触发");
+    }
+
+    #[test]
+    fn multi_table_isolated() {
+        // 多表隔离：各表独立计数与缓冲（全局阈值 3）
+        let mut b = InsertBatcher::new(3, 1024, 10_000);
+        assert!(!b.push("a", row(1)));
+        assert!(!b.push("a", row(2)), "a 表未满");
+        assert!(!b.push("b", row(1)), "b 表写入不影响 a 表计数");
+        assert!(b.push("a", row(3)), "a 表满 3 行触发");
+        assert_eq!(b.pending(), 4, "b 表 1 行仍缓冲");
+        assert_eq!(b.drain("b").len(), 1, "b 表未触发，缓冲保留");
+    }
+
+    #[test]
+    fn drain_single_table() {
+        let mut b = InsertBatcher::new(4, 1024, 10_000);
+        b.push("t", row(1));
+        b.push("t", row(2));
+        let rows = b.drain("t");
+        assert_eq!(rows.len(), 2);
+        assert!(b.is_empty(), "drain 后应清空该表");
+        assert!(b.drain("t").is_empty(), "重复 drain 得空");
+        assert!(b.drain("absent").is_empty(), "未知表得空");
+    }
+
+    #[test]
+    fn drain_all_tables() {
+        let mut b = InsertBatcher::new(100, 1024, 10_000);
+        b.push("a", row(1));
+        b.push("b", row(2));
+        b.push("b", row(3));
+        let all = b.drain_all();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|(t, r)| t == "a" && r.len() == 1));
+        assert!(all.iter().any(|(t, r)| t == "b" && r.len() == 2));
+        assert!(b.is_empty());
+        assert!(b.drain_all().is_empty(), "重复 drain_all 得空");
+    }
+
+    #[test]
+    fn pending_counts_rows() {
+        let mut b = InsertBatcher::new(10, 1024, 10_000);
+        assert_eq!(b.pending(), 0);
+        b.push("a", row(1));
+        b.push("a", row(2));
+        b.push("b", vec![row(3).pop().unwrap(), row(4).pop().unwrap()]);
+        assert_eq!(b.pending(), 4);
+    }
+}
