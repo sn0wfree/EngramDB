@@ -246,3 +246,74 @@ fn test_layered_no_pk_table_unaffected() {
     let table = conn.database_mut().get_table("t").unwrap();
     assert_eq!(table.column_store().sparse_granule_count(), 0, "无主键表无稀疏索引");
 }
+
+#[test]
+fn test_pk_cache_lifecycle() {
+    // 主键列连续缓存：compact 后首次点查惰性构建，写入后失效重建
+    let mut conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    for i in 0..300 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 2)).unwrap();
+    }
+    force_compact(conn.database_mut());
+    assert!(
+        !conn.database_mut().get_table("t").unwrap().column_store().pk_cache_built(),
+        "compact 后未点查前不应构建缓存"
+    );
+    // 首次点查 → 惰性构建
+    let r = conn.execute("SELECT v FROM t WHERE id = 123").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(246));
+    assert!(
+        conn.database_mut().get_table("t").unwrap().column_store().pk_cache_built(),
+        "首次点查后应构建缓存"
+    );
+    // 写入新数据（append 失效）→ 再点查触发重建，新旧值都正确
+    conn.execute("INSERT INTO t VALUES (300, 600)").unwrap();
+    let r = conn.execute("SELECT v FROM t WHERE id = 123").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(246));
+    let r = conn.execute("SELECT v FROM t WHERE id = 300").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(600));
+    // 重建后的缓存命中新数据（新行在 delta，列存缓存重建覆盖旧列存段）
+    force_compact(conn.database_mut());
+    let r = conn.execute("SELECT v FROM t WHERE id = 300").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(600));
+    let r = conn.execute("SELECT v FROM t WHERE id = 299").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(598));
+}
+
+#[test]
+fn test_pk_cache_unsorted_correctness() {
+    // 乱序负载 + 缓存：全局降级线性扫，缓存确认结果正确
+    let mut conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    for i in 100..300 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i)).unwrap();
+    }
+    force_compact(conn.database_mut());
+    for i in 0..100 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i)).unwrap();
+    }
+    force_compact(conn.database_mut());
+    for i in [0usize, 50, 99, 100, 150, 299] {
+        let r = conn.execute(&format!("SELECT v FROM t WHERE id = {i}")).unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(i as i64), "乱序 + 缓存点查必须正确 id={i}");
+    }
+}
+
+#[test]
+fn test_pk_cache_varchar_skipped() {
+    // Varchar 主键：跳过连续缓存（堆分配类型），走原 get_value_at 路径
+    let mut conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY, v INT)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('k1', 10), ('k2', 20), ('k3', 30)").unwrap();
+    force_compact(conn.database_mut());
+    let r = conn.execute("SELECT v FROM t WHERE id = 'k2'").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(20));
+    assert!(
+        !conn.database_mut().get_table("t").unwrap().column_store().pk_cache_built(),
+        "Varchar 主键不应构建连续缓存"
+    );
+    // 乱序 Varchar（按插入序无序）
+    let r = conn.execute("SELECT v FROM t WHERE id = 'k1'").unwrap();
+    assert_eq!(r.rows[0][0], Value::Int64(10));
+}

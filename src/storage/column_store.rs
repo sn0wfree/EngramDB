@@ -40,6 +40,47 @@ fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     None
 }
 
+/// 连续缓存段内确认（只读纯函数；sorted → 二分，否则线性）
+///
+/// `start` 为全局行序偏移，`count` 为段行数，`cache` 为主键列连续副本。
+/// 返回命中行的全局行序（= row_id）。
+fn confirm_cached(
+    key: &Value,
+    start: u32,
+    count: u32,
+    cache: &ColumnData,
+    sorted: bool,
+) -> Result<Option<u32>> {
+    let (lo0, hi0) = (start as usize, (start + count) as usize);
+    if sorted {
+        let (mut lo, mut hi) = (lo0, hi0);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let v = cache.get(mid);
+            match cmp_values(&v, key) {
+                Some(std::cmp::Ordering::Less) => lo = mid + 1,
+                Some(std::cmp::Ordering::Greater) => hi = mid,
+                _ => return Ok(Some(mid as u32)),
+            }
+        }
+        return Ok(None);
+    }
+    for i in lo0..hi0 {
+        let v = cache.get(i);
+        match cmp_values(&v, key) {
+            Some(std::cmp::Ordering::Equal) => return Ok(Some(i as u32)),
+            None => {
+                // 类型不可比（如 Varchar vs Int）→ 按 Value 精确相等兜底
+                if v == *key {
+                    return Ok(Some(i as u32));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 /// 列存表
 pub struct ColumnStore {
     table_def: TableDef,
@@ -54,6 +95,12 @@ pub struct ColumnStore {
     sparse_pk_col: Option<usize>,
     /// 稀疏索引是否保持全局有序（true → granule 二分；append 乱序时降级 false → 线性扫）
     sparse_sorted: bool,
+    /// 主键列连续缓存（点查段内确认快路径）
+    ///
+    /// 惰性构建：首次点查时把主键列整列拼为连续 ColumnData（类型化数组 + null
+    /// 位图），段内确认零除法寻址 / 零压缩检查。仅数值主键启用（Varchar 等
+    /// 堆分配类型跳过，内存失控）。任何列存写入后失效，下次点查重建。
+    pk_value_cache: Option<ColumnData>,
 }
 
 /// Row Group（行组）
@@ -127,6 +174,7 @@ impl ColumnStore {
             sparse_primary: None,
             sparse_pk_col: None,
             sparse_sorted: false,
+            pk_value_cache: None,
         }
     }
 
@@ -145,6 +193,7 @@ impl ColumnStore {
             sparse_primary: sparse,
             sparse_pk_col: pk_col,
             sparse_sorted: false,
+            pk_value_cache: None,
         }
     }
 
@@ -155,6 +204,7 @@ impl ColumnStore {
             sparse.clear_index();
         }
         self.sparse_sorted = false;
+        self.pk_value_cache = None;
     }
 
     /// 稀疏索引是否启用（有主键且已接线）
@@ -400,6 +450,8 @@ impl ColumnStore {
 
         // 分层索引：增量维护稀疏主键索引
         self.sparse_append(columns, start_total, sorted);
+        // 主键列缓存失效（列存数据已变）
+        self.pk_value_cache = None;
 
         Ok(())
     }
@@ -490,66 +542,146 @@ impl ColumnStore {
     /// 定位 = granule 粗路由（有序二分 / 无序线性扫）+ 段内确认
     /// （有序段二分 / 无序段线性）。数值类型归一化：Int32/Int64/Timestamp 互查。
     /// 返回全局行序（= row_id，与 table.rs get_row_by_id 对齐）。
+    ///
+    /// 零堆分配：granule 元组逐次块内读取（Copy），不收集 Vec。
+    /// 快路径：数值主键首次点查惰性构建连续缓存，段内确认零除法/零压缩检查。
     pub fn locate_pk(&mut self, key: &Value) -> Result<Option<u32>> {
         let Some(pk_col) = self.sparse_pk_col else { return Ok(None) };
+
+        // 惰性构建主键列连续缓存（数值主键 + 稀疏有数据时）
+        if self.pk_value_cache.is_none()
+            && self.sparse_primary.is_some()
+            && self.sparse_granule_count() > 0
+            && self.pk_cacheable(pk_col)
+        {
+            self.build_pk_cache()?;
+        }
+
         let sorted = self.sparse_sorted;
-        if sorted {
-            // 全局有序：borrow 内二分定位候选 granule（不克隆全部），段内二分确认
-            let candidates = {
-                let Some(sparse) = self.sparse_primary.as_ref() else { return Ok(None) };
-                if sparse.granule_count() == 0 {
-                    None
-                } else {
-                    let mut lo = 0usize;
-                    let mut hi = sparse.granule_count();
-                    while lo < hi {
-                        let mid = (lo + hi) / 2;
-                        match cmp_values(&sparse.get_granule(mid).unwrap().first_key, key) {
-                            Some(std::cmp::Ordering::Greater) => hi = mid,
-                            _ => lo = mid + 1,
-                        }
-                    }
-                    let idx = lo.saturating_sub(1);
-                    if idx >= sparse.granule_count() {
-                        None
-                    } else {
-                        let g = sparse.get_granule(idx).unwrap();
-                        let c = (g.row_offset, g.row_count);
-                        if idx + 1 < sparse.granule_count() {
-                            let n = sparse.get_granule(idx + 1).unwrap();
-                            Some(vec![c, (n.row_offset, n.row_count)])
-                        } else {
-                            Some(vec![c])
-                        }
+
+        // 快路径：连续缓存只读确认（无 &mut，无除法寻址）
+        if let Some(cache) = self.pk_value_cache.as_ref() {
+            if sorted {
+                let idx = self.granule_candidate_idx(key);
+                let Some(idx) = idx else { return Ok(None) };
+                let (off, cnt) = self.granule_range(idx);
+                if let Some(v) = confirm_cached(key, off, cnt, cache, sorted)? {
+                    return Ok(Some(v));
+                }
+                // 相邻 granule（first_key 重复兜底）
+                if let Some((off2, cnt2)) = self.granule_range_opt(idx + 1) {
+                    if let Some(v) = confirm_cached(key, off2, cnt2, cache, sorted)? {
+                        return Ok(Some(v));
                     }
                 }
-            };
-            let Some(candidates) = candidates else { return Ok(None) };
-            for (offset, count) in candidates {
-                if let Some(v) = self.granule_confirm_range(key, pk_col, offset, count)? {
+                return Ok(None);
+            }
+            let total = self.granule_count();
+            for i in 0..total {
+                let Some((off, cnt)) = self.granule_range_opt(i) else { continue };
+                if let Some(v) = confirm_cached(key, off, cnt, cache, sorted)? {
                     return Ok(Some(v));
                 }
             }
             return Ok(None);
         }
 
-        // 全局无序（或未知）：轻量拷贝 (offset, count) 列表，逐个段内确认
-        let ranges = {
-            let Some(sparse) = self.sparse_primary.as_ref() else { return Ok(None) };
-            if sparse.granule_count() == 0 {
-                return Ok(None);
+        // 无缓存路径（Varchar 主键等）：逐次块内读元组（零分配）
+        if sorted {
+            let idx = self.granule_candidate_idx(key);
+            let Some(idx) = idx else { return Ok(None) };
+            let (off, cnt) = self.granule_range(idx);
+            if let Some(v) = self.granule_confirm_range(key, pk_col, off, cnt)? {
+                return Ok(Some(v));
             }
-            (0..sparse.granule_count())
-                .filter_map(|i| sparse.get_granule(i))
-                .map(|g| (g.row_offset, g.row_count))
-                .collect::<Vec<(u32, u32)>>()
-        };
-        for (offset, count) in ranges {
-            if let Some(v) = self.granule_confirm_range(key, pk_col, offset, count)? {
+            if let Some((off2, cnt2)) = self.granule_range_opt(idx + 1) {
+                if let Some(v) = self.granule_confirm_range(key, pk_col, off2, cnt2)? {
+                    return Ok(Some(v));
+                }
+            }
+            return Ok(None);
+        }
+
+        let total = self.granule_count();
+        for i in 0..total {
+            let Some((off, cnt)) = self.granule_range_opt(i) else { continue };
+            if let Some(v) = self.granule_confirm_range(key, pk_col, off, cnt)? {
                 return Ok(Some(v));
             }
         }
         Ok(None)
+    }
+
+    /// granule 总数（块内只读）
+    fn granule_count(&self) -> usize {
+        self.sparse_primary.as_ref().map(|s| s.granule_count()).unwrap_or(0)
+    }
+
+    /// 读取第 idx 个 granule 的 (row_offset, row_count)（Copy，零分配）
+    fn granule_range(&self, idx: usize) -> (u32, u32) {
+        self.granule_range_opt(idx).unwrap_or((0, 0))
+    }
+
+    /// 读取第 idx 个 granule 的 (row_offset, row_count)
+    fn granule_range_opt(&self, idx: usize) -> Option<(u32, u32)> {
+        self.sparse_primary.as_ref()?
+            .get_granule(idx)
+            .map(|g| (g.row_offset, g.row_count))
+    }
+
+    /// 有序 granule 二分：候选 granule 索引（first_key <= key 的最后一个）
+    fn granule_candidate_idx(&self, key: &Value) -> Option<usize> {
+        let sparse = self.sparse_primary.as_ref()?;
+        if sparse.granule_count() == 0 {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = sparse.granule_count();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match cmp_values(&sparse.get_granule(mid).unwrap().first_key, key) {
+                Some(std::cmp::Ordering::Greater) => hi = mid,
+                _ => lo = mid + 1,
+            }
+        }
+        let idx = lo.saturating_sub(1);
+        if idx < sparse.granule_count() { Some(idx) } else { None }
+    }
+
+    /// 主键列是否适合连续缓存（数值类型：Copy 值，无堆分配）
+    fn pk_cacheable(&self, col_idx: usize) -> bool {
+        use crate::common::types::DataType;
+        matches!(
+            self.table_def.columns.get(col_idx).map(|c| &c.data_type),
+            Some(DataType::Int32)
+                | Some(DataType::Int64)
+                | Some(DataType::Float32)
+                | Some(DataType::Float64)
+                | Some(DataType::Timestamp)
+        )
+    }
+
+    /// 惰性构建主键列连续缓存（跨 row group 拼装为单个 ColumnData）
+    fn build_pk_cache(&mut self) -> Result<()> {
+        let Some(pk_col) = self.sparse_pk_col else { return Ok(()) };
+        if !self.pk_cacheable(pk_col) {
+            return Ok(());
+        }
+        let total = self.total_rows() as usize;
+        let data_type = self.table_def.columns[pk_col].data_type.clone();
+        let mut cache = ColumnData::from_values_typed(&[], &data_type);
+        for rg in 0..self.row_groups.len() {
+            let data = self.read_column(rg, pk_col)?;
+            cache.append(data);
+        }
+        debug_assert_eq!(cache.len(), total, "pk cache 行数与列存不一致");
+        self.pk_value_cache = Some(cache);
+        Ok(())
+    }
+
+    /// 主键列缓存是否已构建（测试/统计用）
+    pub fn pk_cache_built(&self) -> bool {
+        self.pk_value_cache.is_some()
     }
 
     /// 单个 granule 段内确认：二分（段内有序）或线性（段内无序）
@@ -977,6 +1109,8 @@ impl ColumnStore {
             });
         }
 
+        // 数据整体替换 → 主键列缓存失效
+        self.pk_value_cache = None;
         Ok(())
     }
 
