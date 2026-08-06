@@ -956,6 +956,45 @@ impl Table {
     /// 阈值：超过 row_group_size 的 1/4 时直接走列式路径，避免行存→列存转换开销
     ///
     /// Compact 调度：写入 Delta 后根据策略决定是否触发合并
+    /// 主键唯一性检查（对齐 MemoryEngine 语义；无主键表零开销）
+    ///
+    /// 检查已存在主键 + 同批内自重复。位于落盘前，失败时零副作用。
+    #[inline]
+    fn check_pk_uniqueness(&self, rows: &[Vec<crate::Value>]) -> Result<()> {
+        let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_ref()) else {
+            return Ok(());
+        };
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            if let Some(cell) = row.get(pk_idx) {
+                if idx.contains_key(cell) || !seen.insert(cell.clone()) {
+                    return Err(EngramDbError::ConstraintViolation(format!(
+                        "UNIQUE constraint failed: {}={:?}",
+                        self.def.columns[pk_idx].name, cell
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 主键唯一性检查（单行版，insert_row apply 路径用）
+    #[inline]
+    fn check_pk_uniqueness_one(&self, row: &[crate::Value]) -> Result<()> {
+        let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_ref()) else {
+            return Ok(());
+        };
+        if let Some(cell) = row.get(pk_idx) {
+            if idx.contains_key(cell) {
+                return Err(EngramDbError::ConstraintViolation(format!(
+                    "UNIQUE constraint failed: {}={:?}",
+                    self.def.columns[pk_idx].name, cell
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn insert(&mut self, mut rows: Vec<Vec<Value>>) -> Result<u64> {
         let count = rows.len() as u64;
 
@@ -1038,6 +1077,9 @@ impl Table {
                 }
             }
         }
+
+        // 主键唯一性检查（已存在 + 同批自重复；失败时零副作用）
+        self.check_pk_uniqueness(&rows)?;
 
         let direct_threshold = (self.column_store.row_group_size() / 4) as usize;
 
@@ -1164,6 +1206,12 @@ impl Table {
                     }
                 }
             }
+        }
+
+        // 主键唯一性检查（列式：转置为行后检查，语义与 insert() 一致）
+        if self.primary_index.is_some() {
+            let rows = transpose_columns_to_rows(&columns, num_rows);
+            self.check_pk_uniqueness(&rows)?;
         }
 
         let direct_threshold = (self.column_store.row_group_size() / 4) as usize;
@@ -1311,6 +1359,9 @@ impl Table {
                 owned_row[ttl_col] = Value::Timestamp(now_ms);
             }
         }
+
+        // 主键唯一性检查（apply 路径对齐 MemoryEngine）
+        self.check_pk_uniqueness_one(&owned_row)?;
 
         // 写入 Delta 层（单行直接插入）
         self.delta_store.insert_row(row_id, owned_row)?;
@@ -2130,6 +2181,24 @@ impl Table {
 
         // 更新索引：先删旧条目，再插新条目
         if self.primary_index.is_some() && !old_rows.is_empty() {
+            // 主键迁移冲突检查：新主键已存在且非自身行 → 报错（对齐 insert 语义）
+            if let (Some(pk_idx), Some(idx)) = (self.def.primary_key_index(), self.primary_index.as_ref()) {
+                let mut seen = std::collections::HashSet::new();
+                for (i, new_row) in new_rows.iter().enumerate() {
+                    if let Some(cell) = new_row.get(pk_idx) {
+                        let occupied = match idx.get(cell) {
+                            Some(&existing_rid) => existing_rid != row_ids[i],
+                            None => false,
+                        };
+                        if occupied || !seen.insert(cell.clone()) {
+                            return Err(EngramDbError::ConstraintViolation(format!(
+                                "UNIQUE constraint failed: {}={:?}",
+                                self.def.columns[pk_idx].name, cell
+                            )));
+                        }
+                    }
+                }
+            }
             // Perf03：先删旧主键索引，再插新主键索引
             self.primary_index_remove_batch(&old_rows);
             for (i, new_row) in new_rows.iter().enumerate() {
@@ -2372,5 +2441,166 @@ impl crate::storage::engine::EngineTableOps for Table {
 
     fn lookup_primary_key(&self, pk: &crate::Value) -> Option<u32> {
         self.lookup_primary_key(pk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{ColumnDef, DataType, EngineType, TableDef};
+
+    fn make_def(pk: bool) -> TableDef {
+        TableDef {
+            id: 1,
+            engine: EngineType::Columnar,
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Int64,
+                    nullable: !pk,
+                    is_primary_key: pk,
+                    default_value: None,
+                    auto_increment: false,
+                },
+                ColumnDef::new("v", DataType::Varchar),
+            ],
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+            row_count: 0,
+        }
+    }
+
+    fn row(id: i64, v: &str) -> Vec<Value> {
+        vec![Value::Int64(id), Value::Varchar(v.to_string())]
+    }
+
+    #[test]
+    fn test_insert_and_row_count() {
+        let mut t = Table::new(make_def(false), CompactStrategy::manual());
+        t.insert(vec![row(1, "a"), row(2, "b")]).unwrap();
+        assert_eq!(t.row_count(), 2);
+        assert_eq!(t.get_row_by_id(1).unwrap().unwrap(), row(2, "b"));
+        assert!(t.get_row_by_id(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_insert_columns_and_pk_index() {
+        let mut t = Table::new(make_def(true), CompactStrategy::manual());
+        let cols = vec![
+            vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)],
+            vec![Value::Varchar("a".into()), Value::Varchar("b".into()), Value::Varchar("c".into())],
+        ];
+        t.insert_columns(cols).unwrap();
+        assert_eq!(t.row_count(), 3);
+        assert_eq!(t.lookup_primary_key(&Value::Int64(2)), Some(1), "批量插入维护主键索引");
+        assert_eq!(t.get_row_by_id(2).unwrap().unwrap(), row(3, "c"));
+    }
+
+    #[test]
+    fn test_compact_preserves_row_id_read() {
+        // 核心：compact（Delta→列存迁移）后按绝对 row_id 读取必须正确
+        let mut t = Table::new(make_def(false), CompactStrategy::manual());
+        let mut rows = Vec::new();
+        for i in 0..100 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        // 全部在 Delta 层
+        assert_eq!(t.get_row_by_id(30).unwrap().unwrap()[0], Value::Int64(30));
+        t.compact_delta_partial(30).unwrap();
+        assert_eq!(t.row_count(), 100, "compact 只迁移数据，行数不变");
+        // 前 30 行在列存，后 70 行在 Delta——绝对 row_id 读取必须稳定
+        for i in [0usize, 29, 30, 60, 99] {
+            assert_eq!(t.get_row_by_id(i as u32).unwrap().unwrap()[0], Value::Int64(i as i64),
+                "compact 后 row_id={} 读取错位", i);
+        }
+        // 再次 compact 至全部迁移
+        t.compact_delta_partial(1000).unwrap();
+        assert_eq!(t.row_count(), 100);
+        assert_eq!(t.get_row_by_id(99).unwrap().unwrap()[0], Value::Int64(99));
+    }
+
+    #[test]
+    fn test_compact_delta_eviction_threshold() {
+        // Incremental 策略：超过 threshold 后写入路径自动触发合并
+        let def = make_def(false);
+        let mut t = Table::new(def.clone(), CompactStrategy::incremental(10, 5));
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        assert_eq!(t.row_count(), 30);
+        // 数据正确性（无论迁移发生在何处）
+        for i in [0usize, 7, 15, 29] {
+            assert_eq!(t.get_row_by_id(i as u32).unwrap().unwrap()[0], Value::Int64(i as i64));
+        }
+    }
+
+    #[test]
+    fn test_delete_delta_rows_updates_pk() {
+        let mut t = Table::new(make_def(true), CompactStrategy::manual());
+        let mut rows = Vec::new();
+        for i in 0..10 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        t.delete_delta_rows(&[2, 5]).unwrap();
+        assert_eq!(t.row_count(), 8);
+        assert_eq!(t.lookup_primary_key(&Value::Int64(2)), None, "删除行主键移除");
+        assert_eq!(t.lookup_primary_key(&Value::Int64(5)), None);
+        assert_eq!(t.lookup_primary_key(&Value::Int64(3)), Some(3), "未删行主键保留");
+    }
+
+    #[test]
+    fn test_update_delta_rows_migrates_pk() {
+        let mut t = Table::new(make_def(true), CompactStrategy::manual());
+        let mut rows = Vec::new();
+        for i in 0..5 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        let n = t.update_delta_rows(&[(0, vec![(0, Value::Int64(100))])]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(t.lookup_primary_key(&Value::Int64(100)), Some(0), "主键迁移生效");
+        assert_eq!(t.lookup_primary_key(&Value::Int64(0)), None, "旧主键清除");
+        let r = t.get_row_by_id(0).unwrap().unwrap();
+        assert_eq!(r[0], Value::Int64(100));
+    }
+
+    #[test]
+    fn test_update_pk_migration_conflict_rejected() {
+        let mut t = Table::new(make_def(true), CompactStrategy::manual());
+        let mut rows = Vec::new();
+        for i in 0..5 {
+            rows.push(row(i, &format!("r{}", i)));
+        }
+        t.insert(rows).unwrap();
+        // 行 0 迁移主键到 3（已被行 3 占用）→ 报错
+        let err = t.update_delta_rows(&[(0, vec![(0, Value::Int64(3))])]).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        // 同批自重复迁移
+        let err2 = t.update_delta_rows(&[
+            (1, vec![(0, Value::Int64(50))]),
+            (2, vec![(0, Value::Int64(50))]),
+        ]).unwrap_err();
+        assert!(matches!(err2, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        // 原主键未被破坏
+        assert_eq!(t.lookup_primary_key(&Value::Int64(3)), Some(3));
+        assert_eq!(t.row_count(), 5);
+    }
+
+    #[test]
+    fn test_duplicate_pk_rejected_on_insert() {
+        let mut t = Table::new(make_def(true), CompactStrategy::manual());
+        t.insert(vec![row(1, "a")]).unwrap();
+        let err = t.insert(vec![row(1, "dup")]).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        assert_eq!(t.row_count(), 1, "冲突插入零副作用");
     }
 }

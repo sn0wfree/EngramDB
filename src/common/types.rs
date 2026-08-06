@@ -437,4 +437,28 @@ mod tests {
         assert_eq!(table.name, table2.name);
         assert_eq!(table.columns.len(), table2.columns.len());
     }
+
+    #[test]
+    fn test_engine_type_from_str() {
+        assert_eq!(EngineType::from_str("columnar"), Some(EngineType::Columnar));
+        assert_eq!(EngineType::from_str("COLUMNAR"), Some(EngineType::Columnar), "大小写不敏感");
+        assert_eq!(EngineType::from_str("memory"), Some(EngineType::Memory));
+        assert_eq!(EngineType::from_str("log"), Some(EngineType::Log));
+        assert_eq!(EngineType::from_str("unknown"), None);
+        assert_eq!(EngineType::from_str(""), None);
+    }
+
+    #[test]
+    fn test_engine_type_from_u8() {
+        assert_eq!(EngineType::from_u8(0), Some(EngineType::Columnar));
+        assert_eq!(EngineType::from_u8(1), Some(EngineType::Memory));
+        assert_eq!(EngineType::from_u8(2), Some(EngineType::Log));
+        assert_eq!(EngineType::from_u8(3), None);
+        assert_eq!(EngineType::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_engine_type_default() {
+        assert_eq!(EngineType::default(), EngineType::Columnar);
+    }
 }

@@ -187,4 +187,52 @@ mod tests {
         assert_eq!(restored.next_table_id, 1);
         assert!(restored.tables.is_empty());
     }
+
+    #[test]
+    fn test_catalog_truncated_data_rejected() {
+        assert!(CatalogSnapshot::from_bytes(&[0u8; 7]).is_err(), "短于 8 字节应报错");
+        // 截断的 table id
+        let bytes = vec![0u8, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+        assert!(CatalogSnapshot::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_catalog_corrupt_def_rejected() {
+        let snapshot = CatalogSnapshot {
+            next_table_id: 1,
+            tables: vec![(
+                1,
+                TableDef::new(1, "t", vec![ColumnDef::new("id", DataType::Int64)]),
+            )],
+        };
+        let mut bytes = snapshot.to_bytes().unwrap();
+        // 破坏 def 字节
+        let def_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let def_start = 16;
+        for b in &mut bytes[def_start..def_start + def_len] {
+            *b ^= 0xFF;
+        }
+        assert!(CatalogSnapshot::from_bytes(&bytes).is_err(), "损坏的 TableDef 应报错");
+    }
+
+    #[test]
+    fn test_catalog_collect_sorts_by_id() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            2,
+            crate::storage::engine::EngineTable::Memory(crate::storage::memory_engine::MemoryTable::new(
+                TableDef::new(2, "b", vec![ColumnDef::new("id", DataType::Int64)]),
+            )),
+        );
+        tables.insert(
+            1,
+            crate::storage::engine::EngineTable::Memory(crate::storage::memory_engine::MemoryTable::new(
+                TableDef::new(1, "a", vec![ColumnDef::new("id", DataType::Int64)]),
+            )),
+        );
+        let snap = CatalogSnapshot::collect(3, &tables);
+        assert_eq!(snap.tables[0].0, 1);
+        assert_eq!(snap.tables[1].0, 2);
+        assert_eq!(snap.next_table_id, 3);
+    }
 }
