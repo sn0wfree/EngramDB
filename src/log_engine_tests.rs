@@ -394,3 +394,86 @@ fn test_prepared_direct_batch() {
     assert_eq!(r.rows[0][0], Value::Int64(10));
     conn.close().unwrap();
 }
+
+// ============================================================
+// v0.18 P0-1 prepared 直通路径护栏测试（锁定内联 eval 与计划路径等价性）
+// ============================================================
+
+#[test]
+fn test_prepared_direct_guard_nonexpr() {
+    // 分叉点 1：非平凡表达式（BinaryOp）在直通 `_` 臂与计划路径报同一错误
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let sql = "INSERT INTO t VALUES (1+2, ?)";
+    let direct_err = conn.execute_prepared(&conn.prepare(sql).unwrap(), &[Value::Varchar("x".into())]).unwrap_err();
+    let plan_err = conn.execute(sql).unwrap_err();
+    assert_eq!(direct_err.to_string(), plan_err.to_string(),
+        "直通 `_` 臂与 eval_constant_expr 必须报同一错误");
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_guard_table_missing() {
+    // 直通不掩盖表错误：表不存在时两条路径都报 TableNotFound
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    let sql = "INSERT INTO missing VALUES (?, ?)";
+    let direct_err = conn.execute_prepared(&conn.prepare(sql).unwrap(), &[Value::Int64(1), Value::Int64(2)]).unwrap_err();
+    let plan_err = conn.execute("INSERT INTO missing VALUES (1, 2)").unwrap_err();
+    assert!(matches!(direct_err, crate::common::error::EngramDbError::TableNotFound(_)));
+    assert!(matches!(plan_err, crate::common::error::EngramDbError::TableNotFound(_)));
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_guard_jump_placeholder() {
+    // 分叉点 2：跳跃占位符 $2/$1（param_count=2），入口校验不误报且映射正确
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES ($2, $1)").unwrap();
+    conn.execute_prepared(&stmt, &[Value::Varchar("v1".into()), Value::Int64(7)]).unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT ts, v FROM t").unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int64(7), Value::Varchar("v1".into())]],
+        "$2 -> params[1]，$1 -> params[0]");
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_guard_multirow_mixed() {
+    // 内联循环多行 + 混合字面量/占位符：3 行全部正确
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (ts INT64, v TEXT) ENGINE = Log").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES (1, ?), (2, ?), (3, ?)").unwrap();
+    conn.execute_prepared(&stmt, &[
+        Value::Varchar("a".into()), Value::Varchar("b".into()), Value::Varchar("c".into()),
+    ]).unwrap();
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT ts, v FROM t ORDER BY ts").unwrap();
+    assert_eq!(r.rows, vec![
+        vec![Value::Int64(1), Value::Varchar("a".into())],
+        vec![Value::Int64(2), Value::Varchar("b".into())],
+        vec![Value::Int64(3), Value::Varchar("c".into())],
+    ]);
+    conn.close().unwrap();
+}
+
+#[test]
+fn test_prepared_direct_guard_column_vs_plain() {
+    // 两条 eval 路径（无列名内联 / 有列名 eval_insert_rows）插入同值结果一致
+    let mut conn = super::Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t (a INT64, b TEXT) ENGINE = Log").unwrap();
+    let plain = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    let columned = conn.prepare("INSERT INTO t (a, b) VALUES (?, ?)").unwrap();
+    for i in 0..5 {
+        conn.execute_prepared(&plain, &[Value::Int64(i as i64), Value::Varchar(format!("p{}", i))]).unwrap();
+        conn.execute_prepared(&columned, &[Value::Int64(i as i64), Value::Varchar(format!("c{}", i))]).unwrap();
+    }
+    conn.sync_wal().unwrap();
+    let r = conn.execute("SELECT a, b FROM t ORDER BY a").unwrap();
+    assert_eq!(r.rows.len(), 10);
+    for i in 0..5 {
+        assert_eq!(r.rows[i * 2], vec![Value::Int64(i as i64), Value::Varchar(format!("p{}", i))]);
+        assert_eq!(r.rows[i * 2 + 1], vec![Value::Int64(i as i64), Value::Varchar(format!("c{}", i))]);
+    }
+    conn.close().unwrap();
+}
