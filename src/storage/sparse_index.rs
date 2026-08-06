@@ -6,6 +6,7 @@
 //! 默认 granule 大小：8192 行（与 ClickHouse 一致）
 //! 10 亿行仅需数 MB 索引（vs B+Tree 数 GB）
 
+use crate::common::value_cmp::total_cmp;
 use crate::Value;
 
 /// 默认 granule 大小（每 granule 的行数）
@@ -196,30 +197,7 @@ impl SparseIndex {
 
 /// Value 比较：a > b
 fn value_gt(a: &Value, b: &Value) -> bool {
-    use Value::*;
-    match (a, b) {
-        (Int32(x), Int32(y)) => x > y,
-        (Int64(x), Int64(y)) => x > y,
-        (Int32(x), Int64(y)) => (*x as i64) > *y,
-        (Int64(x), Int32(y)) => *x > (*y as i64),
-        (Int32(x), Float64(y)) => (*x as f64) > *y,
-        (Float64(x), Int32(y)) => *x > (*y as f64),
-        (Int64(x), Float64(y)) => (*x as f64) > *y,
-        (Float64(x), Int64(y)) => *x > (*y as f64),
-        (Float64(x), Float64(y)) => x > y,
-        (Timestamp(x), Timestamp(y)) => x > y,
-        (Timestamp(x), Int32(y)) => *x > (*y as i64),
-        (Timestamp(x), Int64(y)) => *x > *y,
-        (Int32(x), Timestamp(y)) => (*x as i64) > *y,
-        (Int64(x), Timestamp(y)) => *x > *y,
-        (Timestamp(x), Float64(y)) => (*x as f64) > *y,
-        (Float64(x), Timestamp(y)) => *x > (*y as f64),
-        (Varchar(x), Varchar(y)) => x > y,
-        (Boolean(x), Boolean(y)) => x > y,
-        (Null, _) => false,
-        (_, Null) => true,
-        _ => false,
-    }
+    total_cmp(a, b) == std::cmp::Ordering::Greater
 }
 
 #[cfg(test)]

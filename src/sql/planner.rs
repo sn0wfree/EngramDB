@@ -4,6 +4,7 @@
 //! 计划树结构：TableScan -> Filter -> Aggregate -> Projection -> OrderBy -> Limit
 
 use crate::common::error::{EngramDbError, Result};
+use crate::common::value_cmp::total_cmp;
 use crate::storage::Database;
 use crate::Value;
 use log::trace;
@@ -1925,19 +1926,13 @@ fn merge_range_predicates(a: RangePredicate, b: RangePredicate) -> Option<RangeP
     })
 }
 
-/// 规划器内的 Value 比较（用于边界合并，与跳表 key_less 语义一致）
+/// 规划器内的 Value 比较（用于边界合并）
+///
+/// 委托 `common::value_cmp::total_cmp`：NULL-aware + 跨类型数值互通。
+/// 注：旧实现用 `(!x).cmp(&!y)` 让 Boolean 颠倒序，疑似 bug——已修正为标准序
+/// （false < true），与 skiplist 语义对齐。
 fn value_cmp_planner(a: &Value, b: &Value) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-        (Value::Null, _) => std::cmp::Ordering::Less,
-        (_, Value::Null) => std::cmp::Ordering::Greater,
-        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Int32(x), Value::Int32(y)) => x.cmp(y),
-        (Value::Float64(x), Value::Float64(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
-        (Value::Boolean(x), Value::Boolean(y)) => (!x).cmp(&!y),
-        _ => std::cmp::Ordering::Equal,
-    }
+    total_cmp(a, b)
 }
 
 /// 尝试生成索引范围扫描计划（①：IndexRangeScan）
@@ -3869,15 +3864,15 @@ mod tests {
             std::cmp::Ordering::Less);
         assert_eq!(value_cmp_planner(&Value::Varchar("a".into()), &Value::Varchar("b".into())),
             std::cmp::Ordering::Less);
-        // Boolean：false > true（实现语义：!x 比较）
+        // Boolean：标准序 false < true（旧 `(!x).cmp(&!y)` 反序疑似 bug，已修正）
         assert_eq!(value_cmp_planner(&Value::Boolean(false), &Value::Boolean(true)),
-            std::cmp::Ordering::Greater);
+            std::cmp::Ordering::Less);
         // Null 最小
         assert_eq!(value_cmp_planner(&Value::Null, &Value::Int64(0)),
             std::cmp::Ordering::Less);
-        // 跨类型 → Equal
+        // 跨类型 → type_rank 兜底（Int64 rank 2 < Varchar rank 4）
         assert_eq!(value_cmp_planner(&Value::Int64(1), &Value::Varchar("a".into())),
-            std::cmp::Ordering::Equal);
+            std::cmp::Ordering::Less);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! 3. 在每个分区内计算窗口函数
 
 use crate::common::error::Result;
+use crate::common::value_cmp::total_cmp;
 use crate::executor::physical_plan::{WindowFunctionExpr, WindowFuncType};
 use crate::executor::vector::DataChunk;
 use crate::sql::ast::{WindowSpec, WindowFrameBound, Expression};
@@ -284,18 +285,7 @@ fn resolve_column_index(expr: &Expression, column_names: &[String]) -> Option<us
 }
 
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-        (Value::Null, _) => std::cmp::Ordering::Less,
-        (_, Value::Null) => std::cmp::Ordering::Greater,
-        (Value::Int32(x), Value::Int32(y)) => x.cmp(y),
-        (Value::Int32(x), Value::Int64(y)) => (*x as i64).cmp(y),
-        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Int64(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
-        (Value::Float64(x), Value::Float64(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
-        _ => std::cmp::Ordering::Equal,
-    }
+    total_cmp(a, b)
 }
 
 fn chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<Value>> {

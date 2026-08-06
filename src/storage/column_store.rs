@@ -6,6 +6,7 @@ use crate::common::error::Result;
 use crate::common::types::{DataType, TableDef};
 use crate::common::config::CompressionType;
 use crate::common::column_data::{ColumnData, ColumnValue};
+use crate::common::value_cmp::{total_cmp, total_eq};
 use super::bloom::BloomFilter;
 use super::sparse_index::SparseIndex;
 use crate::Value;
@@ -1362,22 +1363,7 @@ pub fn matches_predicate_typed(data: &ColumnData, row: usize, op: PredicateOp, t
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
-    use Value::*;
-    match (a, b) {
-        (Int32(x), Int32(y)) => x == y,
-        (Int64(x), Int64(y)) => x == y,
-        (Int32(x), Int64(y)) => (*x as i64) == *y,
-        (Int64(x), Int32(y)) => *x == (*y as i64),
-        (Float64(x), Float64(y)) => x == y,
-        (Int32(x), Float64(y)) => (*x as f64) == *y,
-        (Int64(x), Float64(y)) => (*x as f64) == *y,
-        (Float64(x), Int32(y)) => *x == (*y as f64),
-        (Float64(x), Int64(y)) => *x == (*y as f64),
-        (Varchar(x), Varchar(y)) => x == y,
-        (Boolean(x), Boolean(y)) => x == y,
-        (Null, Null) => true,
-        _ => false,
-    }
+    total_eq(a, b)
 }
 
 // ============================================================================
@@ -1385,35 +1371,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 // ============================================================================
 
 pub(crate) fn value_less(a: &Value, b: &Value) -> bool {
-    use Value::*;
-    match (a, b) {
-        (Int32(x), Int32(y)) => x < y,
-        (Int64(x), Int64(y)) => x < y,
-        (Int32(x), Int64(y)) => (*x as i64) < *y,
-        (Int64(x), Int32(y)) => *x < (*y as i64),
-        (Float64(x), Float64(y)) => x < y,
-        (Int32(x), Float64(y)) => (*x as f64) < *y,
-        (Int64(x), Float64(y)) => (*x as f64) < *y,
-        (Float64(x), Int32(y)) => *x < (*y as f64),
-        (Float64(x), Int64(y)) => *x < (*y as f64),
-        // M3：Timestamp 与数值互比（时间列 MinMax 跳读：SQL 字面量均为 Int64）
-        (Timestamp(x), Timestamp(y)) => x < y,
-        (Timestamp(x), Int32(y)) => *x < (*y as i64),
-        (Timestamp(x), Int64(y)) => *x < *y,
-        (Int32(x), Timestamp(y)) => (*x as i64) < *y,
-        (Int64(x), Timestamp(y)) => *x < *y,
-        (Timestamp(x), Float64(y)) => (*x as f64) < *y,
-        (Float64(x), Timestamp(y)) => *x < (*y as f64),
-        (Varchar(x), Varchar(y)) => x < y,
-        (Boolean(x), Boolean(y)) => x < y,
-        (Null, _) => true,
-        (_, Null) => false,
-        _ => false,
-    }
+    total_cmp(a, b) == std::cmp::Ordering::Less
 }
 
 pub(crate) fn value_greater(a: &Value, b: &Value) -> bool {
-    value_less(b, a)
+    total_cmp(a, b) == std::cmp::Ordering::Greater
 }
 
 /// 将 Value 序列化为字节（用于持久化）

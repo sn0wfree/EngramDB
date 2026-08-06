@@ -8,6 +8,7 @@
 //! - 简单统计即可支撑大部分优化决策（PostgreSQL 风格）
 
 use crate::Value;
+use crate::common::value_cmp::total_cmp;
 use crate::executor::vector::{DataChunk, Vector};
 
 /// 表级统计信息
@@ -293,25 +294,11 @@ fn count_distinct(values: &[&Value]) -> u64 {
 }
 
 fn value_less(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Int32(x), Value::Int32(y)) => x < y,
-        (Value::Int64(x), Value::Int64(y)) => x < y,
-        (Value::Float64(x), Value::Float64(y)) => x < y,
-        (Value::Varchar(x), Value::Varchar(y)) => x < y,
-        (Value::Boolean(x), Value::Boolean(y)) => x < y,
-        _ => false,
-    }
+    total_cmp(a, b) == std::cmp::Ordering::Less
 }
 
 fn value_greater(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Int32(x), Value::Int32(y)) => x > y,
-        (Value::Int64(x), Value::Int64(y)) => x > y,
-        (Value::Float64(x), Value::Float64(y)) => x > y,
-        (Value::Varchar(x), Value::Varchar(y)) => x > y,
-        (Value::Boolean(x), Value::Boolean(y)) => x > y,
-        _ => false,
-    }
+    total_cmp(a, b) == std::cmp::Ordering::Greater
 }
 
 // ============================================================================

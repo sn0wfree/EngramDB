@@ -13,6 +13,7 @@
 
 use crate::Value;
 use crate::common::error::{Result, EngramDbError};
+use crate::common::value_cmp::total_cmp;
 use rand::Rng;
 use std::cmp::Ordering;
 
@@ -434,21 +435,11 @@ impl SkipListIndex {
     // --- 比较辅助函数 ---
 
     fn key_less(&self, a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Null, Value::Null) => false,
-            (Value::Null, _) => true,
-            (_, Value::Null) => false,
-            (Value::Int64(x), Value::Int64(y)) => x < y,
-            (Value::Int32(x), Value::Int32(y)) => x < y,
-            (Value::Float64(x), Value::Float64(y)) => x < y,
-            (Value::Varchar(x), Value::Varchar(y)) => x < y,
-            (Value::Boolean(x), Value::Boolean(y)) => !*x && *y,
-            _ => false,
-        }
+        total_cmp(a, b) == Ordering::Less
     }
 
     fn key_greater(&self, a: &Value, b: &Value) -> bool {
-        self.key_less(b, a)
+        total_cmp(a, b) == Ordering::Greater
     }
 
     /// 迭代器：按顺序遍历所有 key（兼容旧 API）

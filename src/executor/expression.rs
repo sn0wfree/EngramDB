@@ -10,6 +10,7 @@
 //! - 布尔短路（AND/OR 提前终止）
 
 use crate::common::error::{EngramDbError, Result};
+use crate::common::value_cmp::{total_cmp, total_eq};
 use crate::Value;
 use rand::Rng;
 use crate::sql::ast::{Expression, BinaryOperator, UnaryOperator, DataType};
@@ -1337,52 +1338,7 @@ fn eval_compare(left: &Value, op: BinaryOperator, right: &Value) -> Value {
 }
 
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
-    match (a, b) {
-        (Value::Null, Value::Null) => Equal,
-        (Value::Null, _) => Less,
-        (_, Value::Null) => Greater,
-        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-        (Value::Int32(x), Value::Int32(y)) => x.cmp(y),
-        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Int32(x), Value::Int64(y)) => (*x as i64).cmp(y),
-        (Value::Int64(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
-        (Value::Float64(x), Value::Float64(y)) => x.partial_cmp(y).unwrap_or(Equal),
-        (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
-        // S1.3：Timestamp 按 i64 数值语义比较（此前落 `_` 分支：as_f64 为 None → tag 恒等）
-        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Timestamp(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
-        (Value::Int32(x), Value::Timestamp(y)) => (*x as i64).cmp(y),
-        (Value::Timestamp(x), Value::Int64(y)) => x.cmp(y),
-        (Value::Int64(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Timestamp(x), Value::Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
-        (Value::Float64(x), Value::Timestamp(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
-        // 跨类型比较：尝试数值比较
-        _ => {
-            if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
-                x.partial_cmp(&y).unwrap_or(Equal)
-            } else {
-                // 类型不兼容，按类型 discriminant 排序
-                fn value_tag(v: &Value) -> u8 {
-                    match v {
-                        Value::Null => 0,
-                        Value::Boolean(_) => 1,
-                        Value::Int32(_) => 2,
-                        Value::Int64(_) => 3,
-                        Value::Float32(_) => 4,
-                        Value::Float64(_) => 5,
-                        Value::Varchar(_) => 6,
-                        Value::Json(_) => 7,
-                        Value::Vector(_) => 8,
-                        Value::Blob(_) => 9,
-                        Value::Timestamp(_) => 10,
-                        Value::VectorInt8(_) => 11,
-                    }
-                }
-                value_tag(a).cmp(&value_tag(b))
-            }
-        }
-    }
+    total_cmp(a, b)
 }
 
 // --- 逻辑运算（三值逻辑）---
@@ -1640,14 +1596,8 @@ fn eval_in_list(expr_vec: &Vector, list_vecs: &[Vector]) -> Result<Vector> {
 }
 
 fn value_eq(a: &Value, b: &Value) -> bool {
-    // NULL = NULL 为 true（IN 语义）
-    if a.is_null() && b.is_null() {
-        return true;
-    }
-    if a.is_null() || b.is_null() {
-        return false;
-    }
-    value_cmp(a, b) == std::cmp::Ordering::Equal
+    // NULL-aware：NULL=NULL → true（IN 语义），NULL vs 非空 → false
+    total_eq(a, b)
 }
 
 // ============================================================================

@@ -4,6 +4,7 @@
 //! 后续可扩展为外部排序（外排）以支持超大数据集。
 
 use crate::common::error::Result;
+use crate::common::value_cmp::total_cmp;
 use crate::Value;
 
 use super::super::physical_plan::{SortKey, SortDirection};
@@ -335,51 +336,10 @@ impl<'a> Ord for HeapRow<'a> {
 
 /// Value 比较（用于排序）
 ///
-/// 排序规则：
-/// - NULL 排在最前（ASC）或最后（DESC）
-/// - 同类型按值比较
-/// - 不同类型按类型优先级排序（Int64 < Float64 < Varchar < ...）
+/// 委托 `common::value_cmp::total_cmp`：NULL-aware + 跨类型数值/Timestamp 互通
+/// + 不相关类型 type-rank 兜底。
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
-    use Value::*;
-
-    match (a, b) {
-        (Null, Null) => Equal,
-        (Null, _) => Less,      // NULL 排在最前
-        (_, Null) => Greater,
-
-        (Int64(x), Int64(y)) => x.cmp(y),
-        (Int64(x), Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
-        (Float64(x), Int64(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
-        (Float64(x), Float64(y)) => x.partial_cmp(y).unwrap_or(Equal),
-
-        (Varchar(x), Varchar(y)) => x.cmp(y),
-
-        (Boolean(x), Boolean(y)) => x.cmp(y),
-
-        (Int32(x), Int32(y)) => x.cmp(y),
-        (Int32(x), Int64(y)) => (*x as i64).cmp(y),
-        (Int64(x), Int32(y)) => x.cmp(&(*y as i64)),
-        (Int32(x), Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
-        (Float64(x), Int32(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
-
-        // S1.1：Timestamp 按 i64 数值语义比较（此前落 `_` 分支按类型名恒等，
-        // 导致 Timestamp 列排序失效——保持原序）
-        (Timestamp(x), Timestamp(y)) => x.cmp(y),
-        (Timestamp(x), Int32(y)) => x.cmp(&(*y as i64)),
-        (Int32(x), Timestamp(y)) => (*x as i64).cmp(y),
-        (Timestamp(x), Int64(y)) => x.cmp(y),
-        (Int64(x), Timestamp(y)) => x.cmp(y),
-        (Timestamp(x), Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
-        (Float64(x), Timestamp(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
-
-        _ => {
-            // 不同类型：按类型名排序（确定性）
-            let type_a = std::mem::discriminant(a);
-            let type_b = std::mem::discriminant(b);
-            format!("{:?}", type_a).cmp(&format!("{:?}", type_b))
-        }
-    }
+    total_cmp(a, b)
 }
 
 // ============================================================================

@@ -6,6 +6,7 @@ use crate::common::config::CompactStrategy;
 use crate::common::error::Result;
 use crate::common::types::{TableDef, IndexDef, ColumnDef};
 use crate::common::column_data::ColumnData;
+use crate::common::value_cmp::total_cmp;
 use crate::Value;
 use crate::executor::vector::{DataChunk, Vector};
 
@@ -79,28 +80,11 @@ fn sort_columns_by_key(columns: &mut [Vec<Value>], pk_idx: usize) {
     }
 }
 
-/// Value 全序比较（排序用；数值按数值语义，Varchar/Json 字典序，Boolean 布尔序，
-/// 不可比类型按调试表示兜底）
+/// Value 全序比较（排序用）
+///
+/// 委托 `common::value_cmp::total_cmp`（统一 NULL-aware 跨类型语义）。
 fn cmp_values_for_sort(a: &Value, b: &Value) -> std::cmp::Ordering {
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
-        return x.cmp(&y);
-    }
-    if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
-        return x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
-    }
-    if let (Value::Varchar(x), Value::Varchar(y)) = (a, b) {
-        return x.cmp(y);
-    }
-    if let (Value::Json(x), Value::Json(y)) = (a, b) {
-        return x.cmp(y);
-    }
-    if let (Value::Boolean(x), Value::Boolean(y)) = (a, b) {
-        return x.cmp(y);
-    }
-    if let (Value::Null, Value::Null) = (a, b) {
-        return std::cmp::Ordering::Equal;
-    }
-    format!("{:?}", a).cmp(&format!("{:?}", b))
+    total_cmp(a, b)
 }
 
 /// 将行列表转置为列格式（行 -> 列式存储）
