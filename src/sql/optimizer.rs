@@ -1531,4 +1531,1037 @@ mod tests {
             _ => panic!("Expected TableScan"),
         }
     }
+
+    // ============ 常量折叠深路径 ============
+
+    #[test]
+    fn test_fold_division_and_modulo() {
+        // 10 / 3 = 3.33…（非整数结果 → Float64，无整数截断）
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(10))),
+            op: Divide,
+            right: Box::new(Literal(Value::Int64(3))),
+        };
+        assert!(matches!(fold_expression(e),
+            Literal(Value::Float64(v)) if (v - 10.0 / 3.0).abs() < 1e-9));
+        // 10 / 2 = 5（整数结果 → Int64）
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(10))),
+            op: Divide,
+            right: Box::new(Literal(Value::Int64(2))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Int64(5))));
+        // 1 / 2 = 0.5（结果非整 → Float64）
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(1))),
+            op: Divide,
+            right: Box::new(Literal(Value::Int64(2))),
+        };
+        assert!(matches!(fold_expression(e),
+            Literal(Value::Float64(v)) if (v - 0.5).abs() < 1e-9));
+        // 10 % 3 = 1
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(10))),
+            op: Modulo,
+            right: Box::new(Literal(Value::Int64(3))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Int64(1))));
+        // 除零：不折叠，保留表达式
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(1))),
+            op: Divide,
+            right: Box::new(Literal(Value::Int64(0))),
+        };
+        assert!(matches!(fold_expression(e), BinaryOp { .. }));
+        // 模零：保留表达式
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(1))),
+            op: Modulo,
+            right: Box::new(Literal(Value::Int64(0))),
+        };
+        assert!(matches!(fold_expression(e), BinaryOp { .. }));
+        // Float64 运算 → Float64
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Float64(1.5))),
+            op: Plus,
+            right: Box::new(Literal(Value::Float64(2.5))),
+        };
+        assert!(matches!(fold_expression(e),
+            Literal(Value::Float64(v)) if (v - 4.0).abs() < 1e-9));
+        // Float32 不支持数值折叠（as_f64 不含 Float32）→ 保留
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Float32(1.5))),
+            op: Plus,
+            right: Box::new(Literal(Value::Float32(2.5))),
+        };
+        assert!(matches!(fold_expression(e), BinaryOp { .. }));
+        // 负号参与：-5 + 3 = -2
+        let e = BinaryOp {
+            left: Box::new(UnaryOp {
+                op: UnaryOperator::Negate,
+                expr: Box::new(Literal(Value::Int64(5))),
+            }),
+            op: Plus,
+            right: Box::new(Literal(Value::Int64(3))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Int64(-2))));
+    }
+
+    #[test]
+    fn test_fold_cross_type_comparison() {
+        // 1 < 2.5 → true（数值跨类型比较走 as_f64）
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(1))),
+            op: Lt,
+            right: Box::new(Literal(Value::Float64(2.5))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(true))));
+        // Int64(1) == Float64(1.0)：Value 按变体比较 → false
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(1))),
+            op: Eq,
+            right: Box::new(Literal(Value::Float64(1.0))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(false))));
+        // 同变体布尔相等
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Boolean(false))),
+            op: Eq,
+            right: Box::new(Literal(Value::Boolean(false))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(true))));
+        // 布尔 < 比较：无数值语义 → 保留表达式
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Boolean(false))),
+            op: Lt,
+            right: Box::new(Literal(Value::Boolean(true))),
+        };
+        assert!(matches!(fold_expression(e), BinaryOp { .. }));
+        // Null 与任何值 Eq → false（变体不同），Null == Null → true
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Null)),
+            op: Eq,
+            right: Box::new(Literal(Value::Null)),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(true))));
+    }
+
+    #[test]
+    fn test_fold_logic_identity() {
+        // x AND true → x
+        let e = BinaryOp {
+            left: Box::new(ColumnRef { table: None, column: "a".into() }),
+            op: And,
+            right: Box::new(Literal(Value::Boolean(true))),
+        };
+        assert!(matches!(fold_expression(e), ColumnRef { .. }));
+        // false AND x → false
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Boolean(false))),
+            op: And,
+            right: Box::new(ColumnRef { table: None, column: "a".into() }),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(false))));
+        // true OR x → true
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Boolean(true))),
+            op: Or,
+            right: Box::new(ColumnRef { table: None, column: "a".into() }),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(true))));
+        // x OR false → x
+        let e = BinaryOp {
+            left: Box::new(ColumnRef { table: None, column: "a".into() }),
+            op: Or,
+            right: Box::new(Literal(Value::Boolean(false))),
+        };
+        assert!(matches!(fold_expression(e), ColumnRef { .. }));
+        // 非布尔 AND（Int64 1 AND x）→ 不恒等化简，保留
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(1))),
+            op: And,
+            right: Box::new(ColumnRef { table: None, column: "a".into() }),
+        };
+        assert!(matches!(fold_expression(e), BinaryOp { .. }));
+        // 双方字面量：true AND false → false
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Boolean(true))),
+            op: And,
+            right: Box::new(Literal(Value::Boolean(false))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(false))));
+        // 双重恒等化简：x AND true AND false → false
+        let e = BinaryOp {
+            left: Box::new(BinaryOp {
+                left: Box::new(ColumnRef { table: None, column: "a".into() }),
+                op: And,
+                right: Box::new(Literal(Value::Boolean(true))),
+            }),
+            op: And,
+            right: Box::new(Literal(Value::Boolean(false))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(false))));
+    }
+
+    #[test]
+    fn test_fold_string_concat() {
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Varchar("a".into()))),
+            op: Concat,
+            right: Box::new(Literal(Value::Varchar("b".into()))),
+        };
+        assert!(matches!(fold_expression(e), Literal(Value::Varchar(s)) if s == "ab"));
+        // 非字符串拼接 → 保留
+        let e = BinaryOp {
+            left: Box::new(Literal(Value::Int64(1))),
+            op: Concat,
+            right: Box::new(Literal(Value::Varchar("b".into()))),
+        };
+        assert!(matches!(fold_expression(e), BinaryOp { .. }));
+    }
+
+    #[test]
+    fn test_fold_unary_limits() {
+        // NOT 非布尔 → 保留
+        let e = UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(Literal(Value::Int64(5))),
+        };
+        assert!(matches!(fold_expression(e), UnaryOp { .. }));
+        // Negate Float64
+        let e = UnaryOp {
+            op: UnaryOperator::Negate,
+            expr: Box::new(Literal(Value::Float64(2.5))),
+        };
+        assert!(matches!(fold_expression(e),
+            Literal(Value::Float64(v)) if (v + 2.5).abs() < 1e-9));
+        // Negate 非数值 → 保留
+        let e = UnaryOp {
+            op: UnaryOperator::Negate,
+            expr: Box::new(Literal(Value::Boolean(true))),
+        };
+        assert!(matches!(fold_expression(e), UnaryOp { .. }));
+        // 双重 NOT：NOT (NOT true) → true
+        let inner = UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(Literal(Value::Boolean(true))),
+        };
+        let e = UnaryOp { op: UnaryOperator::Not, expr: Box::new(inner) };
+        assert!(matches!(fold_expression(e), Literal(Value::Boolean(true))));
+        // Negate 整数最小值边界：-(-5) = 5
+        let inner = UnaryOp {
+            op: UnaryOperator::Negate,
+            expr: Box::new(Literal(Value::Int64(5))),
+        };
+        let e = UnaryOp { op: UnaryOperator::Negate, expr: Box::new(inner) };
+        assert!(matches!(fold_expression(e), Literal(Value::Int64(5))));
+    }
+
+    #[test]
+    fn test_fold_cast_variants() {
+        use crate::common::types::DataType;
+        let cast = |v: Value, t: DataType| {
+            fold_expression(Cast {
+                expr: Box::new(Literal(v)),
+                data_type: t,
+            })
+        };
+        // Int64 → Boolean（非零为 true）
+        assert!(matches!(cast(Value::Int64(1), DataType::Boolean),
+            Literal(Value::Boolean(true))));
+        assert!(matches!(cast(Value::Int64(0), DataType::Boolean),
+            Literal(Value::Boolean(false))));
+        // Boolean → Int64：as_i64 不支持 → 保留 Cast
+        assert!(matches!(cast(Value::Boolean(true), DataType::Int64), Cast { .. }));
+        // Float64 → Int64 截断
+        assert!(matches!(cast(Value::Float64(3.7), DataType::Int64),
+            Literal(Value::Int64(3))));
+        // Int64 → Varchar
+        assert!(matches!(cast(Value::Int64(42), DataType::Varchar),
+            Literal(Value::Varchar(s)) if s == "42"));
+        // Varchar → Json
+        assert!(matches!(cast(Value::Varchar("{}".into()), DataType::Json),
+            Literal(Value::Json(s)) if s == "{}"));
+        // Int64 → Float32
+        assert!(matches!(cast(Value::Int64(5), DataType::Float32),
+            Literal(Value::Float32(f)) if f == 5.0));
+        // Timestamp → Varchar
+        assert!(matches!(cast(Value::Timestamp(123), DataType::Varchar),
+            Literal(Value::Varchar(_))));
+        // Varchar → Int64 无规则 → 保留
+        assert!(matches!(cast(Value::Varchar("5".into()), DataType::Int64), Cast { .. }));
+        // Vector → Varchar 无规则 → 保留
+        assert!(matches!(cast(Value::Vector(vec![1.0]), DataType::Varchar), Cast { .. }));
+        // Null → Varchar → Null
+        assert!(matches!(cast(Value::Null, DataType::Varchar), Literal(Value::Null)));
+        // Null → Blob → Null
+        assert!(matches!(cast(Value::Null, DataType::Blob), Literal(Value::Null)));
+    }
+
+    #[test]
+    fn test_fold_case_branches() {
+        // CASE WHEN false THEN 1 WHEN true THEN 2 ELSE 3 END → CASE WHEN true THEN 2 ELSE 3
+        let e = Case {
+            when_then: vec![
+                (Literal(Value::Boolean(false)), Literal(Value::Int64(1))),
+                (Literal(Value::Boolean(true)), Literal(Value::Int64(2))),
+            ],
+            else_expr: Some(Box::new(Literal(Value::Int64(3)))),
+        };
+        match fold_expression(e) {
+            Case { when_then, else_expr } => {
+                assert_eq!(when_then.len(), 1);
+                assert!(matches!(&when_then[0].0, Literal(Value::Boolean(true))));
+                assert!(matches!(&when_then[0].1, Literal(Value::Int64(2))));
+                assert!(else_expr.is_some());
+            }
+            other => panic!("expected Case with skipped branch, got {other:?}"),
+        }
+        // 非常量 WHEN 保留结构
+        let e = Case {
+            when_then: vec![(
+                ColumnRef { table: None, column: "a".into() },
+                Literal(Value::Int64(1)),
+            )],
+            else_expr: Some(Box::new(Literal(Value::Int64(2)))),
+        };
+        assert!(matches!(fold_expression(e), Case { .. }));
+        // 多分支全部折叠：当条件非常量但结果常量 → 分支内部折叠
+        let e = Case {
+            when_then: vec![(
+                BinaryOp {
+                    left: Box::new(Literal(Value::Int64(1))),
+                    op: Plus,
+                    right: Box::new(Literal(Value::Int64(1))),
+                },
+                BinaryOp {
+                    left: Box::new(Literal(Value::Int64(2))),
+                    op: Multiply,
+                    right: Box::new(Literal(Value::Int64(3))),
+                },
+            )],
+            else_expr: None,
+        };
+        match fold_expression(e) {
+            Case { when_then, .. } => {
+                assert!(matches!(&when_then[0].0, Literal(Value::Int64(2))));
+                assert!(matches!(&when_then[0].1, Literal(Value::Int64(6))));
+            }
+            other => panic!("expected folded Case, got {other:?}"),
+        }
+    }
+
+    // ============ 谓词下推深路径 ============
+
+    fn scan(t: &str, cols: &[usize]) -> PhysicalPlan {
+        PhysicalPlan::TableScan {
+            table_name: t.to_string(),
+            column_indices: cols.to_vec(),
+        }
+    }
+
+    fn col_ref(c: &str) -> Expression {
+        ColumnRef { table: None, column: c.to_string() }
+    }
+
+    fn lit_i(v: i64) -> Expression {
+        Literal(Value::Int64(v))
+    }
+
+    fn cmp_expr(op: BinaryOperator, l: Expression, r: Expression) -> Expression {
+        BinaryOp { left: Box::new(l), op, right: Box::new(r) }
+    }
+
+    #[test]
+    fn test_pushdown_through_projection() {
+        // Filter(a>5 AND x>10) over Projection(x = a+1, b)
+        // → a>5 可下推（a 是纯列引用）；x>10 引用计算列 → 保留在投影之上
+        let cond = BinaryOp {
+            left: Box::new(cmp_expr(Gt, col_ref("a"), lit_i(5))),
+            op: And,
+            right: Box::new(cmp_expr(Gt, col_ref("x"), lit_i(10))),
+        };
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::Projection {
+                input: Box::new(scan("t", &[0, 1])),
+                // 输出 a（纯列引用，可下推谓词）+ x（计算列，谓词不可下推）
+                expressions: vec![col_ref("a"), cmp_expr(Plus, col_ref("a"), lit_i(1))],
+                column_names: vec!["a".into(), "x".into()],
+            }),
+            condition: cond,
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        match &result {
+            // 顶层 Filter 保留不可下推谓词 x>10
+            PhysicalPlan::Filter { condition, input } => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::Projection { .. }));
+                let top_preds: Vec<Expression> = {
+                    let mut v = Vec::new();
+                    split_and_conditions(condition, &mut v);
+                    v
+                };
+                assert_eq!(top_preds.len(), 1, "expected x>10 kept above projection");
+                // 投影之下已插入 a>5 的 Filter
+                match input.as_ref() {
+                    PhysicalPlan::Projection { input, .. } => {
+                        assert!(matches!(input.as_ref(), PhysicalPlan::Filter { .. }));
+                    }
+                    other => panic!("expected Projection, got {other:?}"),
+                }
+            }
+            other => panic!("expected Filter on top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_projection_non_pushable_kept() {
+        // Filter(b>1) over Projection(a)（b 不在投影输出中）→ 不可下推，保留
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::Projection {
+                input: Box::new(scan("t", &[0])),
+                expressions: vec![col_ref("a")],
+                column_names: vec!["a".into()],
+            }),
+            condition: cmp_expr(Gt, col_ref("b"), lit_i(1)),
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { input, .. } => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::Projection { .. }));
+            }
+            other => panic!("expected Filter kept, got {other:?}"),
+        }
+        // 投影之下不应再有 Filter（无谓词可下推）
+        if let PhysicalPlan::Filter { input, .. } = &result {
+            if let PhysicalPlan::Projection { input, .. } = input.as_ref() {
+                assert!(!matches!(input.as_ref(), PhysicalPlan::Filter { .. }),
+                    "b>1 must not be pushed below projection");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pushdown_multiple_filters_merge() {
+        // Filter(x)(Filter(y)(Scan)) → 单 Filter(x AND y) 于扫描上
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::Filter {
+                input: Box::new(scan("t", &[0, 1])),
+                condition: cmp_expr(Gt, col_ref("a"), lit_i(5)),
+            }),
+            condition: cmp_expr(Lt, col_ref("b"), lit_i(10)),
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { input, condition } => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::TableScan { .. }));
+                let mut preds = Vec::new();
+                split_and_conditions(condition, &mut preds);
+                assert_eq!(preds.len(), 2);
+            }
+            other => panic!("expected merged Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_kept_above_aggregate() {
+        // Filter(SUM(a) > 10) over Aggregate → Filter 保留在聚合上
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::Aggregate {
+                input: Box::new(scan("t", &[0])),
+                group_by: vec![],
+                aggregates: vec![],
+            }),
+            condition: cmp_expr(Gt, col_ref("sum_a"), lit_i(10)),
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { input, .. } => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::Aggregate { .. }));
+            }
+            other => panic!("expected Filter above Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_kept_above_hashjoin() {
+        // Filter over HashJoin：谓词不得穿过 JOIN（外连接语义）
+        let join = PhysicalPlan::HashJoin {
+            left: Box::new(scan("t", &[0])),
+            right: Box::new(scan("u", &[0])),
+            join_type: crate::executor::physical_plan::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+        };
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(join),
+            condition: cmp_expr(Gt, col_ref("t.a"), lit_i(5)),
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { input, condition } => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::HashJoin { .. }));
+                assert!(format!("{condition:?}").contains("t.a"));
+            }
+            other => panic!("expected Filter above HashJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_kept_above_crossjoin() {
+        let join = PhysicalPlan::CrossJoin {
+            left: Box::new(scan("t", &[0])),
+            right: Box::new(scan("u", &[0])),
+        };
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(join),
+            condition: cmp_expr(Gt, col_ref("a"), lit_i(5)),
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { input, .. } => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::CrossJoin { .. }));
+            }
+            other => panic!("expected Filter above CrossJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pushdown_through_limit_deep_chain() {
+        // Filter(Limit(Filter(Projection(Filter(Scan))))) → 全部谓词汇聚到扫描
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::Limit {
+                input: Box::new(PhysicalPlan::Filter {
+                    input: Box::new(PhysicalPlan::Projection {
+                        input: Box::new(PhysicalPlan::Filter {
+                            input: Box::new(scan("t", &[0, 1])),
+                            condition: cmp_expr(Gt, col_ref("a"), lit_i(1)),
+                        }),
+                        expressions: vec![col_ref("a"), col_ref("b")],
+                        column_names: vec!["a".into(), "b".into()],
+                    }),
+                    condition: cmp_expr(Lt, col_ref("b"), lit_i(100)),
+                }),
+                limit: 10,
+            }),
+            condition: cmp_expr(GtEq, col_ref("a"), lit_i(50)),
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        // 顶层为 Limit，所有谓词（a>=50、b<100、a>1）都下沉到扫描附近
+        assert!(matches!(&result, PhysicalPlan::Limit { .. }));
+        let tree = format!("{result:?}");
+        assert!(tree.contains("TableScan"), "scan preserved: {tree}");
+        assert!(tree.contains("GtEq"), "a>=50 preserved: {tree}");
+        assert!(tree.contains("Lt"), "b<100 preserved: {tree}");
+        assert!(tree.contains("Gt"), "a>1 preserved: {tree}");
+        // Limit 之下仍有 Filter（谓词未丢失）
+        if let PhysicalPlan::Limit { input, .. } = &result {
+            assert!(format!("{input:?}").contains("Filter"),
+                "predicates pushed below limit: {input:?}");
+        }
+    }
+
+    // ============ 投影下推 ============
+
+    #[test]
+    fn test_projection_pushdown_structure_preserved() {
+        // 深链结构保留 + 递归无错
+        let plan = PhysicalPlan::Limit {
+            input: Box::new(PhysicalPlan::Filter {
+                input: Box::new(PhysicalPlan::Projection {
+                    input: Box::new(scan("t", &[0, 1])),
+                    expressions: vec![cmp_expr(Plus, col_ref("a"), lit_i(1)), col_ref("b")],
+                    column_names: vec!["x".into(), "b".into()],
+                }),
+                condition: cmp_expr(Gt, col_ref("x"), lit_i(0)),
+            }),
+            limit: 5,
+        };
+        let result = projection_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Limit { input, limit: 5 } => match input.as_ref() {
+                PhysicalPlan::Filter { input, .. } => {
+                    assert!(matches!(input.as_ref(), PhysicalPlan::Projection { .. }));
+                }
+                other => panic!("expected Filter, got {other:?}"),
+            },
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_projection_pushdown_filter_adds_condition_cols() {
+        // Filter 条件列被加入 required 集合（传递到输入）
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(scan("t", &[0, 1])),
+            condition: cmp_expr(Gt, col_ref("hidden"), lit_i(1)),
+        };
+        let result = projection_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { condition, input } => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::TableScan { .. }));
+                assert!(format!("{condition:?}").contains("hidden"));
+            }
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    // ============ 恒等投影消除 ============
+
+    #[test]
+    fn test_identity_projection_elimination_removes() {
+        // Projection(全部 ColumnRef, 与扫描列一致) → 消除
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(scan("t", &[0, 1])),
+            expressions: vec![col_ref("a"), col_ref("b")],
+            column_names: vec!["a".into(), "b".into()],
+        };
+        let result = identity_projection_elimination(plan);
+        assert!(matches!(result, PhysicalPlan::TableScan { .. }));
+    }
+
+    #[test]
+    fn test_identity_projection_elimination_keeps() {
+        // 表达式含计算 → 保留
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(scan("t", &[0, 1])),
+            expressions: vec![cmp_expr(Plus, col_ref("a"), lit_i(1)), col_ref("b")],
+            column_names: vec!["a".into(), "b".into()],
+        };
+        assert!(matches!(identity_projection_elimination(plan),
+            PhysicalPlan::Projection { .. }));
+        // 数量不匹配 → 保留
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(scan("t", &[0, 1])),
+            expressions: vec![col_ref("a")],
+            column_names: vec!["a".into()],
+        };
+        assert!(matches!(identity_projection_elimination(plan),
+            PhysicalPlan::Projection { .. }));
+        // 列名不匹配（a 输出为 x）→ 保留
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(scan("t", &[0, 1])),
+            expressions: vec![col_ref("a"), col_ref("b")],
+            column_names: vec!["x".into(), "b".into()],
+        };
+        assert!(matches!(identity_projection_elimination(plan),
+            PhysicalPlan::Projection { .. }));
+        // 非 TableScan 输入 → 保留
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(PhysicalPlan::Filter {
+                input: Box::new(scan("t", &[0, 1])),
+                condition: cmp_expr(Gt, col_ref("a"), lit_i(1)),
+            }),
+            expressions: vec![col_ref("a"), col_ref("b")],
+            column_names: vec!["a".into(), "b".into()],
+        };
+        assert!(matches!(identity_projection_elimination(plan),
+            PhysicalPlan::Projection { .. }));
+        // 嵌套：恒等投影下还有恒等投影 → 递归消除
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(PhysicalPlan::Projection {
+                input: Box::new(scan("t", &[0])),
+                expressions: vec![col_ref("a")],
+                column_names: vec!["a".into()],
+            }),
+            expressions: vec![col_ref("a")],
+            column_names: vec!["a".into()],
+        };
+        assert!(matches!(identity_projection_elimination(plan),
+            PhysicalPlan::TableScan { .. }));
+    }
+
+    // ============ build side 交换（CBO） ============
+
+    #[test]
+    fn test_build_side_swap_inner_join() {
+        // 左 Filter（约 3000 行）右 Scan（10000 行）→ 交换：小表为 build side
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::Filter {
+                input: Box::new(scan("small", &[0])),
+                condition: cmp_expr(Gt, col_ref("a"), lit_i(5)),
+            }),
+            right: Box::new(scan("big", &[0])),
+            join_type: crate::executor::physical_plan::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![1],
+        };
+        let result = optimize_build_sides(plan).unwrap();
+        match &result {
+            PhysicalPlan::HashJoin { left, right, join_type, left_keys, right_keys } => {
+                // 交换后：left = 原 big（TableScan），right = 原 small（Filter）
+                assert!(matches!(left.as_ref(), PhysicalPlan::TableScan { .. }));
+                assert!(matches!(right.as_ref(), PhysicalPlan::Filter { .. }));
+                assert_eq!(*join_type, crate::executor::physical_plan::JoinType::Inner);
+                // 键映射随侧交换
+                assert_eq!(*left_keys, vec![1]);
+                assert_eq!(*right_keys, vec![0]);
+            }
+            other => panic!("expected swapped HashJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_side_no_swap() {
+        // 左大右小 → 不交换
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(scan("big", &[0])),
+            right: Box::new(PhysicalPlan::Filter {
+                input: Box::new(scan("small", &[0])),
+                condition: cmp_expr(Gt, col_ref("a"), lit_i(5)),
+            }),
+            join_type: crate::executor::physical_plan::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![1],
+        };
+        let result = optimize_build_sides(plan).unwrap();
+        match &result {
+            PhysicalPlan::HashJoin { left, right, left_keys, right_keys, .. } => {
+                assert!(matches!(left.as_ref(), PhysicalPlan::TableScan { .. }));
+                assert!(matches!(right.as_ref(), PhysicalPlan::Filter { .. }));
+                assert_eq!(*left_keys, vec![0]);
+                assert_eq!(*right_keys, vec![1]);
+            }
+            other => panic!("expected unswapped HashJoin, got {other:?}"),
+        }
+        // Left Join 即使右大也不交换（语义保留）
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::Filter {
+                input: Box::new(scan("small", &[0])),
+                condition: cmp_expr(Gt, col_ref("a"), lit_i(5)),
+            }),
+            right: Box::new(scan("big", &[0])),
+            join_type: crate::executor::physical_plan::JoinType::Left,
+            left_keys: vec![0],
+            right_keys: vec![1],
+        };
+        let result = optimize_build_sides(plan).unwrap();
+        match &result {
+            PhysicalPlan::HashJoin { left, right, join_type, .. } => {
+                assert!(matches!(left.as_ref(), PhysicalPlan::Filter { .. }));
+                assert!(matches!(right.as_ref(), PhysicalPlan::TableScan { .. }));
+                assert_eq!(*join_type, crate::executor::physical_plan::JoinType::Left);
+            }
+            other => panic!("expected Left join unswapped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_side_swap_nested() {
+        // 三表：外层 join 右大交换，内层 join 左大右小不交换
+        let inner = PhysicalPlan::HashJoin {
+            left: Box::new(scan("a", &[0])),
+            right: Box::new(PhysicalPlan::Filter {
+                input: Box::new(scan("b", &[0])),
+                condition: cmp_expr(Gt, col_ref("x"), lit_i(1)),
+            }),
+            join_type: crate::executor::physical_plan::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+        };
+        let outer = PhysicalPlan::HashJoin {
+            left: Box::new(inner),
+            right: Box::new(scan("c", &[0])),
+            join_type: crate::executor::physical_plan::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+        };
+        let result = optimize_build_sides(outer).unwrap();
+        match &result {
+            PhysicalPlan::HashJoin { left, right, left_keys, right_keys, .. } => {
+                // 外层：左（inner join 估算 3000*10000*0.1=3M）右 10000 → 不交换？！
+                // inner 估算：10000*3000*0.1=3,000,000 > 10000 → right 小 → 不交换
+                assert!(matches!(right.as_ref(), PhysicalPlan::TableScan { .. }));
+                assert_eq!(*left_keys, vec![0]);
+                assert_eq!(*right_keys, vec![0]);
+                // 内层：a(10000) vs b-filter(3000) → 不交换
+                match left.as_ref() {
+                    PhysicalPlan::HashJoin { left, right, .. } => {
+                        assert!(matches!(left.as_ref(), PhysicalPlan::TableScan { .. }));
+                        assert!(matches!(right.as_ref(), PhysicalPlan::Filter { .. }));
+                    }
+                    other => panic!("expected inner HashJoin, got {other:?}"),
+                }
+            }
+            other => panic!("expected nested HashJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_estimate_rows_variants() {
+        assert_eq!(estimate_rows(&scan("t", &[0])), 10_000);
+        let filter = PhysicalPlan::Filter {
+            input: Box::new(scan("t", &[0])),
+            condition: cmp_expr(Gt, col_ref("a"), lit_i(1)),
+        };
+        assert_eq!(estimate_rows(&filter), 3_000);
+        // 聚合无 group_by → 1
+        let agg = PhysicalPlan::Aggregate {
+            input: Box::new(scan("t", &[0])),
+            group_by: vec![],
+            aggregates: vec![],
+        };
+        assert_eq!(estimate_rows(&agg), 1);
+        // 有 group_by → max(1000, 1)
+        let agg2 = PhysicalPlan::Aggregate {
+            input: Box::new(scan("t", &[0])),
+            group_by: vec![0],
+            aggregates: vec![],
+        };
+        assert_eq!(estimate_rows(&agg2), 1_000);
+        // Limit 取 min
+        let lim = PhysicalPlan::Limit {
+            input: Box::new(scan("t", &[0])),
+            limit: 7,
+        };
+        assert_eq!(estimate_rows(&lim), 7);
+        // HashJoin 笛卡尔积 × 0.1
+        let join = PhysicalPlan::HashJoin {
+            left: Box::new(scan("t", &[0])),
+            right: Box::new(scan("u", &[0])),
+            join_type: crate::executor::physical_plan::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+        };
+        assert_eq!(estimate_rows(&join), 10_000_000);
+        // 未知节点 → 1000
+        let p = PhysicalPlan::CountStar { output_name: "c".into(), count: 3 };
+        assert_eq!(estimate_rows(&p), 1000);
+        // 恒等投影行数不变
+        let proj = PhysicalPlan::Projection {
+            input: Box::new(scan("t", &[0])),
+            expressions: vec![col_ref("a")],
+            column_names: vec!["a".into()],
+        };
+        assert_eq!(estimate_rows(&proj), 10_000);
+    }
+
+    // ============ 过滤条件重排深路径 ============
+
+    #[test]
+    fn test_predicate_selectivity_order() {
+        // 等值 < IS NULL < 范围 < IN < 不等 < LIKE；常量最前；NOT +10
+        let pred = |e: Expression| predicate_selectivity_score(&e);
+        assert_eq!(pred(Literal(Value::Boolean(true))), 0);
+        assert_eq!(pred(cmp_expr(Eq, col_ref("a"), lit_i(1))), 1);
+        assert_eq!(pred(IsNull(Box::new(col_ref("a")))), 2);
+        assert_eq!(pred(cmp_expr(Gt, col_ref("a"), lit_i(1))), 3);
+        assert_eq!(pred(cmp_expr(LtEq, col_ref("a"), lit_i(1))), 3);
+        assert_eq!(pred(InList {
+            expr: Box::new(col_ref("a")),
+            list: vec![lit_i(1), lit_i(2)],
+        }), 4);
+        assert_eq!(pred(cmp_expr(NotEq, col_ref("a"), lit_i(1))), 5);
+        assert_eq!(pred(Like {
+            expr: Box::new(col_ref("a")),
+            pattern: Box::new(lit_i(1)),
+        }), 6);
+        assert_eq!(pred(col_ref("a")), 7);
+        // NOT 包裹 = 内部 + 10
+        let not = UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(cmp_expr(Eq, col_ref("a"), lit_i(1))),
+        };
+        assert_eq!(pred(not), 11);
+    }
+
+    #[test]
+    fn test_filter_reorder_full_order() {
+        // 常量 + LIKE + Eq → 常量最前，Eq 在 LIKE 前
+        let cond = BinaryOp {
+            left: Box::new(BinaryOp {
+                left: Box::new(Literal(Value::Boolean(true))),
+                op: And,
+                right: Box::new(Like {
+                    expr: Box::new(col_ref("c")),
+                    pattern: Box::new(Literal(Value::Varchar("%x%".into()))),
+                }),
+            }),
+            op: And,
+            right: Box::new(cmp_expr(Eq, col_ref("b"), lit_i(10))),
+        };
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(scan("t", &[0, 1, 2])),
+            condition: cond,
+        };
+        let result = filter_reorder(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { condition, .. } => {
+                let mut preds = Vec::new();
+                split_and_conditions(condition, &mut preds);
+                assert_eq!(preds.len(), 3);
+                assert!(matches!(&preds[0], Literal(_)), "constant first");
+                assert!(matches!(&preds[1], BinaryOp { op: Eq, .. }), "Eq second");
+                assert!(matches!(&preds[2], Like { .. }), "Like last");
+            }
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_filter_reorder_single_predicate_unchanged() {
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(scan("t", &[0])),
+            condition: cmp_expr(Gt, col_ref("a"), lit_i(1)),
+        };
+        let before = format!("{plan:?}");
+        let result = filter_reorder(plan).unwrap();
+        assert_eq!(format!("{result:?}"), before);
+    }
+
+    // ============ 辅助函数 ============
+
+    #[test]
+    fn test_split_and_conditions_nested() {
+        let cond = BinaryOp {
+            left: Box::new(BinaryOp {
+                left: Box::new(col_ref("a")),
+                op: And,
+                right: Box::new(BinaryOp {
+                    left: Box::new(col_ref("b")),
+                    op: And,
+                    right: Box::new(col_ref("c")),
+                }),
+            }),
+            op: And,
+            right: Box::new(col_ref("d")),
+        };
+        let mut preds = Vec::new();
+        split_and_conditions(&cond, &mut preds);
+        assert_eq!(preds.len(), 4);
+        // OR 不被拆分
+        let or_cond = BinaryOp {
+            left: Box::new(col_ref("a")),
+            op: Or,
+            right: Box::new(col_ref("b")),
+        };
+        let mut preds = Vec::new();
+        split_and_conditions(&or_cond, &mut preds);
+        assert_eq!(preds.len(), 1);
+    }
+
+    #[test]
+    fn test_split_pushable_predicates() {
+        let preds = vec![
+            cmp_expr(Gt, col_ref("a"), lit_i(1)),
+            cmp_expr(Gt, cmp_expr(Plus, col_ref("a"), col_ref("b")), lit_i(2)),
+            cmp_expr(Eq, col_ref("c"), lit_i(3)),
+        ];
+        // 投影只有 a（纯列引用）
+        let projections = vec![col_ref("a")];
+        let (pushable, non_pushable) = split_pushable_predicates(preds, &projections);
+        assert_eq!(pushable.len(), 1); // a>1
+        assert_eq!(non_pushable.len(), 2); // a+b>2、c=3
+        // 空投影：全部不可下推
+        let (pushable, non_pushable) = split_pushable_predicates(
+            vec![cmp_expr(Gt, col_ref("a"), lit_i(1))], &[]);
+        assert!(pushable.is_empty());
+        assert_eq!(non_pushable.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_joins_and_tables() {
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::HashJoin {
+                left: Box::new(scan("t", &[0])),
+                right: Box::new(PhysicalPlan::Projection {
+                    input: Box::new(scan("u", &[0])),
+                    expressions: vec![col_ref("a")],
+                    column_names: vec!["a".into()],
+                }),
+                join_type: crate::executor::physical_plan::JoinType::Inner,
+                left_keys: vec![0],
+                right_keys: vec![0],
+            }),
+            condition: cmp_expr(Gt, col_ref("a"), lit_i(1)),
+        };
+        let mut joins = Vec::new();
+        let mut tables = Vec::new();
+        collect_joins_and_tables(&plan, &mut joins, &mut tables);
+        assert_eq!(joins.len(), 1);
+        assert_eq!(tables, vec!["t".to_string(), "u".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_eq_compare() {
+        let p1 = scan("t", &[0]);
+        let p2 = scan("t", &[0]);
+        let p3 = scan("t", &[1]);
+        assert!(plan_eq(&p1, &p2));
+        assert!(!plan_eq(&p1, &p3));
+    }
+
+    #[test]
+    fn test_combine_predicates() {
+        let combined = combine_predicates(vec![col_ref("a"), col_ref("b"), col_ref("c")]);
+        let mut preds = Vec::new();
+        split_and_conditions(&combined, &mut preds);
+        assert_eq!(preds.len(), 3);
+    }
+
+    // ============ 全链路 ============
+
+    #[test]
+    fn test_optimize_build_side_swap_end_to_end() {
+        // optimize() 全链路触发 build side 交换
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::Filter {
+                input: Box::new(scan("small", &[0])),
+                condition: cmp_expr(Gt, col_ref("a"), lit_i(5)),
+            }),
+            right: Box::new(scan("big", &[0])),
+            join_type: crate::executor::physical_plan::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![1],
+        };
+        let result = optimize(plan).unwrap();
+        match &result {
+            PhysicalPlan::HashJoin { left, right, left_keys, right_keys, .. } => {
+                assert!(matches!(left.as_ref(), PhysicalPlan::TableScan { .. }),
+                    "build side swap through optimize()");
+                assert!(matches!(right.as_ref(), PhysicalPlan::Filter { .. }));
+                assert_eq!(*left_keys, vec![1]);
+                assert_eq!(*right_keys, vec![0]);
+            }
+            other => panic!("expected HashJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_optimize_full_pipeline() {
+        // 复杂计划：Filter(Join(Filter(Scan), Scan)) + Limit + Projection
+        // 全链路优化：谓词下推 + 恒等投影消除 + build side 交换 + 常量折叠
+        let plan = PhysicalPlan::Projection {
+            input: Box::new(PhysicalPlan::Limit {
+                input: Box::new(PhysicalPlan::Filter {
+                    input: Box::new(PhysicalPlan::HashJoin {
+                        left: Box::new(PhysicalPlan::Filter {
+                            input: Box::new(scan("small", &[0, 1])),
+                            condition: BinaryOp {
+                                left: Box::new(cmp_expr(Gt, col_ref("a"), lit_i(1))),
+                                op: And,
+                                right: Box::new(cmp_expr(Eq, col_ref("b"), lit_i(2))),
+                            },
+                        }),
+                        right: Box::new(scan("big", &[0, 1])),
+                        join_type: crate::executor::physical_plan::JoinType::Inner,
+                        left_keys: vec![0],
+                        right_keys: vec![0],
+                    }),
+                    condition: BinaryOp {
+                        left: Box::new(cmp_expr(Lt, col_ref("small.a"), lit_i(100))),
+                        op: And,
+                        right: Box::new(cmp_expr(Plus, lit_i(1), lit_i(1)), )
+                    },
+                }),
+                limit: 50,
+            }),
+            expressions: vec![col_ref("a")],
+            column_names: vec!["a".into()],
+        };
+        let result = optimize(plan).unwrap();
+        // 常量 1+1 → 2 折叠进条件
+        let tree = format!("{result:?}");
+        assert!(!tree.contains("Plus"), "constant folding in pipeline: {tree}");
+        assert!(tree.contains("HashJoin"));
+    }
 }
