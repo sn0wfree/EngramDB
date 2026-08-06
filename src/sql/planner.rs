@@ -255,6 +255,18 @@ fn substitute_params_stmt(stmt: Statement, params: &[Value]) -> Statement {
             }
             Statement::Select(s)
         }
+        // DELETE / UPDATE：WHERE 与 SET 参数替换（此前被静默跳过）
+        Statement::Delete(mut s) => {
+            s.where_clause = s.where_clause.map(|w| substitute_params_expr(&w, params));
+            Statement::Delete(s)
+        }
+        Statement::Update(mut s) => {
+            s.where_clause = s.where_clause.map(|w| substitute_params_expr(&w, params));
+            s.assignments = s.assignments.iter().map(|(c, e)| {
+                (c.clone(), substitute_params_expr(e, params))
+            }).collect();
+            Statement::Update(s)
+        }
         other => other,
     }
 }
@@ -701,13 +713,6 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     // ===== Q23：FROM 子查询（Derived Table）=====
     // SELECT * FROM (SELECT ...) AS sub:
     // 规划内层查询，通过 SubqueryScan 节点获取结果行。
-    if let Some(TableRef::Derived { query, .. }) = &stmt.from {
-        let inner_plan = plan_select(*query.clone(), db)?;
-        return Ok(PhysicalPlan::SubqueryScan {
-            plan: Box::new(inner_plan),
-        });
-    }
-
     // ===== JOIN / CROSS JOIN（②）=====
     // 连接查询走完整流水线（WHERE/聚合/投影/排序/LIMIT）：
     // plan_join_tree 构建连接树（HashJoin/CrossJoin），随后与单表
@@ -716,108 +721,133 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         return plan_select_join(&stmt, db);
     }
 
-    let table_name = stmt.from
-        .as_ref()
-        .and_then(|t| match t {
-            TableRef::Table { table_name, .. } => Some(table_name.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
+    // ===== Q23：FROM 子查询（Derived Table）=====
+    // 内层计划作为 SubqueryScan 起点，外层 WHERE/聚合/投影/排序/LIMIT
+    // 等通用阶段继续叠加（此前直接返回导致外层条件被静默丢弃）。
+    let mut derived_plan: Option<(PhysicalPlan, Vec<String>)> = None;
+    if let Some(TableRef::Derived { query, .. }) = &stmt.from {
+        let inner_plan = plan_select(*query.clone(), db)?;
+        let inner_names = extract_column_names(&inner_plan);
+        derived_plan = Some((
+            PhysicalPlan::SubqueryScan { plan: Box::new(inner_plan) },
+            inner_names,
+        ));
+    }
 
-    let table = db.get_engine_table(&table_name)
-        .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+    // 单表名（Derived 时为 None，走 SubqueryScan 起点）
+    let table_name: Option<String> = stmt.from.as_ref().and_then(|t| match t {
+        TableRef::Table { table_name, .. } => Some(table_name.clone()),
+        _ => None,
+    });
 
-    // ===== Perf03：主键点查短路（WHERE pk = Literal）=====
-    // 条件：
-    // 1. 表有 PRIMARY KEY 索引
-    // 2. WHERE 唯一条件为 `pk_col = Literal`（BinaryEq）
-    // 3. 无 GROUP BY / HAVING / ORDER BY / LIMIT（简化，后续可扩展）
-    let mut pk_short_circuit: Option<crate::Value> = None;
-    if table.def().primary_key_index().is_some()
-        && stmt.group_by.is_empty()
-        && stmt.having.is_none()
-        && stmt.order_by.is_empty()
-        // P3.3：主键点查最多返回 1 行，LIMIT 天然满足，放开该限制
-        //（LIMIT 0 由 Limit 算子的 take(0) 处理）
-    {
-        if let Some(ref where_expr) = stmt.where_clause {
-            if let Expression::BinaryOp { left, op, right } = where_expr {
-                if *op == BinaryOperator::Eq {
-                    let pk_idx = table.def().primary_key_index().unwrap();
-                    let pk_name = &table.def().columns[pk_idx].name;
-                    let mut maybe_pk_value: Option<crate::Value> = None;
-                    // 接受 (pk_col = literal) 或 (literal = pk_col)
-                    match (left.as_ref(), right.as_ref()) {
-                        (Expression::ColumnRef { column, .. }, Expression::Literal(v))
-                            if column == pk_name =>
-                        {
-                            maybe_pk_value = Some(v.clone());
+    // 表 schema 列（Derived 时为空，窗口函数/投影仅回退使用）
+    let window_table_cols: &[crate::common::types::ColumnDef] = table_name.as_ref()
+        .and_then(|n| db.get_engine_table(n))
+        .map(|t| t.def().columns.as_slice())
+        .unwrap_or(&[]);
+
+    let (mut plan, scan_column_names, had_pk) = if let Some((p, n)) = derived_plan {
+        (p, n, false)
+    } else {
+        let table_name = table_name
+            .clone()
+            .ok_or_else(|| EngramDbError::Parse("SELECT without FROM not supported".into()))?;
+        let table = db.get_engine_table(&table_name)
+            .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
+
+        // ===== Perf03：主键点查短路（WHERE pk = Literal）=====
+        // 条件：
+        // 1. 表有 PRIMARY KEY 索引
+        // 2. WHERE 唯一条件为 `pk_col = Literal`（BinaryEq）
+        // 3. 无 GROUP BY / HAVING / ORDER BY / LIMIT（简化，后续可扩展）
+        let mut pk_short_circuit: Option<crate::Value> = None;
+        if table.def().primary_key_index().is_some()
+            && stmt.group_by.is_empty()
+            && stmt.having.is_none()
+            && stmt.order_by.is_empty()
+            // P3.3：主键点查最多返回 1 行，LIMIT 天然满足，放开该限制
+            //（LIMIT 0 由 Limit 算子的 take(0) 处理）
+        {
+            if let Some(ref where_expr) = stmt.where_clause {
+                if let Expression::BinaryOp { left, op, right } = where_expr {
+                    if *op == BinaryOperator::Eq {
+                        let pk_idx = table.def().primary_key_index().unwrap();
+                        let pk_name = &table.def().columns[pk_idx].name;
+                        let mut maybe_pk_value: Option<crate::Value> = None;
+                        // 接受 (pk_col = literal) 或 (literal = pk_col)
+                        match (left.as_ref(), right.as_ref()) {
+                            (Expression::ColumnRef { column, .. }, Expression::Literal(v))
+                                if column == pk_name =>
+                            {
+                                maybe_pk_value = Some(v.clone());
+                            }
+                            (Expression::Literal(v), Expression::ColumnRef { column, .. })
+                                if column == pk_name =>
+                            {
+                                maybe_pk_value = Some(v.clone());
+                            }
+                            _ => {}
                         }
-                        (Expression::Literal(v), Expression::ColumnRef { column, .. })
-                            if column == pk_name =>
-                        {
-                            maybe_pk_value = Some(v.clone());
-                        }
-                        _ => {}
+                        pk_short_circuit = maybe_pk_value;
                     }
-                    pk_short_circuit = maybe_pk_value;
                 }
             }
         }
-    }
 
-    // 确定扫描的列（所有被引用的列）
-    // 注意：collect_referenced_columns 现在返回列名（Vec 而非 HashSet），保持 SELECT/WHERE 中出现的顺序
-    let all_referenced_cols = collect_referenced_columns(&stmt, &table.def().columns);
-    let mut scan_column_indices: Vec<usize> = all_referenced_cols.iter()
-        .filter_map(|name| table.def().column_index(name))
-        .collect();
+        // 确定扫描的列（所有被引用的列）
+        // 注意：collect_referenced_columns 现在返回列名（Vec 而非 HashSet），保持 SELECT/WHERE 中出现的顺序
+        let all_referenced_cols = collect_referenced_columns(&stmt, &table.def().columns);
+        let mut scan_column_indices: Vec<usize> = all_referenced_cols.iter()
+            .filter_map(|name| table.def().column_index(name))
+            .collect();
 
-    // 纯聚合（如 COUNT(*)）不引用任何列时，至少扫描第一列用于计数
-    let has_agg_in_select = select_list_has_aggregates(&stmt.select_list);
-    if scan_column_indices.is_empty() && has_agg_in_select && !table.def().columns.is_empty() {
-        scan_column_indices.push(0);
-    }
-
-    // 扫描阶段的列名映射（扫描输出的列名）
-    let scan_column_names: Vec<String> = scan_column_indices.iter()
-        .map(|&i| table.def().columns[i].name.clone())
-        .collect();
-
-    // ===== 覆盖索引优化（v0.12.0 新增）=====
-    // 检测条件：
-    // 1. WHERE 条件为单列等值比较（col = literal）
-    // 2. 该列是某个索引的首键列
-    // 3. 所有扫描列都在该索引的 key_columns + included_columns 中
-    // 4. 无 GROUP BY / HAVING / ORDER BY（简化版，后续可扩展）
-    let has_group_by = !stmt.group_by.is_empty();
-    let has_having = stmt.having.is_some();
-    let has_order_by = !stmt.order_by.is_empty();
-    let has_agg = select_list_has_aggregates(&stmt.select_list);
-
-    let can_use_index_only = !has_group_by && !has_having && !has_order_by && !has_agg;
-
-    let had_pk = pk_short_circuit.is_some();
-    let mut plan = if let Some(pk_val) = pk_short_circuit.take() {
-        trace!("Perf03: PrimaryKeyLookup fast-path for '{}' pk={:?}", table_name, pk_val);
-        PhysicalPlan::PrimaryKeyLookup {
-            table_name: table_name.clone(),
-            pk_value: pk_val,
-            output_column_indices: scan_column_indices.clone(),
+        // 纯聚合（如 COUNT(*)）不引用任何列时，至少扫描第一列用于计数
+        let has_agg_in_select = select_list_has_aggregates(&stmt.select_list);
+        if scan_column_indices.is_empty() && has_agg_in_select && !table.def().columns.is_empty() {
+            scan_column_indices.push(0);
         }
-    } else if can_use_index_only {
-        try_index_only_scan(&stmt, db, &table_name, &scan_column_indices)
-            .or_else(|| try_index_scan(&stmt, db, &table_name, &scan_column_indices))
-            .or_else(|| try_index_range_scan(&stmt, db, &table_name, &scan_column_indices))
-            .unwrap_or_else(|| PhysicalPlan::TableScan {
+
+        // 扫描阶段的列名映射（扫描输出的列名）
+        let scan_column_names: Vec<String> = scan_column_indices.iter()
+            .map(|&i| table.def().columns[i].name.clone())
+            .collect();
+
+        // ===== 覆盖索引优化（v0.12.0 新增）=====
+        // 检测条件：
+        // 1. WHERE 条件为单列等值比较（col = literal）
+        // 2. 该列是某个索引的首键列
+        // 3. 所有扫描列都在该索引的 key_columns + included_columns 中
+        // 4. 无 GROUP BY / HAVING / 聚合
+        //    （ORDER BY 不阻断：排序可由 can_skip_sort_by_index 利用索引有序性跳过）
+        let has_group_by = !stmt.group_by.is_empty();
+        let has_having = stmt.having.is_some();
+        let has_agg = select_list_has_aggregates(&stmt.select_list);
+
+        let can_use_index_only = !has_group_by && !has_having && !has_agg;
+
+        let had_pk = pk_short_circuit.is_some();
+        let plan = if let Some(pk_val) = pk_short_circuit.take() {
+            trace!("Perf03: PrimaryKeyLookup fast-path for '{}' pk={:?}", table_name, pk_val);
+            PhysicalPlan::PrimaryKeyLookup {
+                table_name: table_name.clone(),
+                pk_value: pk_val,
+                output_column_indices: scan_column_indices.clone(),
+            }
+        } else if can_use_index_only {
+            try_index_only_scan(&stmt, db, &table_name, &scan_column_indices)
+                .or_else(|| try_index_scan(&stmt, db, &table_name, &scan_column_indices))
+                .or_else(|| try_index_range_scan(&stmt, db, &table_name, &scan_column_indices))
+                .unwrap_or_else(|| PhysicalPlan::TableScan {
+                    table_name: table_name.clone(),
+                    column_indices: scan_column_indices.clone(),
+                })
+        } else {
+            PhysicalPlan::TableScan {
                 table_name: table_name.clone(),
                 column_indices: scan_column_indices.clone(),
-            })
-    } else {
-        PhysicalPlan::TableScan {
-            table_name: table_name.clone(),
-            column_indices: scan_column_indices.clone(),
-        }
+            }
+        };
+        (plan, scan_column_names, had_pk)
     };
 
     // Filter（WHERE）：主键短路已吸收 WHERE 条件，跳过
@@ -853,7 +883,11 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             .collect();
 
         // 从 SELECT 列表中提取聚合表达式
-        let (agg_exprs, _non_agg_exprs) = extract_aggregates_from_select(&stmt.select_list);
+        // （HAVING 中的聚合也递归纳入：否则 HAVING 单独引用聚合时重写失败）
+        let (mut agg_exprs, _non_agg_exprs) = extract_aggregates_from_select(&stmt.select_list);
+        if let Some(having) = &stmt.having {
+            collect_agg_exprs(having, &mut agg_exprs);
+        }
 
         aggregates = agg_exprs.iter()
             .filter_map(|(func_name, arg_expr, distinct)| {
@@ -916,7 +950,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         let mut funcs = Vec::new();
         for item in &stmt.select_list {
             if let SelectItem::Expression(expr, alias) = item {
-                extract_window_functions(expr, alias, &scan_column_names, &table.def().columns, &mut funcs);
+                extract_window_functions(expr, alias, &scan_column_names, window_table_cols, &mut funcs);
             }
         }
         funcs
@@ -938,7 +972,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         &stmt.select_list,
         &scan_column_names,
         needs_aggregate,
-        &table.def().columns,
+        window_table_cols,
     )?;
 
     if needs_aggregate {
@@ -1005,7 +1039,7 @@ fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             &plan,
             &sort_keys,
             &stmt.order_by,
-            &table_name,
+            table_name.as_deref().unwrap_or(""),
             db,
         );
 
@@ -1102,7 +1136,12 @@ fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             })
             .collect();
 
-        let (agg_exprs, _non_agg_exprs) = extract_aggregates_from_select(&qualified_select);
+        let (mut agg_exprs, _non_agg_exprs) = extract_aggregates_from_select(&qualified_select);
+        // HAVING 中的聚合也递归纳入（HAVING 单独引用聚合时可被重写为输出列）
+        if let Some(having_expr) = &stmt.having {
+            let qualified_having = qualify_column_refs(having_expr);
+            collect_agg_exprs(&qualified_having, &mut agg_exprs);
+        }
         aggregates = agg_exprs.iter()
             .filter_map(|(func_name, arg_expr, distinct)| {
                 let input_col = match arg_expr {
@@ -2245,6 +2284,48 @@ fn extract_aggregates_from_select(items: &[SelectItem]) -> (Vec<(String, Express
     (aggs, non_aggs)
 }
 
+/// 递归提取表达式中的聚合函数调用（HAVING 等嵌套场景）
+fn collect_agg_exprs(expr: &Expression, out: &mut Vec<(String, Expression, bool)>) {
+    match expr {
+        Expression::Function { name, args, distinct, .. } => {
+            if matches!(name.to_uppercase().as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+            {
+                let arg = args.first().cloned().unwrap_or(Expression::Literal(Value::Null));
+                out.push((name.clone(), arg, *distinct));
+                return;
+            }
+            for a in args {
+                collect_agg_exprs(a, out);
+            }
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            collect_agg_exprs(left, out);
+            collect_agg_exprs(right, out);
+        }
+        Expression::UnaryOp { expr, .. } => collect_agg_exprs(expr, out),
+        Expression::InList { expr, list } => {
+            collect_agg_exprs(expr, out);
+            for e in list { collect_agg_exprs(e, out); }
+        }
+        Expression::Like { expr, pattern } => {
+            collect_agg_exprs(expr, out);
+            collect_agg_exprs(pattern, out);
+        }
+        Expression::Case { when_then, else_expr } => {
+            for (w, t) in when_then {
+                collect_agg_exprs(w, out);
+                collect_agg_exprs(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_agg_exprs(e, out);
+            }
+        }
+        Expression::IsNull(e) => collect_agg_exprs(e, out),
+        _ => {}
+    }
+}
+
 /// 将 HAVING 中的聚合函数调用替换为 ColumnRef
 ///
 /// HAVING 条件中的聚合函数（如 SUM(x) > 100）应引用 Aggregate 节点的输出列，
@@ -2513,3 +2594,1346 @@ fn extract_column_names(plan: &PhysicalPlan) -> Vec<String> {
         _ => vec![],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Connection;
+    use crate::sql::parser::parse;
+    use crate::common::types::EngineType;
+    use crate::executor::physical_plan::{
+        AggregateFunc, JoinType, PhysicalPlan, SetUnionOp, WindowFuncType,
+    };
+
+    fn setup() -> Connection {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT, dept TEXT)").unwrap();
+        conn.execute("CREATE TABLE u (id INT PRIMARY KEY, tid INT, score INT)").unwrap();
+        conn.execute("CREATE TABLE v (id INT PRIMARY KEY, tag TEXT)").unwrap();
+        conn.execute("CREATE TABLE log_t (ts INT64, v INT64) ENGINE = Log").unwrap();
+        conn.execute("CREATE TABLE mem_t (id INT PRIMARY KEY, v INT) ENGINE = Memory").unwrap();
+        let db = conn.database_mut();
+        db.create_index("t", "idx_age", &[2], &[1], false).unwrap();
+        db.create_index("t", "idx_dept", &[3], &[], false).unwrap();
+        conn
+    }
+
+    fn plan_sql(conn: &mut Connection, sql: &str) -> Result<PhysicalPlan> {
+        let stmt = parse(sql).unwrap();
+        plan(stmt, conn.database_mut())
+    }
+
+    fn plan_ok(conn: &mut Connection, sql: &str) -> PhysicalPlan {
+        plan_sql(conn, sql).unwrap_or_else(|e| panic!("plan failed for {sql:?}: {e}"))
+    }
+
+    fn assert_err(conn: &mut Connection, sql: &str) -> EngramDbError {
+        match plan_sql(conn, sql) {
+            Err(e) => e,
+            Ok(p) => panic!("expected error for {sql:?}, got plan {p:?}"),
+        }
+    }
+
+    fn node_name(plan: &PhysicalPlan) -> &'static str {
+        match plan {
+            PhysicalPlan::TableScan { .. } => "TableScan",
+            PhysicalPlan::IndexOnlyScan { .. } => "IndexOnlyScan",
+            PhysicalPlan::IndexScan { .. } => "IndexScan",
+            PhysicalPlan::IndexRangeScan { .. } => "IndexRangeScan",
+            PhysicalPlan::Filter { .. } => "Filter",
+            PhysicalPlan::Projection { .. } => "Projection",
+            PhysicalPlan::Aggregate { .. } => "Aggregate",
+            PhysicalPlan::Insert { .. } => "Insert",
+            PhysicalPlan::InsertColumns { .. } => "InsertColumns",
+            PhysicalPlan::InsertSelect { .. } => "InsertSelect",
+            PhysicalPlan::CreateTable { .. } => "CreateTable",
+            PhysicalPlan::CreateIndex { .. } => "CreateIndex",
+            PhysicalPlan::Delete { .. } => "Delete",
+            PhysicalPlan::Update { .. } => "Update",
+            PhysicalPlan::Sort { .. } => "Sort",
+            PhysicalPlan::HashJoin { .. } => "HashJoin",
+            PhysicalPlan::CrossJoin { .. } => "CrossJoin",
+            PhysicalPlan::Limit { .. } => "Limit",
+            PhysicalPlan::Analyze { .. } => "Analyze",
+            PhysicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
+            PhysicalPlan::RefreshMaterializedView { .. } => "RefreshMaterializedView",
+            PhysicalPlan::DropMaterializedView { .. } => "DropMaterializedView",
+            PhysicalPlan::CountStar { .. } => "CountStar",
+            PhysicalPlan::PrimaryKeyLookup { .. } => "PrimaryKeyLookup",
+            PhysicalPlan::BeginTransaction => "BeginTransaction",
+            PhysicalPlan::Commit => "Commit",
+            PhysicalPlan::Rollback => "Rollback",
+            PhysicalPlan::AlterTable(_) => "AlterTable",
+            PhysicalPlan::Pragma(_) => "Pragma",
+            PhysicalPlan::Distinct { .. } => "Distinct",
+            PhysicalPlan::Explain { .. } => "Explain",
+            PhysicalPlan::Window { .. } => "Window",
+            PhysicalPlan::SubqueryScan { .. } => "SubqueryScan",
+            PhysicalPlan::SetUnion { .. } => "SetUnion",
+            PhysicalPlan::TruncateTable { .. } => "TruncateTable",
+            PhysicalPlan::CreateTableAs { .. } => "CreateTableAs",
+            PhysicalPlan::Savepoint { .. } => "Savepoint",
+            PhysicalPlan::ReleaseSavepoint { .. } => "ReleaseSavepoint",
+            PhysicalPlan::RollbackToSavepoint { .. } => "RollbackToSavepoint",
+            PhysicalPlan::VectorSearch { .. } => "VectorSearch",
+        }
+    }
+
+    fn tree_has(plan: &PhysicalPlan, name: &str) -> bool {
+        if node_name(plan) == name {
+            return true;
+        }
+        match plan {
+            PhysicalPlan::Filter { input, .. } => tree_has(input, name),
+            PhysicalPlan::Projection { input, .. } => tree_has(input, name),
+            PhysicalPlan::Aggregate { input, .. } => tree_has(input, name),
+            PhysicalPlan::Sort { input, .. } => tree_has(input, name),
+            PhysicalPlan::Limit { input, .. } => tree_has(input, name),
+            PhysicalPlan::Window { input, .. } => tree_has(input, name),
+            PhysicalPlan::Distinct { input } => tree_has(input, name),
+            PhysicalPlan::Explain { plan, .. } => tree_has(plan, name),
+            PhysicalPlan::SubqueryScan { plan } => tree_has(plan, name),
+            PhysicalPlan::HashJoin { left, right, .. } => tree_has(left, name) || tree_has(right, name),
+            PhysicalPlan::CrossJoin { left, right } => tree_has(left, name) || tree_has(right, name),
+            PhysicalPlan::SetUnion { left, right, .. } => tree_has(left, name) || tree_has(right, name),
+            PhysicalPlan::CreateTableAs { source, .. } => tree_has(source, name),
+            PhysicalPlan::InsertSelect { source, .. } => tree_has(source, name),
+            _ => false,
+        }
+    }
+
+    fn find_node<'a>(plan: &'a PhysicalPlan, name: &str) -> Option<&'a PhysicalPlan> {
+        if node_name(plan) == name {
+            return Some(plan);
+        }
+        match plan {
+            PhysicalPlan::Filter { input, .. } => find_node(input, name),
+            PhysicalPlan::Projection { input, .. } => find_node(input, name),
+            PhysicalPlan::Aggregate { input, .. } => find_node(input, name),
+            PhysicalPlan::Sort { input, .. } => find_node(input, name),
+            PhysicalPlan::Limit { input, .. } => find_node(input, name),
+            PhysicalPlan::Window { input, .. } => find_node(input, name),
+            PhysicalPlan::Distinct { input } => find_node(input, name),
+            PhysicalPlan::Explain { plan, .. } => find_node(plan, name),
+            PhysicalPlan::SubqueryScan { plan } => find_node(plan, name),
+            PhysicalPlan::HashJoin { left, right, .. } => find_node(left, name).or_else(|| find_node(right, name)),
+            PhysicalPlan::CrossJoin { left, right } => find_node(left, name).or_else(|| find_node(right, name)),
+            PhysicalPlan::SetUnion { left, right, .. } => find_node(left, name).or_else(|| find_node(right, name)),
+            PhysicalPlan::CreateTableAs { source, .. } => find_node(source, name),
+            PhysicalPlan::InsertSelect { source, .. } => find_node(source, name),
+            _ => None,
+        }
+    }
+
+    // ===== Perf01：COUNT(*) 元数据短路 =====
+    #[test]
+    fn test_count_star_shortcut() {
+        let mut conn = setup();
+        match plan_ok(&mut conn, "SELECT COUNT(*) FROM t") {
+            PhysicalPlan::CountStar { output_name, count } => {
+                assert_eq!(output_name, "count(*)");
+                assert_eq!(count, 0);
+            }
+            other => panic!("expected CountStar, got {other:?}"),
+        }
+        match plan_ok(&mut conn, "SELECT COUNT(*) AS c FROM t") {
+            PhysicalPlan::CountStar { output_name, count: 0 } => assert_eq!(output_name, "c"),
+            other => panic!("expected CountStar alias, got {other:?}"),
+        }
+        match plan_ok(&mut conn, "SELECT COUNT(1) FROM t") {
+            PhysicalPlan::CountStar { count: 0, .. } => {}
+            other => panic!("expected CountStar for COUNT(1), got {other:?}"),
+        }
+        // COUNT(列) 不短路
+        match plan_ok(&mut conn, "SELECT COUNT(id) FROM t") {
+            PhysicalPlan::Aggregate { aggregates, .. } => {
+                assert_eq!(aggregates.len(), 1);
+                assert!(matches!(aggregates[0].func, AggregateFunc::Count));
+            }
+            other => panic!("expected Aggregate for COUNT(col), got {other:?}"),
+        }
+        // WHERE 阻断短路
+        match plan_ok(&mut conn, "SELECT COUNT(*) FROM t WHERE age > 1") {
+            PhysicalPlan::Aggregate { input, aggregates, .. } => {
+                assert!(matches!(aggregates[0].func, AggregateFunc::Count));
+                assert!(matches!(*input, PhysicalPlan::Filter { .. }));
+            }
+            other => panic!("expected Aggregate over Filter, got {other:?}"),
+        }
+        // GROUP BY 阻断短路
+        assert!(matches!(
+            plan_ok(&mut conn, "SELECT COUNT(*) FROM t GROUP BY dept"),
+            PhysicalPlan::Aggregate { .. }
+        ));
+        // JOIN 不走短路
+        assert!(tree_has(&plan_ok(&mut conn, "SELECT COUNT(*) FROM t JOIN u ON t.id = u.tid"),
+            "HashJoin"));
+    }
+
+    // ===== Perf03：主键点查短路 =====
+    #[test]
+    fn test_pk_lookup_shortcut() {
+        let mut conn = setup();
+        match find_node(&plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5"), "PrimaryKeyLookup") {
+            Some(PhysicalPlan::PrimaryKeyLookup { pk_value, output_column_indices, .. }) => {
+                assert_eq!(*pk_value, crate::Value::Int64(5));
+                assert_eq!(*output_column_indices, vec![0, 1, 2, 3]);
+            }
+            other => panic!("expected PrimaryKeyLookup, got {other:?}"),
+        }
+        // 字面量在左
+        match find_node(&plan_ok(&mut conn, "SELECT * FROM t WHERE 5 = id"), "PrimaryKeyLookup") {
+            Some(PhysicalPlan::PrimaryKeyLookup { pk_value, .. }) => {
+                assert_eq!(*pk_value, crate::Value::Int64(5));
+            }
+            other => panic!("expected PrimaryKeyLookup, got {other:?}"),
+        }
+        // 列裁剪
+        match find_node(&plan_ok(&mut conn, "SELECT name FROM t WHERE id = 5"), "PrimaryKeyLookup") {
+            Some(PhysicalPlan::PrimaryKeyLookup { output_column_indices, .. }) => {
+                // 扫描列 = SELECT 列 + WHERE 引用列（pk 列）
+                assert_eq!(*output_column_indices, vec![1, 0]);
+            }
+            other => panic!("expected column-pruned PK lookup, got {other:?}"),
+        }
+        // LIMIT 不阻断（P3.3）
+        match plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5 LIMIT 1") {
+            PhysicalPlan::Limit { input, limit: 1 } => {
+                assert!(tree_has(&input, "PrimaryKeyLookup"));
+            }
+            other => panic!("expected Limit over PK lookup, got {other:?}"),
+        }
+        // 列对列比较不短路
+        assert!(tree_has(&plan_ok(&mut conn, "SELECT * FROM t WHERE id = age"), "Filter"));
+        // AND 组合不短路
+        assert!(tree_has(&plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5 AND age = 1"),
+            "Filter"));
+        // ORDER BY 阻断主键短路
+        assert!(tree_has(&plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5 ORDER BY name"),
+            "Filter"));
+        // GROUP BY 阻断
+        assert!(matches!(
+            plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5 GROUP BY name"),
+            PhysicalPlan::Aggregate { .. }
+        ));
+    }
+
+    // ===== 覆盖索引 / 索引点查 / 范围扫描 =====
+    #[test]
+    fn test_index_scan_variants() {
+        let mut conn = setup();
+        // 覆盖索引：name 在 INCLUDE 中 → IndexOnlyScan
+        match find_node(&plan_ok(&mut conn, "SELECT name FROM t WHERE age = 3"), "IndexOnlyScan") {
+            Some(PhysicalPlan::IndexOnlyScan { index_name, key_value, output_col_map, .. }) => {
+                assert_eq!(index_name, "idx_age");
+                assert_eq!(*key_value, crate::Value::Int64(3));
+                // 扫描列 [name, age]（WHERE 列追加）→ name→included 1, age→key 0
+                assert_eq!(*output_col_map, vec![1, 0]);
+            }
+            other => panic!("expected IndexOnlyScan, got {other:?}"),
+        }
+        // 键列 + 覆盖列都在索引内
+        match find_node(&plan_ok(&mut conn, "SELECT age, name FROM t WHERE age = 3"), "IndexOnlyScan") {
+            Some(PhysicalPlan::IndexOnlyScan { output_col_map, .. }) => {
+                assert_eq!(*output_col_map, vec![0, 1]);
+            }
+            other => panic!("expected covering IndexOnlyScan, got {other:?}"),
+        }
+        // 键列单独覆盖
+        match find_node(&plan_ok(&mut conn, "SELECT dept FROM t WHERE dept = 'x'"), "IndexOnlyScan") {
+            Some(PhysicalPlan::IndexOnlyScan { index_name, output_col_map, .. }) => {
+                assert_eq!(index_name, "idx_dept");
+                assert_eq!(*output_col_map, vec![0]);
+            }
+            other => panic!("expected dept IndexOnlyScan, got {other:?}"),
+        }
+        // id 不在覆盖范围 → 回表 IndexScan
+        match find_node(&plan_ok(&mut conn, "SELECT id FROM t WHERE age = 3"), "IndexScan") {
+            Some(PhysicalPlan::IndexScan { index_name, key_value, output_column_indices, .. }) => {
+                assert_eq!(index_name, "idx_age");
+                assert_eq!(*key_value, crate::Value::Int64(3));
+                // 扫描列 = SELECT id + WHERE age
+                assert_eq!(*output_column_indices, vec![0, 2]);
+            }
+            other => panic!("expected IndexScan, got {other:?}"),
+        }
+        // SELECT * 混合列 → 回表
+        assert!(tree_has(&plan_ok(&mut conn, "SELECT * FROM t WHERE age = 3"), "IndexScan"));
+        // 无索引列等值 → 全表扫描 + Filter
+        let p = plan_ok(&mut conn, "SELECT * FROM t WHERE name = 'x'");
+        assert!(tree_has(&p, "Filter"), "{p:?}");
+        assert!(tree_has(&p, "TableScan"), "{p:?}");
+    }
+
+    #[test]
+    fn test_index_range_scan() {
+        let mut conn = setup();
+        match find_node(&plan_ok(&mut conn, "SELECT name FROM t WHERE age > 3"), "IndexRangeScan") {
+            Some(PhysicalPlan::IndexRangeScan { index_name, low, low_inclusive, high, high_inclusive, .. }) => {
+                assert_eq!(index_name, "idx_age");
+                assert_eq!(*low, Some(crate::Value::Int64(3)));
+                assert!(!low_inclusive);
+                assert_eq!(*high, None);
+                assert!(!high_inclusive);
+            }
+            other => panic!("expected IndexRangeScan gt, got {other:?}"),
+        }
+        match find_node(&plan_ok(&mut conn, "SELECT name FROM t WHERE age >= 3"), "IndexRangeScan") {
+            Some(PhysicalPlan::IndexRangeScan { low_inclusive, .. }) => assert!(*low_inclusive),
+            other => panic!("expected IndexRangeScan ge, got {other:?}"),
+        }
+        match find_node(&plan_ok(&mut conn, "SELECT name FROM t WHERE age < 5"), "IndexRangeScan") {
+            Some(PhysicalPlan::IndexRangeScan { high, high_inclusive, .. }) => {
+                assert_eq!(*high, Some(crate::Value::Int64(5)));
+                assert!(!high_inclusive);
+            }
+            other => panic!("expected IndexRangeScan lt, got {other:?}"),
+        }
+        match find_node(&plan_ok(&mut conn, "SELECT name FROM t WHERE age <= 5"), "IndexRangeScan") {
+            Some(PhysicalPlan::IndexRangeScan { high_inclusive, .. }) => assert!(*high_inclusive),
+            other => panic!("expected IndexRangeScan le, got {other:?}"),
+        }
+        // 双边合并
+        match find_node(&plan_ok(&mut conn, "SELECT name FROM t WHERE age >= 3 AND age < 10"), "IndexRangeScan") {
+            Some(PhysicalPlan::IndexRangeScan { low, low_inclusive, high, high_inclusive, .. }) => {
+                assert_eq!(*low, Some(crate::Value::Int64(3)));
+                assert!(*low_inclusive);
+                assert_eq!(*high, Some(crate::Value::Int64(10)));
+                assert!(!high_inclusive);
+            }
+            other => panic!("expected two-sided IndexRangeScan, got {other:?}"),
+        }
+        // 边界冲突（下界 > 上界）→ 回退全表扫描
+        let p = plan_ok(&mut conn, "SELECT name FROM t WHERE age > 5 AND age < 3");
+        assert!(tree_has(&p, "TableScan"), "{p:?}");
+        assert!(!tree_has(&p, "IndexRangeScan"), "{p:?}");
+        // 三条件（AND 嵌套）无法完全表示 → 回退
+        assert!(tree_has(
+            &plan_ok(&mut conn, "SELECT name FROM t WHERE age > 3 AND age < 10 AND dept = 'x'"),
+            "TableScan"
+        ));
+        // 不同列范围无法合并 → 回退
+        assert!(tree_has(
+            &plan_ok(&mut conn, "SELECT id FROM t WHERE age > 1 AND id > 1"),
+            "TableScan"
+        ));
+        // 无索引列范围 → 回退全表扫描 + Filter
+        let p = plan_ok(&mut conn, "SELECT id FROM t WHERE name > 'a'");
+        assert!(tree_has(&p, "Filter"), "{p:?}");
+        assert!(tree_has(&p, "TableScan"), "{p:?}");
+    }
+
+    #[test]
+    fn test_sort_skip_via_index() {
+        let mut conn = setup();
+        // 覆盖索引 + ASC 顺序 → 跳过 Sort
+        assert!(!tree_has(
+            &plan_ok(&mut conn, "SELECT age, name FROM t WHERE age = 3 ORDER BY age"),
+            "Sort"
+        ));
+        // 跳过后底层仍为索引扫描（修复前 ORDER BY 阻断索引优化）
+        assert!(tree_has(
+            &plan_ok(&mut conn, "SELECT age, name FROM t WHERE age = 3 ORDER BY age"),
+            "IndexOnlyScan"
+        ));
+        // DESC → 保留 Sort
+        assert!(tree_has(
+            &plan_ok(&mut conn, "SELECT age, name FROM t WHERE age = 3 ORDER BY age DESC"),
+            "Sort"
+        ));
+        // 排序列不在输出列 → sort_keys 解析为空 → 无 Sort 节点（排序列被省略）
+        assert!(!tree_has(
+            &plan_ok(&mut conn, "SELECT name FROM t WHERE age = 3 ORDER BY age"),
+            "Sort"
+        ));
+        // 无索引普通排序
+        match plan_ok(&mut conn, "SELECT id FROM t ORDER BY id DESC") {
+            PhysicalPlan::Sort { sort_keys, .. } => {
+                assert_eq!(sort_keys[0].column_index, 0);
+                assert!(matches!(sort_keys[0].direction,
+                    crate::executor::physical_plan::SortDirection::Desc));
+            }
+            other => panic!("expected Sort, got {other:?}"),
+        }
+        // LIMIT 随 Sort 传递（Sort 携带 limit，顶层仍叠加 Limit）
+        match find_node(&plan_ok(&mut conn, "SELECT id FROM t ORDER BY id LIMIT 5"), "Sort") {
+            Some(PhysicalPlan::Sort { limit: Some(5), .. }) => {}
+            other => panic!("expected Sort with limit, got {other:?}"),
+        }
+    }
+
+    // ===== 聚合 / GROUP BY / HAVING =====
+    #[test]
+    fn test_aggregate_plan() {
+        let mut conn = setup();
+        match plan_ok(&mut conn, "SELECT dept, COUNT(*) FROM t GROUP BY dept") {
+            PhysicalPlan::Aggregate { group_by, aggregates, .. } => {
+                assert_eq!(group_by, vec![0]);
+                assert_eq!(aggregates.len(), 1);
+                assert!(matches!(aggregates[0].func, AggregateFunc::Count));
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+        match plan_ok(&mut conn, "SELECT dept, SUM(age) FROM t GROUP BY dept") {
+            PhysicalPlan::Aggregate { aggregates, .. } => {
+                assert!(matches!(aggregates[0].func, AggregateFunc::Sum));
+                assert_eq!(aggregates[0].input, 1);
+                assert!(!aggregates[0].distinct);
+            }
+            other => panic!("expected SUM aggregate, got {other:?}"),
+        }
+        // MIN/MAX/AVG
+        for (sql, f) in [
+            ("SELECT MIN(age) FROM t", AggregateFunc::Min),
+            ("SELECT MAX(age) FROM t", AggregateFunc::Max),
+            ("SELECT AVG(age) FROM t", AggregateFunc::Avg),
+        ] {
+            match plan_ok(&mut conn, sql) {
+                PhysicalPlan::Aggregate { aggregates, .. } => {
+                    assert!(matches!(aggregates[0].func, f));
+                }
+                other => panic!("expected {f:?} aggregate, got {other:?}"),
+            }
+        }
+        // HAVING：聚合重写为输出列引用（HAVING 聚合不在 SELECT 中也能重写）
+        match plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1") {
+            PhysicalPlan::Filter { input, condition } => {
+                assert!(matches!(*input, PhysicalPlan::Aggregate { .. }));
+                let rewritten = format!("{condition:?}");
+                assert!(rewritten.contains("Count(0)"), "HAVING rewrite: {rewritten}");
+            }
+            other => panic!("expected HAVING Filter, got {other:?}"),
+        }
+        // HAVING 单独引用聚合：聚合节点必须包含该聚合（修复后）
+        match plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING SUM(age) > 100") {
+            PhysicalPlan::Filter { input, condition } => {
+                match *input {
+                    PhysicalPlan::Aggregate { aggregates, .. } => {
+                        assert!(matches!(aggregates[0].func, AggregateFunc::Sum), "{aggregates:?}");
+                    }
+                    other => panic!("expected Aggregate, got {other:?}"),
+                }
+                assert!(format!("{condition:?}").contains("Sum("), "HAVING rewrite: {condition:?}");
+            }
+            other => panic!("expected HAVING Filter, got {other:?}"),
+        }
+        // GROUP BY + ORDER BY
+        match plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept ORDER BY dept") {
+            PhysicalPlan::Sort { input, .. } => {
+                assert!(matches!(*input, PhysicalPlan::Aggregate { .. }));
+            }
+            other => panic!("expected Sort over Aggregate, got {other:?}"),
+        }
+        // DISTINCT
+        match plan_ok(&mut conn, "SELECT DISTINCT dept FROM t") {
+            PhysicalPlan::Distinct { input, .. } => {
+                assert!(matches!(*input, PhysicalPlan::Projection { .. }));
+            }
+            other => panic!("expected Distinct, got {other:?}"),
+        }
+    }
+
+    // ===== 窗口函数 =====
+    #[test]
+    fn test_window_plan() {
+        let mut conn = setup();
+        match find_node(&plan_ok(&mut conn, "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM t"), "Window") {
+            Some(PhysicalPlan::Window { window_functions, .. }) => {
+                assert_eq!(window_functions.len(), 1);
+                assert!(matches!(window_functions[0].func, WindowFuncType::RowNumber));
+                assert!(window_functions[0].input_column.is_none());
+            }
+            other => panic!("expected Window ROW_NUMBER, got {other:?}"),
+        }
+        match find_node(&plan_ok(&mut conn, "SELECT name, LAG(age, 1) OVER (ORDER BY id) FROM t"), "Window") {
+            Some(PhysicalPlan::Window { window_functions, .. }) => {
+                assert!(matches!(window_functions[0].func, WindowFuncType::Lag(1)));
+                assert_eq!(window_functions[0].input_column, Some(1));
+                assert_eq!(window_functions[0].output_name, "lag");
+            }
+            other => panic!("expected Window LAG, got {other:?}"),
+        }
+        // 别名作为输出列名
+        match find_node(&plan_ok(&mut conn, "SELECT RANK() OVER (ORDER BY id) AS r FROM t"), "Window") {
+            Some(PhysicalPlan::Window { window_functions, .. }) => {
+                assert!(matches!(window_functions[0].func, WindowFuncType::Rank));
+                assert_eq!(window_functions[0].output_name, "r");
+            }
+            other => panic!("expected Window RANK, got {other:?}"),
+        }
+        // JOIN 查询窗口函数 → 明确报错
+        assert!(matches!(
+            assert_err(&mut conn, "SELECT ROW_NUMBER() OVER (ORDER BY t.id) FROM t JOIN u ON t.id = u.tid"),
+            EngramDbError::Parse(_)
+        ));
+    }
+
+    // ===== JOIN 复杂场景 =====
+    #[test]
+    fn test_join_types() {
+        let mut conn = setup();
+        for (sql, jt) in [
+            ("SELECT * FROM t JOIN u ON t.id = u.tid", JoinType::Inner),
+            ("SELECT * FROM t LEFT JOIN u ON t.id = u.tid", JoinType::Left),
+            ("SELECT * FROM t RIGHT JOIN u ON t.id = u.tid", JoinType::Right),
+            ("SELECT * FROM t FULL JOIN u ON t.id = u.tid", JoinType::Full),
+        ] {
+            match find_node(&plan_ok(&mut conn, sql), "HashJoin") {
+                Some(PhysicalPlan::HashJoin { join_type, left_keys, right_keys, .. }) => {
+                    assert_eq!(*join_type, jt);
+                    assert_eq!(left_keys.len(), 1);
+                    assert_eq!(right_keys.len(), 1);
+                }
+                other => panic!("expected {jt:?} HashJoin, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_join_keys_and_structure() {
+        let mut conn = setup();
+        // 多等值键
+        match find_node(&plan_ok(&mut conn, "SELECT * FROM t JOIN u ON t.id = u.tid AND t.age = u.score"), "HashJoin") {
+            Some(PhysicalPlan::HashJoin { left_keys, right_keys, .. }) => {
+                assert_eq!(*left_keys, vec![0, 2]);
+                assert_eq!(*right_keys, vec![1, 2]);
+            }
+            other => panic!("expected multi-key HashJoin, got {other:?}"),
+        }
+        // 非等值 INNER → CrossJoin + 残留 Filter
+        match find_node(&plan_ok(&mut conn, "SELECT * FROM t JOIN u ON t.age > u.score"), "Filter") {
+            Some(PhysicalPlan::Filter { input, .. }) => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::CrossJoin { .. }));
+            }
+            other => panic!("expected residual Filter over CrossJoin, got {other:?}"),
+        }
+        // 非等值 LEFT → 报错
+        assert!(matches!(
+            assert_err(&mut conn, "SELECT * FROM t LEFT JOIN u ON t.age > u.score"),
+            EngramDbError::Parse(_)
+        ));
+        // CROSS JOIN
+        assert!(tree_has(&plan_ok(&mut conn, "SELECT * FROM t CROSS JOIN u"), "CrossJoin"));
+        // 三表左深嵌套
+        match find_node(&plan_ok(&mut conn, "SELECT * FROM t JOIN u ON t.id = u.tid JOIN v ON u.score = v.id"), "HashJoin") {
+            Some(PhysicalPlan::HashJoin { left, .. }) => {
+                assert!(matches!(left.as_ref(), PhysicalPlan::HashJoin { .. }));
+            }
+            other => panic!("expected nested HashJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_join_full_pipeline() {
+        let mut conn = setup();
+        // JOIN + WHERE + ORDER BY + LIMIT 完整流水线
+        match plan_ok(&mut conn,
+            "SELECT t.id FROM t JOIN u ON t.id = u.tid WHERE t.age > 1 ORDER BY t.id LIMIT 3")
+        {
+            PhysicalPlan::Limit { input, limit: 3 } => match *input {
+                PhysicalPlan::Sort { input, sort_keys, .. } => {
+                    assert_eq!(sort_keys.len(), 1);
+                    assert_eq!(sort_keys[0].column_index, 0);
+                    match *input {
+                        PhysicalPlan::Projection { input, column_names, .. } => {
+                            assert_eq!(column_names, vec!["id"]);
+                            match *input {
+                                PhysicalPlan::Filter { input, .. } => {
+                                    assert!(tree_has(&input, "HashJoin"));
+                                }
+                                other => panic!("expected Filter, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected Projection, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Sort, got {other:?}"),
+            },
+            other => panic!("expected Limit pipeline, got {other:?}"),
+        }
+        // JOIN + GROUP BY 聚合
+        match plan_ok(&mut conn, "SELECT u.tid, COUNT(*) FROM t JOIN u ON t.id = u.tid GROUP BY u.tid") {
+            PhysicalPlan::Aggregate { group_by, aggregates, .. } => {
+                assert_eq!(aggregates.len(), 1);
+                assert_eq!(group_by.len(), 1);
+            }
+            other => panic!("expected join aggregate, got {other:?}"),
+        }
+        // JOIN 输出列带表前缀（消歧）
+        match plan_ok(&mut conn, "SELECT t.id, u.id FROM t JOIN u ON t.id = u.tid") {
+            PhysicalPlan::Projection { expressions, column_names, .. } => {
+                assert_eq!(column_names, vec!["id", "id"]);
+                assert_eq!(expressions.len(), 2);
+            }
+            other => panic!("expected join projection, got {other:?}"),
+        }
+        // 列名前缀带表名（消歧作用在表达式里）
+        match plan_ok(&mut conn, "SELECT t.id, u.id FROM t JOIN u ON t.id = u.tid") {
+            PhysicalPlan::Projection { expressions, .. } => {
+                let s0 = format!("{:?}", expressions[0]);
+                let s1 = format!("{:?}", expressions[1]);
+                assert!(s0.contains("t.id"), "exp0: {s0}");
+                assert!(s1.contains("u.id"), "exp1: {s1}");
+            }
+            other => panic!("expected join projection, got {other:?}"),
+        }
+    }
+
+    // ===== CTE / 派生表 / 子查询 =====
+    #[test]
+    fn test_cte_and_derived_tables() {
+        let mut conn = setup();
+        // CTE 内联 → Derived → SubqueryScan（外层 SELECT 投影保留）
+        match find_node(&plan_ok(&mut conn, "WITH c AS (SELECT id FROM t) SELECT * FROM c"),
+            "SubqueryScan")
+        {
+            Some(PhysicalPlan::SubqueryScan { plan }) => {
+                assert!(matches!(plan.as_ref(), PhysicalPlan::Projection { .. }));
+            }
+            other => panic!("expected SubqueryScan from CTE, got {other:?}"),
+        }
+        // 直接派生表（age 有索引 → 内层为范围扫描）
+        match find_node(&plan_ok(&mut conn, "SELECT * FROM (SELECT id, age FROM t WHERE age > 1) AS s"),
+            "SubqueryScan")
+        {
+            Some(PhysicalPlan::SubqueryScan { plan }) => {
+                assert!(tree_has(&plan, "Filter"));
+                assert!(tree_has(&plan, "IndexRangeScan"));
+            }
+            other => panic!("expected SubqueryScan, got {other:?}"),
+        }
+        // 派生表嵌套过滤（内层 Filter + 外层 Filter）
+        match find_node(&plan_ok(&mut conn,
+            "SELECT s.id FROM (SELECT id FROM t WHERE age > 1) s WHERE s.id > 2"), "Filter")
+        {
+            Some(PhysicalPlan::Filter { input, .. }) => {
+                assert!(matches!(input.as_ref(), PhysicalPlan::SubqueryScan { .. }));
+            }
+            other => panic!("expected outer Filter over SubqueryScan, got {other:?}"),
+        }
+        // JOIN 中派生表 → 明确报错
+        assert!(matches!(
+            assert_err(&mut conn, "SELECT * FROM (SELECT id FROM t) s JOIN u ON s.id = u.tid"),
+            EngramDbError::Parse(_)
+        ));
+    }
+
+    // ===== 集合操作 =====
+    #[test]
+    fn test_set_operations() {
+        let mut conn = setup();
+        for (sql, op) in [
+            ("SELECT id FROM t UNION SELECT id FROM t", SetUnionOp::Union),
+            ("SELECT id FROM t UNION ALL SELECT id FROM t", SetUnionOp::UnionAll),
+            ("SELECT id FROM t INTERSECT SELECT id FROM t", SetUnionOp::Intersect),
+            ("SELECT id FROM t EXCEPT SELECT id FROM t", SetUnionOp::Except),
+        ] {
+            match plan_ok(&mut conn, sql) {
+                PhysicalPlan::SetUnion { op: got, left, right } => {
+                    assert_eq!(got, op);
+                    assert!(tree_has(&left, "TableScan"));
+                    assert!(tree_has(&right, "TableScan"));
+                }
+                other => panic!("expected SetUnion {op:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // ===== INSERT 计划路径 =====
+    #[test]
+    fn test_insert_plan_paths() {
+        let mut conn = setup();
+        // 默认事务模式：行式 Insert + 字面量求值
+        match plan_ok(&mut conn, "INSERT INTO t VALUES (1, 'a', 2, 'x')") {
+            PhysicalPlan::Insert { rows, returning, on_conflict, .. } => {
+                assert_eq!(rows, vec![vec![
+                    crate::Value::Int64(1),
+                    crate::Value::Varchar("a".into()),
+                    crate::Value::Int64(2),
+                    crate::Value::Varchar("x".into()),
+                ]]);
+                assert!(returning.is_none());
+                assert!(on_conflict.is_none());
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+        // 多行
+        match plan_ok(&mut conn, "INSERT INTO t VALUES (1, 'a', 2, 'x'), (2, 'b', 3, 'y')") {
+            PhysicalPlan::Insert { rows, .. } => assert_eq!(rows.len(), 2),
+            other => panic!("expected multi-row Insert, got {other:?}"),
+        }
+        // 列重排 + Null 填充
+        match plan_ok(&mut conn, "INSERT INTO t (name, id) VALUES ('a', 1)") {
+            PhysicalPlan::Insert { rows, .. } => {
+                assert_eq!(rows, vec![vec![
+                    crate::Value::Int64(1),
+                    crate::Value::Varchar("a".into()),
+                    crate::Value::Null,
+                    crate::Value::Null,
+                ]]);
+            }
+            other => panic!("expected column-reordered Insert, got {other:?}"),
+        }
+        // 列子集
+        match plan_ok(&mut conn, "INSERT INTO t (id) VALUES (9)") {
+            PhysicalPlan::Insert { rows, .. } => {
+                assert_eq!(rows, vec![vec![
+                    crate::Value::Int64(9),
+                    crate::Value::Null,
+                    crate::Value::Null,
+                    crate::Value::Null,
+                ]]);
+            }
+            other => panic!("expected subset Insert, got {other:?}"),
+        }
+        // INSERT ... SELECT
+        match plan_ok(&mut conn, "INSERT INTO u (tid, score) SELECT age, dept FROM t") {
+            PhysicalPlan::InsertSelect { table_name, columns, source } => {
+                assert_eq!(table_name, "u");
+                assert_eq!(columns, Some(vec!["tid".into(), "score".into()]));
+                assert!(tree_has(&source, "TableScan"));
+            }
+            other => panic!("expected InsertSelect, got {other:?}"),
+        }
+        // ON CONFLICT DO NOTHING
+        match plan_ok(&mut conn, "INSERT INTO t VALUES (1, 'a', 2, 'x') ON CONFLICT DO NOTHING") {
+            PhysicalPlan::Insert { on_conflict, rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match on_conflict {
+                    Some(crate::sql::ast::OnConflictClause {
+                        action: crate::sql::ast::OnConflictAction::DoNothing,
+                        ..
+                    }) => {}
+                    other => panic!("expected DoNothing, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insert on conflict, got {other:?}"),
+        }
+        // RETURNING
+        assert!(matches!(
+            plan_ok(&mut conn, "INSERT INTO t VALUES (1, 'a', 2, 'x') RETURNING id"),
+            PhysicalPlan::Insert { returning: Some(_), .. }
+        ));
+        // 表不存在
+        assert!(matches!(assert_err(&mut conn, "INSERT INTO nosuch VALUES (1)"),
+            EngramDbError::TableNotFound(_)));
+    }
+
+    #[test]
+    fn test_insert_columns_fast_path() {
+        // 事务关闭：列式快路径
+        let mut conn = Connection::open_with_config(":memory:",
+            crate::common::config::Config { enable_transaction: false, ..Default::default() }).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        match plan_ok(&mut conn, "INSERT INTO t VALUES (1, 'a'), (2, 'b')") {
+            PhysicalPlan::InsertColumns { table_name, columns } => {
+                assert_eq!(table_name, "t");
+                assert_eq!(columns, vec![
+                    vec![crate::Value::Int64(1), crate::Value::Int64(2)],
+                    vec![crate::Value::Varchar("a".into()), crate::Value::Varchar("b".into())],
+                ]);
+            }
+            other => panic!("expected InsertColumns fast path, got {other:?}"),
+        }
+        // 列名重排阻断快路径
+        assert!(matches!(plan_ok(&mut conn, "INSERT INTO t (name) VALUES ('a')"),
+            PhysicalPlan::Insert { .. }));
+        // 行宽不齐阻断快路径
+        assert!(matches!(plan_ok(&mut conn, "INSERT INTO t VALUES (1, 'a', 2)"),
+            PhysicalPlan::Insert { .. }));
+        // 单行同样走快路径
+        assert!(matches!(plan_ok(&mut conn, "INSERT INTO t VALUES (1, 'a')"),
+            PhysicalPlan::InsertColumns { .. }));
+    }
+
+    // ===== UPDATE / DELETE 计划 =====
+    #[test]
+    fn test_update_delete_plan() {
+        let mut conn = setup();
+        match plan_ok(&mut conn, "DELETE FROM t") {
+            PhysicalPlan::Delete { condition, .. } => assert!(condition.is_none()),
+            other => panic!("expected full Delete, got {other:?}"),
+        }
+        match plan_ok(&mut conn, "DELETE FROM t WHERE id = 1") {
+            PhysicalPlan::Delete { condition, .. } => {
+                assert!(matches!(condition, Some(crate::sql::ast::Expression::BinaryOp {
+                    op: crate::sql::ast::BinaryOperator::Eq, ..
+                })));
+            }
+            other => panic!("expected conditional Delete, got {other:?}"),
+        }
+        // Memory 引擎支持 DELETE
+        assert!(matches!(plan_ok(&mut conn, "DELETE FROM mem_t WHERE id = 1"),
+            PhysicalPlan::Delete { .. }));
+        // Log 引擎被 planner 拦截（能力不足 → NotSupported）
+        assert!(matches!(assert_err(&mut conn, "DELETE FROM log_t"),
+            EngramDbError::NotSupported(_)));
+        // 表不存在
+        assert!(matches!(assert_err(&mut conn, "DELETE FROM nosuch"),
+            EngramDbError::TableNotFound(_)));
+
+        match plan_ok(&mut conn, "UPDATE t SET age = 10") {
+            PhysicalPlan::Update { assignments, condition, .. } => {
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].0, 2);
+                assert!(matches!(&assignments[0].1, crate::sql::ast::Expression::Literal(
+                    crate::Value::Int64(10))));
+                assert!(condition.is_none());
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+        match plan_ok(&mut conn, "UPDATE t SET age = 10, name = 'z' WHERE id = 1") {
+            PhysicalPlan::Update { assignments, condition, .. } => {
+                assert_eq!(assignments.len(), 2);
+                assert!(condition.is_some());
+            }
+            other => panic!("expected conditional Update, got {other:?}"),
+        }
+        // 列不存在 → 明确报错
+        assert!(matches!(assert_err(&mut conn, "UPDATE t SET nope = 1"),
+            EngramDbError::ColumnNotFound(_)));
+        // Log 引擎被 planner 拦截（能力不足 → NotSupported）
+        assert!(matches!(assert_err(&mut conn, "UPDATE log_t SET v = 1"),
+            EngramDbError::NotSupported(_)));
+    }
+
+    // ===== CREATE TABLE / 引擎 =====
+    #[test]
+    fn test_create_table_plan() {
+        let mut conn = setup();
+        match plan_ok(&mut conn,
+            "CREATE TABLE t2 (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT NOT NULL, score FLOAT)") {
+            PhysicalPlan::CreateTable { table_def } => {
+                assert_eq!(table_def.columns.len(), 3);
+                assert_eq!(table_def.columns[0].name, "id");
+                assert!(table_def.columns[0].is_primary_key);
+                assert!(table_def.columns[0].auto_increment);
+                assert!(!table_def.columns[0].nullable);
+                assert!(!table_def.columns[1].nullable);
+                assert!(table_def.primary_key_index().is_some());
+                assert_eq!(table_def.engine, EngineType::Columnar);
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+        // 列级 UNIQUE → 自动唯一索引
+        match plan_ok(&mut conn, "CREATE TABLE t3 (id INT PRIMARY KEY, email TEXT UNIQUE)") {
+            PhysicalPlan::CreateTable { table_def } => {
+                assert_eq!(table_def.indexes.len(), 1);
+                assert_eq!(table_def.indexes[0].name, "uniq_t3_email");
+                assert!(table_def.indexes[0].unique);
+            }
+            other => panic!("expected auto unique index, got {other:?}"),
+        }
+        // ENGINE 指定
+        match plan_ok(&mut conn, "CREATE TABLE m1 (id INT PRIMARY KEY) ENGINE = Memory") {
+            PhysicalPlan::CreateTable { table_def } => {
+                assert_eq!(table_def.engine, EngineType::Memory);
+            }
+            other => panic!("expected Memory CreateTable, got {other:?}"),
+        }
+        match plan_ok(&mut conn, "CREATE TABLE l1 (id INT PRIMARY KEY) ENGINE = Log") {
+            PhysicalPlan::CreateTable { table_def } => {
+                assert_eq!(table_def.engine, EngineType::Log);
+            }
+            other => panic!("expected Log CreateTable, got {other:?}"),
+        }
+        // 非法引擎
+        assert!(matches!(assert_err(&mut conn, "CREATE TABLE b1 (id INT) ENGINE = Nope"),
+            EngramDbError::Parse(_)));
+        // CTAS
+        match plan_ok(&mut conn, "CREATE TABLE t4 AS SELECT id, name FROM t") {
+            PhysicalPlan::CreateTableAs { table_def, source } => {
+                assert_eq!(table_def.columns.len(), 2);
+                assert_eq!(table_def.columns[0].name, "id");
+                assert_eq!(table_def.columns[1].name, "name");
+                assert!(tree_has(&source, "TableScan"));
+            }
+            other => panic!("expected CreateTableAs, got {other:?}"),
+        }
+        // CTAS SELECT * → 报错
+        assert!(matches!(
+            assert_err(&mut conn, "CREATE TABLE t5 AS SELECT * FROM t"),
+            EngramDbError::Parse(_)
+        ));
+    }
+
+    #[test]
+    fn test_create_index_plan() {
+        let mut conn = setup();
+        match plan_ok(&mut conn, "CREATE INDEX idx_name ON t (name) INCLUDE (age)") {
+            PhysicalPlan::CreateIndex { index_name, key_columns, included_columns, unique, .. } => {
+                assert_eq!(index_name, "idx_name");
+                assert_eq!(key_columns, vec![1]);
+                assert_eq!(included_columns, vec![2]);
+                assert!(!unique);
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+        // 列不存在
+        assert!(matches!(assert_err(&mut conn, "CREATE INDEX bad ON t (nosuch)"),
+            EngramDbError::ColumnNotFound(_)));
+        // 键列重复为覆盖列
+        assert!(matches!(
+            assert_err(&mut conn, "CREATE INDEX bad2 ON t (age) INCLUDE (age)"),
+            EngramDbError::Parse(_)
+        ));
+        // Log 引擎不支持索引
+        assert!(matches!(assert_err(&mut conn, "CREATE INDEX bad3 ON log_t (ts)"),
+            EngramDbError::NotSupported(_)));
+        // 唯一索引
+        match plan_ok(&mut conn, "CREATE UNIQUE INDEX idx_u ON u (tid)") {
+            PhysicalPlan::CreateIndex { unique, key_columns, .. } => {
+                assert!(unique);
+                assert_eq!(key_columns, vec![1]);
+            }
+            other => panic!("expected unique CreateIndex, got {other:?}"),
+        }
+    }
+
+    // ===== 杂项语句 =====
+    #[test]
+    fn test_misc_statement_plans() {
+        let mut conn = setup();
+        // TRUNCATE：AST 级直接规划（sqlparser 版本语法不兼容）
+        match plan(crate::sql::ast::Statement::TruncateTable {
+            table_name: "t".into(),
+        }, conn.database_mut()).unwrap() {
+            PhysicalPlan::TruncateTable { table_name } => assert_eq!(table_name, "t"),
+            other => panic!("expected TruncateTable, got {other:?}"),
+        }
+        assert!(matches!(plan_ok(&mut conn, "BEGIN TRANSACTION"),
+            PhysicalPlan::BeginTransaction));
+        assert!(matches!(plan_ok(&mut conn, "COMMIT"), PhysicalPlan::Commit));
+        assert!(matches!(plan_ok(&mut conn, "ROLLBACK"), PhysicalPlan::Rollback));
+        assert!(matches!(plan_ok(&mut conn, "SAVEPOINT sp1"),
+            PhysicalPlan::Savepoint { name } if name == "sp1"));
+        assert!(matches!(plan_ok(&mut conn, "RELEASE SAVEPOINT sp1"),
+            PhysicalPlan::ReleaseSavepoint { name } if name == "sp1"));
+        assert!(matches!(plan_ok(&mut conn, "ROLLBACK TO SAVEPOINT sp1"),
+            PhysicalPlan::RollbackToSavepoint { name } if name == "sp1"));
+
+        match plan_ok(&mut conn, "EXPLAIN SELECT * FROM t") {
+            PhysicalPlan::Explain { analyze: false, plan } => {
+                assert!(tree_has(&plan, "TableScan"));
+            }
+            other => panic!("expected Explain, got {other:?}"),
+        }
+        assert!(matches!(plan_ok(&mut conn, "EXPLAIN ANALYZE SELECT * FROM t"),
+            PhysicalPlan::Explain { analyze: true, .. }));
+        assert!(matches!(plan_ok(&mut conn, "PRAGMA table_info = 't'"),
+            PhysicalPlan::Pragma(crate::sql::ast::PragmaStmt { name, arg, .. })
+                if name == "table_info" && arg.as_deref() == Some("t")));
+        // ALTER TABLE：parser 不支持，AST 级直接规划
+        let stmt = crate::sql::ast::Statement::AlterTable(crate::sql::ast::AlterTableStmt {
+            table_name: "t".into(),
+            operation: crate::sql::ast::AlterTableOp::RenameTable { new_name: "t9".into() },
+        });
+        match plan(stmt, conn.database_mut()).unwrap() {
+            PhysicalPlan::AlterTable(crate::sql::ast::AlterTableStmt {
+                operation: crate::sql::ast::AlterTableOp::RenameTable { new_name }, ..
+            }) => assert_eq!(new_name, "t9"),
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+        match plan_ok(&mut conn, "ANALYZE TABLE t") {
+            PhysicalPlan::Analyze { column_indices, .. } => {
+                assert_eq!(column_indices, vec![0, 1, 2, 3]);
+            }
+            other => panic!("expected Analyze, got {other:?}"),
+        }
+        // 列级 ANALYZE：AST 直接规划（sqlparser 不支持列列表）
+        let stmt = crate::sql::ast::Statement::Analyze(crate::sql::ast::AnalyzeStmt {
+            table_name: "t".into(),
+            columns: vec!["name".into()],
+        });
+        match plan(stmt, conn.database_mut()).unwrap() {
+            PhysicalPlan::Analyze { column_indices, .. } => assert_eq!(column_indices, vec![1]),
+            other => panic!("expected Analyze column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_materialized_view_plans() {
+        let mut conn = setup();
+        assert!(matches!(
+            plan_ok(&mut conn, "CREATE MATERIALIZED VIEW mv1 AS SELECT id FROM t"),
+            PhysicalPlan::CreateMaterializedView { view_name, with_data, .. }
+                if view_name == "mv1" && with_data
+        ));
+        // REFRESH：parser 不支持（非标准语句），AST 级直接规划
+        let stmt = crate::sql::ast::Statement::RefreshMaterializedView(
+            crate::sql::ast::RefreshMaterializedViewStmt {
+                view_name: "mv1".into(),
+                concurrently: true,
+            });
+        match plan(stmt, conn.database_mut()).unwrap() {
+            PhysicalPlan::RefreshMaterializedView { concurrently: true, .. } => {}
+            other => panic!("expected RefreshMaterializedView, got {other:?}"),
+        }
+        // DROP：sqlparser 统一走 DROP VIEW
+        assert!(matches!(plan_ok(&mut conn, "DROP VIEW mv1"),
+            PhysicalPlan::DropMaterializedView { if_exists: false, .. }));
+    }
+
+    // ===== 错误路径 =====
+    #[test]
+    fn test_plan_error_paths() {
+        let mut conn = setup();
+        assert!(matches!(plan_sql(&mut conn, "SELECT * FROM nosuch"),
+            Err(EngramDbError::TableNotFound(_))));
+        assert!(matches!(plan_sql(&mut conn, "SELECT 1"),
+            Err(EngramDbError::Parse(_))));
+        assert!(matches!(plan_sql(&mut conn, "EXPLAIN SELECT * FROM nosuch"),
+            Err(EngramDbError::TableNotFound(_))));
+        assert!(matches!(plan_sql(&mut conn, "SELECT * FROM vector_search('nosuch', 'idx', '[1.0]', 5)"),
+            Err(EngramDbError::TableNotFound(_))));
+    }
+
+    // ===== vector_search 表值函数 =====
+    #[test]
+    fn test_vector_search_plan() {
+        let mut conn = setup();
+        match plan_ok(&mut conn,
+            "SELECT * FROM vector_search('t', 'idx_age', '[1.0, 2.0]', 5)")
+        {
+            PhysicalPlan::VectorSearch { table_name, index_name, query_vector, k } => {
+                assert_eq!(table_name, "t");
+                assert_eq!(index_name, "idx_age");
+                assert_eq!(query_vector, vec![1.0, 2.0]);
+                assert_eq!(k, 5);
+            }
+            other => panic!("expected VectorSearch, got {other:?}"),
+        }
+        // 参数不足
+        assert!(matches!(
+            assert_err(&mut conn, "SELECT * FROM vector_search('t', 'idx_age')"),
+            EngramDbError::Parse(_)
+        ));
+        // k 非整数
+        assert!(matches!(
+            assert_err(&mut conn, "SELECT * FROM vector_search('t', 'idx', '[1.0]', 'x')"),
+            EngramDbError::Parse(_)
+        ));
+        // 非法向量 JSON
+        assert!(matches!(
+            assert_err(&mut conn, "SELECT * FROM vector_search('t', 'idx', 'notjson', 5)"),
+            EngramDbError::Parse(_)
+        ));
+        // Log 引擎无向量能力
+        assert!(matches!(
+            assert_err(&mut conn, "SELECT * FROM vector_search('log_t', 'idx', '[1.0]', 5)"),
+            EngramDbError::NotSupported(_)
+        ));
+    }
+
+    // ===== 参数化计划 =====
+    #[test]
+    fn test_plan_with_params() {
+        let mut conn = setup();
+        let stmt = parse("INSERT INTO t VALUES (?, ?, ?, ?)").unwrap();
+        match plan_with_params(stmt, conn.database_mut(),
+            &[crate::Value::Int64(1), crate::Value::Varchar("a".into()),
+              crate::Value::Int64(2), crate::Value::Varchar("x".into())]).unwrap()
+        {
+            PhysicalPlan::Insert { rows, .. } => {
+                assert_eq!(rows, vec![vec![
+                    crate::Value::Int64(1),
+                    crate::Value::Varchar("a".into()),
+                    crate::Value::Int64(2),
+                    crate::Value::Varchar("x".into()),
+                ]]);
+            }
+            other => panic!("expected parameterized Insert, got {other:?}"),
+        }
+        // SELECT 参数替换后仍走主键短路
+        let stmt = parse("SELECT * FROM t WHERE id = ?").unwrap();
+        match find_node(&plan_with_params(stmt, conn.database_mut(),
+            &[crate::Value::Int64(5)]).unwrap(), "PrimaryKeyLookup")
+        {
+            Some(PhysicalPlan::PrimaryKeyLookup { pk_value, .. }) => {
+                assert_eq!(*pk_value, crate::Value::Int64(5));
+            }
+            other => panic!("expected PK lookup after param substitution, got {other:?}"),
+        }
+        // DELETE / UPDATE 参数替换
+        let stmt = parse("DELETE FROM t WHERE id = ?").unwrap();
+        match plan_with_params(stmt, conn.database_mut(), &[crate::Value::Int64(5)]).unwrap() {
+            PhysicalPlan::Delete { condition, .. } => {
+                // 参数替换后 WHERE id = 5 保持 Eq 表达式（参数已替换为字面量）
+                assert!(matches!(condition, Some(crate::sql::ast::Expression::BinaryOp {
+                    left, op: crate::sql::ast::BinaryOperator::Eq, right
+                }) if matches!(*right, crate::sql::ast::Expression::Literal(crate::Value::Int64(5)))
+                    && matches!(*left, crate::sql::ast::Expression::ColumnRef { .. })));
+            }
+            other => panic!("expected parameterized Delete, got {other:?}"),
+        }
+        let stmt = parse("UPDATE t SET age = ? WHERE id = ?").unwrap();
+        match plan_with_params(stmt, conn.database_mut(),
+            &[crate::Value::Int64(10), crate::Value::Int64(5)]).unwrap()
+        {
+            PhysicalPlan::Update { assignments, .. } => {
+                assert_eq!(assignments[0].0, 2);
+                assert!(matches!(&assignments[0].1, crate::sql::ast::Expression::Literal(
+                    crate::Value::Int64(10))));
+            }
+            other => panic!("expected parameterized Update, got {other:?}"),
+        }
+        // 无参数：占位符保留 → 无法短路
+        let stmt = parse("SELECT * FROM t WHERE id = ?").unwrap();
+        match find_node(&plan_with_params(stmt, conn.database_mut(), &[]).unwrap(), "Filter") {
+            Some(PhysicalPlan::Filter { condition, .. }) => {
+                // WHERE id = ? → BinaryOp 右操作数为占位符
+                assert!(matches!(condition, crate::sql::ast::Expression::BinaryOp { right, .. }
+                    if matches!(right.as_ref(), crate::sql::ast::Expression::Placeholder(0))));
+            }
+            other => panic!("expected placeholder Filter, got {other:?}"),
+        }
+        // INSERT 参数越界 → 明确报错
+        let stmt = parse("INSERT INTO t VALUES (?, ?, ?, ?)").unwrap();
+        assert!(matches!(
+            plan_with_params(stmt, conn.database_mut(), &[crate::Value::Int64(1)]),
+            Err(EngramDbError::Parse(_))
+        ));
+    }
+
+    // ===== 直通路径 eval_insert_rows =====
+    #[test]
+    fn test_eval_insert_rows() {
+        let mut conn = setup();
+        let db = conn.database_mut();
+        // 无列名：直接求值
+        let stmt = parse("INSERT INTO t VALUES (1, 'a', 2, 'x'), (3, 'b', 4, 'y')").unwrap();
+        if let crate::sql::ast::Statement::Insert(s) = stmt {
+            let rows = eval_insert_rows(&s, db, &[]).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], crate::Value::Int64(1));
+            assert_eq!(rows[1][2], crate::Value::Int64(4));
+        } else {
+            panic!("expected Insert stmt");
+        }
+        // 有列名：Null 填充 + 重排
+        let stmt = parse("INSERT INTO t (name, id) VALUES ('a', 1)").unwrap();
+        if let crate::sql::ast::Statement::Insert(s) = stmt {
+            let rows = eval_insert_rows(&s, db, &[]).unwrap();
+            assert_eq!(rows, vec![vec![
+                crate::Value::Int64(1),
+                crate::Value::Varchar("a".into()),
+                crate::Value::Null,
+                crate::Value::Null,
+            ]]);
+        } else {
+            panic!("expected Insert stmt");
+        }
+        // 参数替换
+        let stmt = parse("INSERT INTO t VALUES (?, ?, ?, ?)").unwrap();
+        if let crate::sql::ast::Statement::Insert(s) = stmt {
+            let rows = eval_insert_rows(&s, db,
+                &[crate::Value::Int64(7), crate::Value::Varchar("p".into()),
+                  crate::Value::Int64(8), crate::Value::Varchar("q".into())]).unwrap();
+            assert_eq!(rows[0][3], crate::Value::Varchar("q".into()));
+        } else {
+            panic!("expected Insert stmt");
+        }
+        // 参数越界
+        let stmt = parse("INSERT INTO t VALUES (?)").unwrap();
+        if let crate::sql::ast::Statement::Insert(s) = stmt {
+            assert!(matches!(eval_insert_rows(&s, db, &[]), Err(EngramDbError::Parse(_))));
+        }
+        // 非常量表达式
+        let stmt = parse("INSERT INTO t VALUES (id)").unwrap();
+        if let crate::sql::ast::Statement::Insert(s) = stmt {
+            assert!(matches!(eval_insert_rows(&s, db, &[]), Err(EngramDbError::Parse(_))));
+        }
+        // 有列名但表不存在
+        let stmt = parse("INSERT INTO nosuch (id) VALUES (1)").unwrap();
+        if let crate::sql::ast::Statement::Insert(s) = stmt {
+            assert!(matches!(eval_insert_rows(&s, db, &[]),
+                Err(EngramDbError::TableNotFound(_))));
+        }
+        // 与 plan_insert 结果一致（无列名）
+        let stmt = parse("INSERT INTO t VALUES (1, 'a', 2, 'x')").unwrap();
+        if let crate::sql::ast::Statement::Insert(s) = stmt {
+            let direct = eval_insert_rows(&s, db, &[]).unwrap();
+            match plan_insert(s, db, &[]) {
+                Ok(PhysicalPlan::Insert { rows, .. }) => assert_eq!(direct, rows),
+                other => panic!("expected plan Insert, got {other:?}"),
+            }
+        }
+    }
+
+    // ===== 表达式提取辅助 =====
+    #[test]
+    fn test_extract_equality_condition() {
+        let col = |n: &str| Expression::ColumnRef { table: None, column: n.to_string() };
+        let lit = |v: i64| Expression::Literal(crate::Value::Int64(v));
+        let eq = |l: Expression, r: Expression| Expression::BinaryOp {
+            left: Box::new(l), op: BinaryOperator::Eq, right: Box::new(r),
+        };
+        assert_eq!(extract_equality_condition(&eq(col("id"), lit(5))),
+            Some(("id".into(), crate::Value::Int64(5))));
+        assert_eq!(extract_equality_condition(&eq(lit(5), col("id"))),
+            Some(("id".into(), crate::Value::Int64(5))));
+        assert_eq!(extract_equality_condition(&eq(col("id"), col("age"))), None);
+        assert_eq!(extract_equality_condition(&Expression::Literal(crate::Value::Null)), None);
+    }
+
+    #[test]
+    fn test_extract_single_bound() {
+        let col = |n: &str| Expression::ColumnRef { table: None, column: n.to_string() };
+        let lit = |v: i64| Expression::Literal(crate::Value::Int64(v));
+        let cmp = |op: BinaryOperator| Expression::BinaryOp {
+            left: Box::new(col("age")), op, right: Box::new(lit(3)),
+        };
+        let r = extract_single_bound(&cmp(BinaryOperator::Gt)).unwrap();
+        assert_eq!(r.col_name, "age");
+        assert_eq!(r.low, Some((crate::Value::Int64(3), false)));
+        assert!(r.high.is_none());
+        assert!(extract_single_bound(&cmp(BinaryOperator::GtEq)).unwrap().low
+            == Some((crate::Value::Int64(3), true)));
+        assert!(extract_single_bound(&cmp(BinaryOperator::Lt)).unwrap().high
+            == Some((crate::Value::Int64(3), false)));
+        assert!(extract_single_bound(&cmp(BinaryOperator::LtEq)).unwrap().high
+            == Some((crate::Value::Int64(3), true)));
+        // 反向：字面量在左
+        let rev = Expression::BinaryOp {
+            left: Box::new(lit(3)), op: BinaryOperator::Gt, right: Box::new(col("age")),
+        };
+        assert!(extract_single_bound(&rev).unwrap().low == Some((crate::Value::Int64(3), false)));
+        // 非比较运算符
+        assert!(extract_single_bound(&cmp(BinaryOperator::Eq)).is_none());
+        // 列对列
+        let colcol = Expression::BinaryOp {
+            left: Box::new(col("age")), op: BinaryOperator::Gt, right: Box::new(col("id")),
+        };
+        assert!(extract_single_bound(&colcol).is_none());
+    }
+
+    #[test]
+    fn test_extract_range_condition() {
+        let col = |n: &str| Expression::ColumnRef { table: None, column: n.to_string() };
+        let lit = |v: i64| Expression::Literal(crate::Value::Int64(v));
+        let cmp = |op: BinaryOperator, c: &str, v: i64| Expression::BinaryOp {
+            left: Box::new(col(c)), op, right: Box::new(lit(v)),
+        };
+        let and = |l: Expression, r: Expression| Expression::BinaryOp {
+            left: Box::new(l), op: BinaryOperator::And, right: Box::new(r),
+        };
+        // 单边
+        assert!(extract_range_condition(&cmp(BinaryOperator::Gt, "age", 3)).is_some());
+        // 双边同列
+        let two = extract_range_condition(&and(
+            cmp(BinaryOperator::GtEq, "age", 3),
+            cmp(BinaryOperator::Lt, "age", 10),
+        )).unwrap();
+        assert_eq!(two.low, Some((crate::Value::Int64(3), true)));
+        assert_eq!(two.high, Some((crate::Value::Int64(10), false)));
+        // 双边异列 → None
+        assert!(extract_range_condition(&and(
+            cmp(BinaryOperator::Gt, "age", 3),
+            cmp(BinaryOperator::Lt, "id", 10),
+        )).is_none());
+        // AND 一侧非边界 → None
+        assert!(extract_range_condition(&and(
+            cmp(BinaryOperator::Gt, "age", 3),
+            lit(1),
+        )).is_none());
+    }
+
+    #[test]
+    fn test_merge_range_predicates() {
+        let p = |low: Option<(i64, bool)>, high: Option<(i64, bool)>| RangePredicate {
+            col_name: "age".to_string(),
+            low: low.map(|(v, i)| (crate::Value::Int64(v), i)),
+            high: high.map(|(v, i)| (crate::Value::Int64(v), i)),
+        };
+        // 同值开闭合并：取更严格（开区间）
+        let m = merge_range_predicates(p(Some((3, false)), None), p(Some((3, true)), None)).unwrap();
+        assert_eq!(m.low, Some((crate::Value::Int64(3), false)));
+        // 下界取更大值
+        let m = merge_range_predicates(p(Some((3, true)), None), p(Some((5, true)), None)).unwrap();
+        assert_eq!(m.low, Some((crate::Value::Int64(5), true)));
+        // 上界取更小值
+        let m = merge_range_predicates(p(None, Some((10, false))), p(None, Some((8, true)))).unwrap();
+        assert_eq!(m.high, Some((crate::Value::Int64(8), true)));
+        // 冲突（下界 > 上界）→ None
+        assert!(merge_range_predicates(
+            p(Some((10, true)), None), p(None, Some((3, true)))).is_none());
+        // 值相等上界：开区间更严格
+        let m = merge_range_predicates(p(None, Some((8, true))), p(None, Some((8, false)))).unwrap();
+        assert_eq!(m.high, Some((crate::Value::Int64(8), false)));
+    }
+
+    #[test]
+    fn test_value_cmp_planner() {
+        use crate::Value;
+        assert_eq!(value_cmp_planner(&Value::Int64(3), &Value::Int64(5)),
+            std::cmp::Ordering::Less);
+        assert_eq!(value_cmp_planner(&Value::Varchar("a".into()), &Value::Varchar("b".into())),
+            std::cmp::Ordering::Less);
+        // Boolean：false > true（实现语义：!x 比较）
+        assert_eq!(value_cmp_planner(&Value::Boolean(false), &Value::Boolean(true)),
+            std::cmp::Ordering::Greater);
+        // Null 最小
+        assert_eq!(value_cmp_planner(&Value::Null, &Value::Int64(0)),
+            std::cmp::Ordering::Less);
+        // 跨类型 → Equal
+        assert_eq!(value_cmp_planner(&Value::Int64(1), &Value::Varchar("a".into())),
+            std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_eval_constant_expr() {
+        assert_eq!(eval_constant_expr(&Expression::Literal(crate::Value::Int64(1)), &[]).unwrap(),
+            crate::Value::Int64(1));
+        assert_eq!(eval_constant_expr(
+            &Expression::Placeholder(0), &[crate::Value::Int64(9)]).unwrap(),
+            crate::Value::Int64(9));
+        assert!(matches!(eval_constant_expr(&Expression::Placeholder(2), &[crate::Value::Int64(9)]),
+            Err(EngramDbError::Parse(_))));
+        assert!(matches!(eval_constant_expr(
+            &Expression::ColumnRef { table: None, column: "id".into() }, &[]),
+            Err(EngramDbError::Parse(_))));
+    }
+
+    #[test]
+    fn test_rewrite_having_aggregates() {
+        let col = |n: &str| Expression::ColumnRef { table: None, column: n.to_string() };
+        let agg = AggregateExpr { func: AggregateFunc::Count, input: 0, distinct: false };
+        let gt = Expression::BinaryOp {
+            left: Box::new(Expression::Function {
+                name: "COUNT".into(),
+                args: vec![Expression::ColumnRef { table: None, column: "dept".into() }],
+                distinct: false,
+                count_star: true,
+                over: None,
+            }),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expression::Literal(crate::Value::Int64(1))),
+        };
+        let rewritten = rewrite_having_aggregates(&gt, &[0], &[agg], &["dept".to_string()]);
+        match &rewritten {
+            Expression::BinaryOp { left, op: BinaryOperator::Gt, right } => {
+                assert!(matches!(left.as_ref(),
+                    Expression::ColumnRef { column, .. } if column == "Count(0)"));
+                assert!(matches!(right.as_ref(), Expression::Literal(crate::Value::Int64(1))));
+            }
+            other => panic!("expected rewritten comparison, got {other:?}"),
+        }
+        // 非聚合函数递归保留
+        let f = Expression::Function {
+            name: "LOWER".into(),
+            args: vec![Expression::Function {
+                name: "SUM".into(),
+                args: vec![col("age")],
+                distinct: false,
+                count_star: false,
+                over: None,
+            }],
+            distinct: false,
+            count_star: false,
+            over: None,
+        };
+        let rewritten = rewrite_having_aggregates(&f, &[], &[AggregateExpr {
+            func: AggregateFunc::Sum, input: 0, distinct: false,
+        }], &["age".to_string()]);
+        assert!(format!("{rewritten:?}").contains("Sum(0)"), "{rewritten:?}");
+    }}
