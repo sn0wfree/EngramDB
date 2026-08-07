@@ -1,9 +1,9 @@
-# Agent 后端存储引擎 — 更新路线图（v0.21 → v0.24）
+# Agent 后端存储引擎 — 升级路线图（v0.21 → v0.24）
 
-> 日期：2026-08-07
+> 更新：2026-08-07（v0.21 设计定稿：统一 Token 流压缩）
 > 定位：嵌入式 Agent 数据引擎（单进程，无网络 server）
 > 两大方向：① 会话内容存储（第一优先） ② 知识库存储（第二优先）
-> 依据：opencode 实态调研（v0.21 设计文档）+ 代码现状核对
+> 依据：opencode 实态调研 + 源码机制分析 + 业界分词压缩调研
 
 ---
 
@@ -11,24 +11,47 @@
 
 | 版本 | 主题 | 方向 | 核心交付 |
 |---|---|---|---|
-| **v0.21** | 会话存储引擎 | ① | TTL + session 跳读 + 会话 API + 倒排搜索 + 对拍基准 |
-| **v0.22** | 知识库检索全链路 | ② | SQL 混合查询 + ef 可配置 + SIMD + 中文分词 + RRF |
+| **v0.21** | 会话存储引擎 | ① | 统一 Token 流（分词器）+ 分词压缩 codec + Log 事件流 + Columnar 物化 + 会话 API |
+| **v0.22** | 知识库检索全链路 | ② | DAG 检索（复用 v0.21 分词器）+ SQL 混合查询 + SIMD + RRF |
 | **v0.23** | 记忆原语（差异化） | ①+② | 分层记忆、重要性衰减、SearchTrace API、时间旅行 |
 | **v0.24** | 生态与并发（按需） | — | Python 绑定、多进程只读共享、摄取管线、网络模式 |
 
+**横切基础设施**：统一 Token 流（`Tokenizer` + `TokenStream`）是 v0.21-v0.24 的共用底座——压缩、FTS、DAG 检索、记忆分层全部消费同一 token 流。
+
 ---
 
-## 二、v0.21 会话存储引擎（详情见 docs/v0.21-session-storage-engine.md）
+## 二、v0.21 会话存储引擎（定稿）
 
-| # | 任务 | 状态 | 验收 |
+### 架构（业务无感）
+
+```
+业务层（opencode 式 API，无感）:
+  SessionStore::begin_message / append_part(全量快照) / update_part / finish_message
+              / get_session / recent_messages / search_messages
+
+引擎层（透明）:
+  event_log（Log 引擎）: 完整事件流（全量快照），content 分词+delta 压缩 → 审计/回放
+  sessions / messages（Columnar）: 聚合物化（finish 时单事务投影）→ 读取/分析/计费
+```
+
+### 任务清单
+
+| # | 任务 | 内容 | 验收 |
 |---|---|---|---|
-| A1 | Log 引擎表级 TTL + 块级过期淘汰 | 设计定稿 | 10M 消息 90% 过期后扫描零开销跳过；checkpoint 物理释放 |
-| A2 | session 感知块组织（块级跳读） | 设计定稿 | 10 万会话×100 消息：单会话拉取只扫含该会话的块（≥10x）|
-| A3 | 会话 API（Rust 优先）+ SQL 模板 | 设计定稿 | 50 行代码跑通「存-取-搜-删」；写放大 ~1× |
-| A4 | 会话全文搜索（倒排） | 设计定稿 | 10 万会话搜关键词 <10ms |
-| A5 | SQLite 对拍基准（模拟 opencode 负载） | 设计定稿 | 写放大 ~100×、膨胀趋近 0、拉取 ≥10x |
+| P0-1 | **统一 Tokenizer**（`src/common/tokenizer.rs`）| DAG 词表（中文词表 + 可加载扩展，版本化）；TokenStream 三要素（text/norm/offset）；确定性可逆 | 同文本恒同 token 流；无损往返；v0.22 直接复用 |
+| P0-2 | **微型压缩基准** | TokenDelta vs zstd vs 不压缩（场景 A 流式追加 / B 覆盖重写）| 数据定 codec 取舍（业界无先例，必须实测）|
+| P0-3 | **TokenDelta codec** | 静态热词层（词表 top-N 短 ID）+ 块级动态字典 + 前缀 delta；接入 compression/mod.rs 分派 | 事件流压缩后 ≈ 1× 内容 |
+| P0-4 | **Log 序列化接入 + Log TTL** | serialize_typed 按块走 TokenDelta；capabilities.rs 开启 + 块级 cutoff + checkpoint 物理释放 | 过期块零读取、物理释放 |
+| P0-5 | **SessionStore API** | begin/append/update/finish → Log 事件（全量快照，业务无感）；读 API → Columnar | opencode 同款调用直接可用 |
+| P0-6 | **finish 物化投影** | 单事务：Log finish 事件 + Columnar 聚合（message/part/session 计费累计）| 多表原子，强一致 |
+| P0-7 | **FTS 切换统一 Tokenizer** | inverted_index 消费 norm（CJK 即刻可搜）| MATCH 中文命中正确 |
+| P0-8 | **基准 A5** | 模拟 opencode 负载：写放大压缩率、拉取/搜索延迟、体积 vs 7.8GB 实测 | 文档记录对比 |
 
-**前置修复**（实施中发现时）：Log 引擎单谓词下推与 TTL 内置并存、倒排内存边界。
+### 待办风险
+- 分词确定性（词表版本化 + 未登录字兜底）
+- 块字典膨胀（静态热词短 ID + 动态层增量编码）
+- 压缩率退化场景（best-of 自动选型：TokenDelta vs Uncompressed 取小）
+- 孤儿事件（崩溃）→ TTL 兜底 + 后续回放重建（nice-to-have）
 
 ---
 
@@ -36,12 +59,12 @@
 
 | # | 任务 | 现状 | 改动 | 验收 |
 |---|---|---|---|---|
-| B1 | **SQL 混合查询** + ef_search 可配置 | 仅 Rust hybrid_search（post-filter，召回×3）；ef_search 硬编码 50 | `CREATE VECTOR INDEX ... ef_search`；SQL 表值函数带 WHERE 下推 | 一条 SQL 完成「向量+标量过滤」|
-| B2 | 向量点积 SIMD | 逐元素 f32 | f32x16 距离层（HNSW 热路径）| 检索 ≥2x（10k 向量 top-10 基准）|
-| B3 | 中文分词 / 可插拔分词器 | CJK 整串单 token | tokenizer trait + 默认 CJK 切分（FTS 与 A4 倒排共用）| MATCH 中文命中正确 |
-| B4 | RRF 混合排序（V15/Ag06） | 无 | 全文 + 向量两路召回 → RRF 融合 | 排序可解释、命中互补 |
+| B1 | **DAG 检索**（复用 v0.21 分词器）| CJK 整串单 token | 同一 Tokenizer 的 text/offset 构建词图；norm 进倒排；BM25 排序 | 中文检索命中正确、可排序 |
+| B2 | **SQL 混合查询** + ef_search 可配置 | 仅 Rust hybrid_search；ef 硬编码 50 | `CREATE VECTOR INDEX ... ef_search`；SQL 表值函数带 WHERE 下推 | 一条 SQL 完成向量+标量过滤 |
+| B3 | 向量点积 SIMD | 逐元素 f32 | f32x16 距离层 | 检索 ≥2x |
+| B4 | RRF 混合排序（V15/Ag06）| 无 | 全文（同一 token 流）+ 向量两路召回 → RRF | 排序可解释、命中互补 |
 
-依赖：B1 依赖 A 完成（会话检索复用同一查询层）；B3 先于 B4（全文质量前提）。
+依赖：B1 依赖 v0.21 P0-1（分词器同源）；B4 依赖 B1。
 
 ---
 
@@ -49,10 +72,10 @@
 
 | # | 任务 | 说明 |
 |---|---|---|
-| C1 | 分层记忆接口（Ag04） | working（Memory 引擎）/ short（TTL 表）/ long（Columnar+向量）；统一 save/recall/forget |
-| C2 | 记忆重要性评分 + 衰减（Ag05） | importance × time_decay 排序，可配置衰减曲线 |
+| C1 | 分层记忆接口（Ag04）| working（Memory 引擎）/ short（TTL 表）/ long（Columnar+向量）；统一 save/recall/forget |
+| C2 | 记忆重要性评分 + 衰减（Ag05）| importance × time_decay 排序，可配置衰减曲线 |
 | C3 | SearchTrace 导出 API | 命中节点/分数/索引类型，Agent 引用溯源（已内部实现，转公共）|
-| C4 | 会话分支 / 时间旅行 | Agent 探索回滚场景（Log 引擎 append-only 天然支持「回到历史版本」）|
+| C4 | 会话分支 / 时间旅行 | 事件溯源红利：从 event_log 重放重建历史物化 |
 
 ---
 
@@ -60,9 +83,9 @@
 
 | # | 任务 | 触发条件 |
 |---|---|---|
-| D1 | Python 绑定（pyo3，Eco03） | LangChain/生态需求 |
-| D2 | 多进程只读共享（mmap） | 多 agent 进程读同一库 |
-| D3 | 摄取管线（Ag13/Ag16） | 知识库文档摄入 |
+| D1 | Python 绑定（pyo3，Eco03）| LangChain/生态需求 |
+| D2 | 多进程只读共享（mmap）| 多 agent 进程读同一库 |
+| D3 | 摄取管线（Ag13/Ag16）| 知识库文档摄入（复用统一 Tokenizer）|
 | D4 | 网络 server 模式 | 多 agent 共享库成为硬需求（当前架构不支持，需大改）|
 
 ---
@@ -71,10 +94,10 @@
 
 | 维度 | P0（v0.21） | P1（v0.22） | P2（v0.23+） |
 |---|---|---|---|
-| **性能** | session 跳读、TTL 块淘汰、尾部读取 | 向量 SIMD | 并行查询 |
-| **功能** | 会话 TTL、会话 API、倒排搜索 | SQL 混合检索、中文分词、RRF | 记忆分层、时间旅行 |
-| **交互** | Rust 会话 API + SQL 模板 | SQL 向量语法 | Python 绑定 |
-| **差异化** | 零维护会话存储（写放大 1×、无 VACUUM、TTL 自动清）| 统一混合检索 | 记忆原语、SearchTrace |
+| **性能** | 分词压缩（写放大 610×→~1×）、Log TTL 块淘汰 | 向量 SIMD | 并行查询 |
+| **功能** | 会话 API、事件流+物化、FTS 中文 | DAG 检索、SQL 混合检索、RRF | 记忆分层、时间旅行 |
+| **交互** | Rust 会话 API（opencode 式）+ SQL 模板 | SQL 向量语法 | Python 绑定 |
+| **差异化** | 统一 Token 流（压缩+检索同源）、零维护会话存储 | 统一混合检索 | 记忆原语、SearchTrace |
 
 ---
 
@@ -82,9 +105,11 @@
 
 | 日期 | 决策 | 依据 |
 |---|---|---|
-| 2026-08-07 | 会话规模：单机个人/小团队（<10 万会话、单会话 <200 条）| 用户确认 → 块级 session MinMax 足够，无需哈希索引 |
-| 2026-08-07 | TTL 形态：表级（WITH TTL 30d）| 用户确认 → 改动小，复用 v0.20 TTL 模式 |
-| 2026-08-07 | 交互：Rust API 优先 + SQL 模板 | 用户确认 → Agent 开发者主用 SDK |
-| 2026-08-07 | 数据模型：两表（消息元数据 + 内容流）| opencode 实证 part 是主体、流式重写是病根 |
-| 2026-08-07 | 删除语义：墓碑 + TTL 兜底（永不 DELETE）| Log 引擎追加语义，避免 VACUUM 碎片 |
-| 2026-08-07 | 会话存储先于知识库（A → B）| 用户定位 ① 优先；B 复用 A 的查询层 |
+| 2026-08-07 | 会话规模：单机个人/小团队（<10 万会话）| 用户确认 |
+| 2026-08-07 | TTL 形态：表级 | 用户确认 |
+| 2026-08-07 | 交互：Rust API 优先 | 用户确认 |
+| 2026-08-07 | 架构：Log 完整事件流（全量快照）+ Columnar 物化 | 用户确认：业务无感、引擎消除冗余 |
+| 2026-08-07 | 压缩：分词 + 静态热词 + 块字典 + 前缀 delta（TokenDelta）| 业界组件均有先例、组合无先例 → 基准先行验证 |
+| 2026-08-07 | 统一 Token 流：text/norm/offset 三要素，压缩/FTS/DAG 三方消费 | 用户确认：分词器一次建设多处复用 |
+| 2026-08-07 | 审计/回放为 nice-to-have（后续实现），Log 仍完整记录 | 用户确认 |
+| 2026-08-07 | DAG 分词器：本轮建设（含中文词表，v0.22 复用）| 用户确认 |
