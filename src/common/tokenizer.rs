@@ -127,24 +127,22 @@ impl Tokenizer {
         &self.static_lengths
     }
 
-    /// Static 模式熵编码（一次构建缓存）：canonical codes + 解码表，含逃逸符号。
-    /// `escape_id` 为行内逃逸标记（TokenDelta 扩展 id 走 varint 逃逸流，不进表）。
+    /// Static 模式熵编码（一次构建缓存）：canonical codes + 解码表（纯词表码长，
+    /// 不含 escape——词表 Huffman Kraft=1.0 无剩余空间，escape 走行内标记流）
     pub fn static_entropy(
         &self,
-        escape_id: u32,
     ) -> &(
         FxHashMap<u32, crate::common::huffman::Code>,
         crate::common::huffman::HuffmanTable,
     ) {
         self.static_entropy.get_or_init(|| {
             let base = &self.static_lengths;
-            let mut lengths: Vec<(u32, u8)> = base
+            let lengths: Vec<(u32, u8)> = base
                 .iter()
                 .enumerate()
                 .filter(|(_, l)| **l > 0)
                 .map(|(id, l)| (id as u32, *l))
                 .collect();
-            lengths.push((escape_id, 24));
             let codes = crate::common::huffman::canonical_codes(&lengths);
             let table = crate::common::huffman::HuffmanTable::from_lengths(&lengths);
             (codes, table)

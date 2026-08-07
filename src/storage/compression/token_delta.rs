@@ -27,16 +27,11 @@ use crate::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 pub enum EntropyMode {
     /// LEB128 varint（底线）
     Varint,
-    /// 静态档位（全局频率码长，词表训练产物；扩展 id 走行内 varint 逃逸流）
+    /// 静态档位（全局频率码长，词表训练产物；escape id 走行内标记流）
     Static,
     /// 块级自适应 Huffman（表头入块）
     Huffman,
 }
-
-/// Static 模式逃逸符号：扩展 id（动态词 / 码长 0 的词表 id）在静态表中用该符号
-/// 标记，行内流尾部 varint 序列按出现顺序承载真实 id——静态表（含逃逸）一次构建缓存，
-/// 避免每块重建全表。u32::MAX-1：词表内 id 与动态 id 都远小于该值，无冲突。
-const ESCAPE_ID: u32 = u32::MAX - 1;
 
 /// TokenDelta 编解码器
 pub struct TokenDeltaCodec<'a> {
@@ -132,46 +127,76 @@ impl<'a> TokenDeltaCodec<'a> {
                     out
                 })),
                 EntropyMode::Static => {
-                    // 静态表（含逃逸符号）一次构建缓存；扩展 id（动态词/码长 0）
-                    // 走行内 varint 逃逸流，不再逐块重建表
+                    // 静态表（纯词表码长）一次构建缓存；escape id（动态词/码长 0）
+                    // 行内标记流：flag=0 纯 Huffman 码流；flag=1 标记位流 + Huffman
+                    // 码流（仅非 escape）+ escape varint 序列。
+                    // 注意：escape 不进静态表——词表 Huffman Kraft 已满（=1.0），
+                    // 追加任何符号都溢出 canonical 分配（24 位组实测 634+1 > 634 空间）
                     let base = self.static_base();
-                    let (codes, _table) = self.tok.static_entropy(ESCAPE_ID);
+                    let (codes, _table) = self.tok.static_entropy();
                     let vocab_size = self.tok.vocab_size() as u32;
-                    let escape_id = ESCAPE_ID;
                     (
-                        Vec::new(), // 块头 header 空（逃逸 id 在行内）
+                        Vec::new(), // 块头 header 空（escape 在行内）
                         Box::new(move |ids: &[u32]| {
-                            let mut huf: Vec<u8> = Vec::new();
+                            let is_esc = |id: u32| match base {
+                                Some(b) => id >= vocab_size || b[id as usize] == 0,
+                                None => true, // 无码长表 → 全部 escape（退化）
+                            };
+                            // --- Huffman 位流写入器（仅非 escape id） ---
+                            let mut push_huf = |ids: &[u32], out: &mut Vec<u8>| {
+                                let mut buf: u64 = 0;
+                                let mut nbits: u32 = 0;
+                                for &id in ids {
+                                    let c = &codes[&id];
+                                    buf = (buf << c.len as u32) | c.bits as u64;
+                                    nbits += c.len as u32;
+                                    while nbits >= 8 {
+                                        out.push((buf >> (nbits - 8)) as u8);
+                                        nbits -= 8;
+                                        buf &= (1u64 << nbits) - 1;
+                                    }
+                                }
+                                if nbits > 0 {
+                                    out.push((buf << (8 - nbits)) as u8);
+                                }
+                            };
+                            if !ids.iter().any(|&id| is_esc(id)) {
+                                // flag=0：纯 Huffman 码流
+                                let mut out = Vec::with_capacity(ids.len() + 1);
+                                out.push(0u8);
+                                push_huf(ids, &mut out);
+                                return out;
+                            }
+                            // flag=1：标记位流（每符号 1 位，MSB-first，字节对齐）
+                            let mut flags: Vec<u8> = Vec::with_capacity((ids.len() + 7) / 8);
+                            let mut fbuf: u64 = 0;
+                            let mut fnbits: u32 = 0;
+                            let mut huf_ids: Vec<u32> = Vec::new();
                             let mut esc: Vec<u8> = Vec::new();
-                            let mut buf: u64 = 0;
-                            let mut nbits: u32 = 0;
                             for &id in ids {
-                                let escape = match base {
-                                    Some(b) => id >= vocab_size || b[id as usize] == 0,
-                                    None => true, // 无码长表 → 全部逃逸（退化）
-                                };
-                                let c = if escape {
-                                    &codes[&escape_id]
-                                } else {
-                                    &codes[&id]
-                                };
-                                if escape {
+                                let e = is_esc(id);
+                                fbuf = (fbuf << 1) | e as u64;
+                                fnbits += 1;
+                                if fnbits == 8 {
+                                    flags.push(fbuf as u8);
+                                    fbuf = 0;
+                                    fnbits = 0;
+                                }
+                                if e {
                                     encode_varint(&mut esc, id);
-                                }
-                                buf = (buf << c.len as u32) | c.bits as u64;
-                                nbits += c.len as u32;
-                                while nbits >= 8 {
-                                    huf.push((buf >> (nbits - 8)) as u8);
-                                    nbits -= 8;
-                                    buf &= (1u64 << nbits) - 1;
+                                } else {
+                                    huf_ids.push(id);
                                 }
                             }
-                            if nbits > 0 {
-                                huf.push((buf << (8 - nbits)) as u8);
+                            if fnbits > 0 {
+                                flags.push((fbuf << (8 - fnbits)) as u8);
                             }
-                            // 码流（字节对齐）+ 逃逸 varint 序列（顺序对应逃逸符号出现）
-                            huf.extend_from_slice(&esc);
-                            huf
+                            let mut out = Vec::new();
+                            out.push(1u8);
+                            out.extend_from_slice(&flags);
+                            push_huf(&huf_ids, &mut out); // 字节对齐 ✓
+                            out.extend_from_slice(&esc);
+                            out
                         }),
                     )
                 }
@@ -268,7 +293,7 @@ impl<'a> TokenDeltaCodec<'a> {
             1 => {
                 // Static：缓存表（全局码长 + 逃逸符号，词表级一次构建）；
                 // 逃逸流在行 stream 尾部，解码时按逃逸符号出现顺序取
-                let (_codes, table) = self.tok.static_entropy(ESCAPE_ID);
+                let (_codes, table) = self.tok.static_entropy();
                 RowDecoder::HuffmanStatic { table }
             }
             2 => RowDecoder::Huffman { table: huf_table.as_ref().unwrap() },
@@ -301,23 +326,64 @@ impl<'a> TokenDeltaCodec<'a> {
                     dec.decode(count)
                 }
                 RowDecoder::HuffmanStatic { table } => {
-                    let mut dec = huffman::HuffmanDecoder::from_table(table, stream.to_vec());
-                    let syms = dec.decode(count);
-                    // 逃逸流：Huffman 码流字节边界（含对齐 padding）之后
-                    let consumed = dec.consumed_bytes();
-                    let esc_stream = stream.get(consumed..).unwrap_or(&[]);
-                    let mut ep = 0usize;
-                    let mut ids = Vec::with_capacity(syms.len());
-                    for s in syms {
-                        if s == ESCAPE_ID {
-                            ids.push(decode_varint(esc_stream, &mut ep).map_err(|e| {
-                                EngramDbError::Parse(format!("td: escape stream: {e}"))
-                            })?);
+                    // 行流：flag=0 → 纯 Huffman 码流；flag=1 → 标记位流 + Huffman
+                    // 码流（仅非 escape）+ escape varint 序列
+                    let flag = *stream.first().ok_or_else(|| {
+                        EngramDbError::Parse("td: static stream empty".into())
+                    })?;
+                    let payload = stream.get(1..).unwrap_or(&[]);
+                    if flag == 0 {
+                        let mut dec =
+                            huffman::HuffmanDecoder::from_table(table, payload.to_vec());
+                        dec.decode(count)
+                    } else {
+                    // 标记位流：count 位（MSB-first，字节对齐）
+                    let flag_bytes = (count + 7) / 8;
+                    let flags = payload.get(..flag_bytes).ok_or_else(|| {
+                        EngramDbError::Parse("td: static flags".into())
+                    })?;
+                    let mut esc_count = 0usize;
+                    for (bi, byte) in flags.iter().enumerate() {
+                        let bits = if bi == flag_bytes - 1 {
+                            count - bi * 8
                         } else {
-                            ids.push(s);
+                            8
+                        };
+                        for bit in 0..bits {
+                            if (byte >> (7 - bit)) & 1 == 1 {
+                                esc_count += 1;
+                            }
+                        }
+                    }
+                    // Huffman 码流（仅非 escape 符号）
+                    let mut dec =
+                        huffman::HuffmanDecoder::from_table(table, payload[flag_bytes..].to_vec());
+                    let huf_syms = dec.decode(count - esc_count);
+                    // escape varint 序列在 Huffman 码流字节边界后
+                    let esc_stream =
+                        payload.get(flag_bytes + dec.consumed_bytes()..).unwrap_or(&[]);
+                    let mut ep = 0usize;
+                    let mut hi = 0usize;
+                    let mut ids = Vec::with_capacity(count);
+                    for (bi, byte) in flags.iter().enumerate() {
+                        let bits = if bi == flag_bytes - 1 {
+                            count - bi * 8
+                        } else {
+                            8
+                        };
+                        for bit in 0..bits {
+                            if (byte >> (7 - bit)) & 1 == 1 {
+                                ids.push(decode_varint(esc_stream, &mut ep).map_err(|e| {
+                                    EngramDbError::Parse(format!("td: escape stream: {e}"))
+                                })?);
+                            } else {
+                                ids.push(huf_syms[hi]);
+                                hi += 1;
+                            }
                         }
                     }
                     ids
+                    }
                 }
             };
 
