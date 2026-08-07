@@ -319,6 +319,21 @@ impl EngineTable {
         }
     }
 
+    /// 列式批量插入（跳过 PK 复检；仅事务 apply 路径在预检后传入 true）
+    pub fn insert_columns_with_check(
+        &mut self,
+        columns: Vec<Vec<Value>>,
+        skip_pk_check: bool,
+    ) -> Result<u64> {
+        if skip_pk_check {
+            // 仅 Columnar 有 PK 复检语义；Memory/Log 无冗余复检，直接走原路径
+            if let EngineTable::Columnar(t) = self {
+                return t.insert_columns_with_check(columns, true);
+            }
+        }
+        self.insert_columns(columns)
+    }
+
     /// 单行插入（引擎分派入口，事务 apply 路径）
     pub fn insert_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
         match self {
@@ -328,13 +343,34 @@ impl EngineTable {
         }
     }
 
+    /// 单行插入（跳过事务中预检已覆盖的 PK 复检）
+    pub fn insert_row_with_check(
+        &mut self,
+        row_id: u32,
+        row: &[Value],
+        skip_pk_check: bool,
+    ) -> Result<()> {
+        if skip_pk_check {
+            if let EngineTable::Columnar(t) = self {
+                return t.insert_row_with_check(row_id, row, true);
+            }
+        }
+        self.insert_row(row_id, row)
+    }
+
     /// 批量行插入（与 `insert_rows` 同语义；别名保留以避免改动现有调用方）
     pub fn insert(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
-        match self {
-            EngineTable::Columnar(t) => t.insert(rows),
-            EngineTable::Memory(t) => t.insert(rows),
-            EngineTable::Log(t) => t.insert(rows),
+        self.insert_with_check(rows, false)
+    }
+
+    /// 批量行插入（跳过事务中 PK 复检；事务 apply M02 路径在预检后传入 true）
+    pub fn insert_with_check(&mut self, rows: Vec<Vec<Value>>, skip_pk_check: bool) -> Result<u64> {
+        if skip_pk_check {
+            if let EngineTable::Columnar(t) = self {
+                return t.insert_with_check(rows, true);
+            }
         }
+        self.insert_rows(rows)
     }
 }
 

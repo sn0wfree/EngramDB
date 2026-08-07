@@ -1174,7 +1174,29 @@ impl Table {
         Ok(false)
     }
 
-    pub fn insert(&mut self, mut rows: Vec<Vec<Value>>) -> Result<u64> {
+    pub fn insert(&mut self, rows: Vec<Vec<Value>>) -> Result<u64> {
+        self.insert_with_check(rows, false)
+    }
+
+    /// 主键唯一性检查是否可跳过
+    ///
+    /// `skip_pk_check=true` 且主键非 auto_increment 时跳过（冲突预检已覆盖）。
+    /// auto_increment 主键仍须检查：预检对 Null 自增值跳过，值在 apply 才分配。
+    #[inline]
+    fn skippable_pk_check(&self, skip_pk_check: bool) -> bool {
+        if !skip_pk_check {
+            return false;
+        }
+        !self.def.primary_key_index().map_or(false, |pk| self.def.columns[pk].auto_increment)
+    }
+
+    /// 插入数据（事务 apply 可选跳过冲突预检已覆盖的 PK 复检）
+    #[inline]
+    pub fn insert_with_check(
+        &mut self,
+        mut rows: Vec<Vec<Value>>,
+        skip_pk_check: bool,
+    ) -> Result<u64> {
         let count = rows.len() as u64;
 
         // 类型强转：Varchar → Vector（处理 JSON 字面量）
@@ -1258,7 +1280,9 @@ impl Table {
         }
 
         // 主键唯一性检查（已存在 + 同批自重复；失败时零副作用）
-        self.check_pk_uniqueness(&rows)?;
+        if !self.skippable_pk_check(skip_pk_check) {
+            self.check_pk_uniqueness(&rows)?;
+        }
 
         let direct_threshold = (self.column_store.row_group_size() / 4) as usize;
 
@@ -1305,6 +1329,17 @@ impl Table {
     /// 输入：每列一个 Vec<Value>，列数与表定义一致、每列等长。
     /// 仅适用于完整行（所有列都提供）的批量写入场景。
     pub fn insert_columns(&mut self, mut columns: Vec<Vec<Value>>) -> Result<u64> {
+        self.insert_columns_with_check(columns, false)
+    }
+
+    /// 列式批量插入（事务 apply 可选跳过预检已覆盖的 PK 复检）
+    ///
+    /// 语义与 `insert_with_check` 一致，仅落盘走列式 `append_columns`。
+    pub fn insert_columns_with_check(
+        &mut self,
+        mut columns: Vec<Vec<Value>>,
+        skip_pk_check: bool,
+    ) -> Result<u64> {
         let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
         if num_rows == 0 {
             return Ok(0);
@@ -1388,7 +1423,7 @@ impl Table {
         }
 
         // 主键唯一性检查（列式：转置为行后检查，语义与 insert() 一致）
-        if self.def.primary_key_index().is_some() {
+        if !self.skippable_pk_check(skip_pk_check) && self.def.primary_key_index().is_some() {
             let rows = transpose_columns_to_rows(&columns, num_rows);
             self.check_pk_uniqueness(&rows)?;
         }
@@ -1483,6 +1518,19 @@ impl Table {
     /// 2. row_id 由事务管理器分配（避免重复）
     /// 3. 直接写入 Delta 层（单行场景不需要列式路径优化）
     pub fn insert_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
+        self.insert_row_with_check(row_id, row, false)
+    }
+
+    /// 插入单行数据（事务 apply 可选跳过预检已覆盖的 PK 复检）
+    ///
+    /// 与 `insert_row` 相同，`skip_pk_check=true` 且主键非 auto_increment 时
+    /// 跳过 `check_pk_uniqueness_one`（冲突已由 execute_with_txn 预检）。
+    pub fn insert_row_with_check(
+        &mut self,
+        row_id: u32,
+        row: &[Value],
+        skip_pk_check: bool,
+    ) -> Result<()> {
         // NOT NULL 约束检查 + AUTO_INCREMENT 自动分配
         let mut owned_row: Vec<Value> = row.to_vec();
 
@@ -1539,8 +1587,10 @@ impl Table {
             }
         }
 
-        // 主键唯一性检查（apply 路径对齐 MemoryEngine）
-        self.check_pk_uniqueness_one(&owned_row)?;
+        // 主键唯一性检查（apply 路径对齐 MemoryEngine；预检已覆盖时可跳过）
+        if !self.skippable_pk_check(skip_pk_check) {
+            self.check_pk_uniqueness_one(&owned_row)?;
+        }
 
         // 写入 Delta 层（单行直接插入）
         self.delta_store.insert_row(row_id, owned_row)?;
@@ -2696,6 +2746,32 @@ mod tests {
         vec![Value::Int64(id), Value::Varchar(v.to_string())]
     }
 
+    fn make_def_auto_inc() -> TableDef {
+        TableDef {
+            id: 1,
+            engine: EngineType::Columnar,
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    auto_increment: true,
+                },
+                ColumnDef::new("v", DataType::Varchar),
+            ],
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+            row_count: 0,
+        }
+    }
+
     #[test]
     fn test_insert_and_row_count() {
         let mut t = Table::new(make_def(false), CompactStrategy::manual());
@@ -2716,6 +2792,46 @@ mod tests {
         assert_eq!(t.row_count(), 3);
         assert_eq!(t.lookup_primary_key(&Value::Int64(2)), Some(1), "批量插入维护主键索引");
         assert_eq!(t.get_row_by_id(2).unwrap().unwrap(), row(3, "c"));
+    }
+
+        #[test]
+    fn test_insert_with_check_skips_pk_check_non_auto() {
+        // skip=true 且主键非 auto_increment：PK 复检被跳过（预检已覆盖）
+        let mut t = Table::new(make_def(true), CompactStrategy::manual());
+        t.insert_with_check(vec![row(1, "a")], false).unwrap();
+        // 同 PK 已存在，但 skip=true → 不报错（冲突由事务层预检负责）
+        t.insert_with_check(vec![row(1, "b")], true).unwrap();
+        assert_eq!(t.row_count(), 2);
+    }
+
+    #[test]
+    fn test_insert_with_check_keeps_auto_inc_check() {
+        // auto_increment 主键：即使 skip=true 也保留 PK 复检（预检对 Null 自增值跳过）
+        let mut t = Table::new(make_def_auto_inc(), CompactStrategy::manual());
+        // 显式插入 id=100 推进计数器到 101
+        t.insert(vec![row(100, "a")]).unwrap();
+        // 显式插入小于计数器的已存在值 100 → 必须报冲突（skip=true 不能绕过）
+        let err = t.insert_with_check(vec![row(100, "dup")], true).unwrap_err();
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "auto_increment 主键 skip=true 也必须查重, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_insert_columns_with_check_keeps_auto_inc_check() {
+        // insert_columns 路径同样强制 auto_increment 复检
+        let mut t = Table::new(make_def_auto_inc(), CompactStrategy::manual());
+        t.insert(vec![row(50, "a")]).unwrap();
+        let cols = vec![
+            vec![Value::Int64(50), Value::Int64(2)],
+            vec![Value::Varchar("dup".into()), Value::Varchar("b".into())],
+        ];
+        let err = t.insert_columns_with_check(cols, true).unwrap_err();
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "insert_columns auto_increment skip=true 也必须查重, got: {err:?}"
+        );
     }
 
     #[test]

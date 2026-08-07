@@ -259,7 +259,8 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
             let base = table.def().row_count as u32;
             if *base_row_id == base as u64 && !columns.is_empty() {
                 let cols = columns.clone();
-                let inserted = table.insert_columns(cols)?;
+                // skip_pk_check=true：冲突已由 execute_with_txn 预检
+                let inserted = table.insert_columns_with_check(cols, true)?;
                 debug!("✓ P-W2c InsertBatch applied: table_id={}, rows={}", table_id, inserted);
             } else {
                 // 非对齐：按 base_row_id + i 逐行插入
@@ -273,7 +274,7 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                             row.push(Value::Null);
                         }
                     }
-                    table.insert_row((*base_row_id + i as u64) as u32, &row)?;
+                    table.insert_row_with_check((*base_row_id + i as u64) as u32, &row, true)?;
                 }
                 debug!("✓ InsertBatch applied (non-aligned): table_id={}, rows={}", table_id, num_rows);
             }
@@ -322,12 +323,13 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
 
                 if contiguous {
                     // 走批量路径（内部一次 row_count += N，一次索引批量构建）
-                    let inserted = table.insert(rows)?;
+                    // skip_pk_check=true：冲突已由 execute_with_txn 预检
+                    let inserted = table.insert_with_check(rows, true)?;
                     debug!("✓ M02 Batch Insert applied: table_id={}, rows={}", start_tid, inserted);
                 } else {
                     // 非连续 row_id（罕见场景），退回逐行
                     for (i, row) in rows.into_iter().enumerate() {
-                        table.insert_row(row_ids[i], &row)?;
+                        table.insert_row_with_check(row_ids[i], &row, true)?;
                     }
                     debug!("✓ Insert applied (non-contiguous): table_id={}, count={}", start_tid, run_len);
                 }
@@ -350,7 +352,7 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                         error!("This indicates a bug in collect_apply_ops()");
                         EngramDbError::TableNotFound(format!("id={}", table_id))
                     })?;
-                table.insert_row(*row_id as u32, row)?;
+                table.insert_row_with_check(*row_id as u32, row, true)?;
                 debug!("✓ Insert applied: table_id={}, row_id={}", table_id, row_id);
             }
             ApplyOp::InsertBatch { table_id, base_row_id, columns } => {
@@ -371,7 +373,7 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                             row.push(Value::Null);
                         }
                     }
-                    table.insert_row((*base_row_id + i as u64) as u32, &row)?;
+                    table.insert_row_with_check((*base_row_id + i as u64) as u32, &row, true)?;
                 }
                 debug!("✓ InsertBatch applied (fallback): table_id={}, rows={}", table_id, num_rows);
             }
