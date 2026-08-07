@@ -88,28 +88,40 @@ fn main() {
     let vocab_path = std::env::args().nth(2).unwrap_or_else(|| "data/vocab/smoke_vocab.bin".into());
     let corpus = load_corpus(&corpus_path);
     assert!(!corpus.is_empty(), "empty corpus: {corpus_path}");
-    let vocab_bytes = fs::read(&vocab_path).expect("vocab");
-    let tok = Tokenizer::from_bytes(&vocab_bytes).expect("tokenizer");
-    println!("corpus: {} texts | vocab: {}", corpus.len(), tok.vocab_size());
-
-    // 静态码长（全局频率 → Huffman 码长表，模拟训练产物）
+    let vocab_bytes = std::fs::read(&vocab_path).expect("vocab");
+    // Static 模式码长表：从语料频率算 Huffman 码长，塞进词表（v2 字段）
+    let mut vf = engramdb::common::vocab_file::VocabFile::from_bytes(&vocab_bytes).expect("vocab vf");
+    let tok0 = Tokenizer::from_bytes(&vocab_bytes).expect("tokenizer");
     let mut freqs: fxhash::FxHashMap<u32, u64> = fxhash::FxHashMap::default();
+    for text in &corpus {
+        for t in tok0.tokenize(text) {
+            if t.id != UNKNOWN_ID {
+                *freqs.entry(t.id).or_insert(0) += 1;
+            }
+        }
+    }
+    vf.static_lengths = {
+        let mut sl = vec![0u8; tok0.vocab_size()];
+        for (id, len) in huffman::build_lengths(&freqs) {
+            if (id as usize) < tok0.vocab_size() {
+                sl[id as usize] = len;
+            }
+        }
+        sl
+    };
+    let tok = Tokenizer::from_vocab_file(vf).expect("tokenizer");
+    println!("corpus: {} texts | vocab: {}", corpus.len(), tok.vocab_size());
+    println!("static code-lengths: {} non-zero (of {})", tok.static_lengths().iter().filter(|l| **l > 0).count(), tok.vocab_size());
+
+    // 静态码长（全局频率 → Huffman 码长表）已写入词表（上方 vf.static_lengths）
     let mut total_tokens = 0usize;
     for text in &corpus {
         for t in tok.tokenize(text) {
             if t.id != UNKNOWN_ID {
-                *freqs.entry(t.id).or_insert(0) += 1;
                 total_tokens += 1;
             }
         }
     }
-    let mut static_lengths = vec![0u8; tok.vocab_size()];
-    for (id, len) in huffman::build_lengths(&freqs) {
-        if id < tok.vocab_size() as u32 {
-            static_lengths[id as usize] = len;
-        }
-    }
-    println!("static code-lengths: {} non-zero (of {})", static_lengths.iter().filter(|l| **l > 0).count(), tok.vocab_size());
 
     // ---- 场景数据 ----
     let long_texts: Vec<&String> = {
@@ -145,7 +157,7 @@ fn main() {
 
         let mut results = Vec::new();
         for (name, mode) in &arms {
-            let codec = TokenDeltaCodec::new(&tok, *mode, Some(static_lengths.clone()));
+            let codec = TokenDeltaCodec::new(&tok, *mode);
             let encode = |blocks: &[Vec<String>]| -> Vec<Vec<u8>> {
                 blocks.iter().map(|b| {
                     let strs: Vec<&str> = b.iter().map(|s| s.as_str()).collect();

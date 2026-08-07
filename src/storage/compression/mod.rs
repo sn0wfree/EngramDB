@@ -496,7 +496,7 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
                 token_delta::EntropyMode::Static,
                 token_delta::EntropyMode::Huffman,
             ] {
-                let codec = token_delta::TokenDeltaCodec::new(tok, mode, None);
+                let codec = token_delta::TokenDeltaCodec::new(tok, mode);
                 let blob = codec.encode_block(&strs);
                 if best_blob.as_ref().map_or(true, |b| blob.len() < b.len()) {
                     best_blob = Some(blob);
@@ -521,7 +521,7 @@ fn decompress_token_delta(data: &[u8]) -> Result<Vec<u8>> {
             "TokenDelta 块需要全局 Tokenizer（Config::tokenizer_path 未配置）".into(),
         ));
     };
-    let codec = token_delta::TokenDeltaCodec::new(tok, token_delta::EntropyMode::Static, None);
+    let codec = token_delta::TokenDeltaCodec::new(tok, token_delta::EntropyMode::Static);
     let texts = codec.decode_block(data)?;
     // 重建 Varchar 列格式：[len: 4B][value bytes]...
     let mut out = Vec::new();

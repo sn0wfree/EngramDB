@@ -27,45 +27,47 @@ use crate::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 pub enum EntropyMode {
     /// LEB128 varint（底线）
     Varint,
-    /// 静态档位（全局频率码长，词表训练产物；块头仅动态词扩展）
+    /// 静态档位（全局频率码长，词表训练产物；扩展 id 走行内 varint 逃逸流）
     Static,
     /// 块级自适应 Huffman（表头入块）
     Huffman,
 }
 
+/// Static 模式逃逸符号：扩展 id（动态词 / 码长 0 的词表 id）在静态表中用该符号
+/// 标记，行内流尾部 varint 序列按出现顺序承载真实 id——静态表（含逃逸）一次构建缓存，
+/// 避免每块重建全表。u32::MAX-1：词表内 id 与动态 id 都远小于该值，无冲突。
+const ESCAPE_ID: u32 = u32::MAX - 1;
+
 /// TokenDelta 编解码器
 pub struct TokenDeltaCodec<'a> {
     tok: &'a Tokenizer,
     entropy: EntropyMode,
-    /// Static 模式：per-id 码长表（全局频率产物，词表训练端提供）
-    static_lengths: Option<Vec<u8>>,
 }
 
 /// 行内流解码器（三形态统一接口）
-enum RowDecoder {
+enum RowDecoder<'a> {
     Varint,
     Huffman {
-        table: huffman::HuffmanTable,
+        table: &'a huffman::HuffmanTable,
+    },
+    /// Static：缓存表（含逃逸符号）——逃逸 id 在行 stream 尾部 varint 序列
+    HuffmanStatic {
+        table: &'a huffman::HuffmanTable,
     },
 }
 
 impl<'a> TokenDeltaCodec<'a> {
-    pub fn new(tok: &'a Tokenizer, entropy: EntropyMode, static_lengths: Option<Vec<u8>>) -> Self {
-        Self { tok, entropy, static_lengths }
+    pub fn new(tok: &'a Tokenizer, entropy: EntropyMode) -> Self {
+        Self { tok, entropy }
     }
 
-    /// Static 模式码长表：显式传入优先，否则用词表自带（v2 字段）；都无 → 全零（全扩展退化）
-    fn effective_static_lengths(&self) -> Vec<u8> {
-        match &self.static_lengths {
-            Some(sl) => sl.clone(),
-            None => {
-                let from_vocab = self.tok.static_lengths();
-                if from_vocab.is_empty() {
-                    vec![0u8; self.tok.vocab_size()]
-                } else {
-                    from_vocab.to_vec()
-                }
-            }
+    /// Static 模式码长表：词表 v2 字段（训练产物）；None = 未生成（全扩展退化）
+    fn static_base(&self) -> Option<&[u8]> {
+        let from_vocab = self.tok.static_lengths();
+        if from_vocab.is_empty() {
+            None
+        } else {
+            Some(from_vocab)
         }
     }
 
@@ -130,36 +132,48 @@ impl<'a> TokenDeltaCodec<'a> {
                     out
                 })),
                 EntropyMode::Static => {
-                    // 全表 = 全局码长 + 块扩展（码长 0 的词表 id 或动态词，24 位定长）
-                    let base = self.effective_static_lengths();
-                    let mut dyn_ext: Vec<(u32, u8)> = Vec::new();
-                    let mut lengths: Vec<(u32, u8)> = base
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, l)| **l > 0)
-                        .map(|(id, l)| (id as u32, *l))
-                        .collect();
-                    let mut seen: fxhash::FxHashSet<u32> =
-                        lengths.iter().map(|(s, _)| *s).collect();
-                    // 去重后再检查（避免大块 O(n²) 级重复检查）
-                    let unique_ids: fxhash::FxHashSet<u32> = new_ids.iter().copied().collect();
-                    for id in unique_ids {
-                        let needs_ext = (id >= self.tok.vocab_size() as u32)
-                            || base[id as usize] == 0;
-                        if needs_ext && !seen.contains(&id) {
-                            seen.insert(id);
-                            dyn_ext.push((id, 24));
-                            lengths.push((id, 24));
-                        }
-                    }
-                    let codes = huffman::canonical_codes(&lengths);
-                    let mut header = Vec::new();
-                    header.extend_from_slice(&(dyn_ext.len() as u32).to_le_bytes());
-                    for (id, len) in &dyn_ext {
-                        header.extend_from_slice(&id.to_le_bytes());
-                        header.push(*len);
-                    }
-                    (header, Box::new(move |ids: &[u32]| encode_with_codes(ids, &codes)))
+                    // 静态表（含逃逸符号）一次构建缓存；扩展 id（动态词/码长 0）
+                    // 走行内 varint 逃逸流，不再逐块重建表
+                    let base = self.static_base();
+                    let (codes, _table) = self.tok.static_entropy(ESCAPE_ID);
+                    let vocab_size = self.tok.vocab_size() as u32;
+                    let escape_id = ESCAPE_ID;
+                    (
+                        Vec::new(), // 块头 header 空（逃逸 id 在行内）
+                        Box::new(move |ids: &[u32]| {
+                            let mut huf: Vec<u8> = Vec::new();
+                            let mut esc: Vec<u8> = Vec::new();
+                            let mut buf: u64 = 0;
+                            let mut nbits: u32 = 0;
+                            for &id in ids {
+                                let escape = match base {
+                                    Some(b) => id >= vocab_size || b[id as usize] == 0,
+                                    None => true, // 无码长表 → 全部逃逸（退化）
+                                };
+                                let c = if escape {
+                                    &codes[&escape_id]
+                                } else {
+                                    &codes[&id]
+                                };
+                                if escape {
+                                    encode_varint(&mut esc, id);
+                                }
+                                buf = (buf << c.len as u32) | c.bits as u64;
+                                nbits += c.len as u32;
+                                while nbits >= 8 {
+                                    huf.push((buf >> (nbits - 8)) as u8);
+                                    nbits -= 8;
+                                    buf &= (1u64 << nbits) - 1;
+                                }
+                            }
+                            if nbits > 0 {
+                                huf.push((buf << (8 - nbits)) as u8);
+                            }
+                            // 码流（字节对齐）+ 逃逸 varint 序列（顺序对应逃逸符号出现）
+                            huf.extend_from_slice(&esc);
+                            huf
+                        }),
+                    )
                 }
                 EntropyMode::Huffman => {
                     let mut freqs: fxhash::FxHashMap<u32, u64> = fxhash::FxHashMap::default();
@@ -244,30 +258,20 @@ impl<'a> TokenDeltaCodec<'a> {
         pos += header_len;
 
         // 构建行解码器（表只建一次，行级只做轻量流状态）
+        let huf_table = if strategy == 2 {
+            Some(huffman::HuffmanTable::from_header(&header))
+        } else {
+            None
+        };
         let row_decoder = match strategy {
             0 => RowDecoder::Varint,
             1 => {
-                // Static：合成全表（全局 + 动态扩展）→ HuffmanDecoder 格式的 header
-                let base = self.effective_static_lengths();
-                let mut lengths: Vec<(u32, u8)> = base
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| **l > 0)
-                    .map(|(id, l)| (id as u32, *l))
-                    .collect();
-                let mut hpos = 0usize;
-                let ext_count = read_u32(&header, &mut hpos)? as usize;
-                for _ in 0..ext_count {
-                    let id = read_u32(&header, &mut hpos)?;
-                    let len = *header
-                        .get(hpos)
-                        .ok_or_else(|| EngramDbError::Parse("td: ext len".into()))?;
-                    hpos += 1;
-                    lengths.push((id, len));
-                }
-                RowDecoder::Huffman { table: huffman::HuffmanTable::from_header(&lengths_to_header(&lengths)) }
+                // Static：缓存表（全局码长 + 逃逸符号，词表级一次构建）；
+                // 逃逸流在行 stream 尾部，解码时按逃逸符号出现顺序取
+                let (_codes, table) = self.tok.static_entropy(ESCAPE_ID);
+                RowDecoder::HuffmanStatic { table }
             }
-            2 => RowDecoder::Huffman { table: huffman::HuffmanTable::from_header(&header) },
+            2 => RowDecoder::Huffman { table: huf_table.as_ref().unwrap() },
             _ => return Err(EngramDbError::Parse("td: unknown strategy".into())),
         };
 
@@ -295,6 +299,25 @@ impl<'a> TokenDeltaCodec<'a> {
                 RowDecoder::Huffman { table } => {
                     let mut dec = huffman::HuffmanDecoder::from_table(table, stream.to_vec());
                     dec.decode(count)
+                }
+                RowDecoder::HuffmanStatic { table } => {
+                    let mut dec = huffman::HuffmanDecoder::from_table(table, stream.to_vec());
+                    let syms = dec.decode(count);
+                    // 逃逸流：Huffman 码流字节边界（含对齐 padding）之后
+                    let consumed = dec.consumed_bytes();
+                    let esc_stream = stream.get(consumed..).unwrap_or(&[]);
+                    let mut ep = 0usize;
+                    let mut ids = Vec::with_capacity(syms.len());
+                    for s in syms {
+                        if s == ESCAPE_ID {
+                            ids.push(decode_varint(esc_stream, &mut ep).map_err(|e| {
+                                EngramDbError::Parse(format!("td: escape stream: {e}"))
+                            })?);
+                        } else {
+                            ids.push(s);
+                        }
+                    }
+                    ids
                 }
             };
 
@@ -446,13 +469,43 @@ mod tests {
     }
 
     fn codec<'a>(tok: &'a Tokenizer, entropy: EntropyMode) -> TokenDeltaCodec<'a> {
-        // Static 模式：全部词表词 8 位码长（模拟全局频率产物）
-        let static_lengths = if entropy == EntropyMode::Static {
-            Some(vec![8u8; tok.vocab_size()])
-        } else {
-            None
-        };
-        TokenDeltaCodec::new(tok, entropy, static_lengths)
+        TokenDeltaCodec::new(tok, entropy)
+    }
+
+    /// Static 模式：带码长表的词表（高频词短码 + 低频词长码 + 0 码长未登录）
+    fn smoke_tok_static() -> Tokenizer {
+        let mut vf = VocabFile::new(
+            Vec::new(),
+            vec![("你".into(), "好".into()), ("世".into(), "界".into())],
+            vec![
+                "你".into(),
+                "好".into(),
+                "世".into(),
+                "界".into(),
+                "！".into(),
+                "h".into(),
+                "e".into(),
+                "l".into(),
+                "o".into(),
+                " ".into(),
+                "w".into(),
+                "r".into(),
+                "d".into(),
+                "你好".into(),
+                "世界".into(),
+            ],
+        );
+        // Kraft 平衡的码长表：你/好 2 位、世/界 3 位、你好/世界 4 位、
+        // 标点/字母 8 位（0 位 = 无码长 → 走逃逸）
+        let mut sl = vec![0u8; vf.vocab.len()];
+        for (id, len) in [(0usize, 2u8), (1, 2), (2, 3), (3, 3), (13, 4), (14, 4)] {
+            sl[id] = len;
+        }
+        for id in [4usize, 5, 6, 7, 8, 9, 10, 11, 12] {
+            sl[id] = 8;
+        }
+        vf.static_lengths = sl;
+        Tokenizer::from_vocab_file(vf).unwrap()
     }
 
     #[test]
@@ -470,6 +523,22 @@ mod tests {
         let tok = smoke_tok();
         let codec = codec(&tok, EntropyMode::Static);
         let texts = vec!["你好世界！hello world", "你好世界！hello", "世界！世界！"];
+        let bytes = codec.encode_block(&texts);
+        let decoded = codec.decode_block(&bytes).unwrap();
+        assert_eq!(decoded, texts);
+    }
+
+    #[test]
+    fn test_roundtrip_static_with_lengths() {
+        // 带码长表：短码 + 8 位 + 0 码长（逃逸）混合路径
+        let tok = smoke_tok_static();
+        let codec = codec(&tok, EntropyMode::Static);
+        // 含词表外字符（UNKNOWN → 动态词 → 逃逸流）+ 码长 0 词表词（低频）
+        let texts = vec![
+            "你好世界！hello world",
+            "你好世界！𠀀𠀁 hello",
+            "世界！世界！𠀀",
+        ];
         let bytes = codec.encode_block(&texts);
         let decoded = codec.decode_block(&bytes).unwrap();
         assert_eq!(decoded, texts);

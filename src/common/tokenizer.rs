@@ -50,6 +50,12 @@ pub struct Tokenizer {
     static_lengths: Vec<u8>,
     /// 词表版本（块头校验：词表不匹配的块不可解压）
     version: u16,
+    /// Static 模式熵编码缓存（码长表 → canonical codes + HuffmanTable，含逃逸符号；
+    /// 一次构建跨块复用——C 场景 1113 块 × 31756 符号全表重建的根因）
+    static_entropy: std::sync::OnceLock<(
+        FxHashMap<u32, crate::common::huffman::Code>,
+        crate::common::huffman::HuffmanTable,
+    )>,
     /// 词表文件字节（自包含，供块头引用/审计）
     _source_len: usize,
 }
@@ -101,6 +107,7 @@ impl Tokenizer {
             vocab_by_id,
             static_lengths: vf.static_lengths,
             version: vf.version,
+            static_entropy: std::sync::OnceLock::new(),
             _source_len: 0,
         })
     }
@@ -118,6 +125,30 @@ impl Tokenizer {
     /// TokenDelta Static 模式 per-id 码长表（空 = 未生成，Static 退化）
     pub fn static_lengths(&self) -> &[u8] {
         &self.static_lengths
+    }
+
+    /// Static 模式熵编码（一次构建缓存）：canonical codes + 解码表，含逃逸符号。
+    /// `escape_id` 为行内逃逸标记（TokenDelta 扩展 id 走 varint 逃逸流，不进表）。
+    pub fn static_entropy(
+        &self,
+        escape_id: u32,
+    ) -> &(
+        FxHashMap<u32, crate::common::huffman::Code>,
+        crate::common::huffman::HuffmanTable,
+    ) {
+        self.static_entropy.get_or_init(|| {
+            let base = &self.static_lengths;
+            let mut lengths: Vec<(u32, u8)> = base
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| **l > 0)
+                .map(|(id, l)| (id as u32, *l))
+                .collect();
+            lengths.push((escape_id, 24));
+            let codes = crate::common::huffman::canonical_codes(&lengths);
+            let table = crate::common::huffman::HuffmanTable::from_lengths(&lengths);
+            (codes, table)
+        })
     }
 
     /// 文本是否在词表中（未登录检测，供测试/审计使用）

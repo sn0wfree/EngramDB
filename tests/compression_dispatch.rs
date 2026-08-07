@@ -117,10 +117,10 @@ fn test_tokendelta_vocab_version_mismatch_rejected() {
     vf.version = 1; // 模拟 v1 词表
     let tok_v1 = Tokenizer::from_vocab_file(vf).unwrap();
 
-    let codec_v1 = TokenDeltaCodec::new(&tok_v1, EntropyMode::Varint, None);
+    let codec_v1 = TokenDeltaCodec::new(&tok_v1, EntropyMode::Varint);
     let blob = codec_v1.encode_block(&["你好世界", "你好世界！继续"]);
 
-    let codec_v2 = TokenDeltaCodec::new(&tok_v2, EntropyMode::Varint, None);
+    let codec_v2 = TokenDeltaCodec::new(&tok_v2, EntropyMode::Varint);
     let err = codec_v2.decode_block(&blob).unwrap_err();
     match err {
         EngramDbError::Parse(msg) => assert!(msg.contains("vocab version"), "应报版本不匹配：{msg}"),

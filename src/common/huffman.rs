@@ -167,6 +167,7 @@ impl HuffmanEncoder {
 // ============================================================================
 
 /// 解码表（一次构建，多流复用——块内每行共享）
+#[derive(Clone)]
 pub struct HuffmanTable {
     /// first_code[len]：该码长的最小码字
     first_code: [u32; 33],
@@ -193,7 +194,21 @@ impl HuffmanTable {
                 pairs.push((len, s));
             }
         }
+        Self::from_pairs(pairs)
+    }
+
+    /// 从码长对直接建表（免 header 序列化往返，静态表缓存路径）
+    pub fn from_lengths(lengths: &[(u32, u8)]) -> Self {
+        let mut pairs: Vec<(u8, u32)> = lengths
+            .iter()
+            .filter(|(_, l)| *l > 0)
+            .map(|(s, l)| (*l, *s))
+            .collect();
         pairs.sort_unstable();
+        Self::from_pairs(pairs)
+    }
+
+    fn from_pairs(mut pairs: Vec<(u8, u32)>) -> Self {
         let mut first_code = [0u32; 33];
         let mut count = [0u32; 33];
         let mut symbols_by_len: Vec<Vec<u32>> = vec![Vec::new(); 33];
@@ -211,8 +226,8 @@ impl HuffmanTable {
     }
 }
 
-pub struct HuffmanDecoder {
-    table: HuffmanTable,
+pub struct HuffmanDecoder<'t> {
+    table: &'t HuffmanTable,
     /// 码流
     data: Vec<u8>,
     pos: usize,
@@ -220,14 +235,10 @@ pub struct HuffmanDecoder {
     nbits: u32,
 }
 
-impl HuffmanDecoder {
-    pub fn new(header: &[u8], stream: Vec<u8>) -> Self {
-        Self::from_table(&HuffmanTable::from_header(header), stream)
-    }
-
-    /// 轻量构造：表共享，仅流状态新建
-    pub fn from_table(table: &HuffmanTable, stream: Vec<u8>) -> Self {
-        Self { table: HuffmanTable { first_code: table.first_code, count: table.count, symbols_by_len: table.symbols_by_len.clone() }, data: stream, pos: 0, buf: 0, nbits: 0 }
+impl<'t> HuffmanDecoder<'t> {
+    /// 轻量构造：表借用共享（零克隆），仅流状态新建
+    pub fn from_table(table: &'t HuffmanTable, stream: Vec<u8>) -> Self {
+        Self { table, data: stream, pos: 0, buf: 0, nbits: 0 }
     }
 
     fn read_bit(&mut self) -> bool {
@@ -243,6 +254,11 @@ impl HuffmanDecoder {
         self.buf = (self.buf << 1) & 0xFF;
         self.nbits -= 1;
         bit
+    }
+
+    /// 已消费的输入字节数（Huffman 码流字节边界 = 后续流起点；padding 位在 buf 中丢弃）
+    pub fn consumed_bytes(&self) -> usize {
+        self.pos
     }
 
     /// 解码全部符号（count 个）
@@ -294,7 +310,8 @@ mod tests {
         let header = enc.header();
         let symbols = vec![1u32, 2, 3, 4, 5, 1, 2, 4];
         let stream = enc.encode(&symbols);
-        let mut dec = HuffmanDecoder::new(&header, stream);
+        let table = HuffmanTable::from_header(&header);
+        let mut dec = HuffmanDecoder::from_table(&table, stream);
         let out = dec.decode(symbols.len());
         assert_eq!(out, symbols);
     }
@@ -307,7 +324,8 @@ mod tests {
         let header = enc.header();
         let symbols = vec![7u32, 7, 7];
         let stream = enc.encode(&symbols);
-        let mut dec = HuffmanDecoder::new(&header, stream);
+        let table = HuffmanTable::from_header(&header);
+        let mut dec = HuffmanDecoder::from_table(&table, stream);
         let out = dec.decode(symbols.len());
         assert_eq!(out, symbols);
     }
@@ -326,7 +344,8 @@ mod tests {
             symbols.push(i % 7);
         }
         let stream = enc.encode(&symbols);
-        let mut dec = HuffmanDecoder::new(&header, stream);
+        let table = HuffmanTable::from_header(&header);
+        let mut dec = HuffmanDecoder::from_table(&table, stream);
         let out = dec.decode(symbols.len());
         assert_eq!(out, symbols);
     }
