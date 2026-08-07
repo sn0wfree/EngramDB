@@ -29,6 +29,11 @@ pub struct Token {
     pub offset: Range<usize>,
 }
 
+/// 未登录字符标记（Unicode 字符级动态兜底）：
+/// 字符不在词表时输出 `UNKNOWN_ID`，text 从 offset 切片原文获得——
+/// 由 TokenDelta 块级动态字典登记（字符文本 → 动态短 ID），保证可逆与检索粒度。
+pub const UNKNOWN_ID: u32 = u32::MAX;
+
 /// 统一 Tokenizer（运行时编码器）
 pub struct Tokenizer {
     /// token 文本 → id（rank）
@@ -94,6 +99,11 @@ impl Tokenizer {
         self.vocab.len()
     }
 
+    /// 文本是否在词表中（未登录检测，供测试/审计使用）
+    pub fn is_in_vocab(&self, text: &str) -> bool {
+        self.vocab.contains_key(text)
+    }
+
     pub fn seeds(&self) -> &[String] {
         &self.seeds
     }
@@ -123,33 +133,15 @@ impl Tokenizer {
     }
 
     /// 编码单个段（word）：字符级初始 token → merges rank 贪心合并
+    /// 未登录字符 → `UNKNOWN_ID` 标记（Unicode 字符级兜底，块动态字典登记）
     fn encode_word(&self, word: &str, base: usize, out: &mut Vec<Token>) {
-        // --- 初始符号：字符级（未登录字符 byte_fallback <0xXX>） ---
+        // --- 初始符号：字符级（未登录 → UNKNOWN_ID 标记） ---
         let mut symbols: Vec<Symbol> = Vec::new();
-        let mut char_offset = 0usize; // word 内字节偏移
         for c in word.chars() {
             let len = c.len_utf8();
             let id = match self.vocab.get(&c.to_string()) {
                 Some(&id) => id,
-                None => {
-                    // byte_fallback：逐字节 <0xXX>
-                    let mut found = None;
-                    for b in c.to_string().bytes() {
-                        let code = format!("<{b:#04X}>");
-                        if let Some(&id) = self.vocab.get(&code) {
-                            found = Some(id);
-                            break;
-                        }
-                    }
-                    match found {
-                        Some(id) => id,
-                        None => {
-                            // 无 unk_token（同 tokenizers 默认）：跳过该字符
-                            char_offset += len;
-                            continue;
-                        }
-                    }
-                }
+                None => UNKNOWN_ID,
             };
             let idx = symbols.len();
             symbols.push(Symbol {
@@ -162,7 +154,6 @@ impl Tokenizer {
             if idx > 0 {
                 symbols[idx - 1].next = idx;
             }
-            char_offset += len;
         }
         if symbols.is_empty() {
             return;
@@ -313,14 +304,21 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_char_skipped_like_tokenizers() {
-        // 词表无 emoji 且无 <0xXX>（同 tokenizers 无 unk_token）→ 字符被丢弃；
-        // 可逆性只对 token 覆盖区间保证（差分一致性不受影响——冒烟语料全覆盖）
+    fn test_unknown_char_marked_and_reversible() {
+        // Unicode 字符级兜底：未登录字符 → UNKNOWN_ID 标记（非丢弃），
+        // offset 保留原文 → 可逆性完整
         let tok = smoke_tokenizer();
         let text = "你好😀世界";
         let tokens = tok.tokenize(text);
+        let unknown: Vec<bool> = tokens.iter().map(|t| t.id == UNKNOWN_ID).collect();
+        assert!(unknown.iter().any(|&b| b), "未登录字符应标记");
+        assert_eq!(tokens.iter().filter(|t| t.id == UNKNOWN_ID).count(), 1);
+        let recon = tok.reconstruct(text, &tokens);
+        assert_eq!(recon, text, "未登录字符标记后仍可逆");
+        // 其余 token 正常
         let joined: String = tokens
             .iter()
+            .filter(|t| t.id != UNKNOWN_ID)
             .map(|t| &text[t.offset.clone()])
             .collect::<Vec<_>>()
             .join("|");

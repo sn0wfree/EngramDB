@@ -85,10 +85,8 @@ fn main() {
     );
 
     // BPE 训练（直接 feed pretokenized words——与运行时共享同一预分割逻辑）
-    let mut model = BPE::builder()
-        .byte_fallback(true)
-        .build()
-        .expect("build BPE");
+    // byte_fallback 关闭：OOV 采用 Unicode 字符级动态兜底（运行时 UNKNOWN_ID 标记）
+    let mut model = BPE::builder().build().expect("build BPE");
     let mut trainer = BpeTrainer::new(min_frequency, vocab_size);
     trainer.show_progress = false;
 
@@ -142,8 +140,23 @@ fn main() {
 
     // 冒烟自检：tokenizers 编码（差分测试 golden 参考）
     // 格式：JSON 转义文本 + "|" + ids（文本含 "|" 安全）
+    // 含 OOV 样本：词表外字符（tokenizers 无 unk_token 时丢弃）→
+    // 差分测试断言「剔除 UNKNOWN 标记后与 golden 一致」
     let mut golden = String::new();
-    for t in texts.iter().take(20) {
+    let mut samples: Vec<&String> = texts.iter().take(20).collect();
+    let oov_samples: Vec<String> = [
+        "特殊字符测试：😀🎉 emoji 与生僻字 𠀀𠁀 混排",
+        "数学符号 ∑∈ℝ 和箭头 →←↑↓ 与制表符\t结尾",
+        "Emoji 序列：👨‍👩‍👧‍👦 家庭符号与 🇨🇳 旗帜",
+        "中文生僻字：龘靐齉 四字叠加，𬭊𬭛 扩展B区",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for s in &oov_samples {
+        samples.push(s);
+    }
+    for t in samples {
         // 模拟运行时路径：共享预分割 → model.tokenize 每段
         let words = segment_words(t, &[]);
         let mut ids: Vec<u32> = Vec::new();
