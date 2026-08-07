@@ -59,6 +59,9 @@ sqlparser = "0.47"
 # JSON 处理（v0.12.0 新增，Agent 元数据存储）
 serde_json = "1.0"
 
+# Unicode 归一化（v0.21 统一 Tokenizer：norm 视图 NFKC，FTS 专用；不污染 text 压缩路径）
+unicode-normalization = "0.1"
+
 # DataFusion 互操作（可选，启用 datafusion feature 时生效）
 datafusion = { version = "40", optional = true }
 datafusion-common = { version = "40", optional = true }
@@ -68,6 +71,13 @@ datafusion-expr = { version = "40", optional = true }
 tempfile = "3.0"
 criterion = "0.5"
 rusqlite = "0.31"
+
+# v0.21 统一 Tokenizer：离线词表训练（仅开发/训练用，运行时零 C 依赖）
+tokenizers = "0.23"
+
+# v0.21 压缩基准：字节级基线对照（仅基准，运行时零 C 依赖）
+zstd = "0.13"
+brotli = "8"
 
 # 基准测试目标（均自带 main()，需关闭默认 test harness）
 [[bench]]

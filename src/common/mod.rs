@@ -6,6 +6,9 @@ pub mod config;
 pub mod memory_pool;
 pub mod column_data;
 pub mod value_cmp;
+pub mod pretokenize;
+pub mod vocab_file;
+pub mod tokenizer;
 
 pub use types::{DataType, ColumnDef, TableDef};
 pub use error::{EngramDbError, Result};
