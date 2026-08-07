@@ -62,6 +62,9 @@ serde_json = "1.0"
 # Unicode 归一化（v0.21 统一 Tokenizer：norm 视图 NFKC，FTS 专用；不污染 text 压缩路径）
 unicode-normalization = "0.1"
 
+# v0.21：块级文本压缩主臂（zstd-3，运行时依赖；CDict 实测仅 +1% 不引入）
+zstd = "0.13"
+
 # DataFusion 互操作（可选，启用 datafusion feature 时生效）
 datafusion = { version = "40", optional = true }
 datafusion-common = { version = "40", optional = true }
@@ -75,7 +78,7 @@ rusqlite = "0.31"
 # v0.21 统一 Tokenizer：离线词表训练（仅开发/训练用，运行时零 C 依赖）
 tokenizers = "0.23"
 
-# v0.21 压缩基准：字节级基线对照（仅基准，运行时零 C 依赖）
+# v0.21 压缩基准：CDict 对照（运行时用 zstd-3 无字典，CDict 实测仅 +1%）
 zstd = { version = "0.13", features = ["zdict_builder"] }
 brotli = "8"
 

@@ -195,7 +195,7 @@ fn main() {
             let decode = |comps: &[Vec<u8>]| -> usize {
                 let mut total = 0usize;
                 for c in comps {
-                    if let Ok(dec) = zstd::bulk::decompress(c, 16 * 1024 * 1024) {
+                    if let Ok(dec) = zstd::bulk::decompress(c, 1024 * 1024 * 1024) {
                         total += dec.len();
                     }
                 }
@@ -226,7 +226,7 @@ fn main() {
                     zstd::bulk::Decompressor::with_dictionary(&cdict).expect("zstd decomp");
                 let mut total = 0usize;
                 for c in comps {
-                    if let Ok(dec) = decomp.decompress(c, 16 * 1024 * 1024) {
+                    if let Ok(dec) = decomp.decompress(c, 1024 * 1024 * 1024) {
                         total += dec.len();
                     }
                 }

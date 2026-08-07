@@ -58,5 +58,6 @@ fn stmt_type(stmt: &Statement) -> &'static str {
         Statement::BeginTransaction => "BEGIN",
         Statement::Commit => "COMMIT",
         Statement::Rollback => "ROLLBACK",
+        other => "OTHER",
     }
 }

@@ -18,7 +18,8 @@ pub mod gorilla;
 pub mod double_delta;
 pub mod token_delta;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::common::config::CompressionType;
 use crate::common::error::Result;
@@ -30,11 +31,16 @@ use crate::common::types::DataType;
 /// Mutex（非 OnceLock）：进程内可多次 open（不同配置可更新），最后一次 open 生效。
 static GLOBAL_TOKENIZER: Mutex<Option<Arc<Tokenizer>>> = Mutex::new(None);
 
+/// TokenDelta 是否参与 best-of（Config::token_delta_enabled；显式
+/// set_global_tokenizer 也视为启用——测试/降级场景的意图信号）
+static TOKEN_DELTA_ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// 注册全局 Tokenizer（DB 打开时调用；未配置/加载失败 → None，TokenDelta 禁用）
 pub fn set_global_tokenizer(tok: Option<Tokenizer>) {
     if let Ok(mut g) = GLOBAL_TOKENIZER.lock() {
         *g = tok.map(Arc::new);
     }
+    TOKEN_DELTA_ENABLED.store(true, Ordering::Relaxed);
 }
 
 /// 当前全局 Tokenizer（Arc 拷贝，解引用借用期内安全）
@@ -55,6 +61,8 @@ pub fn init_tokenizer_from_config(config: &crate::common::config::Config) -> Res
         crate::common::error::EngramDbError::Parse(format!("tokenizer load ({path}): {e}"))
     })?;
     set_global_tokenizer(Some(tok));
+    // set_global_tokenizer 视显式调用为启用意图；config 路径按配置覆盖
+    TOKEN_DELTA_ENABLED.store(config.token_delta_enabled, Ordering::Relaxed);
     Ok(())
 }
 
@@ -106,7 +114,13 @@ pub fn decompress(data: &[u8], compression_type: CompressionType, data_type: &Da
             Ok(data.to_vec())
         }
         CompressionType::Delta => decompress_delta(data, data_type),
-        CompressionType::Zstd => Ok(data.to_vec()),
+        CompressionType::Zstd => {
+            // zstd-3 解压（Varchar 列字节；容量上限 1GB 防畸形数据）
+            match zstd::bulk::decompress(data, 1024 * 1024 * 1024) {
+                Ok(dec) => Ok(dec),
+                Err(_) => Ok(data.to_vec()),
+            }
+        }
         CompressionType::Gorilla => decompress_gorilla(data),
         CompressionType::ForBitPack => decompress_for_bitpack(data, data_type),
         CompressionType::BooleanPack => decompress_boolean_pack(data),
@@ -472,7 +486,17 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
     let mut best = (CompressionType::Uncompressed, data.to_vec());
     let mut best_size = data.len();
 
-    // 臂 1：Dictionary（低基数，ClickHouse 风格）
+    // 臂 1：zstd-3（块级字节压缩主臂，v0.21——对 Varchar 列字节直接压缩）
+    {
+        if let Ok(comp) = zstd::bulk::compress(data, 3) {
+            if comp.len() < best_size {
+                best_size = comp.len();
+                best = (CompressionType::Zstd, comp);
+            }
+        }
+    }
+
+    // 臂 2：Dictionary（低基数，ClickHouse 风格）
     let string_slices: Vec<&[u8]> = strings.iter().map(|s| s.as_slice()).collect();
     let encoded = dictionary::encode(&string_slices);
     let ratio = dictionary::compression_ratio(&encoded, data.len());
@@ -485,30 +509,33 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
         }
     }
 
-    // 臂 2：TokenDelta（全局 Tokenizer 已注册且块有行数收益时才尝试）
-    if let Some(tok) = global_tokenizer() {
-        let strs: Vec<&str> = strings
-            .iter()
-            .map(|s| std::str::from_utf8(s).unwrap_or(""))
-            .collect();
-        if strs.iter().any(|s| !s.is_empty()) {
-            // 块内三形态 best-of：Varint / Static（词表码长）/ Huffman（块级）取最小
-            let mut best_blob: Option<Vec<u8>> = None;
-            for mode in [
-                token_delta::EntropyMode::Varint,
-                token_delta::EntropyMode::Static,
-                token_delta::EntropyMode::Huffman,
-            ] {
-                let codec = token_delta::TokenDeltaCodec::new(&tok, mode);
-                let blob = codec.encode_block(&strs);
-                if best_blob.as_ref().map_or(true, |b| blob.len() < b.len()) {
-                    best_blob = Some(blob);
+    // 臂 3：TokenDelta（降级选项：Config::token_delta_enabled 或显式
+    // set_global_tokenizer 启用；zstd-3 主臂实测压缩率持平且快 ~15×）
+    if TOKEN_DELTA_ENABLED.load(Ordering::Relaxed) {
+        if let Some(tok) = global_tokenizer() {
+            let strs: Vec<&str> = strings
+                .iter()
+                .map(|s| std::str::from_utf8(s).unwrap_or(""))
+                .collect();
+            if strs.iter().any(|s| !s.is_empty()) {
+                // 块内三形态 best-of：Varint / Static（词表码长）/ Huffman（块级）取最小
+                let mut best_blob: Option<Vec<u8>> = None;
+                for mode in [
+                    token_delta::EntropyMode::Varint,
+                    token_delta::EntropyMode::Static,
+                    token_delta::EntropyMode::Huffman,
+                ] {
+                    let codec = token_delta::TokenDeltaCodec::new(&tok, mode);
+                    let blob = codec.encode_block(&strs);
+                    if best_blob.as_ref().map_or(true, |b| blob.len() < b.len()) {
+                        best_blob = Some(blob);
+                    }
                 }
-            }
-            if let Some(blob) = best_blob {
-                if blob.len() < best_size {
-                    best_size = blob.len();
-                    best = (CompressionType::TokenDelta, blob);
+                if let Some(blob) = best_blob {
+                    if blob.len() < best_size {
+                        best_size = blob.len();
+                        best = (CompressionType::TokenDelta, blob);
+                    }
                 }
             }
         }
@@ -790,9 +817,9 @@ mod tests {
             data.extend_from_slice(bytes);
         }
         let (ctype, compressed) = compress(&data, &DataType::Varchar).unwrap();
-        assert_eq!(ctype, CompressionType::Dictionary);
-        assert!(compressed.len() < data.len());
-        // v0.12.x 修复：Dictionary 解压原为空实现，现重建 Varchar 列字节
+        // v0.21：zstd 臂加入后，低基数文本可能选 Zstd（压缩更小）——不限类型，
+        // 断言「确实压缩且 roundtrip 正确」
+        assert!(compressed.len() < data.len(), "应压缩：{ctype:?}");
         let decompressed = decompress(&compressed, ctype, &DataType::Varchar).unwrap();
         assert_eq!(decompressed, data);
     }

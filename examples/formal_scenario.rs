@@ -72,12 +72,13 @@ fn build_rows(corpus: &[String]) -> Vec<(i64, i64, String)> {
 }
 
 /// 运行一臂，返回 (磁盘大小, 插入耗时, checkpoint 耗时, 读回校验结果)
-fn run_arm(tag: &str, dir: &str, corpus: &[String], tokenizer: Option<&str>, compress: bool) -> (u64, u128, u128, bool) {
+fn run_arm(tag: &str, dir: &str, corpus: &[String], tokenizer: Option<&str>, compress: bool, td_enabled: bool) -> (u64, u128, u128, bool) {
     let _ = std::fs::remove_file(dir);
     let _ = std::fs::remove_file(format!("{dir}-wal"));
     let mut cfg = Config::default();
     cfg.compress_on_persist = compress;
     cfg.tokenizer_path = tokenizer.map(|s| s.to_string());
+    cfg.token_delta_enabled = td_enabled;
     let mut db = Database::open_with_config(dir, cfg).unwrap();
 
     let def = TableDef::new(
@@ -197,12 +198,15 @@ fn main() {
     let text_bytes: usize = rows.iter().map(|(_, _, c)| c.len()).sum();
     println!("文本总量 {:.1}MB\n", text_bytes as f64 / 1048576.0);
 
-    let (a_size, a_i, a_c, a_ok) = run_arm("A 裸存          ", "/tmp/formal_a", &corpus, None, false);
-    let (b_size, b_i, b_c, b_ok) = run_arm("B Dictionary 臂 ", "/tmp/formal_b", &corpus, None, true);
-    let (c_size, c_i, c_c, c_ok) = run_arm("C TokenDelta    ", "/tmp/formal_c", &corpus, Some(&vocab_path), true);
+    let (a_size, a_i, a_c, a_ok) = run_arm("A 裸存          ", "/tmp/formal_a", &corpus, None, false, false);
+    let (b_size, b_i, b_c, b_ok) = run_arm("B zstd-3        ", "/tmp/formal_b", &corpus, None, true, false);
+    let (c_size, c_i, c_c, c_ok) = run_arm("C TokenDelta(降级)", "/tmp/formal_c", &corpus, Some(&vocab_path), true, true);
 
     println!("\n==== 对比 ====");
-    println!("磁盘：C/A = {:.2}x，C/B = {:.2}x", a_size as f64 / c_size.max(1) as f64, b_size as f64 / c_size.max(1) as f64);
+    println!("磁盘：B/A = {:.2}x，C/A = {:.2}x，C/B = {:.2}x",
+        a_size as f64 / b_size.max(1) as f64,
+        a_size as f64 / c_size.max(1) as f64,
+        b_size as f64 / c_size.max(1) as f64);
     println!("压缩率（vs 原文）：A {:.1}x / B {:.1}x / C {:.1}x",
         text_bytes as f64 / a_size.max(1) as f64,
         text_bytes as f64 / b_size.max(1) as f64,
