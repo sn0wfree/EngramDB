@@ -145,7 +145,51 @@ Token ID 空间：
 | 长度 delta | DELTA_LENGTH_BYTE_ARRAY | Parquet 编码 #6 |
 | 时间序列 delta | Gorilla（delta-of-delta + XOR）| Facebook TSDB |
 
-### 6.2 「token 级压缩」全被 LLM 推理路线占据（模型驱动，均不可嵌入）
+### 6.2 LLM Tokenizer 实战对照（2026-08-07 调研：tiktoken / SentencePiece / minbpe 官方实现）
+
+**演进史（三阶段收敛）**：
+
+| 阶段 | 时间 | 方法 | 代表 |
+|---|---|---|---|
+| 词/字符级 | 2015 前 | word-based / char-based | 早期 NMT |
+| Subword 三剑客 | 2015-2018 | BPE（Sennrich, arXiv:1508.07909，频率驱动贪心合并）/ WordPiece（PMI 驱动）/ Unigram LM（概率剪枝）| 各家 |
+| **字节级统一** | 2019 至今 | **BBPE**（GPT-2 发明：256 字节原子 + 零 OOV + 正则预分割）；SentencePiece（Kudo 2018，语言无关 + 空格符号化 + 自包含模型）| GPT/Llama/Mistral/Qwen 全部 |
+
+**主流模型实际用法**：
+
+| 模型 | 方法 | 细节 |
+|---|---|---|
+| GPT-2/3 | BBPE | 首创字节级 + 正则预分割 |
+| GPT-4 / GPT-4o | tiktoken BBPE | cl100k(100k) / o200k(200k)，pat_str 正则预分割 |
+| LLaMA 3/3.x | BBPE + regex | tiktoken 风格，128k，byte fallback |
+| LLaMA 1/2、Mistral | SentencePiece BPE | 字符级 32k |
+| Qwen2.x | BBPE + regex | tiktoken 风格 151k |
+| Gemma 3 | SentencePiece BPE | 256k |
+| Gemini | SentencePiece | 社区分析 |
+| Claude | 未公开 | 计费 ~4 chars/token，暗示 BBPE 类 |
+| T5/XLNet | Unigram LM | 少数派（可采样，确定性差）|
+| BERT | WordPiece | 中文字级（旧体系）|
+
+**十年收敛出的技术共识**：
+1. **字节级原子兜底**（256 字节，零 OOV）——所有现代模型，无「单字兜底」
+2. **数据驱动词表**：语料频率自动学习，无人工词表
+3. **正则预分割**：字母/数字/标点类别边界内独立 BPE，跨类不合并（GPT-2 引入，GPT-4 沿用）
+4. **确定性贪心编码（maxmatch）**：BPE 系天然确定；可采样的 Unigram 被主流抛弃
+5. **自包含模型文件**（SentencePiece `.model` / tiktoken `mergeable_ranks`）
+6. **性能工程**：C++/Rust 实现（SentencePiece 5 万句/秒；tiktoken 比 HF 快 3-6x，FxHashMap 等）
+
+**中文处理**：现代 LLM 不专门处理中文——纯 BBPE 数据驱动，高频双字词由语料自然合并；
+「jieba 预分词 + BPE」有先例（GNMT 中文方向、早期中文 word-level 模型）——种子词表路线有据；
+但主流已放弃语言特定预分词 → **种子设计必须由 P0-2 基准三角对比定夺，不默认**。
+
+**对 Engram 的落地修正**：
+1. P0-1 采用**字节级 BPE + maxmatch + pat_str 式预分割 + 自包含词表文件**——对齐主流十年收敛路径（原「单字兜底 + 手写扫描器」计划升级；第 3 章分词器设计将随 P0-1 实施同步修订）
+2. 实现直接借鉴 **minbpe**（karpathy，完整可读，MIT）+ **minbpe-rs**（Rust 移植），非从零发明
+3. 预分割用 GPT-4 同款 `pat_str` 模式（minbpe regex.py 有完整实现），CJK 连续块为独立类别
+4. 静态热词 = **merges 顺序前 N**：与 tiktoken `mergeable_ranks` 的 rank 排序同构——选择有客观依据
+5. P0-2 基准新增**词表三角对比**：纯 BPE / 种子 BPE / jieba 预分词+BPE（压缩率 + FTS 中文命中率）
+
+### 6.3 「token 级压缩」全被 LLM 推理路线占据（模型驱动，均不可嵌入）
 
 | 工作 | 方法 | 结果 | 为何不可用 |
 |---|---|---|---|
@@ -156,14 +200,14 @@ Token ID 空间：
 | **LLM 压缩自身输出**（arXiv:2505.06297，2025）| 14 个 LLM 预测自身生成文本 | **20x+**（gzip 仅 3x）| 证实「LLM 输出高可压缩」，但需模型推理 |
 | **Nacrith**（GitHub, 2026）| SmolLM2-135M + 上下文混合 + CDF 算术编码 | gzip 3.1x，超 CMIX/LLMZip/FineZip | GPU 加速仍模型级 |
 
-### 6.3 邻近领域（语义压缩 / 存储去重，路线不同）
+### 6.4 邻近领域（语义压缩 / 存储去重，路线不同）
 
 | 工作 | 路线 | 与我们关系 |
 |---|---|---|
 | **SimpleMem**（arXiv:2601.02553，3.7k★）| LLM 把对话蒸馏为原子记忆（语义有损），token 消费 -30x | 应用层语义压缩（需服务端 LLM）；我们为存储层确定性无损——互补不冲突，佐证 agent 数据压缩是热点 |
 | **yams**（GitHub）| SHA-256 内容寻址 + chunk 去重 + zstd + FTS5 | 字节级块去重，无语言感知 |
 
-### 6.4 结论（组合无先例，差异化成立）
+### 6.5 结论（组合无先例，差异化成立）
 
 arXiv/GitHub 检索确认：**「确定性分词器 + 词表静态字典 + 块级动态字典 + token 前缀 delta」无人做过**。
 所有 token 级压缩都绑定 LLM 推理（秒~小时级/MB），嵌入引擎不可行；字节级方案不感知语言。
