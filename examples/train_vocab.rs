@@ -101,11 +101,10 @@ fn main() {
     let _special = trainer.train(&mut model).expect("train BPE");
 
     // 导出 merges（rank 序）：Model::save 写 vocab.json + merges.txt，再解析
-    let save_dir = std::env::temp_dir().join(format!("engram_vocab_save_{}", std::process::id()));
+    let save_dir = PathBuf::from("/tmp/engram_vocab_save_v1");
     std::fs::create_dir_all(&save_dir).expect("create save dir");
     model.save(&save_dir, None).expect("save model");
     let merges_txt = std::fs::read_to_string(save_dir.join("merges.txt")).expect("read merges.txt");
-    let _ = std::fs::remove_dir_all(&save_dir);
     let merges: Vec<(String, String)> = merges_txt
         .lines()
         .filter_map(|line| {
@@ -144,11 +143,13 @@ fn main() {
     // 差分测试断言「剔除 UNKNOWN 标记后与 golden 一致」
     let mut golden = String::new();
     let mut samples: Vec<&String> = texts.iter().take(20).collect();
+    // OOV 样本：私人使用区（U+E000-U+F8FF）/ 补充平面生僻字——任意语料几乎必 OOV，
+    // 保证差分测试的 UNKNOWN 兜底路径被覆盖
     let oov_samples: Vec<String> = [
-        "特殊字符测试：😀🎉 emoji 与生僻字 𠀀𠁀 混排",
-        "数学符号 ∑∈ℝ 和箭头 →←↑↓ 与制表符\t结尾",
-        "Emoji 序列：👨‍👩‍👧‍👦 家庭符号与 🇨🇳 旗帜",
-        "中文生僻字：龘靐齉 四字叠加，𬭊𬭛 扩展B区",
+        "私有区字符：\u{E000}\u{E001}\u{E0FF} 与普通文本混排",
+        "补充平面生僻字：\u{2A6A5}\u{2B734}\u{20525} 三字叠加",
+        "极端生僻：\u{10FFFF} 与 \u{10FFFE} 非字符结尾",
+        "标签字符：\u{E0100}\u{E0101} 变异选择符序列",
     ]
     .iter()
     .map(|s| s.to_string())

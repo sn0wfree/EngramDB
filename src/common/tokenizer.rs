@@ -232,15 +232,16 @@ impl Tokenizer {
         }
 
         // --- 初始堆：所有相邻 pair（在 merges 中）按 rank 入堆 ---
-        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, usize)>> = BinaryHeap::new();
+        // 条目携带 (rank, new_id)：pop 时校验 pair 未变（对齐 tokenizers merge_all）
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, usize)>> = BinaryHeap::new();
         for i in 0..symbols.len() {
-            if let Some((rank, _)) = self.pair_rank(&symbols, i) {
-                heap.push(std::cmp::Reverse((rank, i)));
+            if let Some((rank, new_id)) = self.pair_rank(&symbols, i) {
+                heap.push(std::cmp::Reverse((rank, new_id, i)));
             }
         }
 
         // --- 贪心合并：最小 rank pair 优先 ---
-        while let Some(std::cmp::Reverse((_, pos))) = heap.pop() {
+        while let Some(std::cmp::Reverse((rank, exp_new, pos))) = heap.pop() {
             if !symbols[pos].active || symbols[pos].next == NONE {
                 continue;
             }
@@ -249,9 +250,14 @@ impl Tokenizer {
                 continue;
             }
             let pair = (symbols[pos].id, symbols[right].id);
-            let Some((_, new_id)) = self.merges.get(&pair).copied() else {
+            let Some((cur_rank, new_id)) = self.merges.get(&pair).copied() else {
                 continue; // 过期条目
             };
+            // 校验条目：当前 pair 的 rank/new_id 必须与入堆时一致，
+            // 否则是「pair 已变化」的过期条目（如 (a,s) 顺延成 (a,st)）——跳过
+            if cur_rank != rank || new_id != exp_new {
+                continue;
+            }
             // 合并：pos ← new_id，吞噬 right
             symbols[pos].id = new_id;
             symbols[pos].byte_len += symbols[right].byte_len;
@@ -264,12 +270,12 @@ impl Tokenizer {
             // 新邻接 pair 入堆
             let p = symbols[pos].prev;
             if p != NONE && symbols[p].active {
-                if let Some((rank, _)) = self.pair_rank(&symbols, p) {
-                    heap.push(std::cmp::Reverse((rank, p)));
+                if let Some((rank, new_id)) = self.pair_rank(&symbols, p) {
+                    heap.push(std::cmp::Reverse((rank, new_id, p)));
                 }
             }
-            if let Some((rank, _)) = self.pair_rank(&symbols, pos) {
-                heap.push(std::cmp::Reverse((rank, pos)));
+            if let Some((rank, new_id)) = self.pair_rank(&symbols, pos) {
+                heap.push(std::cmp::Reverse((rank, new_id, pos)));
             }
         }
 

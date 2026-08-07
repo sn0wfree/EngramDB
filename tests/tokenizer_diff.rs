@@ -11,8 +11,8 @@
 
 use engramdb::common::tokenizer::{Tokenizer, UNKNOWN_ID};
 
-const VOCAB: &[u8] = include_bytes!("../data/vocab/smoke_vocab.bin");
-const GOLDEN: &str = include_str!("../data/vocab/smoke_vocab.golden.txt");
+const VOCAB: &[u8] = include_bytes!("../data/vocab/engram_vocab_v1.bin");
+const GOLDEN: &str = include_str!("../data/vocab/engram_vocab_v1.golden.txt");
 
 fn parse_ids(ids_str: &str) -> Vec<u32> {
     ids_str
@@ -22,6 +22,16 @@ fn parse_ids(ids_str: &str) -> Vec<u32> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().parse().unwrap())
         .collect()
+}
+
+/// 字符边界安全截断（断言显示用，避免中文截断 panic）
+fn safe_preview(text: &str) -> String {
+    let end = text
+        .char_indices()
+        .nth(60)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    text[..end].to_string()
 }
 
 fn golden_lines() -> Vec<(String, Vec<u32>)> {
@@ -49,18 +59,18 @@ fn test_diff_vs_tokenizers() {
         if actual.contains(&UNKNOWN_ID) {
             // OOV 行：剔除 UNKNOWN 标记后与 tokenizers（丢弃）一致
             let stripped: Vec<u32> = actual.into_iter().filter(|&id| id != UNKNOWN_ID).collect();
+            let preview = safe_preview(&text);
             assert_eq!(
                 stripped, expected,
-                "OOV 行剔除标记后与 tokenizers 不一致（line {line_no}）：{}",
-                &text[..text.len().min(60)]
+                "OOV 行剔除标记后与 tokenizers 不一致（line {line_no}）：{preview}"
             );
             oov_lines += 1;
         } else {
             // 无 OOV 行：逐 token 全等
+            let preview = safe_preview(&text);
             assert_eq!(
                 actual, expected,
-                "token 序列与 tokenizers 不一致（line {line_no}）：{}",
-                &text[..text.len().min(60)]
+                "token 序列与 tokenizers 不一致（line {line_no}）：{preview}"
             );
         }
         total += expected.len();
@@ -100,7 +110,7 @@ fn test_diff_roundtrip_reconstruct() {
     for (text, _) in golden_lines() {
         let tokens = tok.tokenize(&text);
         let recon = tok.reconstruct(&text, &tokens);
-        assert_eq!(recon, text, "可逆性失败：{}", &text[..text.len().min(60)]);
+        assert_eq!(recon, text, "可逆性失败：{}", safe_preview(&text));
     }
 }
 
