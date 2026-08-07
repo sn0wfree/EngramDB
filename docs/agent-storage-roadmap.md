@@ -34,13 +34,13 @@
   sessions / messages（Columnar）: 聚合物化（finish 时单事务投影）→ 读取/分析/计费
 ```
 
-### 任务清单
+### 任务清单（P0-1 已定稿：路线 B——离线 tokenizers 训练 + 运行时自研轻量编码器）
 
 | # | 任务 | 内容 | 验收 |
 |---|---|---|---|
-| P0-1 | **统一 Tokenizer**（`src/common/tokenizer.rs`）| DAG 词表（中文词表 + 可加载扩展，版本化）；TokenStream 三要素（text/norm/offset）；确定性可逆 | 同文本恒同 token 流；无损往返；v0.22 直接复用 |
-| P0-2 | **微型压缩基准** | TokenDelta vs zstd vs 不压缩（场景 A 流式追加 / B 覆盖重写）| 数据定 codec 取舍（业界无先例，必须实测）|
-| P0-3 | **TokenDelta codec** | 静态热词层（词表 top-N 短 ID）+ 块级动态字典 + 前缀 delta；接入 compression/mod.rs 分派 | 事件流压缩后 ≈ 1× 内容 |
+| P0-1 | **统一 Tokenizer**（`src/common/tokenizer.rs`）| 离线 BPE 训练（tokenizers，混合语料 + 种子词表）+ 运行时自研零分配编码器（类别预分割 + trie 最长匹配 + byte_fallback + NFKC norm）+ TokenStream 三要素；差分测试锁定一致性 | 同文本恒同 token 流；无损往返；golden 与 tokenizers 逐 token 一致；v0.22 直接复用 |
+| P0-2 | **微型压缩基准** | 四臂（TokenDelta+Huffman / TokenDelta+varint / zstd+CDict dev-dep / 不压缩）× 三场景（A 流式 / B 覆盖 / C 独立文档）× 词表三角（纯 BPE / 种子 BPE / 人工词表）| 数据定 codec 取舍（业界无先例，必须实测）|
+| P0-3 | **TokenDelta codec** | 静态热词层（merges rank 前 N 短 ID）+ 块级动态字典 + 前缀 delta + 熵编码（Huffman 起步，rANS 候选）；接入 compression/mod.rs 分派 | 事件流压缩后 ≈ 1× 内容 |
 | P0-4 | **Log 序列化接入 + Log TTL** | serialize_typed 按块走 TokenDelta；capabilities.rs 开启 + 块级 cutoff + checkpoint 物理释放 | 过期块零读取、物理释放 |
 | P0-5 | **SessionStore API** | begin/append/update/finish → Log 事件（全量快照，业务无感）；读 API → Columnar | opencode 同款调用直接可用 |
 | P0-6 | **finish 物化投影** | 单事务：Log finish 事件 + Columnar 聚合（message/part/session 计费累计）| 多表原子，强一致 |
@@ -48,9 +48,10 @@
 | P0-8 | **基准 A5** | 模拟 opencode 负载：写放大压缩率、拉取/搜索延迟、体积 vs 7.8GB 实测 | 文档记录对比 |
 
 ### 待办风险
-- 分词确定性（词表版本化 + 未登录字兜底）
+- 分词确定性（词表版本化 + 未登录字 byte_fallback）
 - 块字典膨胀（静态热词短 ID + 动态层增量编码）
-- 压缩率退化场景（best-of 自动选型：TokenDelta vs Uncompressed 取小）
+- 压缩率退化场景（best-of 自动选型：TokenDelta vs Uncompressed 取小；
+  代码/JSON 退化由 P0-2 数据判定是否引入运行时兜底，见 engram 文档 4.6）
 - 孤儿事件（崩溃）→ TTL 兜底 + 后续回放重建（nice-to-have）
 
 ---

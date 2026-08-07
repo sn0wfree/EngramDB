@@ -54,21 +54,59 @@ opencode 实测：流式会话事件溯源，**写放大 610×**（每次更新�
 
 ## 三、分词器设计（`src/common/tokenizer.rs`）
 
-### 3.1 DAG 分词
+> 定稿（2026-08-07）：数据驱动 BPE 词表 + 自研轻量零分配编码器（路线 B）
+> 训练与运行时分离：**离线训练用 tokenizers（HF，Rust crate）**，
+> **运行时自研编码器**（零分配、零 C 依赖、仅新增 unicode-normalization 依赖）。
+> 正确性由差分测试锁定（tokenizers 编码 vs 自研编码 golden 逐 token 一致）。
+
+### 3.1 训练端（离线，`tools/` dev-dependency: tokenizers）
 
 ```
-文本 → 字符序列 → 词图（DAG）：每位置 → 可达词集合（词表查词）
-     → 路径选择（初版：双向最大匹配；v0.22：词频 + Viterbi 最大概率）
-     → TokenStream
+语料（opencode 主库 + 15.6GB 备份，行级去重）
+  → NFKC 归一化
+  → 自定义 PreTokenizer（与运行时共享同一份规则代码）：
+      类别游标切分（CJK 块 / 字母 / 数字 / 标点 / 空白 / 符号）
+      + 可选种子词贪心（jieba 常用词 top-K，CJK 块内最长匹配）
+  → BpeTrainer（Unicode 字符原子 + byte_fallback，v0.23.1）
+  → 导出自定义词表格式（bincode）：
+      magic + version + 预分割规则 + 种子词 + merges(rank 序) + 归一化标志
 ```
 
-- **词表**：内置中文词表（初版 3-5 万常用词，版本化）+ 支持加载外部扩展（jieba 词表格式）
-- **英文/数字/符号**：规则切分（字母数字串 + 标点独立 token）
-- **未登录字兜底**：词表未命中 → 单字 token（保证任何文本可分词）
-- **可逆性不依赖词表**：词表只影响切分质量（压缩率/检索精度），不影响解码正确性——
-  解压只消费 text + offset，不查词表
+- **字符原子 + byte_fallback**（非 tiktoken 的 256 字节原子）：中文单字 = 1 token
+  （字节级 = 3 token），ID 空间更小、中文压缩率更高；byte_fallback 零 OOV
+- **预分割规则自研**（~80 行游标扫描，无正则依赖）：不抄 GPT-4 pat_str
+  （含 lookahead，`regex` crate 不支持）；同一份规则代码在离线 bin 与运行时共享
+  → 训练/运行**结构上一致**
+- **三种预分割模式**（P0-2 三角对比）：纯类别切分 / +种子词 / 人工词表基准
+- **BPE 编码算法**：位置最长匹配（tokenizers 同构，trie 查找）——对给定词表
+  结果唯一确定，无歧义；与 tiktoken 的 rank 贪心 pair 合并不同但不相干
+  （词表来自 tokenizers 训练，一致性以 tokenizers 为准）
 
-### 3.2 词表版本化
+### 3.2 运行时编码器（`src/common/tokenizer.rs`）
+
+```
+词表 include_bytes! 加载（或外部加载，版本化）
+  → 类别游标预分割（共享代码）
+  → 前缀 trie 位置最长匹配 → token id 序列
+  → 未登录字节 fallback
+  → TokenStream{ text, norm, offset }（流式零分配迭代器）
+  → 静态热词映射：merges rank < TOP_N → 短 ID（TokenDelta 消费）
+```
+
+- **零分配流式输出**：压缩热路径每次 append 都编码，无 Encoding 分配开销
+  （对比 tokenizers 的 `encode()` 每次分配完整 Encoding）
+- **norm**：逐 token 轻量归一化（NFKC + lowercase，可配置），FTS 专用，
+  永不污染 text（压缩路径）
+- **offset**：预分割在原文上做，天然精确；text+offset 保证无损还原，
+  不依赖词表正确性
+
+### 3.3 差分测试（正确性锁）
+
+- CI：离线训练产物 → tokenizers 编码 vs 自研编码，固定语料 golden
+  **逐 token 一致**（id + offset）
+- 覆盖：中英混排、代码、emoji、生僻字、边界空白
+
+### 3.4 词表版本化
 
 - 词表带 `version` 号；TokenDelta 块头记录词表版本
 - 词表更新只影响**新写入块**的压缩率；旧块按自身字典 + text 解压，**永远正确**
@@ -81,12 +119,13 @@ opencode 实测：流式会话事件溯源，**写放大 610×**（每次更新�
 
 ```
 Token ID 空间：
-  [0, TOP_N)         静态热词层：词表 top-N 高频词预分配固定短 ID（如 1024 个 → 1 字节）
-  [TOP_N, ∞)         块级动态层：块内新词按出现顺序增量分配（varint 编码，块头存字典）
+  [0, TOP_N)         静态热词层：merges rank 前 N 高频 token 预分配固定短 ID（如 1024 个 → 1 字节）
+  [TOP_N, ∞)         块级动态层：块内新 token 按出现顺序增量分配（块头存字典）
 ```
 
-- 静态层 = 分词器词表的一部分（**一份词表两用**：切分 + 热词 ID）
-- 动态层只编码每块新词（会话流新词率低 → 块字典极小）
+- 静态层 = 分词器词表的 merges 顺序前 N（**rank = 频率排序**，与 tiktoken
+  `mergeable_ranks` 同构——选择有客观依据）
+- 动态层只编码每块新 token（会话流新词率低 → 块字典极小）
 
 ### 4.2 前缀 Delta
 
@@ -102,22 +141,47 @@ Token ID 空间：
 - 快照冗余 → 共享前缀：610 次更新的历史事件在块内只存各自的新增 token
 - **无损**：解压 = 前事件 tokens[..shared] + 新 ID 序列 → text 按 offset 拼回
 
-### 4.3 编码格式（草案）
+### 4.3 熵编码层（ID 流统计冗余）
+
+前缀 delta 后，每行剩余 ID 序列的**频率分布高度倾斜**（热词占大头）——
+varint 是次优编码。两级架构：**TokenDelta（结构）+ 熵编码（统计）**。
+
+- **Huffman 起步**（自研 ~100 行，确定性、零依赖、可靠）；块头存 Huffman 表
+- **rANS 候选**：若基准显示增益显著（预期 ID 流倾斜下 +10-20%），升级 rANS
+  （Duda 2014，算法公开 ~150 行；Rust 生态无成熟 FSE，`rans` crate v0.4.0 小众）
+- 选型由 P0-2 基准数据定夺（TokenDelta+Huffman vs TokenDelta+varint 对比）
+
+### 4.4 编码格式（草案）
 
 ```
 块头（每 Log 块）:
   [词表版本 u16][静态热词数 u16][动态字典: (text_len u32 + text) * N]
-  [每行: shared_prefix_len varint + new_ids varint 数组 + 行尾 offset 表]
+  [熵编码标志 u8（varint | Huffman | rANS）][Huffman 表（若启用）]
+  [每行: shared_prefix_len varint + new_ids 熵编码流 + 行尾 offset 表]
 
 解码：
   tokens[i] = tokens[i-1][..shared] + new_ids
   原文 = tokens 按 offset 拼接（无损）
 ```
 
-### 4.4 自动选型（best-of）
+### 4.5 自动选型（best-of）
 
 `compress()` 中央分派（compression/mod.rs:32）：TokenDelta 与 Uncompressed 比较，
 取体积小者（沿用现有 best-of 逻辑）。随机文本/短文本场景自动退化，零风险。
+
+### 4.6 压缩算法分层决策（2026-08-07 定案）
+
+| 层次 | 内容 | 状态 |
+|---|---|---|
+| A. 基准对照（dev-dependencies）| zstd（+ 可选纯 Rust brotli）作为字节级基线臂 | **引入**（必要，验证 TokenDelta 价值）|
+| B. 运行时兜底（产品内）| 引擎内置通用压缩器（zstd/deflate）| **不引入**（由 P0-2 数据触发，见下）|
+| C. 熵编码层 | 自研 Huffman 起步，rANS 候选 | 已计划 |
+
+**运行时零 C 依赖**：自研 TokenDelta + Huffman；zstd（C 绑定）仅作 dev-dep 基准。
+**触发「运行时引入兜底」的数据条件**（P0-2 出数后判定）：
+- ① TokenDelta 在代码/JSON 臂压缩率 < zstd，且 ② 该类内容在 opencode 语料占比 > 30%
+  → 引入兜底（优先纯 Rust miniz_oxide/deflate，零 C 依赖）
+- TokenDelta 整体不敌 zstd+CDict → 直接采纳降级方案（基准工具升级为运行时依赖）
 
 ---
 
@@ -222,16 +286,24 @@ arXiv/GitHub 检索确认：**「确定性分词器 + 词表静态字典 + 块�
 
 ## 七、基准验证计划（P0-2，写进生产前必做）
 
-| 场景 | 口径 |
-|---|---|
-| A：流式追加 | 模拟 1 条消息 610 次逐 token 更新（opencode 形态）|
-| B：覆盖重写 | 610 次全量替换快照（最坏场景）|
-| 对照 | TokenDelta vs zstd 基线 vs 不压缩 |
-| 指标 | 压缩率、压缩/解压耗时、块字典大小 |
+**基准矩阵（2026-08-07 更新）**：
+
+| 对比臂 | 场景 | 语料 | 指标 |
+|---|---|---|---|
+| TokenDelta + Huffman | A：流式追加（610 次/消息）| 中文（对话）| 压缩率 |
+| TokenDelta + varint | B：覆盖重写（最坏）| 英文（对话）| 压缩/解压耗时 |
+| zstd + CDict（dev-dep 基线）| C：独立文档（代码/JSON 块）| 代码 / JSON | 块字典大小 |
+| 不压缩 | 三场景 × 三语料 | 来自 opencode 库提取 | Huffman 表开销 |
+
+**词表三角（并行）**：纯 BPE / 种子 BPE（jieba 种子词）/ 人工词表基准
+——同时测压缩率 + FTS 中文命中率。
 
 **决策规则**：
-- TokenDelta 显著优于 zstd → 完整方案（差异化卖点入文档）
-- 接近 zstd → 降级「zstd + 前缀 delta」简化版；分词器仍建（v0.22 检索必用）
+- TokenDelta 显著优于 zstd+CDict → 完整方案（差异化卖点入文档）
+- 接近 zstd → 降级「zstd + CDict」简化版；分词器仍建（v0.22 检索必用）
+- 熵编码层：Huffman vs varint 增益显著 → 保留 Huffman（或升级 rANS）；
+  无增益 → varint 简化
+- 运行时兜底引入条件（见 4.6）：代码/JSON 臂 TokenDelta < zstd 且占比 > 30%
 
 ---
 
