@@ -166,22 +166,18 @@ impl HuffmanEncoder {
 // 解码器
 // ============================================================================
 
-pub struct HuffmanDecoder {
+/// 解码表（一次构建，多流复用——块内每行共享）
+pub struct HuffmanTable {
     /// first_code[len]：该码长的最小码字
     first_code: [u32; 33],
     /// count[len]：该码长符号数
     count: [u32; 33],
     /// 每码长的符号列表（升序）
     symbols_by_len: Vec<Vec<u32>>,
-    /// 码流
-    data: Vec<u8>,
-    pos: usize,
-    buf: u64,
-    nbits: u32,
 }
 
-impl HuffmanDecoder {
-    pub fn new(header: &[u8], stream: Vec<u8>) -> Self {
+impl HuffmanTable {
+    pub fn from_header(header: &[u8]) -> Self {
         let n = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
         let mut off = 4;
         let mut symbols = Vec::with_capacity(n);
@@ -211,15 +207,27 @@ impl HuffmanDecoder {
             code = (code + count[len - 1]) << 1;
             first_code[len] = code;
         }
-        Self {
-            first_code,
-            count,
-            symbols_by_len,
-            data: stream,
-            pos: 0,
-            buf: 0,
-            nbits: 0,
-        }
+        Self { first_code, count, symbols_by_len }
+    }
+}
+
+pub struct HuffmanDecoder {
+    table: HuffmanTable,
+    /// 码流
+    data: Vec<u8>,
+    pos: usize,
+    buf: u64,
+    nbits: u32,
+}
+
+impl HuffmanDecoder {
+    pub fn new(header: &[u8], stream: Vec<u8>) -> Self {
+        Self::from_table(&HuffmanTable::from_header(header), stream)
+    }
+
+    /// 轻量构造：表共享，仅流状态新建
+    pub fn from_table(table: &HuffmanTable, stream: Vec<u8>) -> Self {
+        Self { table: HuffmanTable { first_code: table.first_code, count: table.count, symbols_by_len: table.symbols_by_len.clone() }, data: stream, pos: 0, buf: 0, nbits: 0 }
     }
 
     fn read_bit(&mut self) -> bool {
@@ -246,11 +254,11 @@ impl HuffmanDecoder {
             loop {
                 code = (code << 1) | (self.read_bit() as u32);
                 len += 1;
-                let fc = self.first_code[len];
-                let cnt = self.count[len];
+                let fc = self.table.first_code[len];
+                let cnt = self.table.count[len];
                 if code >= fc && code < fc + cnt {
                     let idx = (code - fc) as usize;
-                    out.push(self.symbols_by_len[len][idx]);
+                    out.push(self.table.symbols_by_len[len][idx]);
                     code = 0;
                     len = 0;
                     break;

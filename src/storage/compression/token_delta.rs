@@ -20,7 +20,7 @@
 
 use crate::common::error::{EngramDbError, Result};
 use crate::common::huffman;
-use crate::common::tokenizer::{Tokenizer, UNKNOWN_ID};
+use crate::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 
 /// 熵编码形态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +45,7 @@ pub struct TokenDeltaCodec<'a> {
 enum RowDecoder {
     Varint,
     Huffman {
-        header: Vec<u8>,
+        table: huffman::HuffmanTable,
     },
 }
 
@@ -63,14 +63,16 @@ impl<'a> TokenDeltaCodec<'a> {
         if texts.is_empty() {
             return Vec::new();
         }
-        // 1. tokenize + 动态字典
+        // 1. tokenize + 动态字典（行间共享前缀 → 增量 tokenize）
         let mut dyn_dict: Vec<String> = Vec::new();
         let mut dyn_index: fxhash::FxHashMap<String, u32> = fxhash::FxHashMap::default();
         let mut rows: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+        let mut prev_text: &str = "";
+        let mut prev_tokens: Vec<Token> = Vec::new();
         for text in texts {
-            let tokens = self.tok.tokenize(text);
+            let tokens = self.tok.tokenize_incremental(prev_text, &prev_tokens, text);
             let mut row = Vec::with_capacity(tokens.len());
-            for t in tokens {
+            for t in &tokens {
                 if t.id == UNKNOWN_ID {
                     let ch = &text[t.offset.clone()];
                     let idx = match dyn_index.get(ch) {
@@ -88,6 +90,8 @@ impl<'a> TokenDeltaCodec<'a> {
                 }
             }
             rows.push(row);
+            prev_text = text;
+            prev_tokens = tokens;
         }
 
         // 2. 前缀 delta
@@ -125,13 +129,15 @@ impl<'a> TokenDeltaCodec<'a> {
                         .collect();
                     let mut seen: fxhash::FxHashSet<u32> =
                         lengths.iter().map(|(s, _)| *s).collect();
-                    for id in &new_ids {
-                        let needs_ext = (*id >= self.tok.vocab_size() as u32)
-                            || base[*id as usize] == 0;
-                        if needs_ext && !seen.contains(id) {
-                            seen.insert(*id);
-                            dyn_ext.push((*id, 24));
-                            lengths.push((*id, 24));
+                    // 去重后再检查（避免大块 O(n²) 级重复检查）
+                    let unique_ids: fxhash::FxHashSet<u32> = new_ids.iter().copied().collect();
+                    for id in unique_ids {
+                        let needs_ext = (id >= self.tok.vocab_size() as u32)
+                            || base[id as usize] == 0;
+                        if needs_ext && !seen.contains(&id) {
+                            seen.insert(id);
+                            dyn_ext.push((id, 24));
+                            lengths.push((id, 24));
                         }
                     }
                     let codes = huffman::canonical_codes(&lengths);
@@ -218,7 +224,7 @@ impl<'a> TokenDeltaCodec<'a> {
             .to_vec();
         pos += header_len;
 
-        // 构建行解码器
+        // 构建行解码器（表只建一次，行级只做轻量流状态）
         let row_decoder = match strategy {
             0 => RowDecoder::Varint,
             1 => {
@@ -243,9 +249,9 @@ impl<'a> TokenDeltaCodec<'a> {
                     hpos += 1;
                     lengths.push((id, len));
                 }
-                RowDecoder::Huffman { header: lengths_to_header(&lengths) }
+                RowDecoder::Huffman { table: huffman::HuffmanTable::from_header(&lengths_to_header(&lengths)) }
             }
-            2 => RowDecoder::Huffman { header },
+            2 => RowDecoder::Huffman { table: huffman::HuffmanTable::from_header(&header) },
             _ => return Err(EngramDbError::Parse("td: unknown strategy".into())),
         };
 
@@ -270,8 +276,8 @@ impl<'a> TokenDeltaCodec<'a> {
                     }
                     ids
                 }
-                RowDecoder::Huffman { header } => {
-                    let mut dec = huffman::HuffmanDecoder::new(header, stream.to_vec());
+                RowDecoder::Huffman { table } => {
+                    let mut dec = huffman::HuffmanDecoder::from_table(table, stream.to_vec());
                     dec.decode(count)
                 }
             };

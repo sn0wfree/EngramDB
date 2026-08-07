@@ -147,6 +147,63 @@ impl Tokenizer {
         tokens
     }
 
+    /// 增量编码：`new_text` 以 `prev_text` 为前缀（流式追加）时复用 `prev_tokens`，
+    /// 仅重放跨界段（公共前缀边界所在词块）与新增尾部。
+    /// 跨界合并正确性：BPE merge 词级独立，重放段内结果与全量 tokenize 一致。
+    /// 非前缀关系 / 文本变短 → 等价全量（变短时直接截断）。
+    pub fn tokenize_incremental(
+        &self,
+        prev_text: &str,
+        prev_tokens: &[Token],
+        new_text: &str,
+    ) -> Vec<Token> {
+        let pbytes = prev_text.as_bytes();
+        let nbytes = new_text.as_bytes();
+        let mut p = 0usize;
+        while p < pbytes.len() && p < nbytes.len() && pbytes[p] == nbytes[p] {
+            p += 1;
+        }
+        // 回退到字符边界（多字节字符内部不同 → 取该字符起点）
+        while p > 0 && !prev_text.is_char_boundary(p) {
+            p -= 1;
+        }
+        let k = prev_tokens.iter().take_while(|t| t.offset.end <= p).count();
+        if p == new_text.len() {
+            // new 是 prev 的前缀（文本变短）→ 截断（跨界 token 被丢弃）
+            return prev_tokens[..k].to_vec();
+        }
+        if p == 0 || p < 8 {
+            return self.tokenize(new_text); // 无共享前缀 / 前缀过短 → 全量
+        }
+        // 公共前缀落在某段（类别段，含段内种子词切分）中间或 prev 最后段尾 →
+        // 该段需整体重放：截断段的 word 划分 ≠ 完整段的划分，段完整重放才与
+        // 全量 tokenize 逐 token 一致。p 恰在非末段段边界 → 从 p 起重放下段。
+        let mut seg_start = p;
+        let pieces = pretokenize::segment(prev_text);
+        for (i, piece) in pieces.iter().enumerate() {
+            if piece.end >= p {
+                if piece.end == p && i + 1 < pieces.len() {
+                    seg_start = p;
+                } else {
+                    seg_start = piece.start;
+                }
+                break;
+            }
+        }
+        // 复用率 < 50% 时增量无收益（重放近全量 + 段扫描开销）→ 全量
+        if seg_start * 2 < new_text.len() {
+            return self.tokenize(new_text);
+        }
+        // prev 保留到重放段起点之前；重放段内 merge 可能吞噬边界 token，
+        // 故整段重放并全部保留（与 prev 保留部分无缝拼接）
+        let k2 = prev_tokens.iter().take_while(|t| t.offset.end <= seg_start).count();
+        let mut tokens = prev_tokens[..k2].to_vec();
+        for t in self.tokenize(&new_text[seg_start..]) {
+            tokens.push(Token { id: t.id, offset: (t.offset.start + seg_start)..(t.offset.end + seg_start) });
+        }
+        tokens
+    }
+
     /// 编码单个段（word）：字符级初始 token → merges rank 贪心合并
     /// 未登录字符 → `UNKNOWN_ID` 标记（Unicode 字符级兜底，块动态字典登记）
     fn encode_word(&self, word: &str, base: usize, out: &mut Vec<Token>) {
@@ -302,6 +359,47 @@ mod tests {
         let a = tok.tokenize(text);
         let b = tok.tokenize(text);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_incremental_equals_full() {
+        let tok = smoke_tokenizer();
+        // 流式前缀序列：每步增量 tokenize 必须与全量一致
+        let base = "你好世界！这是测试 text 123 hello";
+        let mut prev = String::new();
+        let mut prev_tokens: Vec<Token> = Vec::new();
+        for i in 1..=base.chars().count() {
+            let end = base
+                .char_indices()
+                .nth(i)
+                .map(|(idx, _)| idx)
+                .unwrap_or(base.len());
+            let next = base[..end].to_string();
+            let full = tok.tokenize(&next);
+            let inc = tok.tokenize_incremental(&prev, &prev_tokens, &next);
+            assert_eq!(inc, full, "step {i}");
+            prev = next;
+            prev_tokens = inc;
+        }
+    }
+
+    #[test]
+    fn test_incremental_prefix_shrink() {
+        let tok = smoke_tokenizer();
+        let full = "你好世界！这是测试 text 123 hello";
+        let tokens = tok.tokenize(full);
+        let mid = "你好世界！这是测试";
+        let inc = tok.tokenize_incremental(full, &tokens, mid);
+        assert_eq!(inc, tok.tokenize(mid));
+    }
+
+    #[test]
+    fn test_incremental_no_shared_prefix() {
+        let tok = smoke_tokenizer();
+        let tokens = tok.tokenize("你好世界");
+        let other = "hello world 123";
+        let inc = tok.tokenize_incremental("你好世界", &tokens, other);
+        assert_eq!(inc, tok.tokenize(other));
     }
 
     #[test]

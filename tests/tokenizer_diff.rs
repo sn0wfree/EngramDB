@@ -113,3 +113,26 @@ fn test_diff_deterministic() {
         assert_eq!(a, b, "确定性失败");
     }
 }
+
+/// 流式前缀序列：增量 tokenize 必须与全量逐 token 一致（真实词表）
+#[test]
+fn test_diff_incremental_stream() {
+    let tok = Tokenizer::from_bytes(VOCAB).expect("load vocab");
+    for (text, _) in golden_lines() {
+        let mut prev = String::new();
+        let mut prev_tokens = Vec::new();
+        for i in 1..=text.chars().count() {
+            let end = text
+                .char_indices()
+                .nth(i)
+                .map(|(idx, _)| idx)
+                .unwrap_or(text.len());
+            let next = text[..end].to_string();
+            let full = tok.tokenize(&next);
+            let inc = tok.tokenize_incremental(&prev, &prev_tokens, &next);
+            assert_eq!(inc, full, "增量不一致（step {i}, len {end}）：{}", &text[..end]);
+            prev = next;
+            prev_tokens = inc;
+        }
+    }
+}
