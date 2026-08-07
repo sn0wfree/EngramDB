@@ -276,6 +276,20 @@ impl TableDef {
         self.ttl_seconds
     }
 
+    /// TTL 截止时间（毫秒时间戳）。
+    ///
+    /// 与 `is_expired` 语义一致：`created_ms < cutoff` 视为过期。
+    /// 一次扫描只调用一次，避免逐行 `SystemTime::now()` 系统调用。
+    pub fn ttl_cutoff_ms(&self) -> Option<i64> {
+        self.ttl_seconds.map(|ttl| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            now_ms.saturating_sub((ttl as i64).saturating_mul(1000))
+        })
+    }
+
     /// 判断指定行是否已过期（相对于当前时间）
     pub fn is_expired(&self, row: &[crate::Value]) -> bool {
         match self.ttl_seconds {

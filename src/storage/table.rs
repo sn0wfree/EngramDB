@@ -5,7 +5,7 @@
 use crate::common::config::CompactStrategy;
 use crate::common::error::Result;
 use crate::common::types::{TableDef, IndexDef, ColumnDef};
-use crate::common::column_data::ColumnData;
+use crate::common::column_data::{ColumnData, ColumnValue};
 use crate::common::value_cmp::total_cmp;
 use crate::Value;
 use crate::executor::vector::{DataChunk, Vector};
@@ -28,6 +28,7 @@ fn cluster_columns(columns: &[Vec<Value>], cluster_col_idx: usize) -> Vec<Vec<Va
     }
 
     let num_cols = columns.len();
+
     let cluster_col = &columns[cluster_col_idx];
 
     use std::collections::HashMap;
@@ -59,6 +60,25 @@ fn cluster_columns(columns: &[Vec<Value>], cluster_col_idx: usize) -> Vec<Vec<Va
     }
 
     result
+}
+
+/// TTL 存活判定：`created_ms >= cutoff` 视为存活（null/非 Timestamp 列 → 存活）。
+///
+/// 直接用类型化列取值，零 Value 构造；cutoff 由 `TableDef::ttl_cutoff_ms` 一次算出。
+#[inline]
+fn ttl_col_alive(col: &ColumnData, row: usize, cutoff_ms: i64) -> bool {
+    if row < col.len() {
+        if let Some(n) = &col.nulls {
+            if row < n.len() && n.test(row) {
+                return true; // null → 不判定过期
+            }
+        }
+        match &col.values {
+            ColumnValue::Timestamp(v) => return v[row] >= cutoff_ms,
+            _ => return true,
+        }
+    }
+    true
 }
 
 /// 按主键列对列式数据做全排序（分层索引：compact 排序，段内有序 → 稀疏二分）
@@ -1803,9 +1823,20 @@ impl Table {
     /// 全表扫描（合并 Delta + 列存）
     pub fn scan(&mut self, column_indices: &[usize]) -> Result<Vec<Vec<Value>>> {
         let mut result = Vec::new();
+        let full_row_for_ttl = self.def.has_ttl();
+        // TTL 截止线一次算好（避免逐行 SystemTime::now()）
+        let ttl_cutoff: Option<i64> = self.def.ttl_cutoff_ms();
 
         // 从列存读取
         for rg_idx in 0..self.column_store.row_group_count() {
+            // T-TTL: 整个 RowGroup 全部过期（无存活行）→ 整组跳过
+            if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
+                let cutoff_val = Value::Timestamp(cut);
+                if self.column_store.can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val) {
+                    continue;
+                }
+            }
+
             // 读取需要的列
             let mut columns_data = Vec::new();
             for &col_idx in column_indices {
@@ -1816,22 +1847,22 @@ impl Table {
             // 按行组装
             if !columns_data.is_empty() {
                 let row_count = columns_data[0].len();
-                // 如果 TTL 启用，需要完整的行来判断过期
-                let full_row_for_ttl = self.def.has_ttl();
+                // TTL 列：每 RG 读一次克隆（O(N)，替代逐行重建完整行 O(N×M)）
+                let ttl_col_data: Option<ColumnData> = match (full_row_for_ttl, self.def.ttl_column) {
+                    (true, Some(ttl_col)) => {
+                        let cd = self.column_store.read_column(rg_idx, ttl_col)?.clone();
+                        Some(cd)
+                    }
+                    _ => None,
+                };
                 for row_idx in 0..row_count {
                     let mut row = Vec::with_capacity(column_indices.len());
                     for col in &columns_data {
                         row.push(col[row_idx].clone());
                     }
-                    // TTL 过滤：跳过过期行
-                    if full_row_for_ttl {
-                        // 重建完整行用于 TTL 判断
-                        let mut full_row: Vec<Value> = Vec::new();
-                        for ci in 0..self.def.columns.len() {
-                            let col_data = self.column_store.read_column(rg_idx, ci)?;
-                            full_row.push(if row_idx < col_data.len() { col_data.get(row_idx) } else { Value::Null });
-                        }
-                        if self.def.is_expired(&full_row) {
+                    // TTL 过滤：跳过过期行（一次读 TTL 列 + 一次截up）
+                    if let (Some(ttl_col), Some(cut)) = (&ttl_col_data, ttl_cutoff) {
+                        if !ttl_col_alive(ttl_col, row_idx, cut) {
                             continue;
                         }
                     }
@@ -1900,11 +1931,20 @@ impl Table {
 
         let mut chunks: Vec<DataChunk> = Vec::new();
         let full_row_for_ttl = self.def.has_ttl();
+        // TTL 截止线一次算好（避免逐行 SystemTime::now()）
+        let ttl_cutoff: Option<i64> = self.def.ttl_cutoff_ms();
 
         for rg_idx in 0..self.column_store.row_group_count() {
             // P2.4：MinMax 跳过索引 —— 整个 row group 可跳过时不解压
             if let Some((col_idx, op, val)) = &skip_pred {
                 if self.column_store.can_skip_predicate(rg_idx, *col_idx, *op, val) {
+                    continue;
+                }
+            }
+            // T-TTL: 整个 RowGroup 全部过期（created < cutoff 无存活行）→ 整组跳过
+            if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
+                let cutoff_val = Value::Timestamp(cut);
+                if self.column_store.can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val) {
                     continue;
                 }
             }
@@ -1928,26 +1968,44 @@ impl Table {
                 .as_ref()
                 .and_then(|(ci, _, _)| column_indices.iter().position(|&c| c == *ci));
 
-
+            // TTL 列：可能不在输出列，每 RG 克隆一份（O(N) 一次，
+            // 替代旧的逐行重建完整行 O(N×M) + 逐行 SystemTime::now()）
+            let ttl_col_data: Option<ColumnData> = match (full_row_for_ttl, self.def.ttl_column) {
+                (true, Some(ttl_col)) => {
+                    let cd = self.column_store.read_column(rg_idx, ttl_col)?.clone();
+                    Some(cd)
+                }
+                _ => None,
+            };
             // 2. 按 batch_size 分块，逐 chunk 构造
             // S2-M2：take_front 移出类型化子列 → Vector::Typed（零 Value 转换）
             let mut batch_start = 0;
             while batch_start < row_count {
                 let batch_len = BATCH_SIZE.min(row_count - batch_start);
 
-                // PREWHERE 筛选（TTL 场景不做：相对行号语义冲突，走原路径）
-                let survivors: Option<Vec<usize>> = if full_row_for_ttl {
-                    None
-                } else {
-                    match (pred_pos, &skip_pred) {
-                        (Some(pos), Some((_, op, val))) => Some(
-                            (0..batch_len)
-                                .filter(|&j| {
-                                    matches_predicate_typed(&col_owned[pos], j, *op, val)
-                                })
-                                .collect(),
-                        ),
-                        _ => None,
+                // PREWHERE + TTL 合流筛选：谓词幸存行 ∩ TTL 存活行
+                // TTL 之前走 O(N×M) 逐行重建完整行 + 逐行 SystemTime::now()，
+                // 现在并入同一 survivors 通道：只读一次 TTL 列（O(N)），cutoff 一次算好
+                let survivors: Option<Vec<usize>> = {
+                    let mut sel: Vec<usize> = match (pred_pos, &skip_pred) {
+                        (Some(pos), Some((_, op, val))) => (0..batch_len)
+                            .filter(|&j| matches_predicate_typed(&col_owned[pos], j, *op, val))
+                            .collect(),
+                        _ => (0..batch_len).collect(),
+                    };
+                    if let (Some(ttl_col), Some(cut)) = (&ttl_col_data, ttl_cutoff) {
+                        sel.retain(|&j| ttl_col_alive(ttl_col, batch_start + j, cut));
+                    }
+                    if ttl_col_data.is_some() {
+                        if sel.len() == batch_len {
+                            None // 全部存活 → 走原始无滤波快路径
+                        } else {
+                            Some(sel)
+                        }
+                    } else if pred_pos.is_some() {
+                        Some(sel)
+                    } else {
+                        None
                     }
                 };
 
@@ -1969,32 +2027,6 @@ impl Table {
                 } else {
                     for col in &mut col_owned {
                         columns.push(Vector::Typed(col.take_front(batch_len)));
-                    }
-                }
-
-                // TTL 过滤：每行检查是否过期
-                if full_row_for_ttl {
-                    // 重建完整行判断
-                    let mut ttl_pass: Vec<bool> = vec![true; batch_len];
-                    for i in 0..batch_len {
-                        let row_idx = batch_start + i;
-                        let mut full_row: Vec<Value> = Vec::with_capacity(self.def.columns.len());
-                        for ci in 0..self.def.columns.len() {
-                            let col_data = self.column_store.read_column(rg_idx, ci)?;
-                            full_row.push(if row_idx < col_data.len() { col_data.get(row_idx) } else { Value::Null });
-                        }
-                        if self.def.is_expired(&full_row) {
-                            ttl_pass[i] = false;
-                        }
-                    }
-                    // 过滤：本 batch 全部 TTL-pass 才保留
-                    if ttl_pass.iter().all(|&p| !p) {
-                        continue; // 全部过期，跳过整个 chunk
-                    }
-                    if ttl_pass.iter().any(|&p| !p) {
-                        // 部分过期：物化过滤后的行（保留 batch 形状但压缩列）
-                        // 简化：不过滤 chunk，保持原 batch（少量过期行不影响大局）
-                        // 后续 filter 算子可处理
                     }
                 }
 
@@ -2068,6 +2100,8 @@ impl Table {
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
         let full_row_for_ttl = self.def.has_ttl();
+        // TTL 截止线一次算好（避免逐行 SystemTime::now()）
+        let ttl_cutoff: Option<i64> = self.def.ttl_cutoff_ms();
 
         // 谓词列在 output column_indices 中的位置
         // - Some(pos)：谓词列是输出列之一，可做 PREWHERE 短路
@@ -2080,6 +2114,13 @@ impl Table {
             // P2.4/P3.2：MinMax 跳过索引 —— 整个 row group 可跳过时不解压
             if let Some((col_idx, op, val)) = &skip_pred {
                 if self.column_store.can_skip_predicate(rg_idx, *col_idx, *op, val) {
+                    continue;
+                }
+            }
+            // T-TTL: 整个 RowGroup 全部过期（created < cutoff 无存活行）→ 整组跳过
+            if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
+                let cutoff_val = Value::Timestamp(cut);
+                if self.column_store.can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val) {
                     continue;
                 }
             }
@@ -2096,12 +2137,21 @@ impl Table {
 
             let row_count = col_owned[0].len();
 
+            // TTL 列：每 RG 克隆一份（O(N) 一次，替代逐行重建完整行 O(N×M)）
+            let ttl_col_data: Option<ColumnData> = match (full_row_for_ttl, self.def.ttl_column) {
+                (true, Some(ttl_col)) => {
+                    let cd = self.column_store.read_column(rg_idx, ttl_col)?.clone();
+                    Some(cd)
+                }
+                _ => None,
+            };
+
             // 按 batch 处理：先按谓词列筛掉绝大多数行，再为幸存行构造完整 row
             for batch_start in (0..row_count).step_by(BATCH_SIZE) {
                 let batch_end = std::cmp::min(batch_start + BATCH_SIZE, row_count);
 
                 // 1. 找出 batch 内通过谓词的行索引（Typed 谓词列直扫，零 Value 构造）
-                let survivors: Vec<usize> = match (pred_col_pos_in_output, &skip_pred) {
+                let mut survivors: Vec<usize> = match (pred_col_pos_in_output, &skip_pred) {
                     (Some(pos), Some((_, op, val))) => {
                         let col = &col_owned[pos];
                         (batch_start..batch_end)
@@ -2110,21 +2160,12 @@ impl Table {
                     }
                     _ => (batch_start..batch_end).collect(),
                 };
-
-                // 2. 为幸存行构造完整 row（避免对被过滤行分配 Vec + 克隆 cell）
+                // 2. TTL 过滤：按 TTL 列存活集剔过期行（绝对行号，零完整行重建）
+                if let (Some(ttl_col), Some(cut)) = (&ttl_col_data, ttl_cutoff) {
+                    survivors.retain(|&row_idx| ttl_col_alive(ttl_col, row_idx, cut));
+                }
+                // 3. 为幸存行构造完整 row（避免对被过滤行分配 Vec + 克隆 cell）
                 for row_idx in survivors {
-                    // TTL 过滤：必须重建完整行
-                    if full_row_for_ttl {
-                        let mut full_row: Vec<Value> = Vec::with_capacity(self.def.columns.len());
-                        for ci in 0..self.def.columns.len() {
-                            let col_data = self.column_store.read_column(rg_idx, ci)?;
-                            full_row.push(if row_idx < col_data.len() { col_data.get(row_idx) } else { Value::Null });
-                        }
-                        if self.def.is_expired(&full_row) {
-                            continue;
-                        }
-                    }
-
                     let mut row: Vec<Value> = Vec::with_capacity(column_indices.len());
                     for col in &col_owned {
                         row.push(if row_idx < col.len() { col.get(row_idx) } else { Value::Null });
@@ -2778,5 +2819,80 @@ mod tests {
         let err = t.insert(vec![row(1, "dup")]).unwrap_err();
         assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
         assert_eq!(t.row_count(), 1, "冲突插入零副作用");
+    }
+
+    fn make_ttl_def(pk: bool) -> TableDef {
+        let mut def = make_def(pk);
+        def.ttl_seconds = Some(60);
+        def.ttl_column = Some(2); // created 列
+        def.columns.push(ColumnDef::new("created", DataType::Timestamp));
+        def
+    }
+
+    fn ttl_row(id: i64, v: &str, created_ms: i64) -> Vec<Value> {
+        vec![Value::Int64(id), Value::Varchar(v.to_string()), Value::Timestamp(created_ms)]
+    }
+
+    fn now_ms_ago(millis: i64) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+            - millis
+    }
+
+    /// P2.4 递进：TTL 过滤必须在 scan_to_chunks / scan_to_rows_direct / scan 三路一致
+    /// （旧实现 chunk 路径部分过期时"简化不过滤"导致过期行泄漏）
+    ///
+    /// 需要超过 direct_threshold（row_group_size/4 = 30720）行触发直接列式路径，
+    /// 让数据真正落在列存 RowGroup 上，从而测到 chunk 的 TTL 合流筛选。
+    #[test]
+    fn test_ttl_partial_expiry_filtered_across_scan_paths() {
+        let mut t = Table::new(make_ttl_def(false), CompactStrategy::manual());
+        // 直接列式路径（>=30720 行），成批进列存；过期 created 显式给出
+        let mut rows = Vec::new();
+        for i in 0..32_000 {
+            rows.push(
+                if i % 3 == 0 {
+                    // 过期：120 秒前（ttl=60s）
+                    ttl_row(i, &format!("expired{}", i), now_ms_ago(120_000))
+                } else {
+                    ttl_row(i, &format!("ok{}", i), now_ms_ago(1))
+                },
+            );
+        }
+        t.insert(rows).unwrap();
+
+        // 列存路径（批量插入直接进列，不走 Delta）
+        assert_eq!(
+            t.column_store.row_group_count(),
+            1,
+            "列存 RowGroup 已建立，扫描走列存",
+        );
+
+        // chunks 路径：只有存活行（2/3 = 21334 行）
+        let chunks = t.scan_to_chunks(&[0, 1]).unwrap();
+        let alive = chunks.iter().map(|c| c.count).sum::<usize>();
+        assert_eq!(alive, 21_333, "scan_to_chunks 部分过期必须只输出存活行");
+
+        // rows 直出路径
+        let rows_out = t.scan_to_rows_direct(&[0, 1]).unwrap();
+        assert_eq!(rows_out.len(), 21_333, "scan_to_rows_direct 部分过期");
+
+        // 旧 scan 路径
+        let scan_out = t.scan(&[0, 1]).unwrap();
+        assert_eq!(scan_out.len(), 21_333, "scan 部分过期");
+
+        // 单组全过期 → 整组被 TTL RG 级跳过（可跳过索引）
+        let mut t2 = Table::new(make_ttl_def(false), CompactStrategy::manual());
+        let mut rows2 = Vec::new();
+        for i in 0..32_000 {
+            rows2.push(ttl_row(i, &format!("old{}", i), now_ms_ago(120_000)));
+        }
+        t2.insert(rows2).unwrap();
+        let chunks2 = t2.scan_to_chunks(&[0, 1]).unwrap();
+        assert!(chunks2.iter().all(|c| c.count == 0), "全过期 RG 返回空");
+        let out2 = t2.scan_to_rows_direct(&[0, 1]).unwrap();
+        assert!(out2.is_empty(), "全过期 RG rows 直出为空");
     }
 }
