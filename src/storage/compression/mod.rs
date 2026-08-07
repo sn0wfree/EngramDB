@@ -16,6 +16,7 @@ pub mod for_encoding;
 pub mod delta;
 pub mod gorilla;
 pub mod double_delta;
+pub mod token_delta;
 
 use crate::common::config::CompressionType;
 use crate::common::error::Result;

@@ -76,7 +76,7 @@ rusqlite = "0.31"
 tokenizers = "0.23"
 
 # v0.21 压缩基准：字节级基线对照（仅基准，运行时零 C 依赖）
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zdict_builder"] }
 brotli = "8"
 
 # 基准测试目标（均自带 main()，需关闭默认 test harness）

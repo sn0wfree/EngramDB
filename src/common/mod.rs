@@ -9,6 +9,7 @@ pub mod value_cmp;
 pub mod pretokenize;
 pub mod vocab_file;
 pub mod tokenizer;
+pub mod huffman;
 
 pub use types::{DataType, ColumnDef, TableDef};
 pub use error::{EngramDbError, Result};

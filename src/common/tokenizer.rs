@@ -44,6 +44,8 @@ pub struct Tokenizer {
     merges_ordered: Vec<(String, String)>,
     /// 种子词（jieba 风格，可空）
     seeds: Vec<String>,
+    /// id → token 文本（按 id 序，解码用）
+    vocab_by_id: Vec<String>,
     /// 词表文件字节（自包含，供块头引用/审计）
     _source_len: usize,
 }
@@ -73,8 +75,10 @@ impl Tokenizer {
             return Err(EngramDbError::Parse("vocab magic mismatch".into()));
         }
         let mut vocab: FxHashMap<String, u32> = FxHashMap::default();
+        let mut vocab_by_id: Vec<String> = Vec::with_capacity(vf.vocab.len());
         for (id, t) in vf.vocab.iter().enumerate() {
             vocab.insert(t.clone(), id as u32);
+            vocab_by_id.push(t.clone());
         }
         // merges pair → (rank, merged_id)：merged token 文本 = a + b
         let mut merges: FxHashMap<(u32, u32), (u32, u32)> = FxHashMap::default();
@@ -90,6 +94,7 @@ impl Tokenizer {
             merges,
             merges_ordered: vf.merges,
             seeds: vf.seeds,
+            vocab_by_id,
             _source_len: 0,
         })
     }
@@ -102,6 +107,16 @@ impl Tokenizer {
     /// 文本是否在词表中（未登录检测，供测试/审计使用）
     pub fn is_in_vocab(&self, text: &str) -> bool {
         self.vocab.contains_key(text)
+    }
+
+    /// id → token 文本（解码还原用；id 需为词表内 id）
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.vocab_by_id.get(id as usize).map(|s| s.as_str())
+    }
+
+    /// token 文本 → id
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.vocab.get(token).copied()
     }
 
     pub fn seeds(&self) -> &[String] {

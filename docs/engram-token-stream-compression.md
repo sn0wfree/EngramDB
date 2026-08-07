@@ -284,25 +284,40 @@ arXiv/GitHub 检索确认：**「确定性分词器 + 词表静态字典 + 块�
 
 ---
 
-## 七、基准验证计划（P0-2，写进生产前必做）
+## 七、基准验证计划（P0-2）
 
-**基准矩阵（2026-08-07 更新）**：
+### 7.1 首轮实测结果（2026-08-07，冒烟语料 490 条 / 词表 4096）
 
-| 对比臂 | 场景 | 语料 | 指标 |
-|---|---|---|---|
-| TokenDelta + Huffman | A：流式追加（610 次/消息）| 中文（对话）| 压缩率 |
-| TokenDelta + varint | B：覆盖重写（最坏）| 英文（对话）| 压缩/解压耗时 |
-| zstd + CDict（dev-dep 基线）| C：独立文档（代码/JSON 块）| 代码 / JSON | 块字典大小 |
-| 不压缩 | 三场景 × 三语料 | 来自 opencode 库提取 | Huffman 表开销 |
+**场景 A 流式追加（610 快照 × 3 长文本）——压缩率（越高越好）**：
+
+| 臂 | 压缩率 | vs zstd+CDict |
+|---|---|---|
+| **TokenDelta+Static（词表码长）** | **562×** | **1.93×** |
+| TokenDelta+Varint | 421× | 1.44× |
+| TokenDelta+Huffman（块级） | 414× | 1.42× |
+| zstd-3+CDict | 291× | 1.00× |
+| zstd-3 | 263× | 0.90× |
+
+**场景 B 覆盖重写（200 快照 × 3，插入型微改）**：zstd 262-289× vs TokenDelta 1.9-3.4×——**无共享前缀的随机改写场景 zstd 胜**（delta 失效 + zstd 窗口匹配强）。真实覆盖重写（相似前缀）未单独测，此类场景由 best-of 兜底规则覆盖。
+
+**场景 C 独立文档（8 块 × 64 条）**：zstd+CDict 3.13× > TokenDelta+Static 2.82×（zstd +11%）、zstd-3 2.84×、Huffman 2.01×、Varint 1.81×。
+
+### 7.2 数据结论（2026-08-07 定稿）
+
+1. **TokenDelta 在流式场景（主场景）压缩率 1.9-2.1× 于 zstd**——核心卖点验证成立
+2. **熵编码主形态 = Static（词表码长，L3 合并）**：三场景全面优于 Varint（+33%/+53%/+56%），A/C 优于块级 Huffman（delta 后分布均匀 + 零表头）——**与「预设定表合并进词表」的设计一致，映射单一**
+3. **块级 Huffman 弃用**：仅在 B 场景占优，该场景由 zstd/Uncompressed 兜底覆盖，不值得维护块级表
+4. **Varint 差距 >30%，不采用**（Static 是纯 varint 的超集优化，成本仅训练端码长表）
+5. **B 类场景（随机改写）触发兜底考虑**：符合 4.6 条件则运行时引入（流式为主场景下占比低，暂不引入）
+6. **性能（实现未优化，如实记录）**：TokenDelta 编码 ~500ms/1830 事件 vs zstd ~3ms（每次快照全量 tokenize O(n²)）；Static 解码慢于 Varint（每行重建表）——P0-3 优化项（增量 tokenize + 表缓存）
 
 **词表三角（并行）**：纯 BPE / 种子 BPE（jieba 种子词）/ 人工词表基准
-——同时测压缩率 + FTS 中文命中率。
+——同时测压缩率 + FTS 中文命中率（全量语料阶段执行）。
 
-**决策规则**：
-- TokenDelta 显著优于 zstd+CDict → 完整方案（差异化卖点入文档）
-- 接近 zstd → 降级「zstd + CDict」简化版；分词器仍建（v0.22 检索必用）
-- 熵编码层：Huffman vs varint 增益显著 → 保留 Huffman（或升级 rANS）；
-  无增益 → varint 简化
+**决策规则（已按首轮数据更新）**：
+- 主形态：TokenDelta + Static（词表码长合并）
+- best-of：TokenDelta vs Uncompressed 取小；B 类场景（delta 失效）由 Uncompressed/zstd 兜底
+- 熵编码：不再实现 rANS（Static 已近最优且零表头）
 - 运行时兜底引入条件（见 4.6）：代码/JSON 臂 TokenDelta < zstd 且占比 > 30%
 
 ---
