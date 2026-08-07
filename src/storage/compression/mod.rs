@@ -18,7 +18,7 @@ pub mod gorilla;
 pub mod double_delta;
 pub mod token_delta;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::config::CompressionType;
 use crate::common::error::Result;
@@ -27,16 +27,19 @@ use crate::common::types::DataType;
 
 /// 全局统一 Tokenizer（v0.21）：DB 打开时按 `Config::tokenizer_path` 注册，
 /// compress_varchar 的 TokenDelta 分派依赖它。未注册 → TokenDelta 路径禁用。
-static GLOBAL_TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
+/// Mutex（非 OnceLock）：进程内可多次 open（不同配置可更新），最后一次 open 生效。
+static GLOBAL_TOKENIZER: Mutex<Option<Arc<Tokenizer>>> = Mutex::new(None);
 
 /// 注册全局 Tokenizer（DB 打开时调用；未配置/加载失败 → None，TokenDelta 禁用）
 pub fn set_global_tokenizer(tok: Option<Tokenizer>) {
-    let _ = GLOBAL_TOKENIZER.set(tok);
+    if let Ok(mut g) = GLOBAL_TOKENIZER.lock() {
+        *g = tok.map(Arc::new);
+    }
 }
 
-/// 当前全局 Tokenizer（只读借用）
-pub fn global_tokenizer() -> Option<&'static Tokenizer> {
-    GLOBAL_TOKENIZER.get().and_then(|t| t.as_ref())
+/// 当前全局 Tokenizer（Arc 拷贝，解引用借用期内安全）
+pub fn global_tokenizer() -> Option<Arc<Tokenizer>> {
+    GLOBAL_TOKENIZER.lock().ok().and_then(|g| g.clone())
 }
 
 /// 按配置注册全局 Tokenizer（DB open/create 时调用）
@@ -496,7 +499,7 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
                 token_delta::EntropyMode::Static,
                 token_delta::EntropyMode::Huffman,
             ] {
-                let codec = token_delta::TokenDeltaCodec::new(tok, mode);
+                let codec = token_delta::TokenDeltaCodec::new(&tok, mode);
                 let blob = codec.encode_block(&strs);
                 if best_blob.as_ref().map_or(true, |b| blob.len() < b.len()) {
                     best_blob = Some(blob);
@@ -521,7 +524,7 @@ fn decompress_token_delta(data: &[u8]) -> Result<Vec<u8>> {
             "TokenDelta 块需要全局 Tokenizer（Config::tokenizer_path 未配置）".into(),
         ));
     };
-    let codec = token_delta::TokenDeltaCodec::new(tok, token_delta::EntropyMode::Static);
+    let codec = token_delta::TokenDeltaCodec::new(&tok, token_delta::EntropyMode::Static);
     let texts = codec.decode_block(data)?;
     // 重建 Varchar 列格式：[len: 4B][value bytes]...
     let mut out = Vec::new();

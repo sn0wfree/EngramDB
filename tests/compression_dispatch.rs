@@ -127,3 +127,101 @@ fn test_tokendelta_vocab_version_mismatch_rejected() {
         other => panic!("应返回 Parse 错误：{other:?}"),
     }
 }
+
+/// 列存落盘读回回归（v0.21 修复：compression_type_from_u8 缺 TokenDelta=11 映射
+/// 导致压缩列读回被当裸序列化错位）——TokenDelta 压缩列必须跨 checkpoint 精确还原
+#[test]
+fn test_tokendelta_column_persist_roundtrip() {
+    use engramdb::common::config::Config;
+    use engramdb::common::types::{ColumnDef, DataType, TableDef};
+    use engramdb::storage::Database;
+    use engramdb::Value;
+    use std::path::PathBuf;
+
+    let dir = std::env::temp_dir().join(format!(
+        "engramdb_td_persist_{}_{}.hdb",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("t").replace(['(', ')', ':', ' '], "_")
+    ));
+    let dir = dir.to_string_lossy().to_string();
+    let wal = format!("{dir}-wal");
+    let _ = std::fs::remove_file(&dir);
+    let _ = std::fs::remove_file(&wal);
+
+    // 构造带码长表的小词表（训练产物模拟）→ 写入临时文件 → 配置加载
+    let mut vf = VocabFile::new(
+        Vec::new(),
+        vec![("你".into(), "好".into()), ("世".into(), "界".into())],
+        vec![
+            "你".into(), "好".into(), "世".into(), "界".into(), "！".into(),
+            "h".into(), "e".into(), "l".into(), "o".into(), " ".into(),
+            "w".into(), "r".into(), "d".into(), "你好".into(), "世界".into(),
+        ],
+    );
+    let mut sl = vec![0u8; vf.vocab.len()];
+    for (id, len) in [(0usize, 2u8), (1, 2), (2, 3), (3, 3), (13, 4), (14, 4)] {
+        sl[id] = len;
+    }
+    for id in [4usize, 5, 6, 7, 8, 9, 10, 11, 12] {
+        sl[id] = 8;
+    }
+    vf.static_lengths = sl;
+    let vocab_path = PathBuf::from(format!("{dir}.vocab"));
+    std::fs::write(&vocab_path, vf.to_bytes().unwrap()).unwrap();
+
+    let mut cfg = Config::default();
+    cfg.tokenizer_path = Some(vocab_path.to_string_lossy().to_string());
+    let n = 300usize;
+    let base = "你好世界！这是测试文本 hello world 你好世界！继续追加内容测试压缩链路";
+    let cc = base.chars().count();
+
+    let mut db = Database::open_with_config(&dir, cfg).unwrap();
+    let def = TableDef::new(
+        1,
+        "log",
+        vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("msg", DataType::Varchar),
+        ],
+    );
+    db.create_table(def).unwrap();
+    for i in 1..=n {
+        let end = base
+            .char_indices()
+            .nth(((i * cc) / n).max(1))
+            .map(|(x, _)| x)
+            .unwrap_or(base.len());
+        db.get_table_mut("log")
+            .unwrap()
+            .insert(vec![vec![
+                Value::Int64(i as i64),
+                Value::Varchar(base[..end].to_string()),
+            ]])
+            .unwrap();
+    }
+    db.checkpoint().unwrap(); // 压缩落盘
+    drop(db);
+
+    // 重开读回：全部 msg 必须精确还原（压缩列跨落盘无错位）
+    let mut cfg2 = Config::default();
+    cfg2.tokenizer_path = Some(vocab_path.to_string_lossy().to_string());
+    let mut db2 = Database::open_with_config(&dir, cfg2).unwrap();
+    let rows = db2.get_table_mut("log").unwrap().scan(&[1]).unwrap();
+    assert_eq!(rows.len(), n);
+    for (i, row) in rows.iter().enumerate() {
+        let expected = base[..base
+            .char_indices()
+            .nth(((i + 1) * cc / n).max(1))
+            .map(|(x, _)| x)
+            .unwrap_or(base.len())]
+            .to_string();
+        match &row[0] {
+            Value::Varchar(s) => assert_eq!(s, &expected, "行 {} 压缩落盘后错位", i + 1),
+            other => panic!("行 {} 非 Varchar: {other:?}", i + 1),
+        }
+    }
+    drop(db2);
+    let _ = std::fs::remove_file(&dir);
+    let _ = std::fs::remove_file(&wal);
+    let _ = std::fs::remove_file(&vocab_path);
+}

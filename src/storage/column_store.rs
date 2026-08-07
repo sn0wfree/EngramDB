@@ -1852,6 +1852,7 @@ fn compression_type_from_u8(b: u8) -> CompressionType {
         8 => CompressionType::ForBitPack,
         9 => CompressionType::BooleanPack,
         10 => CompressionType::DoubleDelta,
+        11 => CompressionType::TokenDelta,
         _ => CompressionType::Uncompressed,
     }
 }
