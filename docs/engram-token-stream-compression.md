@@ -133,7 +133,9 @@ Token ID 空间：
 
 ---
 
-## 六、业界对照（组件均有先例，组合无先例）
+## 六、业界调研（2026-08-07 复核：组件均有先例，组合无人做）
+
+### 6.1 组件先例（我们方案的技术积木）
 
 | 组件 | 业界对应 | 出处 |
 |---|---|---|
@@ -141,11 +143,36 @@ Token ID 空间：
 | 列内字典 + ID | RLE_DICTIONARY | Parquet 编码 #8 |
 | 静态业务字典 | zstd CDict（`zstd --train`）| zstd |
 | 长度 delta | DELTA_LENGTH_BYTE_ARRAY | Parquet 编码 #6 |
-| token 级压缩 | LLM 压缩（Language Modeling Is Compression, arXiv:2309.10668）| DeepMind 2023——依赖模型推理，不适用 |
 | 时间序列 delta | Gorilla（delta-of-delta + XOR）| Facebook TSDB |
 
-**定位**：字节级（Parquet）与模型级（LLM）之间的**语言级增量压缩**——
-确定性可逆分词 + 词表驱动字典 + token 前缀 delta。组合无直接先例 → **基准先行验证**。
+### 6.2 「token 级压缩」全被 LLM 推理路线占据（模型驱动，均不可嵌入）
+
+| 工作 | 方法 | 结果 | 为何不可用 |
+|---|---|---|---|
+| **Language Modeling Is Compression**（DeepMind, arXiv:2309.10668）| Chinchilla 70B 预测 + 算术编码 | 超越 paq8 等专业压缩器 | 需 GPU 推理 |
+| **LLMZip**（arXiv:2306.04050）| LLaMA-7B 预测 + 熵编码 | 压缩率超 ZPAQ/paq8h | **Llama3-8B 压 10MB 需 9.5 天** |
+| **FineZip**（arXiv:2409.17141）| 在线记忆 + 动态上下文加速 | 54x 提速，压缩率 ~ 同 LLMZip | 10MB 仍 ~4 小时 |
+| **AlphaZip**（arXiv:2409.15046）| transformer 预测 + 自适应 Huffman/LZ77 | 优于信息论基线 | 同上，模型级 |
+| **LLM 压缩自身输出**（arXiv:2505.06297，2025）| 14 个 LLM 预测自身生成文本 | **20x+**（gzip 仅 3x）| 证实「LLM 输出高可压缩」，但需模型推理 |
+| **Nacrith**（GitHub, 2026）| SmolLM2-135M + 上下文混合 + CDF 算术编码 | gzip 3.1x，超 CMIX/LLMZip/FineZip | GPU 加速仍模型级 |
+
+### 6.3 邻近领域（语义压缩 / 存储去重，路线不同）
+
+| 工作 | 路线 | 与我们关系 |
+|---|---|---|
+| **SimpleMem**（arXiv:2601.02553，3.7k★）| LLM 把对话蒸馏为原子记忆（语义有损），token 消费 -30x | 应用层语义压缩（需服务端 LLM）；我们为存储层确定性无损——互补不冲突，佐证 agent 数据压缩是热点 |
+| **yams**（GitHub）| SHA-256 内容寻址 + chunk 去重 + zstd + FTS5 | 字节级块去重，无语言感知 |
+
+### 6.4 结论（组合无先例，差异化成立）
+
+arXiv/GitHub 检索确认：**「确定性分词器 + 词表静态字典 + 块级动态字典 + token 前缀 delta」无人做过**。
+所有 token 级压缩都绑定 LLM 推理（秒~小时级/MB），嵌入引擎不可行；字节级方案不感知语言。
+我们占据两者之间的空白：**语言级、确定性、µs 级、与检索共享分词器**。
+2505.06297 已从理论上验证「LLM 生成文本高度可压缩」（20x 空间存在），
+差异只在解法——我们用确定性分词逼近该空间，零模型依赖。
+
+**风险仍存**：zstd 在流式追加场景的基线强度未知 → P0-2 基准先行，
+若 TokenDelta 优势不显著则降级「zstd + 前缀 delta」（分词器仍建，v0.22 检索必用）。
 
 ---
 
