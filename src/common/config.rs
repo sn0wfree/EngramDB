@@ -207,6 +207,8 @@ pub struct Config {
     pub log_block_rows: usize,
     /// 默认压缩算法
     pub default_compression: CompressionType,
+    /// v0.21：统一 Tokenizer 词表文件路径（配置后 Varchar 列启用 TokenDelta 压缩）
+    pub tokenizer_path: Option<String>,
     /// 列存持久化时是否启用压缩（v0.12.x 压缩接线）
     ///
     /// 开启后：checkpoint 时对列存调用 `compress_all`（内存中按 RowGroup 压缩），
@@ -267,6 +269,8 @@ pub enum CompressionType {
     ForBitPack = 8,
     BooleanPack = 9,
     DoubleDelta = 10,
+    /// TokenDelta（统一 Tokenizer + 前缀 delta + 熵编码，v0.21）
+    TokenDelta = 11,
 }
 
 impl Default for Config {
@@ -294,6 +298,7 @@ impl Default for Config {
             log_block_rows: 0, // P1-5：0 = 默认 8192 行/块
             default_compression: CompressionType::Uncompressed,
             compress_on_persist: true,
+            tokenizer_path: None, // v0.21：统一 Tokenizer 词表文件路径（配置后 Varchar 列启用 TokenDelta 压缩）
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
             sort_compact_by_pk: true,

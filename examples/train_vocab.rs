@@ -126,7 +126,34 @@ fn main() {
     token_ranks.sort_by_key(|(_, id)| *id);
     let vocab: Vec<String> = token_ranks.iter().map(|(t, _)| t.clone()).collect();
 
-    let vf = engramdb::common::vocab_file::VocabFile::new(seeds, merges, vocab);
+    // 静态码长表（TokenDelta Static 模式）：自研编码器统计全语料 token 频率
+    // → Huffman 码长（huffman::build_lengths）→ per-id 码长数组（词表 v2 字段）
+    println!("building static code-lengths from corpus ...");
+    let mut vf = engramdb::common::vocab_file::VocabFile::new(seeds, merges, vocab);
+    {
+        let tok = engramdb::common::tokenizer::Tokenizer::from_vocab_file(vf.clone())
+            .expect("load tokenizer");
+        let mut freqs: fxhash::FxHashMap<u32, u64> = fxhash::FxHashMap::default();
+        for text in &texts {
+            for t in tok.tokenize(text) {
+                if t.id != engramdb::common::tokenizer::UNKNOWN_ID {
+                    *freqs.entry(t.id).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut static_lengths = vec![0u8; tok.vocab_size()];
+        for (id, len) in engramdb::common::huffman::build_lengths(&freqs) {
+            if (id as usize) < tok.vocab_size() {
+                static_lengths[id as usize] = len;
+            }
+        }
+        println!(
+            "static code-lengths: {} non-zero (of {})",
+            static_lengths.iter().filter(|l| **l > 0).count(),
+            tok.vocab_size()
+        );
+        vf.static_lengths = static_lengths;
+    }
     let bytes = vf.to_bytes().expect("serialize vocab");
     let mut f = File::create(&output).expect("create output");
     f.write_all(&bytes).expect("write output");

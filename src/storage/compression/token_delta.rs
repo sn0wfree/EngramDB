@@ -54,6 +54,21 @@ impl<'a> TokenDeltaCodec<'a> {
         Self { tok, entropy, static_lengths }
     }
 
+    /// Static 模式码长表：显式传入优先，否则用词表自带（v2 字段）；都无 → 全零（全扩展退化）
+    fn effective_static_lengths(&self) -> Vec<u8> {
+        match &self.static_lengths {
+            Some(sl) => sl.clone(),
+            None => {
+                let from_vocab = self.tok.static_lengths();
+                if from_vocab.is_empty() {
+                    vec![0u8; self.tok.vocab_size()]
+                } else {
+                    from_vocab.to_vec()
+                }
+            }
+        }
+    }
+
     // ========================================================================
     // 编码
     // ========================================================================
@@ -116,10 +131,7 @@ impl<'a> TokenDeltaCodec<'a> {
                 })),
                 EntropyMode::Static => {
                     // 全表 = 全局码长 + 块扩展（码长 0 的词表 id 或动态词，24 位定长）
-                    let base = self
-                        .static_lengths
-                        .clone()
-                        .unwrap_or_else(|| vec![0u8; self.tok.vocab_size()]);
+                    let base = self.effective_static_lengths();
                     let mut dyn_ext: Vec<(u32, u8)> = Vec::new();
                     let mut lengths: Vec<(u32, u8)> = base
                         .iter()
@@ -162,7 +174,7 @@ impl<'a> TokenDeltaCodec<'a> {
 
         // 4. 组装
         let mut out = Vec::new();
-        out.extend_from_slice(&0u16.to_le_bytes()); // 词表版本占位
+        out.extend_from_slice(&self.tok.version().to_le_bytes()); // 词表版本（解码端校验）
         out.extend_from_slice(&(dyn_dict.len() as u32).to_le_bytes());
         for ch in &dyn_dict {
             out.push(ch.len() as u8);
@@ -195,7 +207,14 @@ impl<'a> TokenDeltaCodec<'a> {
             return Ok(Vec::new());
         }
         let mut pos = 0usize;
-        let _version = read_u16(bytes, &mut pos)?;
+        let version = read_u16(bytes, &mut pos)?;
+        // 词表版本校验：块用旧词表编码（id 映射不同）→ 拒绝解压（需旧词表）
+        if version != self.tok.version() {
+            return Err(EngramDbError::Parse(format!(
+                "td: vocab version mismatch (block={version}, current={})",
+                self.tok.version()
+            )));
+        }
         let dyn_count = read_u32(bytes, &mut pos)? as usize;
         let mut dyn_dict: Vec<String> = Vec::with_capacity(dyn_count);
         for _ in 0..dyn_count {
@@ -229,10 +248,7 @@ impl<'a> TokenDeltaCodec<'a> {
             0 => RowDecoder::Varint,
             1 => {
                 // Static：合成全表（全局 + 动态扩展）→ HuffmanDecoder 格式的 header
-                let base = self
-                    .static_lengths
-                    .clone()
-                    .unwrap_or_else(|| vec![0u8; self.tok.vocab_size()]);
+                let base = self.effective_static_lengths();
                 let mut lengths: Vec<(u32, u8)> = base
                     .iter()
                     .enumerate()

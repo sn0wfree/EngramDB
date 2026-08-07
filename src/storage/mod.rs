@@ -118,6 +118,10 @@ impl Database {
 
     fn create_new(path: &std::path::Path, config: Config) -> Result<Self> {
         use std::io::Write;
+
+        // v0.21：注册全局 Tokenizer（TokenDelta 压缩分派依赖）
+        crate::storage::compression::init_tokenizer_from_config(&config)?;
+
         let mut file = std::fs::File::create(path)?;
 
         // 写入文件头
@@ -155,6 +159,10 @@ impl Database {
 
     fn open_existing(path: &std::path::Path, config: Config) -> Result<Self> {
         use std::io::{Read, Seek};
+
+        // v0.21：注册全局 Tokenizer（TokenDelta 压缩分派依赖）
+        crate::storage::compression::init_tokenizer_from_config(&config)?;
+
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

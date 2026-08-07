@@ -46,6 +46,10 @@ pub struct Tokenizer {
     seeds: Vec<String>,
     /// id → token 文本（按 id 序，解码用）
     vocab_by_id: Vec<String>,
+    /// TokenDelta Static 模式 per-id 码长表（词表 v2 字段，空 = 未生成）
+    static_lengths: Vec<u8>,
+    /// 词表版本（块头校验：词表不匹配的块不可解压）
+    version: u16,
     /// 词表文件字节（自包含，供块头引用/审计）
     _source_len: usize,
 }
@@ -95,6 +99,8 @@ impl Tokenizer {
             merges_ordered: vf.merges,
             seeds: vf.seeds,
             vocab_by_id,
+            static_lengths: vf.static_lengths,
+            version: vf.version,
             _source_len: 0,
         })
     }
@@ -102,6 +108,16 @@ impl Tokenizer {
     /// 词表大小
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    /// 词表版本（块头写入/校验用）
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// TokenDelta Static 模式 per-id 码长表（空 = 未生成，Static 退化）
+    pub fn static_lengths(&self) -> &[u8] {
+        &self.static_lengths
     }
 
     /// 文本是否在词表中（未登录检测，供测试/审计使用）

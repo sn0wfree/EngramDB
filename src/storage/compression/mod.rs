@@ -18,9 +18,42 @@ pub mod gorilla;
 pub mod double_delta;
 pub mod token_delta;
 
+use std::sync::OnceLock;
+
 use crate::common::config::CompressionType;
 use crate::common::error::Result;
+use crate::common::tokenizer::Tokenizer;
 use crate::common::types::DataType;
+
+/// 全局统一 Tokenizer（v0.21）：DB 打开时按 `Config::tokenizer_path` 注册，
+/// compress_varchar 的 TokenDelta 分派依赖它。未注册 → TokenDelta 路径禁用。
+static GLOBAL_TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
+
+/// 注册全局 Tokenizer（DB 打开时调用；未配置/加载失败 → None，TokenDelta 禁用）
+pub fn set_global_tokenizer(tok: Option<Tokenizer>) {
+    let _ = GLOBAL_TOKENIZER.set(tok);
+}
+
+/// 当前全局 Tokenizer（只读借用）
+pub fn global_tokenizer() -> Option<&'static Tokenizer> {
+    GLOBAL_TOKENIZER.get().and_then(|t| t.as_ref())
+}
+
+/// 按配置注册全局 Tokenizer（DB open/create 时调用）
+/// - `tokenizer_path` 未配置 → 不注册（TokenDelta 压缩禁用，Varchar 走 Dictionary/裸存）
+/// - 加载失败 → 返回 Err（配置了路径但文件缺失/损坏应显式暴露）
+pub fn init_tokenizer_from_config(config: &crate::common::config::Config) -> Result<()> {
+    let Some(path) = &config.tokenizer_path else {
+        set_global_tokenizer(None);
+        return Ok(());
+    };
+    let bytes = std::fs::read(path)?;
+    let tok = Tokenizer::from_bytes(&bytes).map_err(|e| {
+        crate::common::error::EngramDbError::Parse(format!("tokenizer load ({path}): {e}"))
+    })?;
+    set_global_tokenizer(Some(tok));
+    Ok(())
+}
 
 // ============================================================================
 // 顶层 API：compress / decompress
@@ -75,6 +108,7 @@ pub fn decompress(data: &[u8], compression_type: CompressionType, data_type: &Da
         CompressionType::ForBitPack => decompress_for_bitpack(data, data_type),
         CompressionType::BooleanPack => decompress_boolean_pack(data),
         CompressionType::DoubleDelta => decompress_double_delta(data, data_type),
+        CompressionType::TokenDelta => decompress_token_delta(data),
     }
 }
 
@@ -420,7 +454,7 @@ fn decompress_gorilla(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 // ============================================================================
-// Varchar 列压缩：Dictionary（低基数时）
+// Varchar 列压缩：Dictionary（低基数）/ TokenDelta（统一 Tokenizer，v0.21）择优
 // ============================================================================
 
 fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
@@ -432,17 +466,70 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
         return Ok((CompressionType::Uncompressed, data.to_vec()));
     }
 
+    let mut best = (CompressionType::Uncompressed, data.to_vec());
+    let mut best_size = data.len();
+
+    // 臂 1：Dictionary（低基数，ClickHouse 风格）
     let string_slices: Vec<&[u8]> = strings.iter().map(|s| s.as_slice()).collect();
     let encoded = dictionary::encode(&string_slices);
     let ratio = dictionary::compression_ratio(&encoded, data.len());
-
     if ratio < 0.9 {
         // 压缩率超过 10% 才使用字典编码
         let serialized = serialize_dictionary(&encoded);
-        Ok((CompressionType::Dictionary, serialized))
-    } else {
-        Ok((CompressionType::Uncompressed, data.to_vec()))
+        if serialized.len() < best_size {
+            best_size = serialized.len();
+            best = (CompressionType::Dictionary, serialized);
+        }
     }
+
+    // 臂 2：TokenDelta（全局 Tokenizer 已注册且块有行数收益时才尝试）
+    if let Some(tok) = global_tokenizer() {
+        let strs: Vec<&str> = strings
+            .iter()
+            .map(|s| std::str::from_utf8(s).unwrap_or(""))
+            .collect();
+        if strs.iter().any(|s| !s.is_empty()) {
+            // 块内三形态 best-of：Varint / Static（词表码长）/ Huffman（块级）取最小
+            let mut best_blob: Option<Vec<u8>> = None;
+            for mode in [
+                token_delta::EntropyMode::Varint,
+                token_delta::EntropyMode::Static,
+                token_delta::EntropyMode::Huffman,
+            ] {
+                let codec = token_delta::TokenDeltaCodec::new(tok, mode, None);
+                let blob = codec.encode_block(&strs);
+                if best_blob.as_ref().map_or(true, |b| blob.len() < b.len()) {
+                    best_blob = Some(blob);
+                }
+            }
+            if let Some(blob) = best_blob {
+                if blob.len() < best_size {
+                    best_size = blob.len();
+                    best = (CompressionType::TokenDelta, blob);
+                }
+            }
+        }
+    }
+
+    Ok(best)
+}
+
+/// TokenDelta 解压（块头带词表版本校验；全局 Tokenizer 未注册 → 报错）
+fn decompress_token_delta(data: &[u8]) -> Result<Vec<u8>> {
+    let Some(tok) = global_tokenizer() else {
+        return Err(crate::common::error::EngramDbError::Parse(
+            "TokenDelta 块需要全局 Tokenizer（Config::tokenizer_path 未配置）".into(),
+        ));
+    };
+    let codec = token_delta::TokenDeltaCodec::new(tok, token_delta::EntropyMode::Static, None);
+    let texts = codec.decode_block(data)?;
+    // 重建 Varchar 列格式：[len: 4B][value bytes]...
+    let mut out = Vec::new();
+    for t in &texts {
+        out.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        out.extend_from_slice(t.as_bytes());
+    }
+    Ok(out)
 }
 
 fn parse_varchar_column(data: &[u8]) -> Vec<Vec<u8>> {
