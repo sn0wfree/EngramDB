@@ -13,6 +13,11 @@ use engramdb::common::types::DataType;
 use engramdb::common::vocab_file::VocabFile;
 use engramdb::storage::compression::{compress, decompress, set_global_tokenizer};
 
+/// 全局 TD 状态（GLOBAL_TOKENIZER / TOKEN_DELTA_ENTROPY / DB open 时 config 覆盖）跨测试
+/// 共享——涉及全局分派语义的测试串行化，防并行污染（如 persist 测试 open DB 会把
+/// entropy 覆盖回 config 默认 Static）
+static TD_GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn make_tokenizer() -> Tokenizer {
     // 小词表（CJK 段内 merge）：字符 + 双字词，TokenDelta 静态码长表非零
     let vf = VocabFile::new(
@@ -60,7 +65,13 @@ fn varchar_column(texts: &[&str]) -> Vec<u8> {
 
 #[test]
 fn test_varchar_tokendelta_dispatch_and_roundtrip() {
+    let _g = TD_GLOBAL_LOCK.lock().unwrap();
     set_global_tokenizer(Some(make_tokenizer()));
+    // 单形态配置（v0.21）：小数据块级表头开销大，Varint（无表）最优；
+    // 显式设置验证 dispatch + roundtrip
+    engramdb::storage::compression::set_token_delta_entropy(
+        engramdb::common::config::TokenDeltaEntropy::Varint,
+    );
 
     // 流式追加（同前缀，TokenDelta 的增量主场景）
     let base = "你好世界！这是测试文本 hello world 你好世界！";
@@ -78,7 +89,7 @@ fn test_varchar_tokendelta_dispatch_and_roundtrip() {
     let data = varchar_column(&texts);
 
     let (ctype, compressed) = compress(&data, &DataType::Varchar).unwrap();
-    // 块级 best-of 三形态（Varint/Static/Huffman）至少应优于裸存
+    // 块级单形态（Varint）至少应优于裸存
     assert_eq!(ctype, CompressionType::TokenDelta, "应选中 TokenDelta");
     assert!(compressed.len() < data.len(), "TokenDelta 应压缩：{} / {}", compressed.len(), data.len());
 
@@ -88,6 +99,7 @@ fn test_varchar_tokendelta_dispatch_and_roundtrip() {
 
 #[test]
 fn test_varchar_tokendelta_high_entropy_uncompressed() {
+    let _g = TD_GLOBAL_LOCK.lock().unwrap();
     set_global_tokenizer(Some(make_tokenizer()));
 
     // 高熵独立短文本：TokenDelta 不占优 → 应兜底 Uncompressed（不 panic）
@@ -132,6 +144,7 @@ fn test_tokendelta_vocab_version_mismatch_rejected() {
 /// 导致压缩列读回被当裸序列化错位）——TokenDelta 压缩列必须跨 checkpoint 精确还原
 #[test]
 fn test_tokendelta_column_persist_roundtrip() {
+    let _g = TD_GLOBAL_LOCK.lock().unwrap();
     use engramdb::common::config::Config;
     use engramdb::common::types::{ColumnDef, DataType, TableDef};
     use engramdb::storage::Database;

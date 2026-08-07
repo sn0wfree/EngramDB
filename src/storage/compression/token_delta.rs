@@ -22,16 +22,8 @@ use crate::common::error::{EngramDbError, Result};
 use crate::common::huffman;
 use crate::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 
-/// 熵编码形态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntropyMode {
-    /// LEB128 varint（底线）
-    Varint,
-    /// 静态档位（全局频率码长，词表训练产物；escape id 走行内标记流）
-    Static,
-    /// 块级自适应 Huffman（表头入块）
-    Huffman,
-}
+/// 熵编码形态（v0.21 起定义于 common::config，此处 re-export 保持路径兼容）
+pub use crate::common::config::{TokenDeltaEntropy, TokenDeltaEntropy as EntropyMode};
 
 /// TokenDelta 编解码器
 pub struct TokenDeltaCodec<'a> {

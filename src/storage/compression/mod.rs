@@ -18,10 +18,10 @@ pub mod gorilla;
 pub mod double_delta;
 pub mod token_delta;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::common::config::CompressionType;
+use crate::common::config::{CompressionType, TokenDeltaEntropy};
 use crate::common::error::Result;
 use crate::common::tokenizer::Tokenizer;
 use crate::common::types::DataType;
@@ -35,6 +35,10 @@ static GLOBAL_TOKENIZER: Mutex<Option<Arc<Tokenizer>>> = Mutex::new(None);
 /// set_global_tokenizer 也视为启用——测试/降级场景的意图信号）
 static TOKEN_DELTA_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// TokenDelta 熵编码形态（Config::token_delta_entropy；单形态配置——三形态
+/// best-of 已裁，见 7.2：正式场景 Static 本身即最优）
+static TOKEN_DELTA_ENTROPY: AtomicU8 = AtomicU8::new(TokenDeltaEntropy::Static as u8);
+
 /// 注册全局 Tokenizer（DB 打开时调用；未配置/加载失败 → None，TokenDelta 禁用）
 pub fn set_global_tokenizer(tok: Option<Tokenizer>) {
     if let Ok(mut g) = GLOBAL_TOKENIZER.lock() {
@@ -46,6 +50,11 @@ pub fn set_global_tokenizer(tok: Option<Tokenizer>) {
 /// 当前全局 Tokenizer（Arc 拷贝，解引用借用期内安全）
 pub fn global_tokenizer() -> Option<Arc<Tokenizer>> {
     GLOBAL_TOKENIZER.lock().ok().and_then(|g| g.clone())
+}
+
+/// 显式设置全局 TokenDelta 熵形态（测试/降级场景；DB 打开时被 Config::token_delta_entropy 覆盖）
+pub fn set_token_delta_entropy(entropy: TokenDeltaEntropy) {
+    TOKEN_DELTA_ENTROPY.store(entropy as u8, Ordering::Relaxed);
 }
 
 /// 按配置注册全局 Tokenizer（DB open/create 时调用）
@@ -63,6 +72,7 @@ pub fn init_tokenizer_from_config(config: &crate::common::config::Config) -> Res
     set_global_tokenizer(Some(tok));
     // set_global_tokenizer 视显式调用为启用意图；config 路径按配置覆盖
     TOKEN_DELTA_ENABLED.store(config.token_delta_enabled, Ordering::Relaxed);
+    TOKEN_DELTA_ENTROPY.store(config.token_delta_entropy as u8, Ordering::Relaxed);
     Ok(())
 }
 
@@ -511,6 +521,8 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
 
     // 臂 3：TokenDelta（降级选项：Config::token_delta_enabled 或显式
     // set_global_tokenizer 启用；zstd-3 主臂实测压缩率持平且快 ~15×）
+    // v0.21：单形态熵编码（Config::token_delta_entropy）——三形态 best-of 已裁
+    // （正式场景 Static 本身即最优；流式/重写场景 Huffman 更优但 zstd 已覆盖）
     if TOKEN_DELTA_ENABLED.load(Ordering::Relaxed) {
         if let Some(tok) = global_tokenizer() {
             let strs: Vec<&str> = strings
@@ -518,24 +530,16 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
                 .map(|s| std::str::from_utf8(s).unwrap_or(""))
                 .collect();
             if strs.iter().any(|s| !s.is_empty()) {
-                // 块内三形态 best-of：Varint / Static（词表码长）/ Huffman（块级）取最小
-                let mut best_blob: Option<Vec<u8>> = None;
-                for mode in [
-                    token_delta::EntropyMode::Varint,
-                    token_delta::EntropyMode::Static,
-                    token_delta::EntropyMode::Huffman,
-                ] {
-                    let codec = token_delta::TokenDeltaCodec::new(&tok, mode);
-                    let blob = codec.encode_block(&strs);
-                    if best_blob.as_ref().map_or(true, |b| blob.len() < b.len()) {
-                        best_blob = Some(blob);
-                    }
-                }
-                if let Some(blob) = best_blob {
-                    if blob.len() < best_size {
-                        best_size = blob.len();
-                        best = (CompressionType::TokenDelta, blob);
-                    }
+                let mode = match TOKEN_DELTA_ENTROPY.load(Ordering::Relaxed) {
+                    0 => TokenDeltaEntropy::Varint,
+                    2 => TokenDeltaEntropy::Huffman,
+                    _ => TokenDeltaEntropy::Static,
+                };
+                let codec = token_delta::TokenDeltaCodec::new(&tok, mode);
+                let blob = codec.encode_block(&strs);
+                if blob.len() < best_size {
+                    best_size = blob.len();
+                    best = (CompressionType::TokenDelta, blob);
                 }
             }
         }
@@ -551,7 +555,7 @@ fn decompress_token_delta(data: &[u8]) -> Result<Vec<u8>> {
             "TokenDelta 块需要全局 Tokenizer（Config::tokenizer_path 未配置）".into(),
         ));
     };
-    let codec = token_delta::TokenDeltaCodec::new(&tok, token_delta::EntropyMode::Static);
+    let codec = token_delta::TokenDeltaCodec::new(&tok, TokenDeltaEntropy::Static);
     let texts = codec.decode_block(data)?;
     // 重建 Varchar 列格式：[len: 4B][value bytes]...
     let mut out = Vec::new();

@@ -345,12 +345,40 @@ arXiv/GitHub 检索确认：**「确定性分词器 + 词表静态字典 + 块�
 4. 压缩率卖点修正：TD 与 zstd 在混合场景持平（14.95×），并非更优；TD 的增量
    能力在 EngramDB 块级 checkpoint 模型中无需求场景
 
+**三形态 best-of 裁剪（2026-08-07，单形态配置定稿）**：
+
+TD 压缩阶段耗时占比（全量 71206 条语料，分阶段计时基准 bench_td_phase）：
+
+| 阶段 | C 独立文档 | A 流式追加 |
+|---|---|---|
+| tokenize | **96.5%**（3.08s/3.19s） | **90.0%** |
+| 动态字典 | 0.6% | 8.6% |
+| 前缀 delta | 0.2% | 1.4% |
+| 熵编码（Varint/Static/Huffman） | 2.7%/7.0%/14.9% | <0.3% |
+
+→ **tokenize 是绝对主导**（90-96.5%）；TD 优化方向 = tokenize（去重共享/查表解码）。
+
+best-of 裁剪判据：
+- 三形态各跑一遍 `encode_block` = **tokenize ×3**（tokenize 占 96.5%）→ 旧 best-of
+  checkpoint 5.78s vs 单形态 2.19s（**2.6× 提速**）——best-of 的隐藏成本
+- 块级 C 场景：Static 2.635× 为三形态最优且**唯一追平 zstd（2.648×）**；
+  Varint 1.796×、Huffman 1.959×
+- 正式场景 DB 链路级：三形态磁盘全部 7.22MB（14.95×）——形态差异被 zstd 臂
+  逐块兜底吸收，best-of 相对单形态零增益
+- 流式/重写场景 Huffman 最优但 zstd 已全面覆盖（916×/553×），TD 不被选中 → 增益白跑
+
+**定稿**：单形态配置 `Config::token_delta_entropy: TokenDeltaEntropy`（三形态 codec
+保留，解码兼容——块头 strategy u8 三值不变）；**默认 Static**（判据：块级 C 场景
+唯一追平 zstd + 正式场景 DB 级三形态等价）。三形态 DB 链路级实测（107MB 语料 /
+31830 行，单形态各一臂）：磁盘均 7.22MB、checkpoint 2.19s/2.19s/2.26s（tokenize 主导，
+形态差异 <4%）。
+
 **词表三角（并行）**：纯 BPE / 种子 BPE（jieba 种子词）/ 人工词表基准
 ——同时测压缩率 + FTS 中文命中率（全量语料阶段执行）。
 
-**决策规则（已按两轮数据更新）**：
-- 运行时：增量 TokenDelta+Static 为主编码路径（事件级即时 delta）
-- best-of：块级 TD vs zstd 取小；Uncompressed 兜底（占比低/无法压缩）
+**决策规则（已按三轮数据更新）**：
+- 运行时：zstd-3 主臂；TokenDelta 单形态（默认 Static）降级开关
+- best-of：zstd-3 vs Dictionary vs TokenDelta(单形态) 取小；Uncompressed 兜底（占比低/无法压缩）
 - 熵编码：不再实现 rANS（Static 增量下已近最优且零表头）
 - 运行时兜底引入条件（见 4.6）：B 类场景（随机改写）占比高时引 zstd
 
@@ -368,7 +396,7 @@ arXiv/GitHub 检索确认：**「确定性分词器 + 词表静态字典 + 块�
 ## 九、验收标准
 
 1. `Tokenizer`：同文本恒同流（确定性）、无损往返（可逆性）、CJK/英文/混合正确
-2. `TokenDelta`：场景 A 压缩后 ≈ 1× 内容；场景 B < 原体积；best-of 自动退化
+2. `TokenDelta`：场景 A 压缩后 ≈ 1× 内容；场景 B < 原体积；best-of 自动退化（单形态 Static 默认，`token_delta_entropy` 可切换）
 3. FTS 中文命中正确（MATCH）
 4. Log 全局受益（任意长文本 Varchar 列）
 5. 全部既有测试绿 + 新回归

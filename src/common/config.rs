@@ -12,13 +12,28 @@ pub enum WalFlushMode {
     Periodic = 2,
 }
 
+/// TokenDelta 熵编码形态（v0.21 单形态配置）
+///
+/// 三形态 best-of 已裁（块级/正式场景实测：best-of 增益只出现在 zstd 碾压 TD 的
+/// 流式/重写场景，正式场景 Static 本身即最优——见 docs/engram-token-stream-compression.md 7.2）。
+/// 默认值由正式场景 DB 链路级测试决定（预期 Static）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TokenDeltaEntropy {
+    /// LEB128 varint（无表底线；编码最快）
+    Varint = 0,
+    /// 静态档位（全局频率码长，词表训练产物；正式场景压缩率最优且追平 zstd）
+    Static = 1,
+    /// 块级自适应 Huffman（表头入块；流式/重写场景最优，但该场景 zstd 已覆盖）
+    Huffman = 2,
+}
+
 /// 事务隔离级别
 ///
 /// 控制事务之间的可见性和隔离程度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
-    /// 读未提交（当前未实现）
-    ReadUncommitted,
+    /// 读未提交（当前未实现）    ReadUncommitted,
     /// 快照隔离（MVCC，当前默认）
     ///
     /// 事务看到的是事务开始时的数据快照，其他事务的修改不可见。
@@ -212,6 +227,10 @@ pub struct Config {
     /// v0.21：TokenDelta 压缩参与 best-of（默认关闭——zstd-3 主臂实测全面持平/更快；
     /// 无 C 依赖环境可开启，压缩率相当但 checkpoint 慢 ~15×）
     pub token_delta_enabled: bool,
+    /// v0.21：TokenDelta 熵编码形态（单形态配置，非 best-of——三形态块级/正式场景
+    /// 实测：正式场景 Static 最优（2.635× 追平 zstd 2.648×）；流式场景 Huffman 最优但
+    /// zstd 已全面覆盖；Varint 为无表底线）
+    pub token_delta_entropy: TokenDeltaEntropy,
     /// 列存持久化时是否启用压缩（v0.12.x 压缩接线）
     ///
     /// 开启后：checkpoint 时对列存调用 `compress_all`（内存中按 RowGroup 压缩），
@@ -303,6 +322,7 @@ impl Default for Config {
             compress_on_persist: true,
             tokenizer_path: None, // v0.21：统一 Tokenizer 词表文件路径（配置后 Varchar 列可启用 TokenDelta 压缩）
             token_delta_enabled: false, // v0.21：TokenDelta 参与 best-of（默认 zstd-3 主臂）
+            token_delta_entropy: TokenDeltaEntropy::Static, // v0.21：正式场景测试决定（见 7.2）
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
             sort_compact_by_pk: true,

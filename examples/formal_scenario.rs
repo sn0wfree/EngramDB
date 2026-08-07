@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use engramdb::common::config::Config;
+use engramdb::common::config::{Config, TokenDeltaEntropy};
 use engramdb::common::types::{ColumnDef, DataType, TableDef};
 use engramdb::storage::Database;
 use engramdb::Value;
@@ -72,13 +72,14 @@ fn build_rows(corpus: &[String]) -> Vec<(i64, i64, String)> {
 }
 
 /// 运行一臂，返回 (磁盘大小, 插入耗时, checkpoint 耗时, 读回校验结果)
-fn run_arm(tag: &str, dir: &str, corpus: &[String], tokenizer: Option<&str>, compress: bool, td_enabled: bool) -> (u64, u128, u128, bool) {
+fn run_arm(tag: &str, dir: &str, corpus: &[String], tokenizer: Option<&str>, compress: bool, td_enabled: bool, entropy: TokenDeltaEntropy) -> (u64, u128, u128, bool) {
     let _ = std::fs::remove_file(dir);
     let _ = std::fs::remove_file(format!("{dir}-wal"));
     let mut cfg = Config::default();
     cfg.compress_on_persist = compress;
     cfg.tokenizer_path = tokenizer.map(|s| s.to_string());
     cfg.token_delta_enabled = td_enabled;
+    cfg.token_delta_entropy = entropy;
     let mut db = Database::open_with_config(dir, cfg).unwrap();
 
     let def = TableDef::new(
@@ -198,24 +199,30 @@ fn main() {
     let text_bytes: usize = rows.iter().map(|(_, _, c)| c.len()).sum();
     println!("文本总量 {:.1}MB\n", text_bytes as f64 / 1048576.0);
 
-    let (a_size, a_i, a_c, a_ok) = run_arm("A 裸存          ", "/tmp/formal_a", &corpus, None, false, false);
-    let (b_size, b_i, b_c, b_ok) = run_arm("B zstd-3        ", "/tmp/formal_b", &corpus, None, true, false);
-    let (c_size, c_i, c_c, c_ok) = run_arm("C TokenDelta(降级)", "/tmp/formal_c", &corpus, Some(&vocab_path), true, true);
+    let (a_size, a_i, a_c, a_ok) = run_arm("A 裸存          ", "/tmp/formal_a", &corpus, None, false, false, TokenDeltaEntropy::Varint);
+    let (b_size, b_i, b_c, b_ok) = run_arm("B zstd-3        ", "/tmp/formal_b", &corpus, None, true, false, TokenDeltaEntropy::Varint);
+    let (v_size, v_i, v_c, v_ok) = run_arm("C1 TD+Varint    ", "/tmp/formal_c1", &corpus, Some(&vocab_path), true, true, TokenDeltaEntropy::Varint);
+    let (s_size, s_i, s_c, s_ok) = run_arm("C2 TD+Static    ", "/tmp/formal_c2", &corpus, Some(&vocab_path), true, true, TokenDeltaEntropy::Static);
+    let (h_size, h_i, h_c, h_ok) = run_arm("C3 TD+Huffman   ", "/tmp/formal_c3", &corpus, Some(&vocab_path), true, true, TokenDeltaEntropy::Huffman);
 
     println!("\n==== 对比 ====");
-    println!("磁盘：B/A = {:.2}x，C/A = {:.2}x，C/B = {:.2}x",
+    println!("磁盘：B/A = {:.2}x，C2(Static)/A = {:.2}x，B/C2 = {:.2}x",
         a_size as f64 / b_size.max(1) as f64,
-        a_size as f64 / c_size.max(1) as f64,
-        b_size as f64 / c_size.max(1) as f64);
-    println!("压缩率（vs 原文）：A {:.1}x / B {:.1}x / C {:.1}x",
+        a_size as f64 / s_size.max(1) as f64,
+        b_size as f64 / s_size.max(1) as f64);
+    println!("压缩率（vs 原文）：A {:.1}x / B {:.1}x / C1(Varint) {:.1}x / C2(Static) {:.1}x / C3(Huffman) {:.1}x",
         text_bytes as f64 / a_size.max(1) as f64,
         text_bytes as f64 / b_size.max(1) as f64,
-        text_bytes as f64 / c_size.max(1) as f64);
-    println!("插入耗时：A {:.2}s / B {:.2}s / C {:.2}s", a_i as f64 / 1e6, b_i as f64 / 1e6, c_i as f64 / 1e6);
-    println!("checkpoint：A {:.2}s / B {:.2}s / C {:.2}s", a_c as f64 / 1e6, b_c as f64 / 1e6, c_c as f64 / 1e6);
-    assert!(a_ok && b_ok && c_ok, "存在数据不一致");
-    println!("数据完整性：三臂全部逐行一致 ✓");
-    for d in ["/tmp/formal_a", "/tmp/formal_b", "/tmp/formal_c"] {
+        text_bytes as f64 / v_size.max(1) as f64,
+        text_bytes as f64 / s_size.max(1) as f64,
+        text_bytes as f64 / h_size.max(1) as f64);
+    println!("插入耗时：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s",
+        a_i as f64 / 1e6, b_i as f64 / 1e6, v_i as f64 / 1e6, s_i as f64 / 1e6, h_i as f64 / 1e6);
+    println!("checkpoint：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s",
+        a_c as f64 / 1e6, b_c as f64 / 1e6, v_c as f64 / 1e6, s_c as f64 / 1e6, h_c as f64 / 1e6);
+    assert!(a_ok && b_ok && v_ok && s_ok && h_ok, "存在数据不一致");
+    println!("数据完整性：五臂全部逐行一致 ✓");
+    for d in ["/tmp/formal_a", "/tmp/formal_b", "/tmp/formal_c1", "/tmp/formal_c2", "/tmp/formal_c3"] {
         let _ = std::fs::remove_file(d);
         let _ = std::fs::remove_file(format!("{d}-wal"));
     }
