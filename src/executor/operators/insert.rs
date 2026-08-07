@@ -53,11 +53,30 @@ pub fn execute(
     
     if db.config().enable_transaction {
         // P0-2 攒批合并（autocommit 逐行 INSERT）：先入批，阈值触发才落盘。
-        // 约束门控：有 NOT NULL / 主键 / 唯一索引 / 自增 / TTL / 外键的表
-        // 绕过 batcher（约束检查在落盘时进行，错误需在该语句返回时暴露）
-        if !bypass_batch && db.batch_insert_enabled() && !db.in_explicit_txn() && !table_has_constraints(db, table_name) {
+        // v0.20：主键/唯一索引/NOT NULL 表也可入批（入批时即校验，错误
+        // 在该语句返回时暴露）；FK/TTL 表仍绕过（table_excludes_batch）。
+        if !bypass_batch
+            && db.batch_insert_enabled()
+            && !db.in_explicit_txn()
+            && table_batchable(db, table_name)
+            && !table_excludes_batch(db, table_name)
+        {
             let n = rows.len();
-            let trigger = db.insert_batcher().push(table_name, rows);
+            // 入批预检：已提交冲突 + 批内自重复（push_checked 内批内判重，
+            // 已提交部分在 validate_rows_against_committed）
+            db.validate_rows_against_committed(table_name, &rows)?;
+            let def = db.get_engine_table(table_name).map(|t| t.def().clone());
+            let (pk_col, unique_cols) = match def {
+                Some(d) => (
+                    d.primary_key_index(),
+                    d.indexes.iter()
+                        .filter(|i| i.unique)
+                        .map(|i| (i.name.clone(), i.key_columns[0]))
+                        .collect::<Vec<_>>(),
+                ),
+                None => (None, Vec::new()),
+            };
+            let trigger = db.insert_batcher().push_checked(table_name, rows, pk_col, &unique_cols)?;
             if trigger {
                 let all = db.insert_batcher().drain(table_name);
                 return execute_with_txn(db, table_name, all);
@@ -67,12 +86,12 @@ pub fn execute(
         }
         // P0-2 事务级 Batcher：显式事务内 INSERT 攒入事务私有 buffer，
         // 在非裸 INSERT 语句 / SAVEPOINT / COMMIT 前一次性 flush 为单个
-        // 内部批量事务。约束表跳过攒批（错误语句时即时暴露），除非配置
-        // txn_batch_bypass_constraint_tables = false。
+        // 内部批量事务。v0.20：约束表也可攒批（txn_buffer_push 内入批即校验）。
         if !bypass_batch
             && db.in_explicit_txn()
             && db.config().txn_batch_enabled
-            && (!db.config().txn_batch_bypass_constraint_tables || !table_has_constraints(db, table_name))
+            && (table_batchable(db, table_name) || !db.config().txn_batch_bypass_constraint_tables)
+            && !table_excludes_batch(db, table_name)
         {
             let n = rows.len();
             let trigger = db.txn_buffer_push(table_name, rows)?;
@@ -87,24 +106,46 @@ pub fn execute(
     }
 }
 
-/// P0-2：表是否含需即时暴露错误的约束（有则绕过攒批合并）
-fn table_has_constraints(db: &Database, table_name: &str) -> bool {
+/// v0.20：表是否可入攒批（约束检查在入批时进行，错误即时报）
+///
+/// 可入批：
+/// - 无任何约束的表（任何引擎，沿用 v0.18 行为，无需预检）
+/// - Columnar 引擎 + 主键/NOT NULL/auto_increment/唯一索引
+///   （这些约束都能在入批时零副作用预检）
+/// 绕过：FK / TTL / 非 Columnar 约束表（保守，后续迭代）。
+fn table_batchable(db: &Database, table_name: &str) -> bool {
     let Some(table) = db.get_engine_table(table_name) else {
         return false; // 表不存在由上层抛 TableNotFound
     };
     let def = table.def();
-    if !def.indexes.is_empty() {
+    // FK / TTL：无法低成本入批预检，绕过
+    if !def.foreign_keys.is_empty() || def.ttl_column.is_some() {
+        return false;
+    }
+    let has_any_constraint = !def.indexes.is_empty()
+        || def.columns.iter().any(|c| !c.nullable || c.is_primary_key || c.auto_increment);
+    if !has_any_constraint {
+        // 无约束表：无需预检，直接入批（v0.18 原行为，任何引擎）
         return true;
     }
-    if def.ttl_column.is_some() {
-        return true;
+    // 有约束表：仅 Columnar 且全部约束都能入批预检（PK / NOT NULL / auto / 唯一索引）
+    if def.engine != crate::common::types::EngineType::Columnar {
+        return false;
     }
-    if !def.foreign_keys.is_empty() {
-        return true;
-    }
-    def.columns.iter().any(|c| {
-        !c.nullable || c.is_primary_key || c.auto_increment
-    })
+    def.columns.iter().any(|c| !c.nullable || c.is_primary_key || c.auto_increment)
+        || def.indexes.iter().any(|i| i.unique)
+}
+
+/// v0.20：表必须绕过攒批（入批时无法低成本预检的约束）
+///
+/// FK：外键引用完整性需要跨表点查（依赖关系复杂，后续迭代）
+/// TTL：TTL 填充/检查在落盘路径内联，入批会改变填充时机
+fn table_excludes_batch(db: &Database, table_name: &str) -> bool {
+    let Some(table) = db.get_engine_table(table_name) else {
+        return false; // 表不存在由上层抛 TableNotFound
+    };
+    let def = table.def();
+    !def.foreign_keys.is_empty() || def.ttl_column.is_some()
 }
 
 /// P0-2：冲刷全部攒批缓冲（每表一个事务批量落盘）
@@ -171,6 +212,34 @@ pub(crate) fn execute_with_txn(
                         return Err(EngramDbError::ConstraintViolation(format!(
                             "UNIQUE constraint failed: {}={:?}", pk_name, cell
                         )));
+                    }
+                }
+            }
+        }
+        // v0.20：唯一索引冲突预检（批内自重复 + 已提交点查；整批一次摊薄）。
+        // 与批量 apply（update_indexes_for_rows）的键列语义一致：key_columns[0]。
+        let unique_idx: Vec<(String, usize)> = table_def.indexes.iter()
+            .filter(|i| i.unique)
+            .map(|i| (i.name.clone(), i.key_columns[0]))
+            .collect();
+        if !unique_idx.is_empty() {
+            let mut seen: Vec<std::collections::HashSet<Value>> =
+                vec![std::collections::HashSet::new(); unique_idx.len()];
+            for row in &rows {
+                for (i, (idx_name, key_col)) in unique_idx.iter().enumerate() {
+                    if let Some(cell) = row.get(*key_col) {
+                        if !seen[i].insert(cell.clone()) {
+                            return Err(EngramDbError::ConstraintViolation(format!(
+                                "UNIQUE constraint failed: index '{}'", idx_name
+                            )));
+                        }
+                        if db.get_engine_table(table_name)
+                            .is_some_and(|t| t.unique_index_contains(idx_name, cell))
+                        {
+                            return Err(EngramDbError::ConstraintViolation(format!(
+                                "UNIQUE constraint failed: index '{}'", idx_name
+                            )));
+                        }
                     }
                 }
             }
@@ -565,5 +634,166 @@ mod tests {
         assert!(db.insert_batcher().is_empty());
         let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // ========================================================================
+    // v0.20：约束表进入攒批（入批即校验）
+    // ========================================================================
+
+    /// 小型攒批阈值：逐行 INSERT 立即入批、少量语句即触发 flush
+    fn small_batch_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.insert_batch_rows = 4;
+        cfg.insert_batch_bytes = 1024 * 1024;
+        cfg.insert_batch_timeout_ms = 0;
+        cfg
+    }
+
+    #[test]
+    fn test_pk_table_batched_autocommit() {
+        // 主键表 autocommit 逐行 INSERT：入批 → 阈值触发单事务 flush，
+        // 行全部落盘且主键索引正确
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        for i in 0..10 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 10)).unwrap();
+        }
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(10));
+        let r = conn.execute("SELECT v FROM t WHERE id = 7").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(70));
+    }
+
+    #[test]
+    fn test_pk_batch_internal_duplicate_rejected_immediately() {
+        // 批内 PK 重复：第二条语句即时报错（入批校验），行数不变
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        let err = conn.execute("INSERT INTO t VALUES (1, 99)").unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}");
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(1));
+    }
+
+    #[test]
+    fn test_pk_batch_conflict_with_committed_rejected_immediately() {
+        // 与已提交行 PK 冲突：即时报错（入批校验点查已提交状态）
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (5, 50)").unwrap();
+        // flush 使 id=5 已提交
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(1));
+        let err = conn.execute("INSERT INTO t VALUES (5, 99)").unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}");
+    }
+
+    #[test]
+    fn test_unique_index_batch_duplicate_rejected_immediately() {
+        // 唯一索引批内重复：即时报错
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, u INT UNIQUE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        let err = conn.execute("INSERT INTO t VALUES (2, 100)").unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}");
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(1));
+    }
+
+    #[test]
+    fn test_batch_apply_unique_conflict_reported() {
+        // ①号修复回归：批量 apply（M02/InsertBatch）唯一索引冲突必须报错，
+        // 不再静默丢弃（表与索引不一致）
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, u INT UNIQUE)").unwrap();
+        // 大批量（>threshold 走列式/批量 apply）含批内唯一重复
+        let rows: Vec<Vec<Value>> = (0..2000).map(|i| vec![Value::Int64(i), Value::Int64(i % 100)]).collect();
+        let err = crate::executor::operators::insert::execute(conn.database_mut(), "t", rows, true).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}");
+    }
+
+    #[test]
+    fn test_not_null_batch_rejected_immediately() {
+        // NOT NULL 违反：即时报错（入批校验）
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL)").unwrap();
+        let err = conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}");
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(0));
+    }
+
+    #[test]
+    fn test_auto_increment_pk_batched_ids_contiguous() {
+        // auto_increment 主键表攒批：flush 分配 ID 连续正确
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v INT)").unwrap();
+        for i in 0..10 {
+            conn.execute("INSERT INTO t (v) VALUES (100)").unwrap();
+        }
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(10));
+        let r = conn.execute("SELECT id FROM t ORDER BY id").unwrap();
+        let ids: Vec<Value> = r.rows.iter().map(|row| row[0].clone()).collect();
+        let expect: Vec<Value> = (1..=10).map(|i| Value::Int64(i)).collect();
+        assert_eq!(ids, expect, "auto_increment 攒批后 ID 必须 1..10 连续");
+    }
+
+    #[test]
+    fn test_rollback_discards_batched_pk_inserts() {
+        // 显式事务 + 主键表：ROLLBACK 正确丢弃攒批行（旧行为撤不掉）
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Value::Int64(0), "ROLLBACK 必须丢弃显式事务内主键表攒批行");
+    }
+
+    #[test]
+    fn test_txn_api_duplicate_pk_errors_at_insert() {
+        // Transaction API：重复 PK 在 insert 即报错（而非 commit 时）
+        let mut conn = crate::Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let mut txn = conn.begin().unwrap();
+        txn.insert("t", vec![vec![Value::Int64(1), Value::Int64(10)]]).unwrap();
+        let err = txn.insert("t", vec![vec![Value::Int64(1), Value::Int64(99)]]).unwrap_err();
+        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "Transaction API 重复 PK 应在 insert 即时报错, got: {err:?}");
+        txn.rollback().unwrap();
+    }
+
+    #[test]
+    fn test_returning_bypasses_batcher() {
+        // RETURNING 仍绕过攒批：语句内即时读回插入行
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        let r = conn.execute("INSERT INTO t VALUES (1, 10) RETURNING id, v").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Int64(1));
+        assert_eq!(r.rows[0][1], Value::Int64(10));
+    }
+
+    #[test]
+    fn test_fk_table_bypasses_batcher() {
+        // FK 表仍绕过攒批（table_excludes_batch）：INSERT 立即落盘（非攒批）
+        let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
+        conn.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+        conn.execute("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))").unwrap();
+        conn.execute("INSERT INTO p VALUES (1)").unwrap();
+        conn.execute("INSERT INTO c VALUES (10, 1)").unwrap();
+        // FK 表不攒批：插入后立即可见（无需 flush 即可从原始 API 读到）
+        let db = conn.database_mut();
+        let rows = db.get_engine_table_mut("c").unwrap().scan_to_rows_direct(&[0, 1], None).unwrap();
+        assert_eq!(rows.len(), 1, "FK 表应绕过攒批、立即落盘");
+        assert_eq!(rows[0][1], Value::Int64(1));
     }
 }

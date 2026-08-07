@@ -424,6 +424,9 @@ impl Connection {
                     table.def_mut().row_count += num_rows as u64;
                 } else {
                     // 小批量：走 Delta 层（列式 Delta，P4）
+                    // v0.20：对齐 rowid 基准（compact 后 delta.next_rowid 与行数脱节）
+                    let rc = table.def().row_count;
+                    table.delta_store_mut().set_next_rowid(rc);
                     table.delta_store_mut().insert_columns(columns)?;
                     // 与 insert() 一致：写入 Delta 层即计入总行数
                     table.def_mut().row_count += num_rows as u64;
@@ -2457,8 +2460,8 @@ mod value_tests {    use super::*;
 
     #[test]
     fn test_txn_batch_constraint_bypass_configurable() {
-        // txn_batch_bypass_constraint_tables=false：约束表也攒批，
-        // PK 冲突延迟到 COMMIT/flush 时暴露
+        // v0.20：约束表一律攒批（txn_batch_bypass_constraint_tables 不再绕过），
+        // 但入批时即校验 → PK 冲突在该语句返回时暴露（而非延迟到 COMMIT）。
         let mut cfg = crate::common::config::Config::default();
         cfg.txn_batch_bypass_constraint_tables = false;
         let mut conn = Connection::open_with_config(":memory:", cfg).unwrap();
@@ -2466,12 +2469,14 @@ mod value_tests {    use super::*;
 
         conn.execute("BEGIN").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
-        // 攒批路径：语句时不报错
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-        // COMMIT 时 flush → 约束错误此时暴露
-        let err = conn.execute("COMMIT").unwrap_err();
+        // 攒批路径 + 入批即校验：第二条冲突语句即时报错
+        let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
         assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "expected ConstraintViolation at COMMIT, got {err:?}");
+            "expected ConstraintViolation at statement, got {err:?}");
+        // 失败零副作用：行数不变
+        conn.execute("COMMIT").unwrap();
+        let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0][0], crate::Value::Int64(1));
     }
 
     #[test]
@@ -3750,6 +3755,8 @@ mod multi_engine_tests {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
+        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
 
         // 引擎句柄访问
         let engine = conn.database_mut().get_engine_table_mut("t").unwrap();
@@ -3804,6 +3811,8 @@ mod multi_engine_tests {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
+        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
 
         let mut table = conn.database_mut().get_table_mut("t").unwrap();
         // 通过 trait 对象调用

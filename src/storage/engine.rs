@@ -240,6 +240,16 @@ impl EngineTable {
         }
     }
 
+    /// 唯一索引键存在性检查（v0.20 攒批入批预检用；仅 Columnar 有二级索引）
+    pub fn unique_index_contains(&self, index_name: &str, key: &Value) -> bool {
+        match self {
+            EngineTable::Columnar(t) => t
+                .get_index(index_name)
+                .is_some_and(|idx| idx.get_entries(key).is_some()),
+            EngineTable::Memory(_) | EngineTable::Log(_) => false,
+        }
+    }
+
     /// 删除一行（引擎分派入口）
     pub fn delete_row(&mut self, row_id: u32) -> Result<()> {
         match self {

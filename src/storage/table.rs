@@ -1133,6 +1133,40 @@ impl Table {
         Ok(())
     }
 
+    /// 唯一索引批量检查（写前调用，零副作用）
+    ///
+    /// v0.20：批量 apply 路径此前静默吞掉唯一索引冲突（update_indexes_for_rows
+    /// 忽略 insert_with_included 返回值）；此检查在落盘前预检「已存在 + 批内
+    /// 自重复」，失败时零副作用。键列取 `key_columns[0]`，与批量 apply 一致。
+    fn check_unique_indexes(&mut self, rows: &[Vec<crate::Value>]) -> Result<()> {
+        let unique_defs: Vec<(String, usize)> = self.def.indexes.iter()
+            .filter(|i| i.unique)
+            .map(|i| (i.name.clone(), i.key_columns[0]))
+            .collect();
+        if unique_defs.is_empty() {
+            return Ok(());
+        }
+        let mut seen: Vec<std::collections::HashSet<crate::Value>> =
+            vec![std::collections::HashSet::new(); unique_defs.len()];
+        for row in rows {
+            for (i, (name, key_col)) in unique_defs.iter().enumerate() {
+                if let Some(cell) = row.get(*key_col) {
+                    if !seen[i].insert(cell.clone()) {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: index '{}'", name
+                        )));
+                    }
+                    if self.indexes.get(name).is_some_and(|idx| idx.get_entries(cell).is_some()) {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: index '{}'", name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 跨层主键存在性检查（分层索引）
     #[inline]
     fn pk_exists(&mut self, cell: &crate::Value) -> Result<bool> {
@@ -1284,6 +1318,9 @@ impl Table {
             self.check_pk_uniqueness(&rows)?;
         }
 
+        // 唯一索引检查（v0.20：写前预检，失败时零副作用；修复批量路径静默吞冲突）
+        self.check_unique_indexes(&rows)?;
+
         let direct_threshold = (self.column_store.row_group_size() / 4) as usize;
 
         // 计算插入前的总行数，用于索引 row_id 计算
@@ -1293,7 +1330,9 @@ impl Table {
             // P1: 大批量直接走列式路径，跳过 Delta 层
             self.column_store.append_rows(&rows)?;
         } else {
-            // 小批量写入 Delta 层
+            // 小批量写入 Delta 层（v0.20：对齐 rowid 基准，防止 compact 后
+            // delta.next_rowid 与 def.row_count 脱节导致 rowid 重叠）
+            self.delta_store.set_next_rowid(base_row_id as u64);
             self.delta_store.insert_batch(rows.clone())?;
             // 根据策略决定是否触发合并
             let _ = self.maybe_compact()?;
@@ -1309,7 +1348,7 @@ impl Table {
 
         // 更新所有二级索引（v0.12.0 覆盖索引）
         if !self.indexes.is_empty() {
-            self.update_indexes_for_rows(&rows, base_row_id);
+            self.update_indexes_for_rows(&rows, base_row_id)?;
         }
 
         // 更新所有向量索引（v0.12.0 优先级 3）
@@ -1428,6 +1467,12 @@ impl Table {
             self.check_pk_uniqueness(&rows)?;
         }
 
+        // 唯一索引检查（v0.20：写前预检，失败时零副作用；修复批量路径静默吞冲突）
+        if !self.indexes.is_empty() {
+            let rows = transpose_columns_to_rows(&columns, num_rows);
+            self.check_unique_indexes(&rows)?;
+        }
+
         let direct_threshold = (self.column_store.row_group_size() / 4) as usize;
         let base_row_id = self.def.row_count as u32;
 
@@ -1435,6 +1480,8 @@ impl Table {
         if num_rows >= direct_threshold && num_rows >= 1000 {
             self.column_store.append_columns(&columns)?;
         } else {
+            // v0.20：对齐 rowid 基准（同 insert() 的 set_next_rowid）
+            self.delta_store.set_next_rowid(base_row_id as u64);
             self.delta_store.insert_columns(columns.clone())?;
             let _ = self.maybe_compact()?;
         }
@@ -1449,7 +1496,7 @@ impl Table {
                 self.primary_index_insert_batch(&rows, base_row_id);
             }
             if !self.indexes.is_empty() {
-                self.update_indexes_for_rows(&rows, base_row_id);
+                self.update_indexes_for_rows(&rows, base_row_id)?;
             }
             if !self.vector_indexes.is_empty() {
                 self.update_vector_indexes_for_rows(&rows, base_row_id);
@@ -1769,7 +1816,10 @@ impl Table {
     }
 
     /// 为一批行更新所有二级索引（内部辅助方法）
-    fn update_indexes_for_rows(&mut self, rows: &[Vec<Value>], base_row_id: u32) {
+    ///
+    /// v0.20：返回 `Result`，unique 索引插入失败报 `ConstraintViolation`
+    /// （修复：批量 apply 路径此前静默吞掉唯一索引冲突，导致表与索引不一致）。
+    fn update_indexes_for_rows(&mut self, rows: &[Vec<Value>], base_row_id: u32) -> Result<()> {
         for (row_idx, row) in rows.iter().enumerate() {
             let row_id = base_row_id + row_idx as u32;
             // 遍历所有索引，逐个更新
@@ -1781,10 +1831,16 @@ impl Table {
                     let included_vals: Vec<Value> = idx_def.included_columns.iter()
                         .map(|&ci| row[ci].clone())
                         .collect();
-                    index.insert_with_included(key, row_id, &included_vals);
+                    let inserted = index.insert_with_included(key, row_id, &included_vals);
+                    if idx_def.unique && !inserted {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: index '{}'", idx_def.name
+                        )));
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// 为一批行更新所有向量索引（内部辅助方法，v0.12.0 优先级 3）

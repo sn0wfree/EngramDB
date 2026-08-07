@@ -66,6 +66,12 @@ pub struct Database {
     txn_buffer: HashMap<String, Vec<Vec<Value>>>,
     /// 事务 buffer 当前总行数（阈值检查：config.txn_batch_rows）
     txn_buffer_rows: usize,
+    /// P0-2/v0.20 事务 buffer 批内约束键 seen-set（表名 → (主键 seen, 唯一索引 seen)）
+    ///
+    /// 约束表（主键/唯一索引/NOT NULL）入批时即校验，冲突在语句返回时暴露；
+    /// 本 seen-set 维护批内自重复判重（O(1)），discard/flush 时清空。
+    txn_buffer_pk_seen: HashMap<String, std::collections::HashSet<Value>>,
+    txn_buffer_unique_seen: HashMap<String, HashMap<String, std::collections::HashSet<Value>>>,
 }
 
 impl Database {
@@ -142,6 +148,8 @@ impl Database {
             current_txn_id: None,
             txn_buffer: HashMap::new(),
             txn_buffer_rows: 0,
+            txn_buffer_pk_seen: HashMap::new(),
+            txn_buffer_unique_seen: HashMap::new(),
         })
     }
 
@@ -181,6 +189,8 @@ impl Database {
             current_txn_id: None,
             txn_buffer: HashMap::new(),
             txn_buffer_rows: 0,
+            txn_buffer_pk_seen: HashMap::new(),
+            txn_buffer_unique_seen: HashMap::new(),
         };
 
         // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
@@ -380,15 +390,152 @@ impl Database {
     ///
     /// 返回 true 表示已达阈值（config.txn_batch_rows），调用方应随即
     /// `flush_txn_buffer`（防内存无界）。仅在显式事务内调用。
+    ///
+    /// v0.20：约束表（主键/唯一索引/NOT NULL）入批时即校验——冲突
+    /// 在语句返回时暴露（与绕过攒批时语义一致），零副作用不落批。
     pub fn txn_buffer_push(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<bool> {
         let n = rows.len();
         if n == 0 {
             return Ok(false);
         }
+        self.validate_rows_against_committed(table_name, &rows)?;
+        self.validate_rows_against_txn_buffer(table_name, &rows)?;
         let entry = self.txn_buffer.entry(table_name.to_string()).or_default();
         entry.extend(rows);
         self.txn_buffer_rows += n;
         Ok(self.txn_buffer_rows >= self.config.txn_batch_rows)
+    }
+
+    /// v0.20：入批预检（已提交状态部分）——主键点查 + 唯一索引点查 + NOT NULL
+    ///
+    /// 仅约束表需要；无主键/唯一索引/NOT NULL 的表零开销直接通过。
+    pub(crate) fn validate_rows_against_committed(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<()> {
+        use crate::common::error::EngramDbError;
+        // 表不存在：无约束可查（生产调用方已先做存在性校验；直接调用方
+        // 的错误在 flush 的 execute_with_txn 暴露）
+        let Some(table) = self.get_engine_table(table_name) else {
+            return Ok(());
+        };
+        let def = table.def().clone();
+        drop(table);
+        // 无约束快速路径：无主键、无唯一索引、全列可空 → 零检查
+        let pk = def.primary_key_index();
+        let unique: Vec<(String, usize)> = def.indexes.iter()
+            .filter(|i| i.unique)
+            .map(|i| (i.name.clone(), i.key_columns[0]))
+            .collect();
+        let has_not_null = def.columns.iter().any(|c| !c.nullable);
+        if pk.is_none() && unique.is_empty() && !has_not_null {
+            return Ok(());
+        }
+        for row in rows {
+            // NOT NULL（auto_increment 列跳过：缺失/NULL 在 flush 时自动填充）
+            if has_not_null {
+                for (ci, col) in def.columns.iter().enumerate() {
+                    if col.auto_increment {
+                        continue;
+                    }
+                    if !col.nullable && row.get(ci).is_none_or(|v| v.is_null()) {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "NOT NULL constraint failed: column '{}'", col.name
+                        )));
+                    }
+                }
+            }
+            // 主键冲突（已提交；auto_increment 的 NULL 跳过，flush 分配后天然唯一）
+            if let Some(pk_idx) = pk {
+                if let Some(cell) = row.get(pk_idx) {
+                    if !cell.is_null()
+                        && self.get_engine_table_mut(table_name)
+                            .and_then(|t| t.lookup_primary_key(cell))
+                            .is_some()
+                    {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: {}={:?}",
+                            def.columns[pk_idx].name, cell
+                        )));
+                    }
+                }
+            }
+            // 唯一索引冲突（已提交）
+            for (idx_name, key_col) in &unique {
+                if let Some(cell) = row.get(*key_col) {
+                    if self.get_engine_table(table_name)
+                        .is_some_and(|t| t.unique_index_contains(idx_name, cell))
+                    {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: index '{}'", idx_name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// v0.20：入批预检（事务 buffer 批内自重复部分）
+    ///
+    /// 主键 / 唯一索引键与已攒入 txn_buffer 的行判重（O(1) seen-set）。
+    fn validate_rows_against_txn_buffer(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<()> {
+        use crate::common::error::EngramDbError;
+        let Some(table) = self.get_engine_table(table_name) else {
+            return Ok(());
+        };
+        let def = table.def().clone();
+        drop(table);
+        let pk = def.primary_key_index();
+        let unique: Vec<(String, usize)> = def.indexes.iter()
+            .filter(|i| i.unique)
+            .map(|i| (i.name.clone(), i.key_columns[0]))
+            .collect();
+        if pk.is_none() && unique.is_empty() {
+            return Ok(());
+        }
+        let pk_seen = self.txn_buffer_pk_seen.entry(table_name.to_string()).or_default();
+        let mut local_pk: std::collections::HashSet<Value> = std::collections::HashSet::new();
+        for row in rows {
+            if let Some(pk_idx) = pk {
+                if let Some(cell) = row.get(pk_idx) {
+                    if !cell.is_null()
+                        && (pk_seen.contains(cell) || !local_pk.insert(cell.clone()))
+                    {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: {}={:?}",
+                            def.columns[pk_idx].name, cell
+                        )));
+                    }
+                }
+            }
+        }
+        pk_seen.extend(local_pk.into_iter());
+        // 唯一索引批内判重
+        let unique_seen = self.txn_buffer_unique_seen.entry(table_name.to_string()).or_default();
+        let mut local_unique: HashMap<String, std::collections::HashSet<Value>> = HashMap::new();
+        for row in rows {
+            for (idx_name, key_col) in &unique {
+                if let Some(cell) = row.get(*key_col) {
+                    let entry_seen = unique_seen.get(idx_name).is_some_and(|s| s.contains(cell));
+                    let local_seen = local_unique.entry(idx_name.clone()).or_default();
+                    if entry_seen || !local_seen.insert(cell.clone()) {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: index '{}'", idx_name
+                        )));
+                    }
+                }
+            }
+        }
+        for (idx_name, keys) in local_unique {
+            unique_seen.entry(idx_name).or_default().extend(keys);
+        }
+        Ok(())
     }
 
     /// 事务 buffer 当前总行数（监控用）
@@ -407,6 +554,8 @@ impl Database {
     pub fn discard_txn_buffer(&mut self) {
         self.txn_buffer.clear();
         self.txn_buffer_rows = 0;
+        self.txn_buffer_pk_seen.clear();
+        self.txn_buffer_unique_seen.clear();
     }
 
     /// P0-2 事务级 Batcher：将 buffer 一次性 flush 为单个内部批量事务
@@ -423,6 +572,8 @@ impl Database {
             .into_iter()
             .collect();
         self.txn_buffer_rows = 0;
+        self.txn_buffer_pk_seen.clear();
+        self.txn_buffer_unique_seen.clear();
         for (table_name, rows) in pending {
             if !rows.is_empty() {
                 crate::executor::operators::insert::execute_with_txn(self, &table_name, rows)?;

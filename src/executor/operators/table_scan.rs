@@ -117,6 +117,8 @@ mod tests {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
+        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
         conn
     }
 

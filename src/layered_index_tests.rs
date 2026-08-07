@@ -255,6 +255,8 @@ fn test_pk_cache_lifecycle() {
     for i in 0..300 {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 2)).unwrap();
     }
+    // v0.20：主键表 INSERT 走攒批，compact 前需 flush（否则 compact 的是空表）
+    crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
     force_compact(conn.database_mut());
     assert!(
         !conn.database_mut().get_table("t").unwrap().column_store().pk_cache_built(),

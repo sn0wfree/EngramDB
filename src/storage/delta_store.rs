@@ -532,6 +532,12 @@ impl DeltaStore {
         self.active_len() == 0
     }
 
+    /// 同步下一个 rowid 基准（v0.20：compact 清空后 next_rowid 与表行数脱节，
+    /// 批量插入前需对齐 def.row_count，否则 rowid 与列存重叠导致索引错乱）
+    pub fn set_next_rowid(&mut self, rowid: u64) {
+        self.next_rowid = self.next_rowid.max(rowid);
+    }
+
     /// 清空（合并到列存后调用）
     pub fn clear(&mut self) {
         for col in &mut self.columns {

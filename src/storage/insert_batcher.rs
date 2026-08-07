@@ -13,7 +13,7 @@
 //! - 崩溃时丢失缓冲行 = 与 WAL 组提交窗口一致的异步窗口（`close` 时兜底 flush）
 //! - INSERT ... RETURNING 绕过 batcher（需立即读回插入行）
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::Value;
@@ -25,6 +25,11 @@ struct BatchedRows {
     bytes: usize,
     /// 首行入批时刻（时间窗从首行起算）
     first_ts: Instant,
+    /// 批内约束键 seen-set（v0.20：约束表攒批入批预检用，O(1) 判重）
+    /// 主键 seen（自动分配的自增值在 flush 才分配，入批跳过 NULL）
+    pk_seen: HashSet<Value>,
+    /// 唯一索引 seen（index name → 批内已见键）
+    unique_seen: HashMap<String, HashSet<Value>>,
 }
 
 /// INSERT 批处理器（Database 内嵌，单线程 &mut 模型无需锁）
@@ -57,6 +62,8 @@ impl InsertBatcher {
                 rows: Vec::new(),
                 bytes: 0,
                 first_ts: Instant::now(),
+                pk_seen: HashSet::new(),
+                unique_seen: HashMap::new(),
             });
         entry.bytes += rows.iter().map(|r| r.len()).sum::<usize>();
         let total = entry.rows.len() + rows.len();
@@ -64,6 +71,82 @@ impl InsertBatcher {
         total >= self.max_rows
             || entry.bytes >= self.max_bytes
             || entry.first_ts.elapsed() >= self.timeout
+    }
+
+    /// 攒入一批行并做约束预检（v0.20：约束表攒批用）
+    ///
+    /// 入批时即校验主键（批内 seen + 由调用方做已提交点查）与唯一索引
+    /// 批内自重复；冲突返回 Err 且**不落批**（零副作用），错误在该语句
+    /// 返回时暴露（与绕过攒批时的语义一致）。
+    ///
+    /// `pk_col`：主键列索引（auto_increment 主键由调用方决定是否跳过 NULL）。
+    /// `unique_cols`：(索引名, 键列索引) 列表。
+    pub fn push_checked(
+        &mut self,
+        table_name: &str,
+        rows: Vec<Vec<Value>>,
+        pk_col: Option<usize>,
+        unique_cols: &[(String, usize)],
+    ) -> crate::common::error::Result<bool> {
+        use crate::common::error::EngramDbError;
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let entry = self
+            .buffers
+            .entry(table_name.to_string())
+            .or_insert_with(|| BatchedRows {
+                rows: Vec::new(),
+                bytes: 0,
+                first_ts: Instant::now(),
+                pk_seen: HashSet::new(),
+                unique_seen: HashMap::new(),
+            });
+        // 两阶段：先全量校验（批内自重复 + 与已攒行重复），全部通过再落批，
+        // 避免中途失败留下脏 seen（零副作用语义）
+        let mut local_pk: HashSet<Value> = HashSet::new();
+        let mut local_unique: HashMap<&str, HashSet<Value>> = HashMap::new();
+        for row in &rows {
+            if let Some(pk) = pk_col {
+                if let Some(cell) = row.get(pk) {
+                    if !cell.is_null()
+                        && (entry.pk_seen.contains(cell) || !local_pk.insert(cell.clone()))
+                    {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: pk={:?}", cell
+                        )));
+                    }
+                }
+            }
+            for (idx_name, key_col) in unique_cols {
+                if let Some(cell) = row.get(*key_col) {
+                    let entry_seen = entry.unique_seen.contains_key(idx_name)
+                        && entry.unique_seen[idx_name].contains(cell);
+                    let local_seen = local_unique.entry(idx_name).or_default();
+                    if entry_seen || !local_seen.insert(cell.clone()) {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "UNIQUE constraint failed: index '{}'", idx_name
+                        )));
+                    }
+                }
+            }
+        }
+        // 全部通过：提交 seen + 落批
+        entry.pk_seen.extend(local_pk.into_iter());
+        for (idx_name, keys) in local_unique {
+            entry.unique_seen.entry(idx_name.to_string()).or_default().extend(keys);
+        }
+        entry.bytes += rows.iter().map(|r| r.len()).sum::<usize>();
+        let total = entry.rows.len() + rows.len();
+        entry.rows.extend(rows);
+        Ok(total >= self.max_rows
+            || entry.bytes >= self.max_bytes
+            || entry.first_ts.elapsed() >= self.timeout)
+    }
+
+    /// 某表当前缓冲行（v0.20 攒批入批预检用；冲突点查需与已攒行对比）
+    pub fn pending_rows(&self, table_name: &str) -> &[Vec<Value>] {
+        self.buffers.get(table_name).map(|e| e.rows.as_slice()).unwrap_or(&[])
     }
 
     /// 取走某表全部缓冲（清零该表）

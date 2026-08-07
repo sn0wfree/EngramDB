@@ -355,6 +355,8 @@ mod tests {
     fn test_delete_with_txn() {
         let mut conn = open_db(true);
         seed(&mut conn);
+        // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
+        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
         let db = conn.database_mut();
         assert_eq!(execute(db, "t", Some(gt_id(1))).unwrap(), 2);
         assert_eq!(rows(db).len(), 1);
