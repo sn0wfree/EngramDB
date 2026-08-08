@@ -2931,7 +2931,9 @@ impl Table {
             return;
         }
         let tok = crate::storage::compression::global_tokenizer();
-        // 并行段：tokenize + prepare（tf 聚合/排序，行×列独立无共享）
+        // 并行段：tokenize + prepare（行×列独立无共享）。postings push 必须
+        // 主线程按行序串行（行号严格递增，并行乱序损坏 delta 流——v0.21.2
+        // 分片锁方案实测损坏回退）
         let prepared: Vec<(
             Vec<crate::common::tokenizer::Token>,
             Vec<(u32, u32)>,
@@ -2961,11 +2963,12 @@ impl Table {
         } else {
             None
         };
+        // postings 定长槽数组：push O(1) 无哈希（v0.21.2）；行序由本循环保证
         for (i, (row_id, ci, col_idx, text)) in jobs.iter().enumerate() {
             if let Some(idx) = self.fts_indexes.get_mut(&col_names[*ci]) {
                 if let Some(tok) = &tok {
                     let (tokens, pairs, n) = &prepared[i];
-                    idx.add_document_prepared(*row_id, pairs.clone(), *n);
+                    idx.add_document_prepared(*row_id, pairs, *n);
                     if let Some(cache) = cache_guard.as_mut() {
                         cache.insert_row(*col_idx, text, tokens, tok);
                     }

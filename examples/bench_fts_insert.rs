@@ -75,6 +75,21 @@ fn phase_full(idx: &mut TokenInvertedIndex, tok: &Tokenizer, texts: &[String]) -
     t.elapsed().as_micros()
 }
 
+/// 阶段 4：并行 tokenize + prepare（rayon，仅测量并行段效率；不含 push）
+fn phase_parallel(tok: &Tokenizer, texts: &[String]) -> u128 {
+    use rayon::prelude::*;
+    let t = Instant::now();
+    let _: Vec<_> = texts
+        .par_iter()
+        .map(|text| {
+            let tokens = tok.tokenize(text);
+            let (pairs, n) = TokenInvertedIndex::prepare_document(&tokens, text);
+            (tokens.len(), pairs.len(), n)
+        })
+        .collect();
+    t.elapsed().as_micros()
+}
+
 fn main() {
     let corpus_path = std::env::args()
         .nth(1)
@@ -113,6 +128,7 @@ fn main() {
     let t2 = phase_tf_sort(&tok, &texts);
     let mut idx = TokenInvertedIndex::with_vocab(tok.version());
     let t3 = phase_full(&mut idx, &tok, &texts);
+    let tp = phase_parallel(&tok, &texts);
 
     let mb = bytes as f64 / 1048576.0;
     let tok_us = t1;
@@ -142,6 +158,13 @@ fn main() {
         total,
         total as f64 / 1e3 / mb,
         total as f64 / texts.len() as f64
+    );
+    let serial_par_part = (tok_us + tf_sort_us) as f64 / 1e3;
+    println!(
+        "并行段（tokenize+prepare）：{:>10}µs | 加速比 {:.1}x（串行并行部分 {:.2}s）",
+        tp,
+        serial_par_part / (tp as f64 / 1e6),
+        serial_par_part
     );
     let (entries, keys) = idx.size_stats();
     println!("索引状态：{} 键 / {} 条目 / doc_lens {}", keys, entries, idx.n_docs());

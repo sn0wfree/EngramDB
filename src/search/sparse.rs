@@ -155,11 +155,22 @@ fn read_varint(data: &[u8], pos: &mut usize) -> Option<u32> {
     }
 }
 
+/// postings 分片数（2 的幂；term id 低 6 位分片——v0.21.2 插入并行 push）
+const POSTINGS_SHARDS: usize = 64;
+
+/// term id → 分片索引
+fn shard_of(id: u32) -> usize {
+    (id as usize) & (POSTINGS_SHARDS - 1)
+}
+/// 定长 postings 槽位数（词表 id 上限；词表 rank < vocab_size < 0x10000——
+/// v0.21.2 数组索引替代 FxHashMap entry：push 每对 47ns → ~15ns）
+const POSTING_SLOTS: usize = 0x10000;
+
 /// Token 级倒排索引（行级 postings）
 #[derive(Debug, Clone)]
 pub struct TokenInvertedIndex {
-    /// token_id → 压缩 postings（行号递增）
-    postings: fxhash::FxHashMap<u32, CompressedPostings>,
+    /// token_id → 压缩 postings（定长槽数组；行号严格递增——push 必须按行序）
+    postings: Vec<Option<CompressedPostings>>,
     /// row_id → token 总数（BM25 doc_len；含重复）
     doc_lens: Vec<u32>,
     n_docs: u32,
@@ -172,7 +183,7 @@ pub struct TokenInvertedIndex {
 impl TokenInvertedIndex {
     pub fn new() -> Self {
         Self {
-            postings: fxhash::FxHashMap::default(),
+            postings: vec![None; POSTING_SLOTS],
             doc_lens: Vec::new(),
             n_docs: 0,
             vocab_version: None,
@@ -187,7 +198,9 @@ impl TokenInvertedIndex {
     }
 
     pub fn clear(&mut self) {
-        self.postings.clear();
+        for slot in self.postings.iter_mut() {
+            *slot = None;
+        }
         self.doc_lens.clear();
         self.n_docs = 0;
         self.string_postings.clear();
@@ -258,16 +271,29 @@ impl TokenInvertedIndex {
         (pairs, n)
     }
 
-    /// 应用预处理结果到索引（主线程串行：postings push + doc_lens）
-    pub fn add_document_prepared(&mut self, row_id: u32, pairs: Vec<(u32, u32)>, n: u32) {
+    /// 应用预处理结果到索引（postings push + doc_lens；串行——postings
+    /// 行号严格递增，并行 push 乱序会损坏 delta 流。定长槽数组索引：
+    /// 每对 O(1) 无哈希）
+    pub fn add_document_prepared(&mut self, row_id: u32, pairs: &[(u32, u32)], n: u32) {
         if row_id as usize >= self.doc_lens.len() {
             self.doc_lens.resize(row_id as usize + 1, 0);
         }
-        for (id, count) in &pairs {
-            self.postings
-                .entry(*id)
-                .or_insert_with(CompressedPostings::new)
+        for (id, count) in pairs {
+            debug_assert!((*id as usize) < POSTING_SLOTS, "term id 超槽位");
+            self.postings[*id as usize]
+                .get_or_insert_with(CompressedPostings::new)
                 .push(row_id, *count);
+        }
+        self.doc_lens[row_id as usize] = n;
+        if row_id >= self.n_docs {
+            self.n_docs = row_id + 1;
+        }
+    }
+
+    /// 主线程 doc_len 写入（resize + n_docs）
+    pub fn set_doc_len(&mut self, row_id: u32, n: u32) {
+        if row_id as usize >= self.doc_lens.len() {
+            self.doc_lens.resize(row_id as usize + 1, 0);
         }
         self.doc_lens[row_id as usize] = n;
         if row_id >= self.n_docs {
@@ -280,7 +306,7 @@ impl TokenInvertedIndex {
     /// 词表版本由 with_vocab 创建时设定；调用方须保证 token 流与索引版本一致）
     pub fn add_document_with_tokens(&mut self, row_id: u32, text: &str, tokens: &[Token]) {
         let (pairs, n) = Self::prepare_document(tokens, text);
-        self.add_document_prepared(row_id, pairs, n);
+        self.add_document_prepared(row_id, &pairs, n);
     }
 
     /// 删除文档（需原文重算 token）
@@ -294,14 +320,14 @@ impl TokenInvertedIndex {
                     }
                 }
                 for id in ids {
-                    if let Some(cp) = self.postings.get_mut(&id) {
+                    if let Some(cp) = self.postings[id as usize].as_mut() {
                         let kept: Vec<(u32, u32)> = cp
                             .decode()
                             .into_iter()
                             .filter(|(r, _)| *r != row_id)
                             .collect();
                         if kept.is_empty() {
-                            self.postings.remove(&id);
+                            self.postings[id as usize] = None;
                         } else {
                             *cp = CompressedPostings::from_pairs(&kept);
                         }
@@ -324,7 +350,8 @@ impl TokenInvertedIndex {
     /// 单 token 召回（词表 id；解码行号）
     pub fn search_term(&self, id: u32) -> Vec<u32> {
         self.postings
-            .get(&id)
+            .get(id as usize)
+            .and_then(|p| p.as_ref())
             .map(|p| p.decode_rows())
             .unwrap_or_default()
     }
@@ -332,7 +359,8 @@ impl TokenInvertedIndex {
     /// 解码 (row, tf) 对（BM25/审计用）
     pub fn decoded_postings(&self, id: u32) -> Vec<(u32, u32)> {
         self.postings
-            .get(&id)
+            .get(id as usize)
+            .and_then(|p| p.as_ref())
             .map(|p| p.decode())
             .unwrap_or_default()
     }
@@ -403,9 +431,14 @@ impl TokenInvertedIndex {
         }
     }
 
-    /// 词表 id 模式 postings（只读，紧凑形态——解码用 decoded_postings/search_term）
-    pub fn postings(&self) -> &fxhash::FxHashMap<u32, CompressedPostings> {
-        &self.postings
+    /// 词表 id 模式 postings（非空槽收集——bench/审计用；解码用
+    /// decoded_postings/search_term）
+    pub fn postings(&self) -> Vec<(u32, &CompressedPostings)> {
+        self.postings
+            .iter()
+            .enumerate()
+            .filter_map(|(id, p)| p.as_ref().map(|cp| (id as u32, cp)))
+            .collect()
     }
 
     /// row_id → token 数（BM25 doc_len）
@@ -424,14 +457,23 @@ impl TokenInvertedIndex {
 
     /// (条目数, 键数)
     pub fn size_stats(&self) -> (usize, usize) {
-        let entries: usize = self.postings.values().map(|p| p.len()).sum();
+        let mut entries = 0usize;
+        let mut keys = 0usize;
+        for p in self.postings.iter().flatten() {
+            entries += p.len();
+            keys += 1;
+        }
         let str_entries: usize = self.string_postings.values().map(|p| p.len()).sum();
-        (entries + str_entries, self.postings.len() + self.string_postings.len())
+        (entries + str_entries, keys + self.string_postings.len())
     }
 
-    /// postings 流内存字节（不含 HashMap 桶开销）
+    /// postings 流内存字节（不含槽数组开销）
     pub fn postings_memory_bytes(&self) -> usize {
-        self.postings.values().map(|p| p.memory_bytes()).sum()
+        self.postings
+            .iter()
+            .flatten()
+            .map(|p| p.memory_bytes())
+            .sum()
     }
 
     // ------------------------------------------------------------------
@@ -444,8 +486,16 @@ impl TokenInvertedIndex {
         let ver: i16 = self.vocab_version.map(|v| v as i16).unwrap_or(-1);
         buf.extend_from_slice(&ver.to_le_bytes());
         buf.extend_from_slice(&self.n_docs.to_le_bytes());
-        buf.extend_from_slice(&(self.postings.len() as u32).to_le_bytes());
-        for (id, cp) in &self.postings {
+        // 非空槽（id 升序确定序——roundtrip 与 zstd 压缩均稳定）
+        let non_empty: Vec<u32> = self
+            .postings
+            .iter()
+            .enumerate()
+            .filter_map(|(id, p)| p.as_ref().map(|_| id as u32))
+            .collect();
+        buf.extend_from_slice(&(non_empty.len() as u32).to_le_bytes());
+        for id in &non_empty {
+            let cp = self.postings[*id as usize].as_ref().unwrap();
             buf.extend_from_slice(&id.to_le_bytes());
             buf.extend_from_slice(&(cp.len() as u32).to_le_bytes());
             let (rows, tfs) = cp.to_wire();
@@ -510,8 +560,8 @@ impl TokenInvertedIndex {
             let rows_len = u32_at(rd(&mut pos, 4, "rows len")?) as usize;
             let rows = rd(&mut pos, rows_len, "rows")?;
             let tfs = rd(&mut pos, count, "tfs")?;
-            idx.postings
-                .insert(id, CompressedPostings::from_wire(rows, tfs, count as u32));
+            idx.postings[id as usize] =
+                Some(CompressedPostings::from_wire(rows, tfs, count as u32));
         }
         let n_lens = u32_at(rd(&mut pos, 4, "doc lens count")?) as usize;
         let lens = rd(&mut pos, n_lens * 4, "doc lens")?;
@@ -563,7 +613,7 @@ impl TokenInvertedIndex {
                 let tf = u32_at(rd(&mut pos, 4, "tf")?);
                 pairs.push((r, tf));
             }
-            idx.postings.insert(id, CompressedPostings::from_pairs(&pairs));
+            idx.postings[id as usize] = Some(CompressedPostings::from_pairs(&pairs));
         }
         let n_lens = u32_at(rd(&mut pos, 4, "doc lens count")?) as usize;
         let mut dl: Vec<(u32, u32)> = Vec::with_capacity(n_lens);

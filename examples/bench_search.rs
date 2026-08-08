@@ -111,7 +111,7 @@ fn main() {
     let mut ranked: Vec<(u32, u64)> = Vec::new();
     for (id, cp) in idx.postings() {
         let f: u64 = cp.decode().iter().map(|(_, tf)| *tf as u64).sum();
-        ranked.push((*id, f));
+        ranked.push((id, f));
     }
     ranked.sort_by_key(|(_, f)| std::cmp::Reverse(*f));
     let mut zh: Vec<String> = Vec::new();
