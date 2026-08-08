@@ -142,9 +142,15 @@ impl HuffmanEncoder {
 
     /// 编码符号序列 → 码流（不含表头）
     pub fn encode(&self, symbols: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(symbols, &mut out);
+        out
+    }
+
+    /// 编码符号序列 → 追加码流到 `out`（不含表头；缓冲复用热路径）
+    pub fn encode_into(&self, symbols: &[u32], out: &mut Vec<u8>) {
         let mut buf: u64 = 0;
         let mut nbits: u32 = 0;
-        let mut out: Vec<u8> = Vec::new();
         for s in symbols {
             let c = self.codes[s];
             buf = (buf << c.len as u32) | c.bits as u64;
@@ -158,7 +164,6 @@ impl HuffmanEncoder {
         if nbits > 0 {
             out.push((buf << (8 - nbits)) as u8);
         }
-        out
     }
 }
 

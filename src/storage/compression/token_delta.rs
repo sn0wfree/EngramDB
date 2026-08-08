@@ -69,21 +69,16 @@ impl<'a> TokenDeltaCodec<'a> {
         if texts.is_empty() {
             return Vec::new();
         }
-        // 1. tokenize（自给路径：无外部缓存）
-        let mut rows_tokens: Vec<Vec<Token>> = Vec::with_capacity(texts.len());
+        // 1. tokenize（自给路径：无外部缓存；逐行直转缓存行，免中间复制）
+        let mut cached: Vec<CachedTokenRow> = Vec::with_capacity(texts.len());
         let mut prev_text: &str = "";
         let mut prev_tokens: Vec<Token> = Vec::new();
         for text in texts {
             let tokens = self.tok.tokenize_incremental(prev_text, &prev_tokens, text);
-            rows_tokens.push(tokens.clone());
+            cached.push(cache_row(text, &tokens));
             prev_text = text;
             prev_tokens = tokens;
         }
-        let cached: Vec<CachedTokenRow> = rows_tokens
-            .iter()
-            .zip(texts.iter())
-            .map(|(tokens, text)| cache_row(text, tokens))
-            .collect();
         self.encode_block_inner(texts, &cached)
     }
 
@@ -140,16 +135,14 @@ impl<'a> TokenDeltaCodec<'a> {
             prev = row;
         }
 
-        // 3. 块级熵编码表
+        // 3. 块级熵编码表（写入器形态：直写目标缓冲，块内行缓冲复用）
         let new_ids: Vec<u32> = deltas.iter().flat_map(|(_, n)| n.iter().copied()).collect();
-        let (header, row_encode): (Vec<u8>, Box<dyn Fn(&[u32]) -> Vec<u8>>) =
+        let (header, row_write): (Vec<u8>, Box<dyn Fn(&[u32], &mut Vec<u8>)>) =
             match self.entropy {
-                EntropyMode::Varint => (Vec::new(), Box::new(|ids| {
-                    let mut out = Vec::new();
+                EntropyMode::Varint => (Vec::new(), Box::new(|ids, out| {
                     for id in ids {
-                        encode_varint(&mut out, *id);
+                        encode_varint(out, *id);
                     }
-                    out
                 })),
                 EntropyMode::Static => {
                     // 静态表（纯词表码长）一次构建缓存；escape id（动态词/码长 0）
@@ -160,44 +153,48 @@ impl<'a> TokenDeltaCodec<'a> {
                     let base = self.static_base();
                     let (codes, _table) = self.tok.static_entropy();
                     let vocab_size = self.tok.vocab_size() as u32;
+                    // HashMap → Vec 索引（块级一次构建，行级 O(1)；非 escape id 必在 codes）
+                    let mut code_vec: Vec<huffman::Code> =
+                        vec![huffman::Code { len: 0, bits: 0 }; vocab_size as usize];
+                    for (id, c) in codes {
+                        code_vec[*id as usize] = *c;
+                    }
                     (
                         Vec::new(), // 块头 header 空（escape 在行内）
-                        Box::new(move |ids: &[u32]| {
+                        Box::new(move |ids: &[u32], out: &mut Vec<u8>| {
                             let is_esc = |id: u32| match base {
                                 Some(b) => id >= vocab_size || b[id as usize] == 0,
                                 None => true, // 无码长表 → 全部 escape（退化）
                             };
-                            // --- Huffman 位流写入器（仅非 escape id） ---
-                            let mut push_huf = |ids: &[u32], out: &mut Vec<u8>| {
+                            // --- Huffman 位流写入器（仅非 escape id，直写 dst） ---
+                            let push_huf = |ids: &[u32], dst: &mut Vec<u8>| {
                                 let mut buf: u64 = 0;
                                 let mut nbits: u32 = 0;
                                 for &id in ids {
-                                    let c = &codes[&id];
+                                    let c = code_vec[id as usize];
                                     buf = (buf << c.len as u32) | c.bits as u64;
                                     nbits += c.len as u32;
                                     while nbits >= 8 {
-                                        out.push((buf >> (nbits - 8)) as u8);
+                                        dst.push((buf >> (nbits - 8)) as u8);
                                         nbits -= 8;
                                         buf &= (1u64 << nbits) - 1;
                                     }
                                 }
                                 if nbits > 0 {
-                                    out.push((buf << (8 - nbits)) as u8);
+                                    dst.push((buf << (8 - nbits)) as u8);
                                 }
                             };
                             if !ids.iter().any(|&id| is_esc(id)) {
                                 // flag=0：纯 Huffman 码流
-                                let mut out = Vec::with_capacity(ids.len() + 1);
                                 out.push(0u8);
-                                push_huf(ids, &mut out);
-                                return out;
+                                push_huf(ids, out);
+                                return;
                             }
                             // flag=1：标记位流（每符号 1 位，MSB-first，字节对齐）
                             let mut flags: Vec<u8> = Vec::with_capacity((ids.len() + 7) / 8);
                             let mut fbuf: u64 = 0;
                             let mut fnbits: u32 = 0;
                             let mut huf_ids: Vec<u32> = Vec::new();
-                            let mut esc: Vec<u8> = Vec::new();
                             for &id in ids {
                                 let e = is_esc(id);
                                 fbuf = (fbuf << 1) | e as u64;
@@ -207,21 +204,21 @@ impl<'a> TokenDeltaCodec<'a> {
                                     fbuf = 0;
                                     fnbits = 0;
                                 }
-                                if e {
-                                    encode_varint(&mut esc, id);
-                                } else {
+                                if !e {
                                     huf_ids.push(id);
                                 }
                             }
                             if fnbits > 0 {
                                 flags.push((fbuf << (8 - fnbits)) as u8);
                             }
-                            let mut out = Vec::new();
                             out.push(1u8);
                             out.extend_from_slice(&flags);
-                            push_huf(&huf_ids, &mut out); // 字节对齐 ✓
-                            out.extend_from_slice(&esc);
-                            out
+                            push_huf(&huf_ids, out); // 字节对齐 ✓
+                            for &id in ids {
+                                if is_esc(id) {
+                                    encode_varint(out, id);
+                                }
+                            }
                         }),
                     )
                 }
@@ -232,11 +229,13 @@ impl<'a> TokenDeltaCodec<'a> {
                     }
                     let enc = huffman::HuffmanEncoder::new(&freqs);
                     let header = enc.header();
-                    (header, Box::new(move |ids: &[u32]| enc.encode(ids)))
+                    (header, Box::new(move |ids: &[u32], out: &mut Vec<u8>| {
+                        enc.encode_into(ids, out)
+                    }))
                 }
             };
 
-        // 4. 组装
+        // 4. 组装（行缓冲复用：row_buf 跨行保留容量）
         let mut out = Vec::new();
         out.extend_from_slice(&self.tok.version().to_le_bytes()); // 词表版本（解码端校验）
         out.extend_from_slice(&(dyn_dict.len() as u32).to_le_bytes());
@@ -252,12 +251,14 @@ impl<'a> TokenDeltaCodec<'a> {
         out.extend_from_slice(&(header.len() as u32).to_le_bytes());
         out.extend_from_slice(&header);
 
+        let mut row_buf: Vec<u8> = Vec::new();
         for (shared, new) in &deltas {
             encode_varint(&mut out, *shared);
             encode_varint(&mut out, new.len() as u32);
-            let stream = row_encode(new);
-            encode_varint(&mut out, stream.len() as u32);
-            out.extend_from_slice(&stream);
+            let start = row_buf.len();
+            row_write(new, &mut row_buf);
+            encode_varint(&mut out, (row_buf.len() - start) as u32);
+            out.extend_from_slice(&row_buf[start..]);
         }
         out
     }

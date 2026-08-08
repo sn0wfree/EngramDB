@@ -38,6 +38,8 @@ pub const UNKNOWN_ID: u32 = u32::MAX;
 pub struct Tokenizer {
     /// token 文本 → id（rank）
     vocab: FxHashMap<String, u32>,
+    /// 单字符 token → id（编码热路径：字符级初始化零分配查表，替代 c.to_string()）
+    char_ids: FxHashMap<char, u32>,
     /// (left_id, right_id) → (rank, merged_id)——merges 按训练顺序
     merges: FxHashMap<(u32, u32), (u32, u32)>,
     /// merges 有序列表（rank 序，静态热词来源）
@@ -60,17 +62,17 @@ pub struct Tokenizer {
     _source_len: usize,
 }
 
-/// 内部符号（双向链表节点）
+/// 内部符号（双向链表节点，紧凑布局：u32 索引 + 4B 长度，32B→20B）
 #[derive(Clone, Copy)]
 struct Symbol {
     id: u32,
-    byte_len: usize,
-    prev: usize,
-    next: usize,
+    byte_len: u32,
+    prev: u32,
+    next: u32,
     active: bool,
 }
 
-const NONE: usize = usize::MAX;
+const NONE: u32 = u32::MAX;
 
 impl Tokenizer {
     /// 从词表文件字节加载（include_bytes! 或外部文件）
@@ -85,10 +87,15 @@ impl Tokenizer {
             return Err(EngramDbError::Parse("vocab magic mismatch".into()));
         }
         let mut vocab: FxHashMap<String, u32> = FxHashMap::default();
+        let mut char_ids: FxHashMap<char, u32> = FxHashMap::default();
         let mut vocab_by_id: Vec<String> = Vec::with_capacity(vf.vocab.len());
         for (id, t) in vf.vocab.iter().enumerate() {
             vocab.insert(t.clone(), id as u32);
             vocab_by_id.push(t.clone());
+            let mut it = t.chars();
+            if let (Some(c), None) = (it.next(), it.next()) {
+                char_ids.insert(c, id as u32);
+            }
         }
         // merges pair → (rank, merged_id)：merged token 文本 = a + b
         let mut merges: FxHashMap<(u32, u32), (u32, u32)> = FxHashMap::default();
@@ -101,6 +108,7 @@ impl Tokenizer {
         }
         Ok(Self {
             vocab,
+            char_ids,
             merges,
             merges_ordered: vf.merges,
             seeds: vf.seeds,
@@ -186,8 +194,8 @@ impl Tokenizer {
     /// 编码整段文本 → token 流（id + offset）
     pub fn tokenize(&self, text: &str) -> Vec<Token> {
         let mut tokens = Vec::new();
-        for (word, piece) in pretokenize::segment_words(text, &self.seeds) {
-            self.encode_word(&word, piece.start, &mut tokens);
+        for piece in pretokenize::segment_word_pieces(text, &self.seeds) {
+            self.encode_word(&text[piece.start..piece.end], piece.start, &mut tokens);
         }
         tokens
     }
@@ -252,15 +260,15 @@ impl Tokenizer {
     /// 编码单个段（word）：字符级初始 token → merges rank 贪心合并
     /// 未登录字符 → `UNKNOWN_ID` 标记（Unicode 字符级兜底，块动态字典登记）
     fn encode_word(&self, word: &str, base: usize, out: &mut Vec<Token>) {
-        // --- 初始符号：字符级（未登录 → UNKNOWN_ID 标记） ---
+        // --- 初始符号：字符级（未登录 → UNKNOWN_ID 标记；char 查表零分配） ---
         let mut symbols: Vec<Symbol> = Vec::new();
         for c in word.chars() {
-            let len = c.len_utf8();
-            let id = match self.vocab.get(&c.to_string()) {
+            let len = c.len_utf8() as u32;
+            let id = match self.char_ids.get(&c) {
                 Some(&id) => id,
                 None => UNKNOWN_ID,
             };
-            let idx = symbols.len();
+            let idx = symbols.len() as u32;
             symbols.push(Symbol {
                 id,
                 byte_len: len,
@@ -269,7 +277,7 @@ impl Tokenizer {
                 active: true,
             });
             if idx > 0 {
-                symbols[idx - 1].next = idx;
+                symbols[(idx - 1) as usize].next = idx;
             }
         }
         if symbols.is_empty() {
@@ -278,8 +286,8 @@ impl Tokenizer {
 
         // --- 初始堆：所有相邻 pair（在 merges 中）按 rank 入堆 ---
         // 条目携带 (rank, new_id)：pop 时校验 pair 未变（对齐 tokenizers merge_all）
-        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, usize)>> = BinaryHeap::new();
-        for i in 0..symbols.len() {
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>> = BinaryHeap::new();
+        for i in 0..symbols.len() as u32 {
             if let Some((rank, new_id)) = self.pair_rank(&symbols, i) {
                 heap.push(std::cmp::Reverse((rank, new_id, i)));
             }
@@ -287,10 +295,11 @@ impl Tokenizer {
 
         // --- 贪心合并：最小 rank pair 优先 ---
         while let Some(std::cmp::Reverse((rank, exp_new, pos))) = heap.pop() {
+            let pos = pos as usize;
             if !symbols[pos].active || symbols[pos].next == NONE {
                 continue;
             }
-            let right = symbols[pos].next;
+            let right = symbols[pos].next as usize;
             if !symbols[right].active {
                 continue;
             }
@@ -309,18 +318,21 @@ impl Tokenizer {
             symbols[pos].next = symbols[right].next;
             symbols[right].active = false;
             if symbols[pos].next != NONE {
-                let n = symbols[pos].next;
-                symbols[n].prev = pos;
+                let n = symbols[pos].next as usize;
+                symbols[n].prev = pos as u32;
             }
             // 新邻接 pair 入堆
             let p = symbols[pos].prev;
-            if p != NONE && symbols[p].active {
-                if let Some((rank, new_id)) = self.pair_rank(&symbols, p) {
-                    heap.push(std::cmp::Reverse((rank, new_id, p)));
+            if p != NONE {
+                let p = p as usize;
+                if symbols[p].active {
+                    if let Some((rank, new_id)) = self.pair_rank(&symbols, p as u32) {
+                        heap.push(std::cmp::Reverse((rank, new_id, p as u32)));
+                    }
                 }
             }
-            if let Some((rank, new_id)) = self.pair_rank(&symbols, pos) {
-                heap.push(std::cmp::Reverse((rank, new_id, pos)));
+            if let Some((rank, new_id)) = self.pair_rank(&symbols, pos as u32) {
+                heap.push(std::cmp::Reverse((rank, new_id, pos as u32)));
             }
         }
 
@@ -329,7 +341,7 @@ impl Tokenizer {
         let mut i = 0usize;
         while i < symbols.len() {
             if symbols[i].active {
-                let byte_len = symbols[i].byte_len;
+                let byte_len = symbols[i].byte_len as usize;
                 out.push(Token { id: symbols[i].id, offset: offset..offset + byte_len });
                 offset += byte_len;
             }
@@ -337,11 +349,12 @@ impl Tokenizer {
         }
     }
 
-    fn pair_rank(&self, symbols: &[Symbol], pos: usize) -> Option<(u32, u32)> {
+    fn pair_rank(&self, symbols: &[Symbol], pos: u32) -> Option<(u32, u32)> {
+        let pos = pos as usize;
         if !symbols[pos].active || symbols[pos].next == NONE {
             return None;
         }
-        let right = symbols[pos].next;
+        let right = symbols[pos].next as usize;
         if !symbols[right].active {
             return None;
         }

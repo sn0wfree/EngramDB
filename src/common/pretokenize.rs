@@ -122,43 +122,48 @@ pub fn segment(text: &str) -> Vec<Piece> {
 /// 特殊处理：**空白段按单字符切分**——tokenizers 的 merges.txt 用空格分隔行，
 /// 含空白字符的 merge（如 "\n\n"、"  "）会破坏格式；空白压缩收益小，
 /// 拆单字符保证 merges 导出安全（token 永不含空白）。训练/运行共享本函数 → 两端自动一致。
-pub fn segment_words(text: &str, seeds: &[String]) -> Vec<(String, Piece)> {
+/// 运行时 word 划分（零分配）：返回段列表，word 文本 = `&text[piece.start..piece.end]`
+/// （seed_segment 的 word 恒等于该切片——最长匹配/单字符回退均保持）。
+/// 与 `segment_words` 结构一致（含空白段逐字符切分），供 tokenize 热路径使用。
+pub fn segment_word_pieces(text: &str, seeds: &[String]) -> Vec<Piece> {
     let pieces = segment(text);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(pieces.len());
     for piece in pieces {
         let slice = &text[piece.start..piece.end];
         if piece.class == CharClass::Cjk && !seeds.is_empty() {
             // CJK 段内种子词贪心最长匹配：词内可合并，未命中单字
-            for (word, rel_start, rel_end) in seed_segment(slice, seeds) {
-                out.push((
-                    word,
-                    Piece {
-                        start: piece.start + rel_start,
-                        end: piece.start + rel_end,
-                        class: CharClass::Cjk,
-                    },
-                ));
+            for (_, rel_start, rel_end) in seed_segment(slice, seeds) {
+                out.push(Piece {
+                    start: piece.start + rel_start,
+                    end: piece.start + rel_end,
+                    class: CharClass::Cjk,
+                });
             }
         } else if piece.class == CharClass::Space {
             // 空白段：逐字符独立 word（不参与 merges 合并）
             let mut pos = 0usize;
             for c in slice.chars() {
                 let len = c.len_utf8();
-                out.push((
-                    c.to_string(),
-                    Piece {
-                        start: piece.start + pos,
-                        end: piece.start + pos + len,
-                        class: CharClass::Space,
-                    },
-                ));
+                out.push(Piece {
+                    start: piece.start + pos,
+                    end: piece.start + pos + len,
+                    class: CharClass::Space,
+                });
                 pos += len;
             }
         } else {
-            out.push((slice.to_string(), piece));
+            out.push(piece);
         }
     }
     out
+}
+
+/// 训练端 word 划分（String 组装版本；结构与 segment_word_pieces 一致）
+pub fn segment_words(text: &str, seeds: &[String]) -> Vec<(String, Piece)> {
+    segment_word_pieces(text, seeds)
+        .into_iter()
+        .map(|p| (text[p.start..p.end].to_string(), p))
+        .collect()
 }
 
 /// CJK 段内种子词贪心最长匹配（jieba 风格）
