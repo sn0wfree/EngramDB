@@ -495,7 +495,8 @@ fn decompress_gorilla(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 // ============================================================================
-// Varchar 列压缩：Dictionary（低基数）/ TokenDelta（统一 Tokenizer，v0.21）择优
+// Varchar 列压缩：zstd 先行调度（v0.21.2）——zstd 压缩率达标（≤50%）直选，
+// Dictionary 参与比较；难块（zstd 压不动）才走 TokenDelta 兜底取小
 // ============================================================================
 
 fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
@@ -511,11 +512,17 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
     let mut best_size = data.len();
 
     // 臂 1：zstd-3（块级字节压缩主臂，v0.21——对 Varchar 列字节直接压缩）
+    // v0.21.2 调度：压缩率达标（≤ 原大小 50%）→ 定稿标记（跳过 TD 编码——
+    // 正式场景 zstd 恒达标，checkpoint 贴 zstd；TD 只在难块兜底保底压缩率）
+    let mut zstd_ok = false;
     {
         if let Ok(comp) = zstd::bulk::compress(data, 3) {
             if comp.len() < best_size {
                 best_size = comp.len();
-                best = (CompressionType::Zstd, comp);
+                best = (CompressionType::Zstd, comp.clone());
+            }
+            if comp.len() * 2 <= data.len() {
+                zstd_ok = true;
             }
         }
     }
@@ -533,12 +540,20 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
         }
     }
 
-    // 臂 3：TokenDelta（降级选项：Config::token_delta_enabled 或显式
-    // set_global_tokenizer 启用；zstd-3 主臂实测压缩率持平且快 ~15×）
+    // v0.21.2 调度：zstd 达标 → 直接定稿（低基数列 Dictionary 已比较，
+    // TD 编码成本 ~0.9s 省去——TD 的降级定位只在难块生效）
+    if zstd_ok {
+        return Ok(best);
+    }
+
+    // 臂 3：TokenDelta（难块兜底：zstd 压缩率不达标才到达——Config::
+    // token_delta_enabled 或显式 set_global_tokenizer 启用；zstd-3 主臂实测
+    // 压缩率持平且快 ~15×）
     // v0.21：单形态熵编码（Config::token_delta_entropy）——三形态 best-of 已裁
     // （正式场景 Static 本身即最优；流式/重写场景 Huffman 更优但 zstd 已覆盖）
     // v0.21.1：checkpoint tokenize 去重共享——FTS 索引插入时的 token 流缓存
     // 直供（内容 hash 精确匹配；miss 回退自 tokenize）
+    // v0.21.2：zstd 先行调度——达标块直选 zstd（省 TD 编码），本臂仅难块参与
     if TOKEN_DELTA_ENABLED.load(Ordering::Relaxed) {
         if let Some(tok) = global_tokenizer() {
             let strs: Vec<&str> = strings

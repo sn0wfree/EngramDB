@@ -13,13 +13,12 @@
 
 use std::collections::BinaryHeap;
 use std::ops::Range;
-use std::sync::Arc;
 
 use fxhash::FxHashMap;
 
 use crate::common::error::Result;
 use crate::common::error::EngramDbError;
-use crate::common::pretokenize::{self, CharClass};
+use crate::common::pretokenize;
 use crate::common::vocab_file::VocabFile;
 
 /// 单个 token 的编码结果：id（rank）+ 原文字节区间

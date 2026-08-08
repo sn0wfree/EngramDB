@@ -1,7 +1,10 @@
 //! 运行时分派集成测试（v0.21 收尾）：Varchar 列 TokenDelta 压缩分派
 //!
-//! - 注册全局 Tokenizer 后：流式追加文本（同前缀）→ compress 选中 TokenDelta
-//! - roundtrip：compress → decompress 逐字节还原 Varchar 列格式
+//! v0.21.2 zstd 先行调度：zstd 压缩率达标（≤50%）直选 Zstd（TD 启用也不参与
+//! 比较——TD 只在难块兜底）；不达标块走 Dictionary/TokenDelta/Uncompressed 兜底。
+//!
+//! - 注册全局 Tokenizer 后：流式追加文本（同前缀，zstd 达标）→ 选中 Zstd
+//! - 难块（zstd 压不动）→ 兜底路径分派，roundtrip 逐字节还原
 //! - 块头词表版本校验：版本不匹配 → 显式报错
 //!
 //! 独立进程（tests/）：不污染 lib 测试的全局 Tokenizer 状态。
@@ -17,6 +20,10 @@ use engramdb::storage::compression::{compress, decompress, set_global_tokenizer}
 /// 共享——涉及全局分派语义的测试串行化，防并行污染（如 persist 测试 open DB 会把
 /// entropy 覆盖回 config 默认 Static）
 static TD_GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_global() -> std::sync::MutexGuard<'static, ()> {
+    TD_GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn make_tokenizer() -> Tokenizer {
     // 小词表（CJK 段内 merge）：字符 + 双字词，TokenDelta 静态码长表非零
@@ -64,8 +71,8 @@ fn varchar_column(texts: &[&str]) -> Vec<u8> {
 }
 
 #[test]
-fn test_varchar_tokendelta_dispatch_and_roundtrip() {
-    let _g = TD_GLOBAL_LOCK.lock().unwrap();
+fn test_varchar_zstd_priority_dispatch_and_roundtrip() {
+    let _g = lock_global();
     set_global_tokenizer(Some(make_tokenizer()));
     // 单形态配置（v0.21）：小数据块级表头开销大，Varint（无表）最优；
     // 显式设置验证 dispatch + roundtrip
@@ -73,7 +80,8 @@ fn test_varchar_tokendelta_dispatch_and_roundtrip() {
         engramdb::common::config::TokenDeltaEntropy::Varint,
     );
 
-    // 流式追加（同前缀，TokenDelta 的增量主场景）
+    // 流式追加（同前缀）：zstd 压缩率达标（≤50%）→ 调度直选 Zstd，
+    // TD 启用也不参与比较（v0.21.2 zstd 先行调度语义）
     let base = "你好世界！这是测试文本 hello world 你好世界！";
     let mut texts = Vec::new();
     let char_count = base.chars().count();
@@ -89,17 +97,52 @@ fn test_varchar_tokendelta_dispatch_and_roundtrip() {
     let data = varchar_column(&texts);
 
     let (ctype, compressed) = compress(&data, &DataType::Varchar).unwrap();
-    // 块级单形态（Varint）至少应优于裸存
-    assert_eq!(ctype, CompressionType::TokenDelta, "应选中 TokenDelta");
-    assert!(compressed.len() < data.len(), "TokenDelta 应压缩：{} / {}", compressed.len(), data.len());
+    // zstd 达标 → 直选 Zstd（不再强制 TD）
+    assert_eq!(ctype, CompressionType::Zstd, "zstd 达标块应直选 Zstd");
+    assert!(compressed.len() < data.len(), "zstd 应压缩：{} / {}", compressed.len(), data.len());
 
     let decompressed = decompress(&compressed, ctype, &DataType::Varchar).unwrap();
     assert_eq!(decompressed, data, "roundtrip 必须逐字节还原");
 }
 
 #[test]
+fn test_varchar_dispatch_hard_block_roundtrip() {
+    // 难块：随机 UUID（高熵，zstd 压缩率不达标 > 50%）→ 走兜底路径
+    // （Dictionary/TokenDelta/Uncompressed 取小）——分派必须可还原不 panic
+    let _g = lock_global();
+    set_global_tokenizer(Some(make_tokenizer()));
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut texts = Vec::new();
+    for i in 0..100u64 {
+        let mut h = DefaultHasher::new();
+        (i * 7919).hash(&mut h);
+        texts.push(format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            h.finish() as u32,
+            (h.finish() >> 32) as u16,
+            (i as u16).wrapping_mul(7),
+            (i as u16).wrapping_mul(31),
+            h.finish().wrapping_mul(2654435761)
+        ));
+    }
+    let strs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let data = varchar_column(&strs);
+    let (ctype, compressed) = compress(&data, &DataType::Varchar).unwrap();
+    let decompressed = decompress(&compressed, ctype, &DataType::Varchar).unwrap();
+    assert_eq!(decompressed, data, "难块任意分派结果必须可还原");
+    assert!(matches!(
+        ctype,
+        CompressionType::Zstd
+            | CompressionType::Dictionary
+            | CompressionType::TokenDelta
+            | CompressionType::Uncompressed
+    ));
+}
+
+#[test]
 fn test_varchar_tokendelta_high_entropy_uncompressed() {
-    let _g = TD_GLOBAL_LOCK.lock().unwrap();
+    let _g = lock_global();
     set_global_tokenizer(Some(make_tokenizer()));
 
     // 高熵独立短文本：TokenDelta 不占优 → 应兜底 Uncompressed（不 panic）
@@ -144,7 +187,7 @@ fn test_tokendelta_vocab_version_mismatch_rejected() {
 /// 导致压缩列读回被当裸序列化错位）——TokenDelta 压缩列必须跨 checkpoint 精确还原
 #[test]
 fn test_tokendelta_column_persist_roundtrip() {
-    let _g = TD_GLOBAL_LOCK.lock().unwrap();
+    let _g = lock_global();
     use engramdb::common::config::Config;
     use engramdb::common::types::{ColumnDef, DataType, TableDef};
     use engramdb::storage::Database;
