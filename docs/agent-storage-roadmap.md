@@ -58,12 +58,19 @@
 
 ## 三、v0.22 知识库检索全链路（第二优先）
 
+> **v0.21 提前落位（2026-08-08）**：`src/search/` 检索层已建——TokenInvertedIndex
+> （token_id → (row, tf) 行级 postings，与压缩同源同表）+ BM25 + 模糊匹配（编辑距离
+> / n-gram）+ RRF 混合；table 级 API（search_fts/search_bm25/search_fuzzy_*/
+> hybrid_search）+ FTS 索引落盘（checkpoint 持久化，词表版本不符惰性重建）。
+> 基准（30080 行混合场景）：构建 4.96× 慢于旧字符串分词（40.5µs/行，<10× 门限 →
+> 行级维护可行）、查询单词持平、中文召回 +32%。
+
 | # | 任务 | 现状 | 改动 | 验收 |
 |---|---|---|---|---|
-| B1 | **DAG 检索**（复用 v0.21 分词器）| CJK 整串单 token | 同一 Tokenizer 的 text/offset 构建词图；norm 进倒排；BM25 排序 | 中文检索命中正确、可排序 |
+| B1 | **DAG 检索**（复用 v0.21 分词器）| 已建 sparse 检索层（BM25/模糊/RRF） | 词图（text/offset 构建，语义关联召回）在检索层上叠加 | 中文检索命中正确、可排序 |
 | B2 | **SQL 混合查询** + ef_search 可配置 | 仅 Rust hybrid_search；ef 硬编码 50 | `CREATE VECTOR INDEX ... ef_search`；SQL 表值函数带 WHERE 下推 | 一条 SQL 完成向量+标量过滤 |
 | B3 | 向量点积 SIMD | 逐元素 f32 | f32x16 距离层 | 检索 ≥2x |
-| B4 | RRF 混合排序（V15/Ag06）| 无 | 全文（同一 token 流）+ 向量两路召回 → RRF | 排序可解释、命中互补 |
+| B4 | RRF 混合排序（V15/Ag06）| **已实现**（src/search/hybrid.rs + table::hybrid_search） | — | 排序可解释、命中互补（已测） |
 
 依赖：B1 依赖 v0.21 P0-1（分词器同源）；B4 依赖 B1。
 

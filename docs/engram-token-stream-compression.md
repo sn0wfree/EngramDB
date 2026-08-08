@@ -391,6 +391,15 @@ best-of 裁剪判据：
 - **混合检索（RRF）**：全文与向量共享同一 token 基建
 - **FTS 中文**：P0-7 即切统一 Tokenizer，v0.21 就获得中文搜索
 
+> **v0.21 检索层已落位（2026-08-08）**：`src/search/`——TokenInvertedIndex
+> （token_id → (row, tf) 行级 postings）+ BM25（k1=1.2/b=0.75）+ 模糊匹配
+> （token 序列编辑距离 / n-gram Jaccard）+ RRF 混合（k=60）。与 TD 压缩同源
+> 同表：同一 Tokenizer / 词表 id 空间 / 同一 token 流；压缩 codec 解耦。
+> table 级 API：`search_fts`（语义不变，中文词级）、`search_bm25`、
+> `search_fuzzy_edit`、`search_fuzzy_ngram`、`hybrid_search`。
+> FTS 索引落盘（checkpoint 持久化；旧文件无 FTS 段 → 空索引；词表版本不符惰性重建）。
+> 基准：构建 4.96× 慢于旧字符串分词（行级维护可行）、查询单词持平、中文召回 +32%。
+
 ---
 
 ## 九、验收标准

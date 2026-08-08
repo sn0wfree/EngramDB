@@ -73,6 +73,7 @@ static GLOBAL_ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 pub mod common;
 pub mod storage;
+pub mod search;
 pub mod wal;
 pub mod txn;
 pub mod sql;

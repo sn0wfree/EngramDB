@@ -12,7 +12,7 @@ use crate::executor::vector::{DataChunk, Vector};
 
 use super::column_store::{matches_predicate, matches_predicate_typed, ColumnStore, PredicateOp};
 use super::delta_store::DeltaStore;
-use super::index::inverted_index::InvertedIndex;
+use crate::search::TokenInvertedIndex;
 use super::index::skiplist::SkipListIndex;
 use super::vector_index::{HnswIndex, HnswConfig, DistanceMetric, Neighbor, SearchTrace};
 use crate::common::error::EngramDbError;
@@ -142,11 +142,12 @@ pub struct Table {
     /// key 为索引名，value 为 (HNSW 索引, hnsw_id -> row_id 映射)。
     /// 用于向量列的近似最近邻搜索，支持 L2/内积/余弦距离。
     vector_indexes: std::collections::HashMap<String, (HnswIndex, Vec<u32>)>,
-    /// 全文检索倒排索引（v0.15.0 新增）
+    /// 全文检索倒排索引（v0.15.0 新增；v0.21 升级为 Token 级 TokenInvertedIndex）
     ///
     /// key 为列名，value 为对应列的倒排索引。
     /// 通过 CREATE INDEX ... USING fts(column) 创建。
-    fts_indexes: std::collections::HashMap<String, InvertedIndex>,
+    /// v0.21：与 TD 压缩同源（同一 Tokenizer / 词表 id 空间）；无 Tokenizer 时降级字符串分词。
+    fts_indexes: std::collections::HashMap<String, TokenInvertedIndex>,
     /// 分层索引：全表稠密 BTreeMap 主键索引（legacy 模式，默认关闭）
     ///
     /// - false（默认）：主键点查走「Delta 稠密 + 列存稀疏」分层索引，内存节省 ~99.9%
@@ -874,6 +875,17 @@ impl Table {
             None => buf.extend_from_slice(&0u32.to_le_bytes()),
         }
 
+        // --- FTS 索引段（v0.21 新增，修复「FTS 索引不落盘」缺陷）---
+        // 格式：[fts_count:u32][(name_len:u32, name, data_len:u32, TokenInvertedIndex::to_bytes)*]
+        buf.extend_from_slice(&(self.fts_indexes.len() as u32).to_le_bytes());
+        for (name, idx) in &self.fts_indexes {
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            let bytes = idx.to_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+
         buf
     }
 
@@ -1012,6 +1024,42 @@ impl Table {
             if !self.column_store.sparse_restore(&bytes, sorted) {
                 return Err(EngramDbError::InvalidFormat("invalid sparse index data".into()));
             }
+        }
+        offset += sparse_len;
+
+        // --- FTS 索引段（v0.21 新增，可选）---
+        // 旧文件（v0.21 之前）无此段 → 剩余 0 字节 → 返回。
+        if offset + 4 > data.len() {
+            return Ok(()); // 旧格式，无 FTS 段
+        }
+        let fts_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4;
+        for _ in 0..fts_count {
+            // name
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated fts name length".into()));
+            }
+            let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + name_len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated fts name".into()));
+            }
+            let name = String::from_utf8(data[offset..offset+name_len].to_vec())
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid fts name: {}", e)))?;
+            offset += name_len;
+            // data
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated fts data length".into()));
+            }
+            let data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + data_len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated fts data".into()));
+            }
+            let idx = TokenInvertedIndex::from_bytes(&data[offset..offset+data_len])
+                .map_err(|e| EngramDbError::InvalidFormat(e))?;
+            offset += data_len;
+            self.fts_indexes.insert(name, idx);
         }
 
         Ok(())
@@ -1356,6 +1404,11 @@ impl Table {
             self.update_vector_indexes_for_rows(&rows, base_row_id);
         }
 
+        // 更新所有全文索引（v0.21 检索层：批量路径补接线——此前仅单行 insert_row 更新）
+        if !self.fts_indexes.is_empty() {
+            self.update_fts_indexes_for_rows(&rows, base_row_id);
+        }
+
         Ok(count)
     }
 
@@ -1490,7 +1543,7 @@ impl Table {
         self.def.row_count += num_rows as u64;
 
         // 索引维护（与 insert() 一致；仅在需要时才转置为行）
-        if self.def.primary_key_index().is_some() || !self.indexes.is_empty() || !self.vector_indexes.is_empty() {
+        if self.def.primary_key_index().is_some() || !self.indexes.is_empty() || !self.vector_indexes.is_empty() || !self.fts_indexes.is_empty() {
             let rows = transpose_columns_to_rows(&columns, num_rows);
             if self.primary_index_legacy {
                 self.primary_index_insert_batch(&rows, base_row_id);
@@ -1500,6 +1553,9 @@ impl Table {
             }
             if !self.vector_indexes.is_empty() {
                 self.update_vector_indexes_for_rows(&rows, base_row_id);
+            }
+            if !self.fts_indexes.is_empty() {
+                self.update_fts_indexes_for_rows(&rows, base_row_id);
             }
         }
 
@@ -2638,16 +2694,157 @@ impl Table {
         if self.def.columns[col_idx].data_type != crate::common::types::DataType::Varchar {
             return Err(EngramDbError::Parse(format!("FTS index requires VARCHAR column, got {:?}", self.def.columns[col_idx].data_type)));
         }
-        self.fts_indexes.insert(column_name.to_string(), InvertedIndex::new(column_name));
+        let idx = match crate::storage::compression::global_tokenizer() {
+            Some(tok) => TokenInvertedIndex::with_vocab(tok.version()),
+            None => TokenInvertedIndex::new(),
+        };
+        self.fts_indexes.insert(column_name.to_string(), idx);
         Ok(())
     }
 
-    /// 全文检索搜索
+    /// 全文检索搜索（v0.21：Token 级倒排；无 Tokenizer 时降级字符串分词）
     pub fn search_fts(&self, column_name: &str, query: &str) -> Vec<u32> {
         if let Some(idx) = self.fts_indexes.get(column_name) {
-            idx.search(query)
+            let tok = crate::storage::compression::global_tokenizer();
+            idx.search(query, tok.as_deref())
         } else {
             Vec::new()
+        }
+    }
+
+    /// BM25 排序检索 top-k（v0.21 检索层；需全局 Tokenizer）
+    pub fn search_bm25(&self, column_name: &str, query: &str, k: usize) -> Vec<(u32, f32)> {
+        let Some(idx) = self.fts_indexes.get(column_name) else {
+            return Vec::new();
+        };
+        let Some(tok) = crate::storage::compression::global_tokenizer() else {
+            return Vec::new();
+        };
+        if idx.requires_rebuild(&tok) {
+            return Vec::new();
+        }
+        crate::search::search_bm25(idx, &tok, query, k, &crate::search::Bm25Params::default())
+    }
+
+    /// 编辑距离模糊检索 top-k（需读候选行原文）
+    pub fn search_fuzzy_edit(&mut self, column_name: &str, query: &str, k: usize) -> Vec<(u32, f32)> {
+        // 阶段 1：不可变借用 fts_indexes 拿候选行
+        let (ids, candidates) = {
+            let Some(idx) = self.fts_indexes.get(column_name) else {
+                return Vec::new();
+            };
+            let Some(tok) = crate::storage::compression::global_tokenizer() else {
+                return Vec::new();
+            };
+            let ids = crate::search::query_ids(&tok, query);
+            let cands = crate::search::fuzzy::candidate_rows(idx, &ids);
+            (ids, cands)
+        };
+        // 阶段 2：可变借用读行打分
+        let max_len = 64usize;
+        let mut out: Vec<(u32, f32)> = Vec::new();
+        for row in candidates {
+            let Some(text) = self.row_text(row, column_name) else { continue };
+            let doc_ids: Vec<u32> = {
+                let Some(tok) = crate::storage::compression::global_tokenizer() else {
+                    break;
+                };
+                tok.tokenize(&text)
+                    .iter()
+                    .filter(|t| t.id != crate::common::tokenizer::UNKNOWN_ID)
+                    .map(|t| t.id)
+                    .collect()
+            };
+            if let Some(score) = crate::search::fuzzy::score_edit(&ids, &doc_ids, max_len) {
+                out.push((row, score));
+            }
+        }
+        out.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(k);
+        out
+    }
+
+    /// n-gram 模糊检索 top-k（需读候选行原文）
+    pub fn search_fuzzy_ngram(&mut self, column_name: &str, query: &str, k: usize, gram: usize) -> Vec<(u32, f32)> {
+        // 阶段 1：不可变借用 fts_indexes 拿候选行
+        let (ids, candidates) = {
+            let Some(idx) = self.fts_indexes.get(column_name) else {
+                return Vec::new();
+            };
+            let Some(tok) = crate::storage::compression::global_tokenizer() else {
+                return Vec::new();
+            };
+            let ids = crate::search::query_ids(&tok, query);
+            let cands = crate::search::fuzzy::candidate_rows(idx, &ids);
+            (ids, cands)
+        };
+        // 阶段 2：可变借用读行打分
+        let mut out: Vec<(u32, f32)> = Vec::new();
+        for row in candidates {
+            let Some(text) = self.row_text(row, column_name) else { continue };
+            let doc_ids: Vec<u32> = {
+                let Some(tok) = crate::storage::compression::global_tokenizer() else {
+                    break;
+                };
+                tok.tokenize(&text)
+                    .iter()
+                    .filter(|t| t.id != crate::common::tokenizer::UNKNOWN_ID)
+                    .map(|t| t.id)
+                    .collect()
+            };
+            let s = crate::search::fuzzy::score_ngram(&ids, &doc_ids, gram);
+            if s > 0.0 {
+                out.push((row, s));
+            }
+        }
+        out.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(k);
+        out
+    }
+
+    /// 混合检索：BM25 sparse + HNSW dense → RRF（v0.21 roadmap B4）
+    pub fn hybrid_search(
+        &mut self,
+        fts_column: &str,
+        vector_index: &str,
+        query: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<(u32, f32)>> {
+        let sparse = self.search_bm25(fts_column, query, k * 3);
+        let (dense, _trace) = self.vector_search_with_trace(vector_index, query_vec, k * 3)?;
+        let dense: Vec<(u32, f32)> = dense.iter().map(|n| (n.id, n.distance)).collect();
+        let merged = crate::search::rrf(&sparse, &dense, 60);
+        Ok(merged.into_iter().take(k).collect())
+    }
+
+    /// 读单行单列文本（fuzzy 检索用；row 可能落在 Delta 或列存）
+    fn row_text(&mut self, row_id: u32, column_name: &str) -> Option<String> {
+        let col_idx = self.def.column_index(column_name)?;
+        let row = self.get_row_by_id(row_id).ok()??;
+        match row.get(col_idx) {
+            Some(crate::Value::Varchar(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// 批量更新全文索引（多行插入）
+    fn update_fts_indexes_for_rows(&mut self, rows: &[Vec<Value>], base_row_id: u32) {
+        let col_names: Vec<String> = self.fts_indexes.keys().cloned().collect();
+        for (row_idx, row) in rows.iter().enumerate() {
+            let row_id = base_row_id + row_idx as u32;
+            for col_name in &col_names {
+                if let Some(col_idx) = self.def.column_index(col_name) {
+                    if col_idx < row.len() {
+                        if let Value::Varchar(text) = &row[col_idx] {
+                            if let Some(idx) = self.fts_indexes.get_mut(col_name) {
+                                let tok = crate::storage::compression::global_tokenizer();
+                                idx.add_document(row_id, text, tok.as_deref());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2659,7 +2856,8 @@ impl Table {
                 if col_idx < row.len() {
                     if let Value::Varchar(text) = &row[col_idx] {
                         if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
-                            idx.add_document(row_id, text);
+                            let tok = crate::storage::compression::global_tokenizer();
+                            idx.add_document(row_id, text, tok.as_deref());
                         }
                     }
                 }
@@ -2675,7 +2873,8 @@ impl Table {
                 if col_idx < row.len() {
                     if let Value::Varchar(text) = &row[col_idx] {
                         if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
-                            idx.remove_document(row_id, text);
+                            let tok = crate::storage::compression::global_tokenizer();
+                            idx.remove_document(row_id, text, tok.as_deref());
                         }
                     }
                 }
@@ -2684,12 +2883,12 @@ impl Table {
     }
 
     /// 获取 FTS 索引列表
-    pub fn fts_indexes(&self) -> &std::collections::HashMap<String, InvertedIndex> {
+    pub fn fts_indexes(&self) -> &std::collections::HashMap<String, TokenInvertedIndex> {
         &self.fts_indexes
     }
 
     /// 获取 FTS 索引的可变引用
-    pub fn fts_indexes_mut(&mut self) -> &mut std::collections::HashMap<String, InvertedIndex> {
+    pub fn fts_indexes_mut(&mut self) -> &mut std::collections::HashMap<String, TokenInvertedIndex> {
         &mut self.fts_indexes
     }
 }

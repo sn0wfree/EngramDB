@@ -86,6 +86,11 @@ impl InvertedIndex {
         self.postings.get(&term).cloned().unwrap_or_default()
     }
 
+    /// 倒排本体（只读访问，统计/审计用）
+    pub fn postings(&self) -> &HashMap<String, Vec<u32>> {
+        &self.postings
+    }
+
     /// 查询多个词（AND 语义 — 同时包含所有词的行）
     pub fn search_and(&self, terms: &[String]) -> Vec<u32> {
         if terms.is_empty() {
