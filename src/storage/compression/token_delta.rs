@@ -163,14 +163,10 @@ impl<'a> TokenDeltaCodec<'a> {
                     // 注意：escape 不进静态表——词表 Huffman Kraft 已满（=1.0），
                     // 追加任何符号都溢出 canonical 分配（24 位组实测 634+1 > 634 空间）
                     let base = self.static_base();
-                    let (codes, _table) = self.tok.static_entropy();
                     let vocab_size = self.tok.vocab_size() as u32;
-                    // HashMap → Vec 索引（块级一次构建，行级 O(1)；非 escape id 必在 codes）
-                    let mut code_vec: Vec<huffman::Code> =
-                        vec![huffman::Code { len: 0, bits: 0 }; vocab_size as usize];
-                    for (id, c) in codes {
-                        code_vec[*id as usize] = *c;
-                    }
+                    // 码字向量（tokenizer 级 OnceLock 缓存，跨块复用——消除每块
+                    // 32k 项重建固定成本；非 escape id 必在向量中）
+                    let code_vec = self.tok.static_code_vec();
                     (
                         Vec::new(), // 块头 header 空（escape 在行内）
                         Box::new(move |ids: &[u32], out: &mut Vec<u8>| {

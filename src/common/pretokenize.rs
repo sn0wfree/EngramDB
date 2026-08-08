@@ -27,12 +27,14 @@ pub enum CharClass {
 
 /// 判定字符类别（训练/运行共享——一致性关键）
 pub fn classify(c: char) -> CharClass {
+    if c.is_ascii() {
+        // ASCII 快路径：128 项查表（一次内存访问替代多分支）
+        return ASCII_CLASS[c as usize];
+    }
     if is_cjk(c) {
         CharClass::Cjk
     } else if c.is_whitespace() {
         CharClass::Space
-    } else if c.is_ascii_digit() {
-        CharClass::Digit
     } else if c.is_alphabetic() {
         CharClass::Letter
     } else if is_punct(c) {
@@ -41,6 +43,28 @@ pub fn classify(c: char) -> CharClass {
         CharClass::Symbol
     }
 }
+
+/// ASCII 128 项分类表（classify 快路径）
+static ASCII_CLASS: [CharClass; 128] = {
+    let mut t = [CharClass::Symbol; 128];
+    let mut i = 0;
+    while i < 128 {
+        let c = i as u8;
+        t[i] = if c.is_ascii_whitespace() {
+            CharClass::Space
+        } else if c.is_ascii_digit() {
+            CharClass::Digit
+        } else if c.is_ascii_alphabetic() {
+            CharClass::Letter
+        } else if c.is_ascii_punctuation() {
+            CharClass::Punct
+        } else {
+            CharClass::Symbol
+        };
+        i += 1;
+    }
+    t
+};
 
 /// CJK 判断：U+3400-U+4DBF（扩展 A）、U+4E00-U+9FFF（基本）、
 /// U+F900-U+FAFF（兼容）、U+20000-U+2FA1F（扩展 B-F）

@@ -38,8 +38,11 @@ pub const UNKNOWN_ID: u32 = u32::MAX;
 pub struct Tokenizer {
     /// token 文本 → id（rank）
     vocab: FxHashMap<String, u32>,
-    /// 单字符 token → id（编码热路径：字符级初始化零分配查表，替代 c.to_string()）
+    /// 单字符 token → id（BMP 外字符回退；BMP 内走 bmp_ids 直查表）
     char_ids: FxHashMap<char, u32>,
+    /// BMP 单字符直查表（0x10000 项 u32，UNKNOWN_ID = 未收录哨兵）——
+    /// 中文主场景每字符 O(1) 直查（一次内存访问），替代 FxHashMap 哈希+探测
+    bmp_ids: Box<[u32]>,
     /// (left_id, right_id) → (rank, merged_id)——merges 按训练顺序
     merges: FxHashMap<(u32, u32), (u32, u32)>,
     /// merges 有序列表（rank 序，静态热词来源）
@@ -58,6 +61,9 @@ pub struct Tokenizer {
         FxHashMap<u32, crate::common::huffman::Code>,
         crate::common::huffman::HuffmanTable,
     )>,
+    /// Static 模式编码向量（code_vec：id 连续索引，替代 HashMap 查询；
+    /// 一次构建跨块复用——encode_block 每块重建 32k 项的固定成本已消除）
+    static_code_vec: std::sync::OnceLock<Vec<crate::common::huffman::Code>>,
     /// 词表文件字节（自包含，供块头引用/审计）
     _source_len: usize,
 }
@@ -88,13 +94,19 @@ impl Tokenizer {
         }
         let mut vocab: FxHashMap<String, u32> = FxHashMap::default();
         let mut char_ids: FxHashMap<char, u32> = FxHashMap::default();
+        let mut bmp_ids: Vec<u32> = vec![UNKNOWN_ID; 0x10000];
         let mut vocab_by_id: Vec<String> = Vec::with_capacity(vf.vocab.len());
         for (id, t) in vf.vocab.iter().enumerate() {
             vocab.insert(t.clone(), id as u32);
             vocab_by_id.push(t.clone());
             let mut it = t.chars();
             if let (Some(c), None) = (it.next(), it.next()) {
-                char_ids.insert(c, id as u32);
+                let cp = c as u32;
+                if cp < 0x10000 {
+                    bmp_ids[cp as usize] = id as u32;
+                } else {
+                    char_ids.insert(c, id as u32);
+                }
             }
         }
         // merges pair → (rank, merged_id)：merged token 文本 = a + b
@@ -109,6 +121,7 @@ impl Tokenizer {
         Ok(Self {
             vocab,
             char_ids,
+            bmp_ids: bmp_ids.into_boxed_slice(),
             merges,
             merges_ordered: vf.merges,
             seeds: vf.seeds,
@@ -116,6 +129,7 @@ impl Tokenizer {
             static_lengths: vf.static_lengths,
             version: vf.version,
             static_entropy: std::sync::OnceLock::new(),
+            static_code_vec: std::sync::OnceLock::new(),
             _source_len: 0,
         })
     }
@@ -154,6 +168,34 @@ impl Tokenizer {
             let codes = crate::common::huffman::canonical_codes(&lengths);
             let table = crate::common::huffman::HuffmanTable::from_lengths(&lengths);
             (codes, table)
+        })
+    }
+
+    /// Static 模式编码码字向量（id 连续索引，编码热路径 O(1) 直取；
+    /// 与 static_entropy 的 codes 同源同值，一次构建跨块复用）
+    pub fn static_code_vec(&self) -> &[crate::common::huffman::Code] {
+        self.static_code_vec.get_or_init(|| {
+            let base = &self.static_lengths;
+            let mut sorted: Vec<(u8, u32)> = base
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| **l > 0)
+                .map(|(id, l)| (*l, id as u32))
+                .collect();
+            sorted.sort_unstable();
+            let mut codes: Vec<crate::common::huffman::Code> =
+                vec![crate::common::huffman::Code { len: 0, bits: 0 }; base.len()];
+            let mut code: u32 = 0;
+            let mut prev_len: u8 = 0;
+            for (len, symbol) in sorted {
+                if len != prev_len {
+                    code <<= len - prev_len;
+                    prev_len = len;
+                }
+                codes[symbol as usize] = crate::common::huffman::Code { len, bits: code };
+                code += 1;
+            }
+            codes
         })
     }
 
@@ -266,13 +308,19 @@ impl Tokenizer {
     /// 编码单个段（word）：字符级初始 token → merges rank 贪心合并
     /// 未登录字符 → `UNKNOWN_ID` 标记（Unicode 字符级兜底，块动态字典登记）
     fn encode_word(&self, word: &str, base: usize, out: &mut Vec<Token>) {
-        // --- 初始符号：字符级（未登录 → UNKNOWN_ID 标记；char 查表零分配） ---
-        let mut symbols: Vec<Symbol> = Vec::new();
+        // --- 初始符号：字符级（未登录 → UNKNOWN_ID 标记；BMP 直查表 O(1)，
+        // BMP 外回退 char_ids） ---
+        let mut symbols: Vec<Symbol> = Vec::with_capacity(word.len());
         for c in word.chars() {
             let len = c.len_utf8() as u32;
-            let id = match self.char_ids.get(&c) {
-                Some(&id) => id,
-                None => UNKNOWN_ID,
+            let cp = c as u32;
+            let id = if cp < 0x10000 {
+                self.bmp_ids[cp as usize]
+            } else {
+                match self.char_ids.get(&c) {
+                    Some(&id) => id,
+                    None => UNKNOWN_ID,
+                }
             };
             let idx = symbols.len() as u32;
             symbols.push(Symbol {
@@ -292,7 +340,8 @@ impl Tokenizer {
 
         // --- 初始堆：所有相邻 pair（在 merges 中）按 rank 入堆 ---
         // 条目携带 (rank, new_id)：pop 时校验 pair 未变（对齐 tokenizers merge_all）
-        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>> = BinaryHeap::new();
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>> =
+            BinaryHeap::with_capacity(symbols.len());
         for i in 0..symbols.len() as u32 {
             if let Some((rank, new_id)) = self.pair_rank(&symbols, i) {
                 heap.push(std::cmp::Reverse((rank, new_id, i)));
