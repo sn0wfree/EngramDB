@@ -231,14 +231,10 @@ impl TokenInvertedIndex {
         }
     }
 
-    /// 添加文档（预 tokenize 直供——v0.21 checkpoint tokenize 去重共享：
-    /// 调用方（table 插入路径）一次 tokenize，索引与 TD 压缩缓存两用。
-    /// 词表版本由 with_vocab 创建时设定；调用方须保证 token 流与索引版本一致）
-    pub fn add_document_with_tokens(&mut self, row_id: u32, text: &str, tokens: &[Token]) {
-        if row_id as usize >= self.doc_lens.len() {
-            self.doc_lens.resize(row_id as usize + 1, 0);
-        }
-        // 单遍：空白 token 集合（BM25 doc_len 排除）+ tf 聚合
+    /// 文档 token 预处理（并行阶段）：tf 聚合 + 空白过滤 + 排序
+    /// → (去重排序对, 有效 doc_len)。与 add_document_with_tokens 内部逻辑
+    /// 逐字节一致（v0.21.2 插入并行化拆分）。
+    pub fn prepare_document(tokens: &[Token], text: &str) -> (Vec<(u32, u32)>, u32) {
         let mut ws_ids: Vec<u32> = Vec::new();
         let mut tf: fxhash::FxHashMap<u32, u32> = fxhash::FxHashMap::default();
         for t in tokens {
@@ -255,18 +251,36 @@ impl TokenInvertedIndex {
         pairs.sort_by_key(|(id, _)| *id);
         let mut n = 0u32;
         for (id, count) in &pairs {
+            if !ws_ids.contains(id) {
+                n += *count;
+            }
+        }
+        (pairs, n)
+    }
+
+    /// 应用预处理结果到索引（主线程串行：postings push + doc_lens）
+    pub fn add_document_prepared(&mut self, row_id: u32, pairs: Vec<(u32, u32)>, n: u32) {
+        if row_id as usize >= self.doc_lens.len() {
+            self.doc_lens.resize(row_id as usize + 1, 0);
+        }
+        for (id, count) in &pairs {
             self.postings
                 .entry(*id)
                 .or_insert_with(CompressedPostings::new)
                 .push(row_id, *count);
-            if !ws_ids.contains(id) {
-                n += *count;
-            }
         }
         self.doc_lens[row_id as usize] = n;
         if row_id >= self.n_docs {
             self.n_docs = row_id + 1;
         }
+    }
+
+    /// 添加文档（预 tokenize 直供——v0.21 checkpoint tokenize 去重共享：
+    /// 调用方（table 插入路径）一次 tokenize，索引与 TD 压缩缓存两用。
+    /// 词表版本由 with_vocab 创建时设定；调用方须保证 token 流与索引版本一致）
+    pub fn add_document_with_tokens(&mut self, row_id: u32, text: &str, tokens: &[Token]) {
+        let (pairs, n) = Self::prepare_document(tokens, text);
+        self.add_document_prepared(row_id, pairs, n);
     }
 
     /// 删除文档（需原文重算 token）

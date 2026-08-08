@@ -2908,31 +2908,69 @@ impl Table {
 
     /// 批量更新全文索引（多行插入）——v0.21.1：一次 tokenize 两用
     /// （FTS 索引 + TokenStreamCache 供 TD 压缩 checkpoint 消费）
+    /// v0.21.2：行×列级并行 tokenize（profiling：tokenize 占插入路径 85%，
+    /// 20 核并行 → 49.5s 级插入 -85%）；索引更新/缓存填充主线程按序
     fn update_fts_indexes_for_rows(&mut self, rows: &[Vec<Value>], base_row_id: u32) {
         let col_names: Vec<String> = self.fts_indexes.keys().cloned().collect();
         let td_enabled = crate::storage::compression::token_delta_enabled();
+        // 预收集 (row_id, 列名索引, col_idx, text) 任务列表（借用 rows，并行只读）
+        let mut jobs: Vec<(u32, usize, u32, &str)> = Vec::new();
         for (row_idx, row) in rows.iter().enumerate() {
             let row_id = base_row_id + row_idx as u32;
-            for col_name in &col_names {
+            for (ci, col_name) in col_names.iter().enumerate() {
                 if let Some(col_idx) = self.def.column_index(col_name) {
                     if col_idx < row.len() {
                         if let Value::Varchar(text) = &row[col_idx] {
-                            if let Some(idx) = self.fts_indexes.get_mut(col_name) {
-                                if let Some(tok) = crate::storage::compression::global_tokenizer() {
-                                    let tokens = tok.tokenize(text);
-                                    idx.add_document_with_tokens(row_id, text, &tokens);
-                                    if td_enabled {
-                                        crate::storage::compression::token_stream_cache::TOKEN_STREAM_CACHE
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner())
-                                            .insert_row(col_idx as u32, text, &tokens, &tok);
-                                    }
-                                } else {
-                                    idx.add_document(row_id, text, None);
-                                }
-                            }
+                            jobs.push((row_id, ci, col_idx as u32, text.as_str()));
                         }
                     }
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let tok = crate::storage::compression::global_tokenizer();
+        // 并行段：tokenize + prepare（tf 聚合/排序，行×列独立无共享）
+        let prepared: Vec<(
+            Vec<crate::common::tokenizer::Token>,
+            Vec<(u32, u32)>,
+            u32,
+        )> = if let Some(tok) = &tok {
+            use rayon::prelude::*;
+            jobs.par_iter()
+                .map(|(_, _, _, text)| {
+                    let tokens = tok.tokenize(text);
+                    let (pairs, n) = crate::search::sparse::TokenInvertedIndex::prepare_document(
+                        &tokens,
+                        text,
+                    );
+                    (tokens, pairs, n)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // 批量缓存锁（v0.21.2：一次持锁填充整批，消除每行 lock 开销）
+        let mut cache_guard = if td_enabled {
+            Some(
+                crate::storage::compression::token_stream_cache::TOKEN_STREAM_CACHE
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            )
+        } else {
+            None
+        };
+        for (i, (row_id, ci, col_idx, text)) in jobs.iter().enumerate() {
+            if let Some(idx) = self.fts_indexes.get_mut(&col_names[*ci]) {
+                if let Some(tok) = &tok {
+                    let (tokens, pairs, n) = &prepared[i];
+                    idx.add_document_prepared(*row_id, pairs.clone(), *n);
+                    if let Some(cache) = cache_guard.as_mut() {
+                        cache.insert_row(*col_idx, text, tokens, tok);
+                    }
+                } else {
+                    idx.add_document(*row_id, text, None);
                 }
             }
         }
