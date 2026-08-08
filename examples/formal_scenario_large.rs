@@ -1,0 +1,215 @@
+//! 大数据量正式场景压测（v0.21.2）：formal_scenario 的放大版
+//!
+//! 数据构造：流式会话（3×610 快照）+ 独立消息 = 全量语料循环 × scale
+//! （默认 scale=2 → ~14 万行 / ~500MB 裸存；scale=3 → ~21 万行）
+//!
+//! 六臂对比：A 裸存 / B zstd-3 / C1-C3 TD 三形态（zstd 先行调度）/ D TD+FTS
+//!
+//! 用法：cargo run --release --example formal_scenario_large -- [corpus.jsonl] [vocab.bin] [scale]
+
+use std::time::Instant;
+
+use engramdb::common::config::{Config, TokenDeltaEntropy};
+use engramdb::common::types::{ColumnDef, DataType, TableDef};
+use engramdb::storage::Database;
+use engramdb::Value;
+
+const STREAM_SESSIONS: usize = 3;
+const STREAM_SNAPSHOTS: usize = 610;
+
+fn load_corpus(path: &str) -> Vec<String> {
+    let content = std::fs::read_to_string(path).expect("corpus");
+    content
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        })
+        .collect()
+}
+
+/// 场景数据：(session_id, seq, content) 行；独立消息 = 全量语料循环取
+/// `corpus.len() * scale` 条（不同相位偏移，流式会话数据不重复）
+fn build_rows(corpus: &[String], scale: usize) -> Vec<(i64, i64, String)> {
+    let independent = corpus.len() * scale;
+    let mut rows = Vec::with_capacity(STREAM_SESSIONS * STREAM_SNAPSHOTS + independent);
+    // 1. 流式会话（opencode 形态：消息前缀递增）
+    let mut long: Vec<&String> = corpus.iter().collect();
+    long.sort_by_key(|s| s.len());
+    for sid in 0..STREAM_SESSIONS {
+        let text = *long.iter().rev().nth(sid).unwrap();
+        let cc = text.chars().count();
+        let mut prev = String::new();
+        for i in 1..=STREAM_SNAPSHOTS {
+            let end = text
+                .char_indices()
+                .nth(i * cc / STREAM_SNAPSHOTS)
+                .map(|(idx, _)| idx)
+                .unwrap_or(text.len());
+            if prev.len() >= end {
+                continue;
+            }
+            prev = text[..end].to_string();
+            rows.push((sid as i64 + 1, i as i64, prev.clone()));
+        }
+    }
+    // 2. 独立消息（语料循环 × scale，相位偏移避免与流式重复）
+    for (i, t) in corpus
+        .iter()
+        .cycle()
+        .skip(97)
+        .take(independent)
+        .enumerate()
+    {
+        rows.push((STREAM_SESSIONS as i64 + 1, i as i64, t.clone()));
+    }
+    rows
+}
+
+/// 运行一臂，返回 (磁盘大小, 插入耗时, checkpoint 耗时, 读回校验结果)
+fn run_arm(tag: &str, dir: &str, corpus: &[String], scale: usize, tokenizer: Option<&str>, compress: bool, td_enabled: bool, entropy: TokenDeltaEntropy, with_fts: bool) -> (u64, u128, u128, bool) {
+    let _ = std::fs::remove_file(dir);
+    let _ = std::fs::remove_file(format!("{dir}-wal"));
+    let mut cfg = Config::default();
+    cfg.compress_on_persist = compress;
+    cfg.tokenizer_path = tokenizer.map(|s| s.to_string());
+    cfg.token_delta_enabled = td_enabled;
+    cfg.token_delta_entropy = entropy;
+    let mut db = Database::open_with_config(dir, cfg).unwrap();
+
+    let def = TableDef::new(
+        1,
+        "session_log",
+        vec![
+            ColumnDef::new("session_id", DataType::Int64),
+            ColumnDef::new("seq", DataType::Int64),
+            ColumnDef::new("ts", DataType::Int64),
+            ColumnDef::new("content", DataType::Varchar),
+        ],
+    );
+    db.create_table(def).unwrap();
+    if with_fts {
+        db.get_table_mut("session_log").unwrap().add_fts_index("content").unwrap();
+    }
+
+    let rows = build_rows(corpus, scale);
+    let mut expect: Vec<(i64, i64, String)> = Vec::with_capacity(rows.len());
+
+    // 插入（批量 2048 行）
+    let t0 = Instant::now();
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(2048);
+    for (i, (sid, seq, content)) in rows.iter().enumerate() {
+        batch.push(vec![
+            Value::Int64(*sid),
+            Value::Int64(*seq),
+            Value::Int64(1_700_000_000_000 + i as i64),
+            Value::Varchar(content.clone()),
+        ]);
+        expect.push((*sid, *seq, content.clone()));
+        if batch.len() >= 2048 {
+            db.get_table_mut("session_log").unwrap().insert(std::mem::take(&mut batch)).unwrap();
+        }
+    }
+    if !batch.is_empty() {
+        db.get_table_mut("session_log").unwrap().insert(batch).unwrap();
+    }
+    let insert_us = t0.elapsed().as_micros();
+
+    // checkpoint（压缩落盘）
+    let t1 = Instant::now();
+    db.checkpoint().unwrap();
+    let ckpt_us = t1.elapsed().as_micros();
+    drop(db);
+
+    // 重开读回：全量逐行校验
+    let t2 = Instant::now();
+    let mut cfg2 = Config::default();
+    cfg2.tokenizer_path = tokenizer.map(|s| s.to_string());
+    let mut db2 = Database::open_with_config(dir, cfg2).unwrap();
+    let scan = db2.get_table_mut("session_log").unwrap().scan(&[0, 1, 3]).unwrap();
+    let scan_us = t2.elapsed().as_micros();
+    let mut ok = scan.len() == expect.len();
+    if ok {
+        for (idx, (row, (exp_sid, exp_seq, exp_content))) in scan.iter().zip(expect.iter()).enumerate() {
+            let sid = match &row[0] { Value::Int64(v) => *v, _ => i64::MIN };
+            let seq = match &row[1] { Value::Int64(v) => *v, _ => i64::MIN };
+            let content = match &row[2] { Value::Varchar(s) => s.as_str(), _ => "" };
+            if sid != *exp_sid || seq != *exp_seq || content != exp_content {
+                ok = false;
+                println!("  ⚠ 首个不一致 @ 行 {idx}: sid={exp_sid} seq={exp_seq} expect len={} got len={}", exp_content.len(), content.len());
+                break;
+            }
+        }
+    }
+    drop(db2);
+
+    let main = std::fs::metadata(dir).map(|m| m.len()).unwrap_or(0);
+    let wal = std::fs::metadata(format!("{dir}-wal")).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "{}: 磁盘 {:.2}MB | 插入 {:.2}s | checkpoint {:.2}s | 读回校验 {:.2}s | {} 行 {}",
+        tag,
+        (main + wal) as f64 / 1048576.0,
+        insert_us as f64 / 1e6,
+        ckpt_us as f64 / 1e6,
+        scan_us as f64 / 1e6,
+        scan.len(),
+        if ok { "✓ 全部一致" } else { "✗ 数据不一致" }
+    );
+    (main + wal, insert_us, ckpt_us, ok)
+}
+
+fn main() {
+    let corpus_path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/engram_corpus/full_corpus.jsonl".into());
+    let vocab_path = std::env::args().nth(2).unwrap_or_else(|| "data/vocab/engram_vocab_v1.bin".into());
+    let scale: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(2);
+    let corpus = load_corpus(&corpus_path);
+    assert!(!corpus.is_empty(), "语料为空");
+    let rows = build_rows(&corpus, scale);
+    let text_bytes: usize = rows.iter().map(|(_, _, c)| c.len()).sum();
+    println!(
+        "大数据压测：语料 {} 条 | scale={} | 行数 {}（流式会话 {}×{} + 独立消息 {}）| 文本总量 {:.1}MB",
+        corpus.len(),
+        scale,
+        rows.len(),
+        STREAM_SESSIONS,
+        STREAM_SNAPSHOTS,
+        corpus.len() * scale,
+        text_bytes as f64 / 1048576.0
+    );
+    println!();
+
+    let (a_size, a_i, a_c, a_ok) = run_arm("A 裸存          ", "/tmp/formal_large_a", &corpus, scale, None, false, false, TokenDeltaEntropy::Varint, false);
+    let (b_size, b_i, b_c, b_ok) = run_arm("B zstd-3        ", "/tmp/formal_large_b", &corpus, scale, None, true, false, TokenDeltaEntropy::Varint, false);
+    let (v_size, v_i, v_c, v_ok) = run_arm("C1 TD+Varint    ", "/tmp/formal_large_c1", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Varint, false);
+    let (s_size, s_i, s_c, s_ok) = run_arm("C2 TD+Static    ", "/tmp/formal_large_c2", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Static, false);
+    let (h_size, h_i, h_c, h_ok) = run_arm("C3 TD+Huffman   ", "/tmp/formal_large_c3", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Huffman, false);
+    let (d_size, d_i, d_c, d_ok) = run_arm("D TD+FTS(缓存共享)", "/tmp/formal_large_d", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Static, true);
+
+    println!("\n==== 对比 ====");
+    println!("磁盘：B/A = {:.2}x，C2(Static)/A = {:.2}x，B/C2 = {:.2}x",
+        a_size as f64 / b_size.max(1) as f64,
+        a_size as f64 / s_size.max(1) as f64,
+        b_size as f64 / s_size.max(1) as f64);
+    println!("压缩率（vs 原文）：A {:.1}x / B {:.1}x / C1(Varint) {:.1}x / C2(Static) {:.1}x / C3(Huffman) {:.1}x / D(FTS缓存) {:.1}x（D 磁盘含 FTS 索引段）",
+        text_bytes as f64 / a_size.max(1) as f64,
+        text_bytes as f64 / b_size.max(1) as f64,
+        text_bytes as f64 / v_size.max(1) as f64,
+        text_bytes as f64 / s_size.max(1) as f64,
+        text_bytes as f64 / h_size.max(1) as f64,
+        text_bytes as f64 / d_size.max(1) as f64);
+    println!("插入耗时：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s / D {:.2}s",
+        a_i as f64 / 1e6, b_i as f64 / 1e6, v_i as f64 / 1e6, s_i as f64 / 1e6, h_i as f64 / 1e6, d_i as f64 / 1e6);
+    println!("checkpoint：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s / D(FTS缓存) {:.2}s",
+        a_c as f64 / 1e6, b_c as f64 / 1e6, v_c as f64 / 1e6, s_c as f64 / 1e6, h_c as f64 / 1e6, d_c as f64 / 1e6);
+    assert!(a_ok && b_ok && v_ok && s_ok && h_ok && d_ok, "存在数据不一致");
+    println!("数据完整性：六臂全部逐行一致 ✓");
+    for d in ["/tmp/formal_large_a", "/tmp/formal_large_b", "/tmp/formal_large_c1", "/tmp/formal_large_c2", "/tmp/formal_large_c3", "/tmp/formal_large_d"] {
+        let _ = std::fs::remove_file(d);
+        let _ = std::fs::remove_file(format!("{d}-wal"));
+    }
+}
