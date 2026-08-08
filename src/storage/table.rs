@@ -2854,9 +2854,11 @@ impl Table {
         }
     }
 
-    /// 批量更新全文索引（多行插入）
+    /// 批量更新全文索引（多行插入）——v0.21.1：一次 tokenize 两用
+    /// （FTS 索引 + TokenStreamCache 供 TD 压缩 checkpoint 消费）
     fn update_fts_indexes_for_rows(&mut self, rows: &[Vec<Value>], base_row_id: u32) {
         let col_names: Vec<String> = self.fts_indexes.keys().cloned().collect();
+        let td_enabled = crate::storage::compression::token_delta_enabled();
         for (row_idx, row) in rows.iter().enumerate() {
             let row_id = base_row_id + row_idx as u32;
             for col_name in &col_names {
@@ -2864,8 +2866,18 @@ impl Table {
                     if col_idx < row.len() {
                         if let Value::Varchar(text) = &row[col_idx] {
                             if let Some(idx) = self.fts_indexes.get_mut(col_name) {
-                                let tok = crate::storage::compression::global_tokenizer();
-                                idx.add_document(row_id, text, tok.as_deref());
+                                if let Some(tok) = crate::storage::compression::global_tokenizer() {
+                                    let tokens = tok.tokenize(text);
+                                    idx.add_document_with_tokens(row_id, text, &tokens);
+                                    if td_enabled {
+                                        crate::storage::compression::token_stream_cache::TOKEN_STREAM_CACHE
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .insert_row(col_idx as u32, text, &tokens, &tok);
+                                    }
+                                } else {
+                                    idx.add_document(row_id, text, None);
+                                }
                             }
                         }
                     }
@@ -2874,17 +2886,28 @@ impl Table {
         }
     }
 
-    /// 更新全文索引（单行插入时）
+    /// 更新全文索引（单行插入时）——v0.21.1：一次 tokenize 两用（同批量路径）
     fn update_fts_indexes_for_row(&mut self, row_id: u32, row: &[Value]) {
         let col_names: Vec<String> = self.fts_indexes.keys().cloned().collect();
+        let td_enabled = crate::storage::compression::token_delta_enabled();
         for col_name in col_names {
             if let Some(col_idx) = self.def.column_index(&col_name) {
                 if col_idx < row.len() {
                     if let Value::Varchar(text) = &row[col_idx] {
-                        if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
-                            let tok = crate::storage::compression::global_tokenizer();
-                            idx.add_document(row_id, text, tok.as_deref());
-                        }
+                            if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
+                                if let Some(tok) = crate::storage::compression::global_tokenizer() {
+                                    let tokens = tok.tokenize(text);
+                                    idx.add_document_with_tokens(row_id, text, &tokens);
+                                    if td_enabled {
+                                        crate::storage::compression::token_stream_cache::TOKEN_STREAM_CACHE
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .insert_row(col_idx as u32, text, &tokens, &tok);
+                                    }
+                                } else {
+                                    idx.add_document(row_id, text, None);
+                                }
+                            }
                     }
                 }
             }

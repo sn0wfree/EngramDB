@@ -373,6 +373,30 @@ best-of 裁剪判据：
 31830 行，单形态各一臂）：磁盘均 7.22MB、checkpoint 2.19s/2.19s/2.26s（tokenize 主导，
 形态差异 <4%）。
 
+**checkpoint tokenize 去重共享（2026-08-08，v0.21.1）**：
+
+问题：FTS 索引插入时 tokenize 一遍（索引维护），TD 压缩 checkpoint 时再 tokenize
+一遍（占压缩 96.5% 成本）——同源同表却算两遍。
+
+方案：`TokenStreamCache`（src/storage/compression/token_stream_cache.rs）——
+FTS 索引插入路径的一次 tokenize 产物（token id 流 + OOV 字符）按 (列号, **单行**
+内容 hash) 缓存；TD 压缩 checkpoint 时逐行精确匹配消费（行序无关——compact 按
+主键排序/删除后内容变化 → miss → 该行回退自 tokenize；tokenize 确定性保证
+hash 相同则 token 流必然一致，正确性零风险）。checkpoint 尾部清残留。
+
+正式场景实测（107MB / 31830 行，TD+Static 同配置）：
+
+| | C2 TD 无共享 | D TD+FTS 缓存共享 |
+|---|---|---|
+| 插入 | 0.14s | 6.39s（tokenize 移入 + FTS 索引构建；成本转移） |
+| **checkpoint** | **6.50s** | **0.71s（9.2×，接近 zstd 0.40s 水平）** |
+| 数据区压缩率 | 14.95× | 14.95×（持平） |
+| 数据完整性 | ✓ | ✓ 逐行一致 |
+
+净效果：FTS+TD 同开时总写路径成本相近，但**checkpoint 阻塞窗口从 6.5s 缩至
+0.7s**——暂停型 checkpoint 场景价值显著；仅 TD 无 FTS 时缓存不收集（无共享可
+用），TD 走自 tokenize（不变）。
+
 **词表三角（并行）**：纯 BPE / 种子 BPE（jieba 种子词）/ 人工词表基准
 ——同时测压缩率 + FTS 中文命中率（全量语料阶段执行）。
 

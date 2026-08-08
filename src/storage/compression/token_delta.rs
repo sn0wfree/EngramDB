@@ -22,6 +22,8 @@ use crate::common::error::{EngramDbError, Result};
 use crate::common::huffman;
 use crate::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 
+use super::token_stream_cache::{cache_row, CachedTokenRow};
+
 /// 熵编码形态（v0.21 起定义于 common::config，此处 re-export 保持路径兼容）
 pub use crate::common::config::{TokenDeltaEntropy, TokenDeltaEntropy as EntropyMode};
 
@@ -67,18 +69,51 @@ impl<'a> TokenDeltaCodec<'a> {
         if texts.is_empty() {
             return Vec::new();
         }
-        // 1. tokenize + 动态字典（行间共享前缀 → 增量 tokenize）
-        let mut dyn_dict: Vec<String> = Vec::new();
-        let mut dyn_index: fxhash::FxHashMap<String, u32> = fxhash::FxHashMap::default();
-        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+        // 1. tokenize（自给路径：无外部缓存）
+        let mut rows_tokens: Vec<Vec<Token>> = Vec::with_capacity(texts.len());
         let mut prev_text: &str = "";
         let mut prev_tokens: Vec<Token> = Vec::new();
         for text in texts {
             let tokens = self.tok.tokenize_incremental(prev_text, &prev_tokens, text);
-            let mut row = Vec::with_capacity(tokens.len());
-            for t in &tokens {
-                if t.id == UNKNOWN_ID {
-                    let ch = &text[t.offset.clone()];
+            rows_tokens.push(tokens.clone());
+            prev_text = text;
+            prev_tokens = tokens;
+        }
+        let cached: Vec<CachedTokenRow> = rows_tokens
+            .iter()
+            .zip(texts.iter())
+            .map(|(tokens, text)| cache_row(text, tokens))
+            .collect();
+        self.encode_block_inner(texts, &cached)
+    }
+
+    /// 从预 tokenize 缓存编码（v0.21 checkpoint tokenize 去重共享：
+    /// FTS 索引插入时的 token 流直供，跳过二次 tokenize）
+    pub fn encode_block_from_cache(&self, texts: &[&str], cached: &[CachedTokenRow]) -> Vec<u8> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        debug_assert_eq!(texts.len(), cached.len(), "缓存行数必须与文本行数一致");
+        self.encode_block_inner(texts, cached)
+    }
+
+    /// 编码主流程（tokenize 后的行 token 流直供；UNKNOWN 字符来自缓存）
+    fn encode_block_inner(&self, texts: &[&str], rows: &[CachedTokenRow]) -> Vec<u8> {
+        // 1. tokenize 结果 + 动态字典（行间共享前缀 → 增量 tokenize 已被缓存全量替代）
+        let mut dyn_dict: Vec<String> = Vec::new();
+        let mut dyn_index: fxhash::FxHashMap<String, u32> = fxhash::FxHashMap::default();
+        let mut row_ids: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
+        for cached in rows {
+            let mut row = Vec::with_capacity(cached.ids.len());
+            let mut unknown_idx = 0usize;
+            for &id in &cached.ids {
+                if id == UNKNOWN_ID {
+                    let ch = cached
+                        .unknowns
+                        .get(unknown_idx)
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    unknown_idx += 1;
                     let idx = match dyn_index.get(ch) {
                         Some(&i) => i,
                         None => {
@@ -90,18 +125,16 @@ impl<'a> TokenDeltaCodec<'a> {
                     };
                     row.push(self.tok.vocab_size() as u32 + idx);
                 } else {
-                    row.push(t.id);
+                    row.push(id);
                 }
             }
-            rows.push(row);
-            prev_text = text;
-            prev_tokens = tokens;
+            row_ids.push(row);
         }
 
         // 2. 前缀 delta
-        let mut deltas: Vec<(u32, Vec<u32>)> = Vec::with_capacity(rows.len());
+        let mut deltas: Vec<(u32, Vec<u32>)> = Vec::with_capacity(row_ids.len());
         let mut prev: &[u32] = &[];
-        for row in &rows {
+        for row in &row_ids {
             let shared = common_prefix(prev, row);
             deltas.push((shared as u32, row[shared..].to_vec()));
             prev = row;

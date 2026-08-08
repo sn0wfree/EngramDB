@@ -1266,6 +1266,9 @@ impl Database {
         // 4. 保存 indexes（二级索引）
         let _ = self.save_indexes()?;
 
+        // v0.21.1：token 流缓存使命完成（TD 压缩已消费可命中项；残留清空防内存泄漏）
+        crate::storage::compression::clear_token_stream_cache();
+
         Ok(())
     }
 }

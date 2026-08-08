@@ -17,6 +17,7 @@ pub mod delta;
 pub mod gorilla;
 pub mod double_delta;
 pub mod token_delta;
+pub mod token_stream_cache;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +56,19 @@ pub fn global_tokenizer() -> Option<Arc<Tokenizer>> {
 /// 显式设置全局 TokenDelta 熵形态（测试/降级场景；DB 打开时被 Config::token_delta_entropy 覆盖）
 pub fn set_token_delta_entropy(entropy: TokenDeltaEntropy) {
     TOKEN_DELTA_ENTROPY.store(entropy as u8, Ordering::Relaxed);
+}
+
+/// TokenDelta 是否参与压缩（table 插入路径据此决定是否收集 token 流缓存）
+pub fn token_delta_enabled() -> bool {
+    TOKEN_DELTA_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 清空 TokenStreamCache（checkpoint 尾部调用：压缩已消费全部可命中项）
+pub fn clear_token_stream_cache() {
+    token_stream_cache::TOKEN_STREAM_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
 }
 
 /// 按配置注册全局 Tokenizer（DB open/create 时调用）
@@ -523,6 +537,8 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
     // set_global_tokenizer 启用；zstd-3 主臂实测压缩率持平且快 ~15×）
     // v0.21：单形态熵编码（Config::token_delta_entropy）——三形态 best-of 已裁
     // （正式场景 Static 本身即最优；流式/重写场景 Huffman 更优但 zstd 已覆盖）
+    // v0.21.1：checkpoint tokenize 去重共享——FTS 索引插入时的 token 流缓存
+    // 直供（内容 hash 精确匹配；miss 回退自 tokenize）
     if TOKEN_DELTA_ENABLED.load(Ordering::Relaxed) {
         if let Some(tok) = global_tokenizer() {
             let strs: Vec<&str> = strings
@@ -536,7 +552,37 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
                     _ => TokenDeltaEntropy::Static,
                 };
                 let codec = token_delta::TokenDeltaCodec::new(&tok, mode);
-                let blob = codec.encode_block(&strs);
+                let blob = {
+                    let col_idx = token_stream_cache::CACHE_COL_IDX.load(Ordering::Relaxed);
+                    let mut cache = token_stream_cache::TOKEN_STREAM_CACHE
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if col_idx >= 0 {
+                        // v0.21.1：逐行匹配缓存（行级内容 hash，行序无关）；
+                        // 命中行用预 token 流，miss 行（排序/删除后内容变化）回退自 tokenize
+                        let mut rows: Vec<token_stream_cache::CachedTokenRow> =
+                            Vec::with_capacity(strs.len());
+                        let mut miss: Vec<usize> = Vec::new();
+                        for (i, s) in strs.iter().enumerate() {
+                            match cache.take_row(col_idx as u32, s, &tok) {
+                                Some(row) => rows.push(row),
+                                None => {
+                                    rows.push(token_stream_cache::cache_row(s, &[]));
+                                    miss.push(i);
+                                }
+                            }
+                        }
+                        if !miss.is_empty() {
+                            for &i in &miss {
+                                let tokens = tok.tokenize(strs[i]);
+                                rows[i] = token_stream_cache::cache_row(strs[i], &tokens);
+                            }
+                        }
+                        codec.encode_block_from_cache(&strs, &rows)
+                    } else {
+                        codec.encode_block(&strs)
+                    }
+                };
                 if blob.len() < best_size {
                     best_size = blob.len();
                     best = (CompressionType::TokenDelta, blob);

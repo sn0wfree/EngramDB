@@ -797,7 +797,7 @@ impl ColumnStore {
         let mut stats = CompressionStats::default();
 
         for rg in &mut self.row_groups {
-            for col in &mut rg.columns {
+            for (col_idx, col) in rg.columns.iter_mut().enumerate() {
                 if col.data.is_none() && !col.compressed_data.is_empty() {
                     continue; // 已经压缩过
                 }
@@ -817,8 +817,13 @@ impl ColumnStore {
                     None => Vec::new(),
                 };
 
-                // 调用压缩模块（自动选择最优算法）
+                // 调用压缩模块（自动选择最优算法）；列号供 TokenStreamCache 消费
+                // （v0.21.1 checkpoint tokenize 去重共享：TD 压缩复用索引 token 流）
+                crate::storage::compression::token_stream_cache::CACHE_COL_IDX
+                    .store(col_idx as i32, std::sync::atomic::Ordering::Relaxed);
                 let (ctype, compressed) = compression::compress(&bytes, &col.data_type)?;
+                crate::storage::compression::token_stream_cache::CACHE_COL_IDX
+                    .store(-1, std::sync::atomic::Ordering::Relaxed);
 
                 stats.total_original += original_size;
                 stats.total_compressed += compressed.len();

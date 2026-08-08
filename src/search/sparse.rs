@@ -16,7 +16,7 @@
 //! [str_len u32][(term_len u32, term, count u32, [row u32]*count)*]   // 降级模式
 //! ```
 
-use crate::common::tokenizer::{Tokenizer, UNKNOWN_ID};
+use crate::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 
 pub const TOKEN_INV_MAGIC: u32 = 0x54494e56; // "TINV"
 
@@ -79,25 +79,8 @@ impl TokenInvertedIndex {
         }
         match tok {
             Some(tok) => {
-                let mut tf: fxhash::FxHashMap<u32, u32> = fxhash::FxHashMap::default();
-                for t in tok.tokenize(text) {
-                    if t.id != UNKNOWN_ID {
-                        *tf.entry(t.id).or_insert(0) += 1;
-                    }
-                }
-                let mut pairs: Vec<(u32, u32)> = tf.into_iter().collect();
-                pairs.sort_by_key(|(id, _)| *id);
-                let mut n = 0u32;
-                for (id, count) in &pairs {
-                    self.postings.entry(*id).or_default().push((row_id, *count));
-                    // 空白 token（空格/制表/换行）不计入文档长度（BM25 惯例：
-                    // 文档长度应按有效词计，避免标点/空格惩罚长文本）
-                    if !is_ws_token(tok, *id) {
-                        n += *count;
-                    }
-                }
-                self.doc_lens[row_id as usize] = n;
-                self.vocab_version = Some(tok.version());
+                let tokens = tok.tokenize(text);
+                self.add_document_with_tokens(row_id, text, &tokens);
             }
             None => {
                 for term in tokenize_string(text) {
@@ -108,6 +91,41 @@ impl TokenInvertedIndex {
                 }
             }
         }
+        if row_id >= self.n_docs {
+            self.n_docs = row_id + 1;
+        }
+    }
+
+    /// 添加文档（预 tokenize 直供——v0.21 checkpoint tokenize 去重共享：
+    /// 调用方（table 插入路径）一次 tokenize，索引与 TD 压缩缓存两用。
+    /// 词表版本由 with_vocab 创建时设定；调用方须保证 token 流与索引版本一致）
+    pub fn add_document_with_tokens(&mut self, row_id: u32, text: &str, tokens: &[Token]) {
+        if row_id as usize >= self.doc_lens.len() {
+            self.doc_lens.resize(row_id as usize + 1, 0);
+        }
+        // 单遍：空白 token 集合（BM25 doc_len 排除）+ tf 聚合
+        let mut ws_ids: Vec<u32> = Vec::new();
+        let mut tf: fxhash::FxHashMap<u32, u32> = fxhash::FxHashMap::default();
+        for t in tokens {
+            if t.id == UNKNOWN_ID {
+                continue;
+            }
+            *tf.entry(t.id).or_insert(0) += 1;
+            let s = &text[t.offset.clone()];
+            if !s.is_empty() && s.chars().all(char::is_whitespace) && !ws_ids.contains(&t.id) {
+                ws_ids.push(t.id);
+            }
+        }
+        let mut pairs: Vec<(u32, u32)> = tf.into_iter().collect();
+        pairs.sort_by_key(|(id, _)| *id);
+        let mut n = 0u32;
+        for (id, count) in &pairs {
+            self.postings.entry(*id).or_default().push((row_id, *count));
+            if !ws_ids.contains(id) {
+                n += *count;
+            }
+        }
+        self.doc_lens[row_id as usize] = n;
         if row_id >= self.n_docs {
             self.n_docs = row_id + 1;
         }
