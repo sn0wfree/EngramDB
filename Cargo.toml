@@ -65,6 +65,10 @@ unicode-normalization = "0.1"
 # v0.21：块级文本压缩主臂（zstd-3，运行时依赖；CDict 实测仅 +1% 不引入）
 zstd = "0.13"
 
+# v0.21.2：TokenDelta Phase 2——checkpoint tokenize 行级并行（纯 Rust，
+# 零 C；流式前缀链场景自动回退串行增量路径）
+rayon = "1.10"
+
 # DataFusion 互操作（可选，启用 datafusion feature 时生效）
 datafusion = { version = "40", optional = true }
 datafusion-common = { version = "40", optional = true }

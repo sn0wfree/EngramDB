@@ -69,16 +69,28 @@ impl<'a> TokenDeltaCodec<'a> {
         if texts.is_empty() {
             return Vec::new();
         }
-        // 1. tokenize（自给路径：无外部缓存；逐行直转缓存行，免中间复制）
-        let mut cached: Vec<CachedTokenRow> = Vec::with_capacity(texts.len());
-        let mut prev_text: &str = "";
-        let mut prev_tokens: Vec<Token> = Vec::new();
-        for text in texts {
-            let tokens = self.tok.tokenize_incremental(prev_text, &prev_tokens, text);
-            cached.push(cache_row(text, &tokens));
-            prev_text = text;
-            prev_tokens = tokens;
-        }
+        // 1. tokenize。两路径（v0.21.2 Phase 2 并行）：
+        //    - 行级并行全量（独立文档块：行间无前缀依赖，tokenize 行独立）
+        //    - 串行增量（流式前缀链 / 小块：增量重放收益 > 并行开销；A 场景
+        //      610 级快照增量总成本 ~1.3× 全长，并行全量则 ~15×）
+        let cached: Vec<CachedTokenRow> = if texts.len() >= 8 && !is_prefix_chain(texts) {
+            use rayon::prelude::*;
+            texts
+                .par_iter()
+                .map(|t| cache_row(t, &self.tok.tokenize(t)))
+                .collect()
+        } else {
+            let mut cached = Vec::with_capacity(texts.len());
+            let mut prev_text: &str = "";
+            let mut prev_tokens: Vec<Token> = Vec::new();
+            for text in texts {
+                let tokens = self.tok.tokenize_incremental(prev_text, &prev_tokens, text);
+                cached.push(cache_row(text, &tokens));
+                prev_text = text;
+                prev_tokens = tokens;
+            }
+            cached
+        };
         self.encode_block_inner(texts, &cached)
     }
 
@@ -478,6 +490,12 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
         n += 1;
     }
     n
+}
+
+/// 相邻行递增前缀链（流式快照形态：strs[i+1] 以 strs[i] 为前缀）——
+/// 是则走串行增量路径（并行全量对快照场景反而慢 11×）
+fn is_prefix_chain(texts: &[&str]) -> bool {
+    texts.windows(2).all(|w| w[1].starts_with(w[0]))
 }
 
 fn encode_varint(out: &mut Vec<u8>, mut v: u32) {

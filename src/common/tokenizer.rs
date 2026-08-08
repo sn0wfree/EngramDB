@@ -210,6 +210,12 @@ impl Tokenizer {
         prev_tokens: &[Token],
         new_text: &str,
     ) -> Vec<Token> {
+        // 前缀关系判定（v0.21.2 收紧）：仅 new 以 prev 为前缀（流式追加）或
+        // new 是 prev 前缀（截断）时走增量；非前缀（共享长前缀但后续不同）
+        // 一律全量——重放段假设 prev 前缀，非前缀重放产生非标准 token 流
+        if !new_text.starts_with(prev_text) && !prev_text.starts_with(new_text) {
+            return self.tokenize(new_text);
+        }
         let pbytes = prev_text.as_bytes();
         let nbytes = new_text.as_bytes();
         let mut p = 0usize;

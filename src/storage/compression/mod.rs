@@ -573,9 +573,17 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
                             }
                         }
                         if !miss.is_empty() {
-                            for &i in &miss {
-                                let tokens = tok.tokenize(strs[i]);
-                                rows[i] = token_stream_cache::cache_row(strs[i], &tokens);
+                            // v0.21.2 Phase 2：miss 行回退 tokenize 并行（独立行，
+                            // 无前缀依赖；rayon 任务不触缓存锁 → 锁内安全）
+                            use rayon::prelude::*;
+                            let miss_rows: Vec<(usize, token_stream_cache::CachedTokenRow)> = miss
+                                .par_iter()
+                                .map(|&i| {
+                                    (i, token_stream_cache::cache_row(strs[i], &tok.tokenize(strs[i])))
+                                })
+                                .collect();
+                            for (i, row) in miss_rows {
+                                rows[i] = row;
                             }
                         }
                         codec.encode_block_from_cache(&strs, &rows)

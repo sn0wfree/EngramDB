@@ -1353,6 +1353,7 @@ dependencies = [
  "log",
  "nom",
  "rand 0.8.7",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",
