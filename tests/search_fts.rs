@@ -114,6 +114,40 @@ fn test_fuzzy_edit_distance() {
 }
 
 #[test]
+fn test_fuzzy_edit_distance_banded() {
+    // banded 与全宽一致（带内）；带外返回长度差（剪枝语义）
+    let tok = make_tokenizer();
+    let a = ids(&tok, "你好世界 hello");
+    let b = ids(&tok, "你好世界 hello world");
+    assert_eq!(edit_distance(&a, &a, 8), 0, "相同序列距离 0");
+    // b 多「空格+w,o,r,l,d」5 个 token（词表无 world 组合，逐字符）
+    assert_eq!(edit_distance(&a, &b, 8), 5, "多 5 个 token 距离 5");
+    // 差异超过 max_dist → 剪枝返回长度差
+    let c = ids(&tok, "你好世界 hello world world world");
+    let d = edit_distance(&a, &c, 2);
+    assert_eq!(d, a.len().abs_diff(c.len()), "带外剪枝返回长度差");
+    // 带外小距离验证：全宽参考
+    let mut brute = 0usize;
+    for _ in 0..1 {
+        // 与全宽行向量对比（小序列）
+        let x = ids(&tok, "你好世界");
+        let y = ids(&tok, "你好世界！");
+        let mut prev: Vec<usize> = (0..=y.len()).collect();
+        let mut cur = vec![0usize; y.len() + 1];
+        for i in 1..=x.len() {
+            cur[0] = i;
+            for j in 1..=y.len() {
+                let cost = if x[i - 1] == y[j - 1] { 0 } else { 1 };
+                cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        brute = prev[y.len()];
+    }
+    assert_eq!(edit_distance(&ids(&tok, "你好世界"), &ids(&tok, "你好世界！"), 8), brute, "banded 与全宽一致");
+}
+
+#[test]
 fn test_fuzzy_ngram_overlap() {
     let tok = make_tokenizer();
     let a = ids(&tok, "你好世界 hello");

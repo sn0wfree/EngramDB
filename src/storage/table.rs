@@ -2745,6 +2745,19 @@ impl Table {
         let mut out: Vec<(u32, f32)> = Vec::new();
         for row in candidates {
             let Some(text) = self.row_text(row, column_name) else { continue };
+            let text = {
+                // 前缀窗口截断（字节安全）——模糊匹配只 tokenize 文档前缀
+                const MAX_BYTES: usize = 2048;
+                if text.len() > MAX_BYTES {
+                    let mut end = MAX_BYTES;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text[..end].to_string()
+                } else {
+                    text
+                }
+            };
             let doc_ids: Vec<u32> = {
                 let Some(tok) = crate::storage::compression::global_tokenizer() else {
                     break;
@@ -2782,6 +2795,19 @@ impl Table {
         let mut out: Vec<(u32, f32)> = Vec::new();
         for row in candidates {
             let Some(text) = self.row_text(row, column_name) else { continue };
+            let text = {
+                // 前缀窗口截断（字节安全）——模糊匹配只 tokenize 文档前缀
+                const MAX_BYTES: usize = 2048;
+                if text.len() > MAX_BYTES {
+                    let mut end = MAX_BYTES;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text[..end].to_string()
+                } else {
+                    text
+                }
+            };
             let doc_ids: Vec<u32> = {
                 let Some(tok) = crate::storage::compression::global_tokenizer() else {
                     break;

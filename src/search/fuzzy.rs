@@ -12,39 +12,57 @@ use super::bm25::query_ids;
 use super::sparse::TokenInvertedIndex;
 use crate::common::tokenizer::{Tokenizer, UNKNOWN_ID};
 
-/// 候选召回上限（防御性：宽召回可能很大）
-const CANDIDATE_LIMIT: usize = 512;
+/// 候选召回上限（防御性：宽召回可能很大；模糊匹配对 top-k=10，256 候选富余）
+const CANDIDATE_LIMIT: usize = 256;
 
-/// token 序列级 Levenshtein 距离（行向量，长度差 > max_dist 直接剪枝）
+/// 模糊匹配输入前缀窗口：只 tokenize 文档前缀（流式会话场景共享前缀即关键区；
+/// 避免全文 tokenize 长文档拖慢模糊检索）
+const MAX_TEXT_BYTES: usize = 1024;
+
+/// 前缀窗口截断（字节安全：回退到字符边界）
+fn prefix_window(text: &str) -> &str {
+    if text.len() <= MAX_TEXT_BYTES {
+        return text;
+    }
+    let mut end = MAX_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// token 序列级 Levenshtein 距离（banded：只算 |i-j| <= max_dist 对角带，
+/// 带外视为不可达——O(m × (2·max_dist)) 替代 O(m×n)）
 pub fn edit_distance(a: &[u32], b: &[u32], max_dist: usize) -> usize {
-    let (la, lb) = (a.len(), b.len());
-    let diff = la.abs_diff(lb);
-    if diff > max_dist {
-        return diff; // 必然超限
+    let m = a.len();
+    let n = b.len();
+    if m.abs_diff(n) > max_dist {
+        return m.abs_diff(n);
     }
-    if la == 0 {
-        return lb;
+    if max_dist == 0 {
+        return if a == b { 0 } else { 1 };
     }
-    if lb == 0 {
-        return la;
-    }
-    let mut prev: Vec<usize> = (0..=lb).collect();
-    let mut cur = vec![0usize; lb + 1];
-    for i in 1..=la {
+    const INF: usize = usize::MAX / 4;
+    // 第 0 行：dp[0][j] = j（空 a 到 b 前缀的距离，全有效边界）
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur = vec![INF; n + 1];
+    for i in 1..=m {
         cur[0] = i;
-        let mut row_min = cur[0];
-        for j in 1..=lb {
+        let lo = 1usize.max(i.saturating_sub(max_dist));
+        let hi = n.min(i + max_dist);
+        for j in lo..=hi {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-            row_min = row_min.min(cur[j]);
+            cur[j] = prev[j].min(cur[j - 1]).min(prev[j - 1]).min(INF - 1) + cost;
         }
-        // 行最小已超限 → 可剪枝（后续行最小单调不减）
-        if row_min > max_dist {
-            return row_min;
+        // 清带外（上一行残余值不得泄漏到下一轮读取）
+        for j in 0..=n {
+            if j > hi + 1 || j + 1 < lo {
+                cur[j] = INF;
+            }
         }
         std::mem::swap(&mut prev, &mut cur);
     }
-    prev[lb]
+    prev[n]
 }
 
 /// token 序列 n-gram（有序对列表）
@@ -131,7 +149,7 @@ pub fn search_edit(
     for row in candidate_rows(idx, &ids) {
         let Some(text) = get_text(row) else { continue };
         let doc_ids: Vec<u32> = tok
-            .tokenize(&text)
+            .tokenize(prefix_window(&text))
             .iter()
             .filter(|t| t.id != UNKNOWN_ID && !tok.id_to_token(t.id).map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace)))
             .map(|t| t.id)
@@ -162,7 +180,7 @@ pub fn search_ngram(
     for row in candidate_rows(idx, &ids) {
         let Some(text) = get_text(row) else { continue };
         let doc_ids: Vec<u32> = tok
-            .tokenize(&text)
+            .tokenize(prefix_window(&text))
             .iter()
             .filter(|t| t.id != UNKNOWN_ID && !tok.id_to_token(t.id).map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace)))
             .map(|t| t.id)
