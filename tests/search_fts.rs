@@ -69,6 +69,38 @@ fn test_token_inverted_serialization_roundtrip() {
 }
 
 #[test]
+fn test_token_inverted_tinv1_compat() {
+    // TINV1 旧段（v0.21 展开格式）→ from_bytes 兼容读取
+    let tok = make_tokenizer();
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&0x54494e56u32.to_le_bytes()); // TINV
+    buf.extend_from_slice(&(tok.version() as i16).to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes()); // n_docs
+    buf.extend_from_slice(&1u32.to_le_bytes()); // postings count
+    // token "你好" id
+    let nid = tok.token_to_id("你好").unwrap();
+    buf.extend_from_slice(&nid.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes()); // count
+    buf.extend_from_slice(&0u32.to_le_bytes()); // row 0
+    buf.extend_from_slice(&1u32.to_le_bytes()); // tf
+    buf.extend_from_slice(&1u32.to_le_bytes()); // row 1
+    buf.extend_from_slice(&2u32.to_le_bytes()); // tf
+    buf.extend_from_slice(&2u32.to_le_bytes()); // doc_lens count
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes()); // doc0 len
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes()); // doc1 len
+    buf.extend_from_slice(&0u32.to_le_bytes()); // string postings
+
+    let restored = TokenInvertedIndex::from_bytes(&buf).unwrap();
+    assert_eq!(restored.n_docs(), 2);
+    let hits = restored.search_and(&[nid]);
+    assert_eq!(hits, vec![0, 1], "TINV1 旧段应正常查询");
+    let (entries, _) = restored.size_stats();
+    assert_eq!(entries, 2);
+}
+
+#[test]
 fn test_token_inverted_string_fallback() {
     // 无 Tokenizer → 字符串降级模式（原 InvertedIndex 语义不丢）
     let mut idx = TokenInvertedIndex::new();

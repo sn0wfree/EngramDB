@@ -94,22 +94,23 @@ fn main() {
     }
     let build_us = t0.elapsed().as_micros();
     let (entries, keys) = idx.size_stats();
+    let mem_stream = idx.postings_memory_bytes();
     let ser = idx.to_bytes();
     println!(
-        "构建：{:>8}µs ({:>7.0} 行/s, {:.1}µs/行) | 键 {} 条目 {} | 内存约 {:.1}MB | 序列化 {:.1}MB",
+        "构建：{:>8}µs ({:>7.0} 行/s, {:.1}µs/行) | 键 {} 条目 {} | postings 流 {:.1}MB | 序列化(TINV2) {:.1}MB",
         build_us,
         rows.len() as f64 / (build_us as f64 / 1e6),
         build_us as f64 / rows.len() as f64,
         keys,
         entries,
-        entries as f64 * 8.0 / 1048576.0,
+        mem_stream as f64 / 1048576.0,
         ser.len() as f64 / 1048576.0
     );
 
     // ---- 2. query 集（全局频率 top 词）----
     let mut ranked: Vec<(u32, u64)> = Vec::new();
-    for (id, pairs) in idx.postings() {
-        let f: u64 = pairs.iter().map(|(_, tf)| *tf as u64).sum();
+    for (id, cp) in idx.postings() {
+        let f: u64 = cp.decode().iter().map(|(_, tf)| *tf as u64).sum();
         ranked.push((*id, f));
     }
     ranked.sort_by_key(|(_, f)| std::cmp::Reverse(*f));

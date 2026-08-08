@@ -8,23 +8,158 @@
 //! - **字符串降级模式**：无全局 Tokenizer 时按空白符+标点分词（原 InvertedIndex 逻辑），
 //!   不丢功能
 //!
-//! 块格式（to_bytes，手动字节流，对齐 storage/index 持久化风格）：
+//! v0.21.2 体积优化（TINV2 格式）：postings 行号 **delta varint 流** + **tf u8 流**
+//! （条目 8B → ~3B，内存 -60%）；doc_lens 连续数组（4B/行）；查询时 term 级解码
+//! （平均 64 行/term ≈ µs 级）。TINV1 旧段读取兼容。
+//!
+//! TINV2 块格式：
 //! ```text
-//! [magic u32][vocab_version i16(-1=字符串模式)][n_docs u32]
-//! [postings_len u32][(token_id u32, count u32, [(row u32, tf u32)]*count)*]
-//! [doc_lens_len u32][(row u32, len u32)*]
+//! [magic u32=0x54494e32][vocab_version i16(-1=字符串模式)][n_docs u32]
+//! [postings_len u32][(token_id u32, count u32, rows_len u32, delta_rows, tfs)]*
+//! [doc_lens_len u32][len u32]*                       // 连续数组（行号 = 下标）
 //! [str_len u32][(term_len u32, term, count u32, [row u32]*count)*]   // 降级模式
 //! ```
 
 use crate::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 
-pub const TOKEN_INV_MAGIC: u32 = 0x54494e56; // "TINV"
+/// TINV1 格式 magic（旧段，读取兼容）
+pub const TOKEN_INV_MAGIC_V1: u32 = 0x54494e56; // "TINV"
+/// TINV2 格式 magic（delta varint + tf u8 + 连续 doc_lens）
+pub const TOKEN_INV_MAGIC: u32 = 0x54494e32; // "TIN2"
+
+/// 压缩 postings：行号 delta varint 流 + tf u8 流（行号严格递增）
+#[derive(Debug, Clone)]
+pub struct CompressedPostings {
+    rows: Vec<u8>,
+    tfs: Vec<u8>,
+    count: u32,
+    /// 最后写入的行号（push O(1) delta）
+    last_row: u32,
+}
+
+impl CompressedPostings {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            tfs: Vec::new(),
+            count: 0,
+            last_row: 0,
+        }
+    }
+
+    /// 追加 (row, tf)；row 必须严格大于上一个
+    fn push(&mut self, row: u32, tf: u32) {
+        debug_assert!(row >= self.last_row, "postings row 必须非递减");
+        push_varint(&mut self.rows, row - self.last_row);
+        self.tfs.push(tf.min(255) as u8); // tf 钳制 u8（>255 罕见）
+        self.count += 1;
+        self.last_row = row;
+    }
+
+    fn from_pairs(pairs: &[(u32, u32)]) -> Self {
+        let mut cp = Self::new();
+        for (r, tf) in pairs {
+            cp.push(*r, *tf);
+        }
+        cp
+    }
+
+    /// 条目数
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// 解码为展开 (row, tf)（有序；查询/BM25 用）
+    pub fn decode(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::with_capacity(self.count as usize);
+        let mut pos = 0usize;
+        let mut row = 0u32;
+        for _ in 0..self.count {
+            let delta = read_varint(&self.rows, &mut pos).unwrap_or(0);
+            row += delta;
+            let tf = self.tfs.get(out.len()).copied().unwrap_or(0) as u32;
+            out.push((row, tf));
+        }
+        out
+    }
+
+    /// 只解行号（召回用）
+    pub fn decode_rows(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.count as usize);
+        let mut pos = 0usize;
+        let mut row = 0u32;
+        for _ in 0..self.count {
+            let delta = read_varint(&self.rows, &mut pos).unwrap_or(0);
+            row += delta;
+            out.push(row);
+        }
+        out
+    }
+
+    /// 内存字节（rows + tfs 流）
+    pub fn memory_bytes(&self) -> usize {
+        self.rows.len() + self.tfs.len()
+    }
+
+    // --- 序列化辅助（TINV2）---
+    fn to_wire(&self) -> (Vec<u8>, Vec<u8>) {
+        (self.rows.clone(), self.tfs.clone())
+    }
+
+    fn from_wire(rows: &[u8], tfs: &[u8], count: u32) -> Self {
+        // last_row = 解码最后一行（一次性 O(n)，load 时仅一次）
+        let mut last_row = 0u32;
+        let mut pos = 0usize;
+        for _ in 0..count {
+            last_row += read_varint(rows, &mut pos).unwrap_or(0);
+        }
+        Self {
+            rows: rows.to_vec(),
+            tfs: tfs.to_vec(),
+            count,
+            last_row,
+        }
+    }
+}
+
+fn push_varint(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            break;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn read_varint(data: &[u8], pos: &mut usize) -> Option<u32> {
+    let mut v = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        v |= ((b & 0x7f) as u32) << shift;
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift > 28 {
+            return None;
+        }
+    }
+}
 
 /// Token 级倒排索引（行级 postings）
 #[derive(Debug, Clone)]
 pub struct TokenInvertedIndex {
-    /// token_id → (row_id, tf)，row_id 严格递增
-    postings: fxhash::FxHashMap<u32, Vec<(u32, u32)>>,
+    /// token_id → 压缩 postings（行号递增）
+    postings: fxhash::FxHashMap<u32, CompressedPostings>,
     /// row_id → token 总数（BM25 doc_len；含重复）
     doc_lens: Vec<u32>,
     n_docs: u32,
@@ -74,9 +209,6 @@ impl TokenInvertedIndex {
 
     /// 添加文档。tok = None → 字符串降级模式。
     pub fn add_document(&mut self, row_id: u32, text: &str, tok: Option<&Tokenizer>) {
-        if row_id as usize >= self.doc_lens.len() {
-            self.doc_lens.resize(row_id as usize + 1, 0);
-        }
         match tok {
             Some(tok) => {
                 let tokens = tok.tokenize(text);
@@ -89,10 +221,13 @@ impl TokenInvertedIndex {
                         entry.push(row_id);
                     }
                 }
+                if row_id as usize >= self.doc_lens.len() {
+                    self.doc_lens.resize(row_id as usize + 1, 0);
+                }
+                if row_id >= self.n_docs {
+                    self.n_docs = row_id + 1;
+                }
             }
-        }
-        if row_id >= self.n_docs {
-            self.n_docs = row_id + 1;
         }
     }
 
@@ -120,7 +255,10 @@ impl TokenInvertedIndex {
         pairs.sort_by_key(|(id, _)| *id);
         let mut n = 0u32;
         for (id, count) in &pairs {
-            self.postings.entry(*id).or_default().push((row_id, *count));
+            self.postings
+                .entry(*id)
+                .or_insert_with(CompressedPostings::new)
+                .push(row_id, *count);
             if !ws_ids.contains(id) {
                 n += *count;
             }
@@ -142,10 +280,16 @@ impl TokenInvertedIndex {
                     }
                 }
                 for id in ids {
-                    if let Some(p) = self.postings.get_mut(&id) {
-                        p.retain(|(r, _)| *r != row_id);
-                        if p.is_empty() {
+                    if let Some(cp) = self.postings.get_mut(&id) {
+                        let kept: Vec<(u32, u32)> = cp
+                            .decode()
+                            .into_iter()
+                            .filter(|(r, _)| *r != row_id)
+                            .collect();
+                        if kept.is_empty() {
                             self.postings.remove(&id);
+                        } else {
+                            *cp = CompressedPostings::from_pairs(&kept);
                         }
                     }
                 }
@@ -161,20 +305,25 @@ impl TokenInvertedIndex {
                 }
             }
         }
-        if row_id as usize == self.n_docs as usize - 1 {
-            // 末行删除可收缩；中间行保持（row_id 空间不重排）
-        }
     }
 
-    /// 单 token 召回（词表 id）
+    /// 单 token 召回（词表 id；解码行号）
     pub fn search_term(&self, id: u32) -> Vec<u32> {
         self.postings
             .get(&id)
-            .map(|p| p.iter().map(|(r, _)| *r).collect())
+            .map(|p| p.decode_rows())
             .unwrap_or_default()
     }
 
-    /// AND 交集（最小 postings 驱动，两侧均有序 → 二分/游标合并）
+    /// 解码 (row, tf) 对（BM25/审计用）
+    pub fn decoded_postings(&self, id: u32) -> Vec<(u32, u32)> {
+        self.postings
+            .get(&id)
+            .map(|p| p.decode())
+            .unwrap_or_default()
+    }
+
+    /// AND 交集（最小 postings 驱动，两侧均有序 → 游标合并）
     pub fn search_and(&self, query_ids: &[u32]) -> Vec<u32> {
         if query_ids.is_empty() {
             return Vec::new();
@@ -240,8 +389,8 @@ impl TokenInvertedIndex {
         }
     }
 
-    /// 词表 id 模式 postings（只读）
-    pub fn postings(&self) -> &fxhash::FxHashMap<u32, Vec<(u32, u32)>> {
+    /// 词表 id 模式 postings（只读，紧凑形态——解码用 decoded_postings/search_term）
+    pub fn postings(&self) -> &fxhash::FxHashMap<u32, CompressedPostings> {
         &self.postings
     }
 
@@ -259,14 +408,20 @@ impl TokenInvertedIndex {
         (sum as f32 / self.n_docs as f32).max(1.0)
     }
 
+    /// (条目数, 键数)
     pub fn size_stats(&self) -> (usize, usize) {
         let entries: usize = self.postings.values().map(|p| p.len()).sum();
         let str_entries: usize = self.string_postings.values().map(|p| p.len()).sum();
         (entries + str_entries, self.postings.len() + self.string_postings.len())
     }
 
+    /// postings 流内存字节（不含 HashMap 桶开销）
+    pub fn postings_memory_bytes(&self) -> usize {
+        self.postings.values().map(|p| p.memory_bytes()).sum()
+    }
+
     // ------------------------------------------------------------------
-    // 序列化（修复现状「FTS 索引不落盘」缺陷；词表版本不符 → 惰性重建）
+    // 序列化（TINV2 紧凑格式；TINV1 旧段读取兼容）
     // ------------------------------------------------------------------
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -276,17 +431,17 @@ impl TokenInvertedIndex {
         buf.extend_from_slice(&ver.to_le_bytes());
         buf.extend_from_slice(&self.n_docs.to_le_bytes());
         buf.extend_from_slice(&(self.postings.len() as u32).to_le_bytes());
-        for (id, pairs) in &self.postings {
+        for (id, cp) in &self.postings {
             buf.extend_from_slice(&id.to_le_bytes());
-            buf.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
-            for (r, tf) in pairs {
-                buf.extend_from_slice(&r.to_le_bytes());
-                buf.extend_from_slice(&tf.to_le_bytes());
-            }
+            buf.extend_from_slice(&(cp.len() as u32).to_le_bytes());
+            let (rows, tfs) = cp.to_wire();
+            buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&rows);
+            buf.extend_from_slice(&tfs);
         }
+        // doc_lens 连续数组（行号 = 下标；4B/行 vs 旧 8B/行）
         buf.extend_from_slice(&(self.doc_lens.len() as u32).to_le_bytes());
-        for (r, l) in self.doc_lens.iter().enumerate() {
-            buf.extend_from_slice(&(r as u32).to_le_bytes());
+        for l in &self.doc_lens {
             buf.extend_from_slice(&l.to_le_bytes());
         }
         buf.extend_from_slice(&(self.string_postings.len() as u32).to_le_bytes());
@@ -302,7 +457,21 @@ impl TokenInvertedIndex {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        let mut pos = 0usize;
+        if data.len() < 4 {
+            return Err("token inverted: too short".into());
+        }
+        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        if magic == TOKEN_INV_MAGIC_V1 {
+            Self::from_bytes_v1(data)
+        } else if magic == TOKEN_INV_MAGIC {
+            Self::from_bytes_v2(data)
+        } else {
+            Err("token inverted: bad magic".into())
+        }
+    }
+
+    fn from_bytes_v2(data: &[u8]) -> Result<Self, String> {
+        let mut pos = 4usize;
         let rd = |pos: &mut usize, n: usize, what: &str| -> Result<&[u8], String> {
             if *pos + n > data.len() {
                 return Err(format!("token inverted: truncated {what}"));
@@ -314,10 +483,56 @@ impl TokenInvertedIndex {
         let u32_at = |p: &[u8]| u32::from_le_bytes(p.try_into().unwrap());
         let i16_at = |p: &[u8]| i16::from_le_bytes(p.try_into().unwrap());
 
-        let magic = u32_at(rd(&mut pos, 4, "magic")?);
-        if magic != TOKEN_INV_MAGIC {
-            return Err("token inverted: bad magic".into());
+        let ver = i16_at(rd(&mut pos, 2, "version")?);
+        let n_docs = u32_at(rd(&mut pos, 4, "n_docs")?);
+        let mut idx = TokenInvertedIndex::new();
+        idx.n_docs = n_docs;
+        idx.vocab_version = if ver < 0 { None } else { Some(ver as u16) };
+
+        let n_postings = u32_at(rd(&mut pos, 4, "postings count")?) as usize;
+        for _ in 0..n_postings {
+            let id = u32_at(rd(&mut pos, 4, "token id")?);
+            let count = u32_at(rd(&mut pos, 4, "posting count")?) as usize;
+            let rows_len = u32_at(rd(&mut pos, 4, "rows len")?) as usize;
+            let rows = rd(&mut pos, rows_len, "rows")?;
+            let tfs = rd(&mut pos, count, "tfs")?;
+            idx.postings
+                .insert(id, CompressedPostings::from_wire(rows, tfs, count as u32));
         }
+        let n_lens = u32_at(rd(&mut pos, 4, "doc lens count")?) as usize;
+        let lens = rd(&mut pos, n_lens * 4, "doc lens")?;
+        idx.doc_lens = lens
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let n_str = u32_at(rd(&mut pos, 4, "string postings count")?) as usize;
+        for _ in 0..n_str {
+            let tlen = u32_at(rd(&mut pos, 4, "term len")?) as usize;
+            let term = String::from_utf8_lossy(rd(&mut pos, tlen, "term")?).into_owned();
+            let count = u32_at(rd(&mut pos, 4, "string count")?) as usize;
+            let mut rows = Vec::with_capacity(count);
+            for _ in 0..count {
+                rows.push(u32_at(rd(&mut pos, 4, "string row")?));
+            }
+            idx.string_postings.insert(term, rows);
+        }
+        Ok(idx)
+    }
+
+    /// TINV1 旧格式（v0.21 写入：展开 (row, tf) 对）→ 转紧凑
+    fn from_bytes_v1(data: &[u8]) -> Result<Self, String> {
+        let mut pos = 4usize;
+        let rd = |pos: &mut usize, n: usize, what: &str| -> Result<&[u8], String> {
+            if *pos + n > data.len() {
+                return Err(format!("token inverted: truncated {what}"));
+            }
+            let s = &data[*pos..*pos + n];
+            *pos += n;
+            Ok(s)
+        };
+        let u32_at = |p: &[u8]| u32::from_le_bytes(p.try_into().unwrap());
+        let i16_at = |p: &[u8]| i16::from_le_bytes(p.try_into().unwrap());
+
         let ver = i16_at(rd(&mut pos, 2, "version")?);
         let n_docs = u32_at(rd(&mut pos, 4, "n_docs")?);
         let mut idx = TokenInvertedIndex::new();
@@ -334,7 +549,7 @@ impl TokenInvertedIndex {
                 let tf = u32_at(rd(&mut pos, 4, "tf")?);
                 pairs.push((r, tf));
             }
-            idx.postings.insert(id, pairs);
+            idx.postings.insert(id, CompressedPostings::from_pairs(&pairs));
         }
         let n_lens = u32_at(rd(&mut pos, 4, "doc lens count")?) as usize;
         let mut dl: Vec<(u32, u32)> = Vec::with_capacity(n_lens);

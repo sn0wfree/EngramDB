@@ -58,13 +58,16 @@ pub fn search(
     let k1 = params.k1;
     let b = params.b;
 
-    // 预取各 term 的 postings + idf
-    let mut terms: Vec<(u32, &[(u32, u32)], f32)> = Vec::with_capacity(ids.len());
+    // 预取各 term 的 postings（v0.21.2 紧凑存储 → term 级解码）+ idf
+    let mut terms: Vec<(u32, Vec<(u32, u32)>, f32)> = Vec::with_capacity(ids.len());
     for id in &ids {
-        let Some(p) = idx.postings().get(id) else { continue };
-        let df = p.len() as f32;
+        let pairs = idx.decoded_postings(*id);
+        if pairs.is_empty() {
+            continue;
+        }
+        let df = pairs.len() as f32;
         let idf = (1.0 + (n_docs - df + 0.5) / (df + 0.5)).ln();
-        terms.push((*id, p.as_slice(), idf));
+        terms.push((*id, pairs, idf));
     }
     if terms.is_empty() {
         return Vec::new();

@@ -1355,11 +1355,11 @@ mod tests {
     fn test_table_empty_indexes() {
         let table = make_test_table();
         let bytes = table.indexes_to_bytes();
-        // skip_count(4B) = 0 + vec_count(4B) = 0 + mark_len(4B) = 0 + sparse_len(4B) = 0 + fts_count(4B) = 0 = 20 bytes
+        // skip_count(4B) = 0 + vec_count(4B) = 0 + mark_len(4B) = 0 + sparse_len(4B) = 0 + fts_magic(4B) + fts_count(4B) = 0 = 24 bytes
         // （v0.17.0 M1-7：尾部追加主键 Mark Index 长度字段）
         // （v0.19 分层索引：再追加稀疏索引段长度字段）
-        // （v0.21 检索层：再追加 FTS 索引段长度字段）
-        assert_eq!(bytes.len(), 20);
+        // （v0.21 检索层：再追加 FTS 索引段；v0.21.2 段头加 magic 区分压缩格式）
+        assert_eq!(bytes.len(), 24);
 
         let mut table2 = make_test_table();
         table2.indexes_from_bytes(&bytes).unwrap();

@@ -876,14 +876,19 @@ impl Table {
         }
 
         // --- FTS 索引段（v0.21 新增，修复「FTS 索引不落盘」缺陷）---
-        // 格式：[fts_count:u32][(name_len:u32, name, data_len:u32, TokenInvertedIndex::to_bytes)*]
+        // v0.21.2 格式：[fts_magic u32=0x46545321][count:u32][(name_len, name, raw_len, data_len, zstd(data))]*
+        // v0.21.1 旧格式（无 magic，count 直接开头）：(name_len, name, data_len, raw_bytes)
+        // 兼容：读端按首 u32 是否 = FTS_MAGIC 区分
+        buf.extend_from_slice(&0x4654_5321u32.to_le_bytes());
         buf.extend_from_slice(&(self.fts_indexes.len() as u32).to_le_bytes());
         for (name, idx) in &self.fts_indexes {
             buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
             buf.extend_from_slice(name.as_bytes());
             let bytes = idx.to_bytes();
+            let compressed = zstd::bulk::compress(&bytes, 3).unwrap_or_else(|_| bytes.clone());
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&bytes);
+            buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&compressed);
         }
 
         buf
@@ -1032,36 +1037,83 @@ impl Table {
         if offset + 4 > data.len() {
             return Ok(()); // 旧格式，无 FTS 段
         }
-        let fts_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-        offset += 4;
-        for _ in 0..fts_count {
-            // name
-            if offset + 4 > data.len() {
-                return Err(EngramDbError::InvalidFormat("truncated fts name length".into()));
-            }
-            let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        let fts_magic = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+        if fts_magic == 0x4654_5321 {
+            // v0.21.2+ 格式（zstd 压缩 + raw_len）
             offset += 4;
-            if offset + name_len > data.len() {
-                return Err(EngramDbError::InvalidFormat("truncated fts name".into()));
-            }
-            let name = String::from_utf8(data[offset..offset+name_len].to_vec())
-                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid fts name: {}", e)))?;
-            offset += name_len;
-            // data
-            if offset + 4 > data.len() {
-                return Err(EngramDbError::InvalidFormat("truncated fts data length".into()));
-            }
-            let data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            self.load_fts_v2(data, &mut offset)?;
+        } else {
+            // v0.21.1 旧格式：无 magic，首 u32 即 count；raw 字节未压缩
+            let count = fts_magic as usize;
             offset += 4;
-            if offset + data_len > data.len() {
-                return Err(EngramDbError::InvalidFormat("truncated fts data".into()));
+            for _ in 0..count {
+                // name
+                if offset + 4 > data.len() {
+                    return Err(EngramDbError::InvalidFormat("truncated fts name length".into()));
+                }
+                let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                offset += 4;
+                if offset + name_len > data.len() {
+                    return Err(EngramDbError::InvalidFormat("truncated fts name".into()));
+                }
+                let name = String::from_utf8(data[offset..offset+name_len].to_vec())
+                    .map_err(|e| EngramDbError::InvalidFormat(format!("invalid fts name: {}", e)))?;
+                offset += name_len;
+                // data
+                if offset + 4 > data.len() {
+                    return Err(EngramDbError::InvalidFormat("truncated fts data length".into()));
+                }
+                let data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                offset += 4;
+                if offset + data_len > data.len() {
+                    return Err(EngramDbError::InvalidFormat("truncated fts data".into()));
+                }
+                let idx = TokenInvertedIndex::from_bytes(&data[offset..offset+data_len])
+                    .map_err(|e| EngramDbError::InvalidFormat(e))?;
+                offset += data_len;
+                self.fts_indexes.insert(name, idx);
             }
-            let idx = TokenInvertedIndex::from_bytes(&data[offset..offset+data_len])
-                .map_err(|e| EngramDbError::InvalidFormat(e))?;
-            offset += data_len;
-            self.fts_indexes.insert(name, idx);
         }
 
+        Ok(())
+    }
+
+    /// v0.21.2+ FTS 段：[count:u32][(name_len, name, raw_len, data_len, zstd(data))]*
+    fn load_fts_v2(&mut self, data: &[u8], offset: &mut usize) -> Result<()> {
+        let rd_u32 = |data: &[u8], o: &mut usize| -> Result<u32> {
+            if *o + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated fts v2".into()));
+            }
+            let v = u32::from_le_bytes(data[*o..*o+4].try_into().unwrap());
+            *o += 4;
+            Ok(v)
+        };
+        let count = rd_u32(data, offset)? as usize;
+        for _ in 0..count {
+            let name_len = rd_u32(data, offset)? as usize;
+            if *offset + name_len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated fts v2 name".into()));
+            }
+            let name = String::from_utf8(data[*offset..*offset+name_len].to_vec())
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid fts name: {}", e)))?;
+            *offset += name_len;
+            let raw_len = rd_u32(data, offset)? as usize;
+            let data_len = rd_u32(data, offset)? as usize;
+            if *offset + data_len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated fts v2 data".into()));
+            }
+            let raw = if data_len == raw_len {
+                data[*offset..*offset+data_len].to_vec() // 未压缩（压缩失败兜底）
+            } else {
+                zstd::bulk::decompress(&data[*offset..*offset+data_len], raw_len).map_err(|e| {
+                    EngramDbError::InvalidFormat(format!("fts index decompress: {e}"))
+                })?
+            };
+            *offset += data_len;
+            let idx = TokenInvertedIndex::from_bytes(&raw)
+                .map_err(|e| EngramDbError::InvalidFormat(e))?;
+            self.fts_indexes.insert(name, idx);
+        }
         Ok(())
     }
 
