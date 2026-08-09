@@ -337,12 +337,30 @@ impl Tokenizer {
             return;
         }
 
-        // --- 初始堆：所有相邻 pair（在 merges 中）按 rank 入堆 ---
-        // 条目携带 (rank, new_id)：pop 时校验 pair 未变（对齐 tokenizers merge_all）
+        // --- 贪心合并：最小 rank pair 优先，pop 时校验 pair 未变 ---
+        self.merge_heap(&mut symbols);
+
+        // --- 输出：按序收集，字节偏移推进 ---
+        let mut offset = base;
+        let mut i = 0usize;
+        while i < symbols.len() {
+            if symbols[i].active {
+                let byte_len = symbols[i].byte_len as usize;
+                out.push(Token { id: symbols[i].id, offset: offset..offset + byte_len });
+                offset += byte_len;
+            }
+            i += 1;
+        }
+    }
+
+    /// 短词线性扫描合并（pairs 恒准确：合并后移除失效邻接并重查插入——
+    /// 每合并 O(n) 移除 + 2 次 merges 查询；无堆 sift 开销）
+    /// 堆贪心合并（最小 rank pair 优先，pop 时校验 pair 未变——对齐 tokenizers merge_all）
+    fn merge_heap(&self, symbols: &mut Vec<Symbol>) {
         let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>> =
             BinaryHeap::with_capacity(symbols.len());
         for i in 0..symbols.len() as u32 {
-            if let Some((rank, new_id)) = self.pair_rank(&symbols, i) {
+            if let Some((rank, new_id)) = self.pair_rank(symbols, i) {
                 heap.push(std::cmp::Reverse((rank, new_id, i)));
             }
         }
@@ -380,26 +398,14 @@ impl Tokenizer {
             if p != NONE {
                 let p = p as usize;
                 if symbols[p].active {
-                    if let Some((rank, new_id)) = self.pair_rank(&symbols, p as u32) {
+                    if let Some((rank, new_id)) = self.pair_rank(symbols, p as u32) {
                         heap.push(std::cmp::Reverse((rank, new_id, p as u32)));
                     }
                 }
             }
-            if let Some((rank, new_id)) = self.pair_rank(&symbols, pos as u32) {
+            if let Some((rank, new_id)) = self.pair_rank(symbols, pos as u32) {
                 heap.push(std::cmp::Reverse((rank, new_id, pos as u32)));
             }
-        }
-
-        // --- 输出：按序收集，字节偏移推进 ---
-        let mut offset = base;
-        let mut i = 0usize;
-        while i < symbols.len() {
-            if symbols[i].active {
-                let byte_len = symbols[i].byte_len as usize;
-                out.push(Token { id: symbols[i].id, offset: offset..offset + byte_len });
-                offset += byte_len;
-            }
-            i += 1;
         }
     }
 
