@@ -1351,6 +1351,7 @@ dependencies = [
  "env_logger",
  "fxhash",
  "jemallocator",
+ "libc",
  "log",
  "memmap2",
  "nom",
