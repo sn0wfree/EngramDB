@@ -22,6 +22,8 @@ pub mod bloom_filter;
 pub mod tier_migration;
 pub mod migration;
 pub mod mmap_integration;
+#[cfg(feature = "mmap-read")]
+pub mod mmap_writer;
 pub mod async_compress;
 pub mod bloom;
 pub mod capabilities;
