@@ -148,6 +148,18 @@ pub fn is_bloomable(value: &Value) -> bool {
     )
 }
 
+/// Phase 2.5 P3：从 Value 提取 bloomable key（i64）
+///
+/// 用于 ColumnChunk::bloom.may_contain() 查询。
+pub fn bloomable_key(value: &Value) -> i64 {
+    match value {
+        Value::Int32(v) => *v as i64,
+        Value::Int64(v) => *v,
+        Value::Timestamp(v) => *v,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
