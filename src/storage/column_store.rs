@@ -1086,6 +1086,77 @@ impl ColumnStore {
         Ok(buf)
     }
 
+    /// Phase 6：mmap 写路径 — 写入到 mmap 后端文件
+    ///
+    /// 与 `data_to_bytes` 格式完全一致，但使用 MmapWriter 直接写文件，
+    /// 不在内存中缓冲整个数据段。
+    #[cfg(feature = "mmap-read")]
+    pub fn data_to_mmap_writer(&mut self, writer: &mut crate::storage::mmap_writer::MmapWriter, compress: bool) -> Result<()> {
+        let rg_count = self.row_groups.len() as u32;
+        writer.write_u32(rg_count)?;
+
+        for rg in &mut self.row_groups {
+            writer.write_u32(rg.row_count)?;
+            writer.write_u32(rg.columns.len() as u32)?;
+
+            for col in &mut rg.columns {
+                let (ctype, payload, ucount): (CompressionType, Vec<u8>, u32) =
+                    if !col.compressed_data.is_empty() {
+                        (col.compression, col.compressed_data.clone(), col.uncompressed_count)
+                    } else {
+                        let serialized = match &col.data {
+                            Some(d) => d.serialize_typed(&col.data_type),
+                            None => Vec::new(),
+                        };
+                        let count = match &col.data {
+                            Some(d) => d.len() as u32,
+                            None => 0,
+                        };
+                        if compress && !serialized.is_empty() {
+                            let (c, comp) = compression::compress(&serialized, &col.data_type)?;
+                            (c, comp, count)
+                        } else {
+                            (CompressionType::Uncompressed, serialized, count)
+                        }
+                    };
+
+                writer.push(data_type_to_u8(&col.data_type));
+                writer.push(ctype as u8);
+                writer.write_u32(col.null_count)?;
+                writer.write_u32(ucount)?;
+                writer.write_u32(payload.len() as u32)?;
+                writer.write(&payload)?;
+
+                // min/max
+                writer.push(if col.min_value.is_some() { 1 } else { 0 });
+                if let Some(min) = &col.min_value {
+                    let mb = serialize_values(std::slice::from_ref(min), &col.data_type);
+                    writer.write_u32(mb.len() as u32)?;
+                    writer.write(&mb)?;
+                }
+                writer.push(if col.max_value.is_some() { 1 } else { 0 });
+                if let Some(max) = &col.max_value {
+                    let mb = serialize_values(std::slice::from_ref(max), &col.data_type);
+                    writer.write_u32(mb.len() as u32)?;
+                    writer.write(&mb)?;
+                }
+
+                // Phase 5 P1-B：Bloom Filter
+                match &col.bloom {
+                    Some(bloom) => {
+                        let bloom_bytes = bloom.to_bytes();
+                        writer.write_u32(bloom_bytes.len() as u32)?;
+                        writer.write(&bloom_bytes)?;
+                    }
+                    None => {
+                        writer.write_u32(0)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 从字节流反序列化 RowGroup 数据
     pub fn data_from_bytes(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < 4 {

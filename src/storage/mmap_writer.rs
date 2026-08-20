@@ -72,6 +72,11 @@ impl MmapWriter {
         Ok(())
     }
 
+    /// 写入单个字节
+    pub fn push(&mut self, byte: u8) -> Result<()> {
+        self.write(&[byte])
+    }
+
     /// 写入 u32 长度前缀
     pub fn write_u32(&mut self, value: u32) -> Result<()> {
         self.write(&value.to_le_bytes())
