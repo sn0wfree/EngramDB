@@ -20,6 +20,8 @@ pub mod mmap_reader;
 pub mod heat_tracker;
 pub mod bloom_filter;
 pub mod tier_migration;
+pub mod migration;
+pub mod mmap_integration;
 pub mod bloom;
 pub mod capabilities;
 pub mod insert_batcher;
@@ -382,13 +384,15 @@ impl Database {
     }
 
     /// Phase 2.5 P2：递增 commit 计数，返回是否应触发迁移 tick
+    ///
+    /// Phase 3 P0：达到阈值时自动执行迁移（不再仅返回决策）
     pub fn on_commit(&mut self) -> bool {
         self.commit_count += 1;
-        // 每 1000 次 commit 触发一次迁移 tick（默认）
-        // 用户可通过 Config 调整（Phase 2.5 后续）
         const TICK_INTERVAL: u64 = 1000;
         if self.commit_count - self.last_tier_tick_at >= TICK_INTERVAL {
             self.last_tier_tick_at = self.commit_count;
+            // Phase 3 P0：实际执行迁移
+            let _ = self.migrate_all_auto();
             true
         } else {
             false
@@ -397,10 +401,36 @@ impl Database {
 
     /// Phase 2.5 P2：执行 Auto 表分层迁移 tick
     ///
-    /// 返回所有"应迁移"的决策列表。Phase 2.5 仅返回决策，
-    /// 真正数据搬迁推迟到 Phase 3。
+    /// 返回所有"应迁移"的决策列表。Phase 3 P0 已实现实际数据搬迁，
+    /// `migrate_all_auto()` 会自动执行 tick 决策。
     pub fn tier_migration_tick(&mut self) -> Vec<tier_migration::MigrationDecision> {
         tier_migration::tick_decisions(self)
+    }
+
+    /// Phase 3 P0：执行所有 Auto 表迁移决策（实际数据搬迁）
+    ///
+    /// 默认每 1000 次 commit 自动触发一次（`on_commit()`）。
+    /// 返回执行的迁移数量和结果。
+    pub fn migrate_all_auto(&mut self) -> Vec<migration::MigrationResult> {
+        let decisions = tier_migration::tick_decisions(self);
+        let mut results = Vec::new();
+        for decision in decisions {
+            let table_id = decision.table_id;
+            // Phase 3 P0 注意：迁移过程中需重置 HeatTracker，
+            // 否则下次 tick 会立即再次触发（同 score + 同 size）
+            if let Some(table) = self.tables.get_mut(&table_id) {
+                match migration::execute_migration(table, &decision) {
+                    Ok(result) => {
+                        self.heat_tracker.reset(table_id);
+                        results.push(result);
+                    }
+                    Err(_) => {
+                        // 迁移失败保留原状态，下次 tick 重试
+                    }
+                }
+            }
+        }
+        results
     }
 
     /// 创建覆盖索引（v0.12.0 新增）
@@ -1278,6 +1308,50 @@ impl Database {
         Ok(section_buf.len() as u64)
     }
 
+    /// Phase 3 P1-B：保存所有列存数据到独立 mmap 文件（COW 写入）
+    ///
+    /// 与 `save_data()` 区别：写入独立文件而非主文件，启用后列存
+    /// 加载可走 mmap 直读路径。
+    ///
+    /// 使用临时文件 + 原子 rename 实现 COW（copy-on-write）：
+    /// 1. 写入到 `path.tmp`
+    /// 2. fsync（保证新数据落盘）
+    /// 3. atomic rename `path.tmp` → `path`
+    /// 4. 旧 mmap 自动失效（OS 引用计数释放）
+    #[cfg(feature = "mmap-read")]
+    pub fn save_data_mmap(&mut self, path: &std::path::Path) -> Result<()> {
+        // 按 save_data 格式构建 section_buf（格式完全兼容）
+        let mut section_buf = Vec::new();
+        let persistent_ids: Vec<u32> = self
+            .tables
+            .iter()
+            .filter(|(_, t)| !matches!(t, EngineTable::Memory(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        let table_count = persistent_ids.len() as u32;
+        section_buf.extend_from_slice(&table_count.to_le_bytes());
+
+        let compress = self.config.compress_on_persist;
+        for table_id in persistent_ids {
+            let table = self.tables.get_mut(&table_id).unwrap();
+            let data_bytes = match table {
+                EngineTable::Columnar(t) => t.column_store_mut().data_to_bytes(compress)?,
+                EngineTable::Log(t) => t.to_bytes(),
+                EngineTable::Memory(_) => continue,
+            };
+            section_buf.extend_from_slice(&table_id.to_le_bytes());
+            section_buf.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
+            section_buf.extend_from_slice(&data_bytes);
+        }
+
+        // COW：临时文件 + 原子 rename
+        let tmp_path = path.with_extension("hdb.tmp");
+        std::fs::write(&tmp_path, &section_buf)?;
+        // SAFETY: rename 是原子操作（POSIX）；旧 path 替换为新 path
+        mmap_integration::atomic_replace(&tmp_path, path)?;
+        Ok(())
+    }
+
     /// 从文件加载所有表的列存数据
     ///
     /// **前置条件**：load_catalog 必须先调用（表结构需已存在）。
@@ -1334,6 +1408,65 @@ impl Database {
                 }
                 // Memory 表无数据段（跳过，保持空白内存表）
                 // 表不存在则跳过（schema 已删但数据未清理）
+                _ => {}
+            }
+            offset += data_len;
+        }
+
+        Ok(loaded)
+    }
+
+    /// Phase 3 P1-B：从 mmap 文件加载列存数据
+    ///
+    /// 与 `load_data()` 区别：走 mmap 直读路径，大表加载更快。
+    /// 文件必须由 `save_data_mmap()` 或兼容格式生成。
+    #[cfg(feature = "mmap-read")]
+    pub fn load_data_mmap(&mut self, path: &std::path::Path) -> Result<usize> {
+        let reader = mmap_reader::MmapReader::open(path)?;
+
+        // 格式与 load_data 相同：table_count + per-table
+        if reader.len() < 4 {
+            return Ok(0);
+        }
+        let table_count =
+            u32::from_le_bytes(reader.slice(0, 4).try_into().unwrap()) as usize;
+        let mut offset = 4;
+        let mut loaded = 0;
+
+        for _ in 0..table_count {
+            if offset + 8 > reader.len() {
+                return Err(EngramDbError::InvalidFormat("truncated mmap data header".into()));
+            }
+            let table_id =
+                u32::from_le_bytes(reader.slice(offset, 4).try_into().unwrap());
+            offset += 4;
+            let data_len =
+                u32::from_le_bytes(reader.slice(offset, 4).try_into().unwrap()) as usize;
+            offset += 4;
+
+            if offset + data_len > reader.len() {
+                return Err(EngramDbError::InvalidFormat("truncated mmap data body".into()));
+            }
+
+            match self.tables.get_mut(&table_id) {
+                Some(EngineTable::Columnar(table)) => {
+                    table.column_store_mut().data_from_bytes(reader.slice(offset, data_len))?;
+                    // 同步行数：列存读取后用总行数修复 def.row_count
+                    let cs_row_count = table.column_store().total_rows();
+                    table.def_mut().row_count = cs_row_count;
+                    table.sync_column_data_types();
+                    if table.primary_index_legacy_enabled() {
+                        table.rebuild_primary_index()?;
+                    } else {
+                        table.column_store_mut().rebuild_sparse()?;
+                    }
+                    table.column_store_mut().rebuild_blooms();
+                    loaded += 1;
+                }
+                Some(EngineTable::Log(table)) => {
+                    table.from_bytes(reader.slice(offset, data_len))?;
+                    loaded += 1;
+                }
                 _ => {}
             }
             offset += data_len;
