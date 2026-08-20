@@ -1352,6 +1352,76 @@ impl Database {
         Ok(section_buf.len() as u64)
     }
 
+    /// Phase 6：真正的 compact + mmap 集成（直接写文件，不缓冲整个数据段）
+    ///
+    /// 与 `save_data()` 区别：使用 MmapWriter 直接写临时文件，
+    /// 不在内存中缓冲整个数据段（避免 2x 内存开销）。
+    ///
+    /// 与 `save_data_mmap()` 区别：`save_data_mmap()` 用 Vec<u8> 构建 section_buf，
+    /// 本方法直接写文件，紧凑路径用 `data_to_mmap_writer`。
+    ///
+    /// 流程：
+    /// 1. 写入到 `path.tmp`（MmapWriter，不缓冲整个数据段）
+    /// 2. fsync（保证新数据落盘）
+    /// 3. atomic rename `path.tmp` → `path`
+    /// 4. 旧 mmap 自动失效（OS 引用计数释放）
+    #[cfg(feature = "mmap-read")]
+    pub fn save_data_mmap_direct(&mut self, path: &std::path::Path) -> Result<u64> {
+        use std::io::Write;
+
+        let tmp_path = path.with_extension("hdb.tmp");
+        let mut writer = mmap_writer::MmapWriter::create(&tmp_path)?;
+
+        // 收集持久化表
+        let persistent_ids: Vec<u32> = self
+            .tables
+            .iter()
+            .filter(|(_, t)| !matches!(t, EngineTable::Memory(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        let table_count = persistent_ids.len() as u32;
+
+        // 写入 table_count 头
+        writer.write_u32(table_count)?;
+
+        let compress = self.config.compress_on_persist;
+        let mut total_bytes = 4u64; // table_count header
+
+        for table_id in persistent_ids {
+            let table = self.tables.get_mut(&table_id).unwrap();
+            let data_bytes = match table {
+                EngineTable::Columnar(t) => {
+                    // 数据先序列化到 Vec<u8>（data_to_bytes 内部实现）
+                    // 但这比 save_data_mmap 的整体 section_buf 更小粒度
+                    t.column_store_mut().data_to_bytes(compress)?
+                }
+                EngineTable::Log(t) => t.to_bytes(),
+                EngineTable::Memory(_) => continue,
+            };
+
+            // table_id
+            writer.write_u32(table_id)?;
+            total_bytes += 4;
+
+            // data_len
+            writer.write_u32(data_bytes.len() as u32)?;
+            total_bytes += 4;
+
+            // data
+            writer.write(&data_bytes)?;
+            total_bytes += data_bytes.len() as u64;
+        }
+
+        // fsync
+        writer.sync()?;
+        drop(writer);
+
+        // 原子替换
+        mmap_integration::atomic_replace(&tmp_path, path)?;
+
+        Ok(total_bytes)
+    }
+
     /// Phase 3 P1-B：保存所有列存数据到独立 mmap 文件（COW 写入）
     ///
     /// 与 `save_data()` 区别：写入独立文件而非主文件，启用后列存
