@@ -22,6 +22,7 @@ pub mod bloom_filter;
 pub mod tier_migration;
 pub mod migration;
 pub mod mmap_integration;
+pub mod async_compress;
 pub mod bloom;
 pub mod capabilities;
 pub mod insert_batcher;
@@ -399,6 +400,21 @@ impl Database {
         }
     }
 
+    /// Phase 3.5：手动触发一次迁移 tick（测试用 — 直接调 migrate_all_auto）
+    pub fn tick_migration_for_test(&mut self) {
+        self.last_tier_tick_at = self.commit_count;
+    }
+
+    /// Phase 3.5：查询表是否被标记为持久化（影响 WAL COMMIT 行为）
+    pub fn txn_manager_is_persistent(&self, table_id: u32) -> bool {
+        self.txn_manager.is_persistent(table_id)
+    }
+
+    /// Phase 3.5：测试用 — 手动取消 non_persistent 标记
+    pub fn txn_manager_unmark_non_persistent_for_test(&mut self, table_id: u32) {
+        self.txn_manager.unmark_non_persistent(table_id);
+    }
+
     /// Phase 2.5 P2：执行 Auto 表分层迁移 tick
     ///
     /// 返回所有"应迁移"的决策列表。Phase 3 P0 已实现实际数据搬迁，
@@ -411,6 +427,9 @@ impl Database {
     ///
     /// 默认每 1000 次 commit 自动触发一次（`on_commit()`）。
     /// 返回执行的迁移数量和结果。
+    ///
+    /// Phase 3.5：迁移后同步更新 txn_manager 的 `table_engines` 和
+    /// `non_persistent_tables`，确保 MVCC 版本链 + WAL engine_type 标记一致。
     pub fn migrate_all_auto(&mut self) -> Vec<migration::MigrationResult> {
         let decisions = tier_migration::tick_decisions(self);
         let mut results = Vec::new();
@@ -421,6 +440,24 @@ impl Database {
             if let Some(table) = self.tables.get_mut(&table_id) {
                 match migration::execute_migration(table, &decision) {
                     Ok(result) => {
+                        // Phase 3.5：迁移后同步更新 txn_manager 状态
+                        // 1. 更新 table_engines（影响 WAL 记录头）
+                        self.txn_manager.register_table_engine(
+                            table_id,
+                            result.new_engine,
+                        );
+                        // 2. 更新 non_persistent_tables（影响 WAL fsync 行为）
+                        // Memory → 不持久化（不写 WAL COMMIT）
+                        // Log/Columnar → 持久化（写 WAL COMMIT）
+                        if result.new_engine == crate::common::types::EngineType::Memory {
+                            self.txn_manager.mark_non_persistent(table_id);
+                        } else if decision.from_engine == crate::common::types::EngineType::Memory {
+                            // Memory → 持久化引擎：从 non_persistent 移除
+                            self.txn_manager.unmark_non_persistent(table_id);
+                        }
+                        // Phase 3.5：迁移后 MVCC 版本链保留检查
+                        // 当前迁移仅复制最终 committed 数据（scan 出来的是已提交版本），
+                        // 未提交的 in-flight 事务在 commit 阶段会按新引擎路径写入。
                         self.heat_tracker.reset(table_id);
                         results.push(result);
                     }

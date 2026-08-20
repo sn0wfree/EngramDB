@@ -412,6 +412,11 @@ impl TransactionManager {
         self.non_persistent_tables.insert(table_id);
     }
 
+    /// Phase 3.5：取消表非持久化标记（Memory → 持久化引擎迁移时调用）
+    pub fn unmark_non_persistent(&mut self, table_id: u32) {
+        self.non_persistent_tables.remove(&table_id);
+    }
+
     /// 表是否持久化（写 WAL）
     pub fn is_persistent(&self, table_id: u32) -> bool {
         !self.non_persistent_tables.contains(&table_id)
