@@ -213,6 +213,74 @@ pub fn str_to_i64_key(s: &str) -> i64 {
     h as i64
 }
 
+// ============================================================================
+// Phase 4 P1-B：Bloom Filter 持久化
+// ============================================================================
+
+impl ColumnBloom {
+    /// 序列化 Bloom Filter 到字节（Phase 4 P1-B）
+    ///
+    /// 格式：[u32 bit_width][u32 hash_count][u32 count][u64 bits...]
+    /// - bit_width: 4 bytes
+    /// - hash_count: 4 bytes
+    /// - count: 4 bytes（已插入元素数）
+    /// - bits: bit_width 位的位数组（存储为 Vec<u64>）
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12 + self.bits.len() * 8);
+        buf.extend_from_slice(&self.bit_width.to_le_bytes());
+        buf.extend_from_slice(&self.hash_count.to_le_bytes());
+        buf.extend_from_slice(&(self.count as u32).to_le_bytes());
+        for &word in &self.bits {
+            buf.extend_from_slice(&word.to_le_bytes());
+        }
+        buf
+    }
+
+    /// 从字节反序列化 Bloom Filter（Phase 4 P1-B）
+    ///
+    /// 返回 None 如果格式无效
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 12 {
+            return None;
+        }
+        let bit_width = u32::from_le_bytes(data[0..4].try_into().ok()?);
+        let hash_count = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        let count = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+
+        let n_words = ((1u64 << bit_width) / 64).max(1) as usize;
+        let expected_len = 12 + n_words * 8;
+        if data.len() < expected_len {
+            return None;
+        }
+
+        let mut bits = Vec::with_capacity(n_words);
+        let mut offset = 12;
+        for _ in 0..n_words {
+            bits.push(u64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ));
+            offset += 8;
+        }
+
+        Some(Self {
+            bits,
+            bit_width,
+            hash_count,
+            count,
+        })
+    }
+
+    /// 序列化到 Vec<u8>（便捷包装）
+    pub fn serialize(&self) -> Vec<u8> {
+        self.to_bytes()
+    }
+
+    /// 从字节反序列化（便捷包装，错误返回空 Bloom）
+    pub fn deserialize(data: &[u8]) -> Self {
+        Self::from_bytes(data).unwrap_or_else(|| Self::with_default_capacity(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +389,55 @@ mod tests {
         // 不同字符串大概率不同（FxHash 高质量）
         let k3 = str_to_i64_key("world");
         assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn test_bloom_serialize_deserialize_roundtrip() {
+        // Phase 4 P1-B：Bloom 持久化往返
+        let mut bloom = ColumnBloom::with_default_capacity(1000);
+        bloom.insert(&42i64);
+        bloom.insert(&12345i64);
+        bloom.insert(&99999i64);
+
+        let bytes = bloom.to_bytes();
+        let restored = ColumnBloom::from_bytes(&bytes).unwrap();
+
+        // 语义一致
+        assert!(restored.may_contain(&42i64));
+        assert!(restored.may_contain(&12345i64));
+        assert!(restored.may_contain(&99999i64));
+        assert_eq!(restored.count, bloom.count);
+        assert_eq!(restored.bit_width, bloom.bit_width);
+        assert_eq!(restored.hash_count, bloom.hash_count);
+    }
+
+    #[test]
+    fn test_bloom_serialize_empty() {
+        let bloom = ColumnBloom::with_default_capacity(100);
+        let bytes = bloom.to_bytes();
+        let restored = ColumnBloom::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.count, 0);
+        assert_eq!(restored.bit_width, bloom.bit_width);
+    }
+
+    #[test]
+    fn test_bloom_deserialize_invalid_data() {
+        assert!(ColumnBloom::from_bytes(&[0, 0, 0]).is_none());
+        assert!(ColumnBloom::from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn test_bloom_serialize_large() {
+        // Phase 4 P1-B：大量数据序列化
+        let mut bloom = ColumnBloom::with_default_capacity(10_000);
+        for i in 0..10_000 {
+            bloom.insert(&(i as i64));
+        }
+        let bytes = bloom.to_bytes();
+        let restored = ColumnBloom::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.count, 10_000);
+        // 序列化后的 Bloom 应能正确查询
+        assert!(restored.may_contain(&5000i64));
+        assert!(!restored.may_contain(&20_000i64)); // 不存在的值
     }
 }

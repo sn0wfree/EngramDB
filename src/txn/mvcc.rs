@@ -47,6 +47,16 @@ impl<T: Clone> MvccStore<T> {
         }
     }
 
+    /// 清除所有版本链（Phase 4 P0：迁移时调用）
+    ///
+    /// 迁移后旧版本链已失效——数据由新引擎管理。
+    /// 旧版本链残留会导致：
+    /// - 不可见的孤儿版本（永远不会被 GC）
+    /// - 潜在的 stale value 读取风险
+    pub fn clear(&mut self) {
+        self.versions.clear();
+    }
+
     /// 读取指定时间戳可见的版本
     /// 可见条件：已提交 && begin_ts <= read_ts && (end_ts.is_none() || end_ts > read_ts)
     pub fn get(&self, key: u64, read_ts: Timestamp) -> Option<&T> {

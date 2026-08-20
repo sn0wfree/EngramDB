@@ -417,6 +417,18 @@ impl TransactionManager {
         self.non_persistent_tables.remove(&table_id);
     }
 
+    /// Phase 4 P0：清除指定表的 MVCC 版本链
+    ///
+    /// 迁移后旧版本链失效（数据由新引擎管理），需清理：
+    /// - 未提交版本（in-flight 事务已终止）
+    /// - 已提交但不再可见的版本（数据已迁移到新引擎）
+    /// - 旧 key 的版本链
+    pub fn clear_mvcc_table(&mut self, table_id: u32) {
+        if let Some(store) = self.mvcc.get_mut(&table_id) {
+            store.clear();
+        }
+    }
+
     /// 表是否持久化（写 WAL）
     pub fn is_persistent(&self, table_id: u32) -> bool {
         !self.non_persistent_tables.contains(&table_id)
