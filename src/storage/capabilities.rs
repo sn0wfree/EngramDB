@@ -92,6 +92,22 @@ impl EngineCapabilities {
                 persistent: true,
                 scan_cost_weight: 0.5,
             },
+            // Phase 2 P0-B：Auto 引擎在创建表时由调度器分配具体引擎，
+            // 此处返回"最通用"（Columnar）能力作为占位，实际能力以最终分配为准。
+            EngineType::Auto => Self {
+                engine,
+                supports_index: true,
+                supports_vector_index: true,
+                supports_fts: true,
+                supports_alter: true,
+                supports_pragma: true,
+                supports_ttl: true,
+                supports_update: true,
+                supports_delete: true,
+                supports_pk_lookup: true,
+                persistent: true,
+                scan_cost_weight: 1.0,
+            },
         }
     }
 

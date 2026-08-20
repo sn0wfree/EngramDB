@@ -16,6 +16,8 @@ pub mod engine;
 
 #[cfg(feature = "mmap-read")]
 pub mod mmap_reader;
+
+pub mod heat_tracker;
 pub mod bloom;
 pub mod capabilities;
 pub mod insert_batcher;
@@ -246,8 +248,25 @@ impl Database {
                     table_def.clone(), self.config.log_block_rows,
                 ))
             }
+            // Phase 2 P0-B：Auto 引擎——根据初始 heat 与表大小调度到具体引擎。
+            // 当前策略：小表（< 1000 行）→ Memory，否则 → Columnar。
+            // 后续由 HeatTracker 在运行时迁移。
+            crate::common::types::EngineType::Auto => {
+                // Phase 2 P0-B 简化：默认走 Columnar（最通用）。
+                // 真正的自动调度在下个迭代实现。
+                let mut t = Table::new(table_def.clone(), self.config.compact_strategy);
+                t.set_index_config(
+                    self.config.sort_compact_by_pk,
+                    self.config.primary_index_legacy,
+                    self.config.sparse_index_granule_rows,
+                );
+                // 标记此表为 Auto，便于后续迁移
+                t.mark_auto_engine();
+                EngineTable::Columnar(t)
+            }
         };
         // M2：Memory 表标记为非持久化（事务跳过 WAL）
+        // Phase 2 P0-B：Auto 表根据最终引擎决定
         if table_def.engine == crate::common::types::EngineType::Memory {
             self.txn_manager.mark_non_persistent(table_id);
         }
@@ -1094,6 +1113,17 @@ impl Database {
                     EngineTable::Log(log_engine::LogTable::with_block_rows(
                         table_def.clone(), self.config.log_block_rows,
                     ))
+                }
+                // Phase 2 P0-B：Auto 引擎恢复时按 Columnar 路径（同创建路径）
+                crate::common::types::EngineType::Auto => {
+                    let mut t = Table::new(table_def.clone(), self.config.compact_strategy);
+                    t.set_index_config(
+                        self.config.sort_compact_by_pk,
+                        self.config.primary_index_legacy,
+                        self.config.sparse_index_granule_rows,
+                    );
+                    t.mark_auto_engine();
+                    EngineTable::Columnar(t)
                 }
             };
             // M2：Memory 表标记为非持久化（事务跳过 WAL）

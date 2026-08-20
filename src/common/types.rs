@@ -147,6 +147,16 @@ pub enum EngineType {
     Columnar,
     Memory,
     Log,
+    /// Phase 2 P0-B：自动分层引擎
+    ///
+    /// 数据库根据 HeatTracker 自动选择最合适的引擎：
+    /// - 高频小表 → Memory
+    /// - 通用温表 → Columnar
+    /// - 只追加冷表 → Log
+    ///
+    /// 注意：`Auto` 是**显式选择**，不会隐式启用。用户需主动声明：
+    /// `CREATE TABLE t (...) ENGINE = Auto`
+    Auto,
 }
 
 impl EngineType {
@@ -156,8 +166,24 @@ impl EngineType {
             0 => Some(EngineType::Columnar),
             1 => Some(EngineType::Memory),
             2 => Some(EngineType::Log),
+            3 => Some(EngineType::Auto),
             _ => None,
         }
+    }
+
+    /// 序列化为字节（与 from_u8 配对）
+    pub fn to_u8(self) -> u8 {
+        match self {
+            EngineType::Columnar => 0,
+            EngineType::Memory => 1,
+            EngineType::Log => 2,
+            EngineType::Auto => 3,
+        }
+    }
+
+    /// 是否为自动分层模式
+    pub fn is_auto(self) -> bool {
+        matches!(self, EngineType::Auto)
     }
 }
 
@@ -173,7 +199,18 @@ impl EngineType {
             "columnar" => Some(EngineType::Columnar),
             "memory" => Some(EngineType::Memory),
             "log" => Some(EngineType::Log),
+            "auto" => Some(EngineType::Auto),
             _ => None,
+        }
+    }
+
+    /// 序列化为字符串（与 from_str 配对）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineType::Columnar => "Columnar",
+            EngineType::Memory => "Memory",
+            EngineType::Log => "Log",
+            EngineType::Auto => "Auto",
         }
     }
 }
@@ -467,8 +504,25 @@ mod tests {
         assert_eq!(EngineType::from_u8(0), Some(EngineType::Columnar));
         assert_eq!(EngineType::from_u8(1), Some(EngineType::Memory));
         assert_eq!(EngineType::from_u8(2), Some(EngineType::Log));
-        assert_eq!(EngineType::from_u8(3), None);
+        assert_eq!(EngineType::from_u8(3), Some(EngineType::Auto));
+        assert_eq!(EngineType::from_u8(4), None);
         assert_eq!(EngineType::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_engine_type_auto_serde() {
+        // Phase 2 P0-B：Auto 引擎应能序列化/反序列化（向后兼容旧文件）
+        let v = EngineType::Auto;
+        let bytes = bincode::serialize(&v).unwrap();
+        let back: EngineType = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn test_engine_type_to_u8_roundtrip() {
+        for e in [EngineType::Columnar, EngineType::Memory, EngineType::Log, EngineType::Auto] {
+            assert_eq!(EngineType::from_u8(e.to_u8()), Some(e));
+        }
     }
 
     #[test]
