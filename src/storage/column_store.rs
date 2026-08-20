@@ -1067,6 +1067,19 @@ impl ColumnStore {
                     buf.extend_from_slice(&(mb.len() as u32).to_le_bytes());
                     buf.extend_from_slice(&mb);
                 }
+
+                // Phase 4 P1-B：Bloom Filter 序列化（向后兼容）
+                // 旧格式无此字段 → 读取时 bloom_len=0 → bloom=None
+                match &col.bloom {
+                    Some(bloom) => {
+                        let bloom_bytes = bloom.to_bytes();
+                        buf.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&bloom_bytes);
+                    }
+                    None => {
+                        buf.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                }
             }
         }
 
@@ -1159,6 +1172,22 @@ impl ColumnStore {
                     offset += 1;
                 }
 
+                // Phase 4 P1-B：Bloom Filter 反序列化（向后兼容）
+                // 旧格式无此字段 → 直接跳过（bloom_len=0）
+                let mut bloom = None;
+                if offset + 4 <= data.len() {
+                    let bloom_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if bloom_len > 0 && offset + bloom_len <= data.len() {
+                        if let Some(b) = crate::storage::bloom_filter::ColumnBloom::from_bytes(
+                            &data[offset..offset + bloom_len],
+                        ) {
+                            bloom = Some(std::sync::Arc::new(b));
+                        }
+                        offset += bloom_len;
+                    }
+                }
+
                 columns.push(ColumnChunk {
                     data_type,
                     data: col_data,
@@ -1168,7 +1197,7 @@ impl ColumnStore {
                     uncompressed_count,
                     min_value,
                     max_value,
-                    bloom: None,
+                    bloom,
                 });
             }
 

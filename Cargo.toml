@@ -56,6 +56,7 @@ jemallocator = "0.5"
 
 # 哈希
 fxhash = "0.2"
+libc = "0.2"
 
 # 随机数（跳表、布隆过滤器、测试）
 rand = "0.8"

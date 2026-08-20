@@ -430,6 +430,8 @@ impl Database {
     ///
     /// Phase 3.5：迁移后同步更新 txn_manager 的 `table_engines` 和
     /// `non_persistent_tables`，确保 MVCC 版本链 + WAL engine_type 标记一致。
+    ///
+    /// Phase 4 P0：迁移前清除旧 MVCC 版本链（数据由新引擎管理，旧链失效）。
     pub fn migrate_all_auto(&mut self) -> Vec<migration::MigrationResult> {
         let decisions = tier_migration::tick_decisions(self);
         let mut results = Vec::new();
@@ -438,6 +440,10 @@ impl Database {
             // Phase 3 P0 注意：迁移过程中需重置 HeatTracker，
             // 否则下次 tick 会立即再次触发（同 score + 同 size）
             if let Some(table) = self.tables.get_mut(&table_id) {
+                // Phase 4 P0：迁移前清除旧 MVCC 版本链
+                // 数据由新引擎管理，旧版本链已失效（孤儿版本永远不被 GC）
+                self.txn_manager.clear_mvcc_table(table_id);
+
                 match migration::execute_migration(table, &decision) {
                     Ok(result) => {
                         // Phase 3.5：迁移后同步更新 txn_manager 状态
@@ -455,9 +461,8 @@ impl Database {
                             // Memory → 持久化引擎：从 non_persistent 移除
                             self.txn_manager.unmark_non_persistent(table_id);
                         }
-                        // Phase 3.5：迁移后 MVCC 版本链保留检查
-                        // 当前迁移仅复制最终 committed 数据（scan 出来的是已提交版本），
-                        // 未提交的 in-flight 事务在 commit 阶段会按新引擎路径写入。
+                        // Phase 3.5：迁移后 MVCC 版本链已清除（Phase 4 P0）
+                        // 新写入会重新创建 MvccStore 条目
                         self.heat_tracker.reset(table_id);
                         results.push(result);
                     }
