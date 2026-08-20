@@ -1341,6 +1341,7 @@ version = "0.14.0"
 dependencies = [
  "bincode",
  "brotli 8.0.4",
+ "bumpalo",
  "bytes",
  "chrono",
  "criterion",

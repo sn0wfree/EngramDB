@@ -21,6 +21,9 @@ path = "src/main.rs"
 default = []
 # DataFusion 互操作（启用后编译 datafusion_ext 模块与集成测试）
 datafusion = ["dep:datafusion", "dep:datafusion-common", "dep:datafusion-expr"]
+# Phase 1 M3：查询生命周期 Arena（默认 OFF，灰度发布）
+# 启用后查询执行期临时分配走 bumpalo，单查询结束一次性 reset
+query-arena = ["dep:bumpalo"]
 
 [dependencies]
 # 解析
@@ -73,6 +76,9 @@ rayon = "1.10"
 datafusion = { version = "40", optional = true }
 datafusion-common = { version = "40", optional = true }
 datafusion-expr = { version = "40", optional = true }
+
+# Phase 1 M3：bumpalo 查询 arena（feature = "query-arena"）
+bumpalo = { version = "3", optional = true }
 
 [dev-dependencies]
 tempfile = "3.0"
