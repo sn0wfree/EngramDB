@@ -480,8 +480,11 @@ impl DeltaStore {
         }
     }
 
-    /// 获取所有行（按 rowid 排序，跳过已删除的行）
-    pub fn all_rows(&self) -> Vec<(u64, Vec<Value>)> {
+    /// 获取所有活动行的 (rowid, col-major-idx) 对（按 rowid 排序，跳过已删除的行）
+    ///
+    /// Phase 1 M2 #2 零拷贝优化：返回借用 self 的索引对，
+    /// 调用方通过 `column_data()` 配合索引直接读取 Value，避免每行 Vec<Value> 分配与每 cell clone。
+    pub fn iter_active_indices(&self) -> Vec<(u64, usize)> {
         let mut entries: Vec<(u64, usize)> = Vec::with_capacity(self.row_count);
 
         // S1.4：连续区间（有序），跳过已删除
@@ -507,6 +510,15 @@ impl DeltaStore {
 
         // 按 rowid 排序
         entries.sort_by_key(|(rowid, _)| *rowid);
+        entries
+    }
+
+    /// 获取所有行（按 rowid 排序，跳过已删除的行）—— 已迁移到 `iter_active_indices` + `column_data()`
+    ///
+    /// 保留此方法为兼容现有调用方（Phase 1 M2 期间），但内部实现走 `iter_active_indices`
+    /// + 按需 clone。后续 Phase 2 准备删除。
+    pub fn all_rows(&self) -> Vec<(u64, Vec<Value>)> {
+        let entries = self.iter_active_indices();
         entries
             .into_iter()
             .map(|(rowid, idx)| {
