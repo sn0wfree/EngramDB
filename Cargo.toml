@@ -209,5 +209,9 @@ name = "log_skip_wal_bench"
 harness = false
 
 [[bench]]
+name = "bloom_integration_bench"
+harness = false
+
+[[bench]]
 name = "wal_group_commit_bench"
 harness = false

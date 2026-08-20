@@ -1324,6 +1324,8 @@ impl Database {
                     } else {
                         table.column_store_mut().rebuild_sparse()?;
                     }
+                    // Phase 2.5 P4：从 typed 数据重建 Bloom Filter
+                    table.column_store_mut().rebuild_blooms();
                     loaded += 1;
                 }
                 Some(EngineTable::Log(table)) => {

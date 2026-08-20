@@ -101,3 +101,37 @@ fn test_bloom_skip_perf_high_cardinality() {
     let dur = start.elapsed();
     println!("100 high-cardinality not-found queries: {:?}", dur);
 }
+
+#[test]
+fn test_bloom_rebuilt_after_restart() {
+    // Phase 2.5 P4：数据库重启后 Bloom 从 typed 数据重建
+    let path = "/tmp/p25_bloom_restart.hdb";
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(format!("{}-wal", path));
+
+    // 写入 + sync_wal → bloom 存在
+    {
+        let mut conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+        for i in 0..1000 {
+            conn.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        }
+        conn.sync_wal().unwrap();
+
+        let r = conn.execute("SELECT * FROM t WHERE id = -1").unwrap();
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    // 重启 → bloom 应从 typed 数据重建（不再持久化）
+    {
+        let mut conn = Connection::open(path).unwrap();
+
+        // 重建后 bloom 仍生效（高基数等值查询跳读）
+        let r = conn.execute("SELECT * FROM t WHERE id = -1").unwrap();
+        assert_eq!(r.rows.len(), 0);
+
+        let r = conn.execute("SELECT * FROM t WHERE id = 500").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].as_i64(), Some(500));
+    }
+}

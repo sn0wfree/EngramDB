@@ -764,6 +764,32 @@ impl ColumnStore {
         Ok(data.get(in_rg))
     }
 
+    /// Phase 2.5 P4：从已加载的 typed columns 重建 Bloom Filter
+    ///
+    /// 数据库重启后 ColumnChunk::bloom 为 None（bloom 不持久化以避免
+    /// 磁盘格式兼容性问题）。本方法在 `load_data` 完成后调用，
+    /// 对所有解压后的 typed 列重建 bloom，恢复等值谓词跳读能力。
+    ///
+    /// 性能：O(N_total) per RG，与 load 串行叠加；
+    ///      10 RG × 100K 值 ≈ 5-10ms（典型场景）。
+    pub fn rebuild_blooms(&mut self) {
+        for rg in &mut self.row_groups {
+            for col in &mut rg.columns {
+                if col.bloom.is_some() {
+                    continue;
+                }
+                if let Some(data) = &col.data {
+                    if let Some(bloom) = crate::storage::bloom_filter::build_bloom_from_column(
+                        data,
+                        &col.data_type,
+                    ) {
+                        col.bloom = Some(bloom);
+                    }
+                }
+            }
+        }
+    }
+
     /// 分层索引：从列存全量重建稀疏主键索引（load/导入兜底）
     ///
     /// 顺带验证全局有序性（有序 → 后续可二分定位）。
