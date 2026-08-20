@@ -18,6 +18,9 @@ pub fn execute(
     table_name: &str,
     column_indices: &[usize],
 ) -> Result<Vec<DataChunk>> {
+    // Phase 2.5 P1：HeatTracker record_access（每张表每次访问一次）
+    db.record_access_by_name(table_name);
+
     // 引擎分派（M2：Memory 表走同一扫描接口）
     let table = db.get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;

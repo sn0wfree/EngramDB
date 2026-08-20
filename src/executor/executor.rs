@@ -28,6 +28,9 @@ fn try_execute_chunks(
 
     match plan {
         PhysicalPlan::TableScan { table_name, column_indices } => {
+            // Phase 2.5 P1：HeatTracker record_access（每张表每次访问一次）
+            db.record_access_by_name(table_name);
+
             let table = db
                 .get_engine_table_mut(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
@@ -581,6 +584,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::TableScan { table_name, column_indices } => {
+            // Phase 2.5 P1：HeatTracker record_access
+            db.record_access_by_name(&table_name);
+
             // 性能优化：直传路径（最常见场景 SELECT * / 简单 SELECT）
             // 跳过 DataChunk 中间层，直接产出行 Vec，避免 chunks_to_rows 的二次克隆
             // 引擎分派（M2：Memory 表走同语义扫描）
