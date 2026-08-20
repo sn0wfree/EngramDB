@@ -247,6 +247,15 @@ pub struct Config {
     /// 仅在 wal_flush_mode = Periodic 时生效。
     /// 开启后，sync_wal() 会在刷盘后检查所有表是否需要合并。
     pub sync_wal_compact: bool,
+    /// Phase 2 P1-C：LogEngine 是否跳过 WAL
+    ///
+    /// LogEngine 是 append-only 写入（数据文件本身已持久化），通常不需要额外 WAL。
+    /// 开启后：LogEngine 表的事务不写 WAL COMMIT 记录（避免双写开销）。
+    /// 关闭后（默认）：保留 WAL 记录（更安全的崩溃恢复保证）。
+    ///
+    /// **风险**：开启后若数据库在 LogEngine 块持久化前崩溃，已写入 LogEngine 的
+    /// 数据可能因文件未 fsync 而丢失。建议配合 `wal_flush_mode = Periodic` 使用。
+    pub log_skip_wal: bool,
     /// 分层索引：compact 时是否按主键排序写入列存（默认 true）
     ///
     /// 开启后固化段内主键有序，稀疏索引段内可二分定位（点查 ~100ns 级）；
@@ -325,6 +334,7 @@ impl Default for Config {
             token_delta_entropy: TokenDeltaEntropy::Static, // v0.21：正式场景测试决定（见 7.2）
             compact_strategy: CompactStrategy::default_adaptive(row_group_size as usize),
             sync_wal_compact: true,
+            log_skip_wal: false, // Phase 2 P1-C：默认关闭（保留 WAL 保证）
             sort_compact_by_pk: true,
             primary_index_legacy: false,
             sparse_index_granule_rows: 8192,

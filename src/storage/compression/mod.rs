@@ -3,11 +3,15 @@
 //! 借鉴 ClickHouse 的 codec 设计思想：按列的数据类型自动选择最优压缩算法，
 //! 而非对所有列使用统一算法。每种类型尝试多种 codec，选择压缩率最高的。
 //!
-//! 策略映射（ClickHouse 对照）：
+//!策略映射（ClickHouse 对照）：
 //! - Boolean  → BooleanPack (1 bit/value，类似 ClickHouse 的位打包)
 //! - Int32/64 → Delta + FOR + Bit-packing + RLE 组合择优（类似 CODEC_Delta + CODEC_For）
 //! - Float64  → Gorilla XOR（类似 CODEC_Gorilla，源自 Facebook Gorilla 论文）
 //! - Varchar  → Dictionary（低基数时，类似 CODEC_Dictionary）
+
+pub mod recommender;
+
+pub use recommender::{recommend_for_column, Recommendation};
 
 pub mod rle;
 pub mod bitpacking;

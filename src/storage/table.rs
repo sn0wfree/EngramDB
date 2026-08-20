@@ -133,6 +133,11 @@ pub struct Table {
     pub delta_store: DeltaStore,
     /// 当前表的 Delta 合并策略
     compact_strategy: CompactStrategy,
+    /// Phase 2 P0-B：是否标记为 Auto 引擎（用于迁移调度）
+    ///
+    /// 当 `def.engine == EngineType::Auto` 时为 true。
+    /// HeatTracker 在运行时可根据此标志决定是否触发迁移。
+    auto_engine_marked: bool,
     /// 二级索引（跳表实现，支持覆盖索引）
     ///
     /// v0.12.0 新增。key 为索引名，value 为跳表索引实例。
@@ -184,6 +189,7 @@ impl Table {
         };
         let cs = ColumnStore::new_with_sparse(def.clone(), row_group_size, 8192);
         let ds = DeltaStore::new(def.clone());
+        let auto_marked = def.engine == crate::common::types::EngineType::Auto;
         Self {
             def,
             column_store: cs,
@@ -196,7 +202,18 @@ impl Table {
             sort_compact_by_pk: true,
             primary_index_legacy: false,
             sparse_granule_rows: 8192,
+            auto_engine_marked: auto_marked,
         }
+    }
+
+    /// Phase 2 P0-B：标记表为 Auto 引擎（用于 HeatTracker 调度）
+    pub fn mark_auto_engine(&mut self) {
+        self.auto_engine_marked = true;
+    }
+
+    /// Phase 2 P0-B：是否为 Auto 引擎表
+    pub fn is_auto_engine(&self) -> bool {
+        self.auto_engine_marked
     }
 
     /// 分层索引配置（Database 创建表后调用，从 Config 注入）

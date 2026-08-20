@@ -13,6 +13,13 @@ pub mod rate_limiter;
 pub mod index;
 pub mod catalog;
 pub mod engine;
+
+#[cfg(feature = "mmap-read")]
+pub mod mmap_reader;
+
+pub mod heat_tracker;
+pub mod bloom_filter;
+pub mod tier_migration;
 pub mod bloom;
 pub mod capabilities;
 pub mod insert_batcher;
@@ -72,6 +79,17 @@ pub struct Database {
     /// 本 seen-set 维护批内自重复判重（O(1)），discard/flush 时清空。
     txn_buffer_pk_seen: HashMap<String, std::collections::HashSet<Value>>,
     txn_buffer_unique_seen: HashMap<String, HashMap<String, std::collections::HashSet<Value>>>,
+    /// Phase 2.5 P1：HeatTracker（每表访问热度）
+    ///
+    /// 每次访问表（scan/insert）调用 `record_access()` 递增。
+    /// 后台 tick 根据 heat 决策是否触发 Auto 表迁移。
+    pub heat_tracker: heat_tracker::HeatTracker,
+    /// Phase 2.5 P2：累计 commit 次数（用于周期性触发迁移 tick）
+    ///
+    /// 每次 commit 后递增；达到阈值时调用 `tier_migration::tick()`。
+    commit_count: u64,
+    /// Phase 2.5 P2：上次迁移 tick 时的 commit_count（避免重复触发）
+    last_tier_tick_at: u64,
 }
 
 impl Database {
@@ -154,6 +172,9 @@ impl Database {
             txn_buffer_rows: 0,
             txn_buffer_pk_seen: HashMap::new(),
             txn_buffer_unique_seen: HashMap::new(),
+            heat_tracker: heat_tracker::HeatTracker::new(),
+            commit_count: 0,
+            last_tier_tick_at: 0,
         })
     }
 
@@ -199,6 +220,9 @@ impl Database {
             txn_buffer_rows: 0,
             txn_buffer_pk_seen: HashMap::new(),
             txn_buffer_unique_seen: HashMap::new(),
+            heat_tracker: heat_tracker::HeatTracker::new(),
+            commit_count: 0,
+            last_tier_tick_at: 0,
         };
 
         // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
@@ -243,8 +267,25 @@ impl Database {
                     table_def.clone(), self.config.log_block_rows,
                 ))
             }
+            // Phase 2 P0-B：Auto 引擎——根据初始 heat 与表大小调度到具体引擎。
+            // 当前策略：小表（< 1000 行）→ Memory，否则 → Columnar。
+            // 后续由 HeatTracker 在运行时迁移。
+            crate::common::types::EngineType::Auto => {
+                // Phase 2 P0-B 简化：默认走 Columnar（最通用）。
+                // 真正的自动调度在下个迭代实现。
+                let mut t = Table::new(table_def.clone(), self.config.compact_strategy);
+                t.set_index_config(
+                    self.config.sort_compact_by_pk,
+                    self.config.primary_index_legacy,
+                    self.config.sparse_index_granule_rows,
+                );
+                // 标记此表为 Auto，便于后续迁移
+                t.mark_auto_engine();
+                EngineTable::Columnar(t)
+            }
         };
         // M2：Memory 表标记为非持久化（事务跳过 WAL）
+        // Phase 2 P0-B：Auto 表根据最终引擎决定
         if table_def.engine == crate::common::types::EngineType::Memory {
             self.txn_manager.mark_non_persistent(table_id);
         }
@@ -303,6 +344,63 @@ impl Database {
     /// 按表 ID 获取可变引擎表句柄（事务 apply 路径）
     pub fn get_engine_table_mut_by_id(&mut self, table_id: u32) -> Option<&mut EngineTable> {
         self.tables.get_mut(&table_id)
+    }
+
+    /// Phase 2.5 P1：记录表访问（HeatTracker）
+    ///
+    /// 调用时机：每次表 scan / insert 入口
+    /// 频率：每张表每次访问一次
+    pub fn record_access(&mut self, table_id: u32) {
+        self.heat_tracker.record_access(table_id);
+    }
+
+    /// Phase 2.5 P1：表名→表 ID + record_access（便利方法）
+    pub fn record_access_by_name(&mut self, table_name: &str) {
+        if let Some(&id) = self.table_names.get(table_name) {
+            self.record_access(id);
+        }
+    }
+
+    /// Phase 2.5 P1：获取当前 HeatTracker（用于外部迁移决策）
+    pub fn heat_tracker(&self) -> &heat_tracker::HeatTracker {
+        &self.heat_tracker
+    }
+
+    /// Phase 2.5 P1：获取可变 HeatTracker（用于外部迁移 tick）
+    pub fn heat_tracker_mut(&mut self) -> &mut heat_tracker::HeatTracker {
+        &mut self.heat_tracker
+    }
+
+    /// Phase 2.5 P1：表名→表 ID 映射（用于 record_access_by_name + 热路径）
+    pub fn table_id_by_name(&self, name: &str) -> Option<u32> {
+        self.table_names.get(name).copied()
+    }
+
+    /// Phase 2.5 P2：内部表名映射（用于迁移决策扫描）
+    pub fn table_names_internal(&self) -> &HashMap<String, u32> {
+        &self.table_names
+    }
+
+    /// Phase 2.5 P2：递增 commit 计数，返回是否应触发迁移 tick
+    pub fn on_commit(&mut self) -> bool {
+        self.commit_count += 1;
+        // 每 1000 次 commit 触发一次迁移 tick（默认）
+        // 用户可通过 Config 调整（Phase 2.5 后续）
+        const TICK_INTERVAL: u64 = 1000;
+        if self.commit_count - self.last_tier_tick_at >= TICK_INTERVAL {
+            self.last_tier_tick_at = self.commit_count;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Phase 2.5 P2：执行 Auto 表分层迁移 tick
+    ///
+    /// 返回所有"应迁移"的决策列表。Phase 2.5 仅返回决策，
+    /// 真正数据搬迁推迟到 Phase 3。
+    pub fn tier_migration_tick(&mut self) -> Vec<tier_migration::MigrationDecision> {
+        tier_migration::tick_decisions(self)
     }
 
     /// 创建覆盖索引（v0.12.0 新增）
@@ -1092,6 +1190,17 @@ impl Database {
                         table_def.clone(), self.config.log_block_rows,
                     ))
                 }
+                // Phase 2 P0-B：Auto 引擎恢复时按 Columnar 路径（同创建路径）
+                crate::common::types::EngineType::Auto => {
+                    let mut t = Table::new(table_def.clone(), self.config.compact_strategy);
+                    t.set_index_config(
+                        self.config.sort_compact_by_pk,
+                        self.config.primary_index_legacy,
+                        self.config.sparse_index_granule_rows,
+                    );
+                    t.mark_auto_engine();
+                    EngineTable::Columnar(t)
+                }
             };
             // M2：Memory 表标记为非持久化（事务跳过 WAL）
             if table_def.engine == crate::common::types::EngineType::Memory {
@@ -1215,6 +1324,8 @@ impl Database {
                     } else {
                         table.column_store_mut().rebuild_sparse()?;
                     }
+                    // Phase 2.5 P4：从 typed 数据重建 Bloom Filter
+                    table.column_store_mut().rebuild_blooms();
                     loaded += 1;
                 }
                 Some(EngineTable::Log(table)) => {

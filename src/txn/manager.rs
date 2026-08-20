@@ -55,6 +55,11 @@ pub struct TransactionManager {
     non_persistent_tables: std::collections::HashSet<u32>,
     /// 表引擎映射（M4：WAL 记录头 engine_type 来源）
     table_engines: std::collections::HashMap<u32, EngineType>,
+    /// Phase 2 P1-C：是否对 LogEngine 表跳过 WAL
+    ///
+    /// 启用后：LogEngine 表的事务不写 WAL COMMIT（避免双写）。
+    /// 由 Database::create_table() 根据 config.log_skip_wal 自动设置。
+    log_skip_wal: bool,
 }
 
 impl TransactionManager {
@@ -77,6 +82,7 @@ impl TransactionManager {
             txns: HashMap::new(),
             db_path: PathBuf::from(db_path),
             non_persistent_tables: std::collections::HashSet::new(),
+            log_skip_wal: config.log_skip_wal,
             table_engines: std::collections::HashMap::new(),
         })
     }
@@ -147,8 +153,14 @@ impl TransactionManager {
         let write_set = std::mem::take(&mut ctx.write_set);
 
         // 只读事务跳过 WAL COMMIT 记录和 fsync（v0.15.0 Txn09）；
-        // 全部写入仅涉及非持久化表（MemoryEngine）时同样跳过（M2）
-        let has_persistent_write = write_set.iter().any(|(tid, _)| self.is_persistent(*tid));
+        // 全部写入仅涉及非持久化表（MemoryEngine）时同样跳过（M2）。
+        // Phase 2 P1-C：LogEngine 表 + log_skip_wal=true 时同样跳过 WAL
+        //   （LogEngine 自身即 append-only，数据文件即 WAL）
+        let has_persistent_write = write_set.iter().any(|(tid, _)| {
+            self.is_persistent(*tid)
+                && !(self.log_skip_wal
+                    && self.table_engines.get(tid) == Some(&EngineType::Log))
+        });
         if !read_only && has_persistent_write {
             self.wal.write_record(WalRecordType::Commit, txn_id, 0, EngineType::Columnar, &[])?;
             self.wal.commit_flush()?;
@@ -267,8 +279,13 @@ impl TransactionManager {
         let _ = std::mem::take(&mut ctx.savepoints);
 
         // 只读事务跳过 WAL ROLLBACK 记录（v0.15.0 Txn09）；
-        // 仅涉及非持久化表（MemoryEngine）时同样跳过（M2）
-        let has_persistent_write = write_set.iter().any(|(tid, _)| self.is_persistent(*tid));
+        // 仅涉及非持久化表（MemoryEngine）时同样跳过（M2）。
+        // Phase 2 P1-C：LogEngine 表 + log_skip_wal=true 时同样跳过 WAL
+        let has_persistent_write = write_set.iter().any(|(tid, _)| {
+            self.is_persistent(*tid)
+                && !(self.log_skip_wal
+                    && self.table_engines.get(tid) == Some(&EngineType::Log))
+        });
         if !read_only && has_persistent_write {
             self.wal.write_record(WalRecordType::Rollback, txn_id, 0, EngineType::Columnar, &[])?;
             self.wal.commit_flush()?;

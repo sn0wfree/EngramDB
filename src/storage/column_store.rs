@@ -7,6 +7,7 @@ use crate::common::types::{DataType, TableDef};
 use crate::common::config::CompressionType;
 use crate::common::column_data::{ColumnData, ColumnValue};
 use crate::common::value_cmp::{total_cmp, total_eq};
+use crate::storage::bloom_filter::{bloomable_key, is_bloomable};
 use super::bloom::BloomFilter;
 use super::sparse_index::SparseIndex;
 use crate::Value;
@@ -132,6 +133,12 @@ pub struct ColumnChunk {
     /// MinMax 跳过索引（数据写入时自动维护）
     pub min_value: Option<Value>,
     pub max_value: Option<Value>,
+    /// Phase 2.5 P3：列级 Bloom Filter（仅 Int32/Int64/Timestamp）
+    ///
+    /// 等值谓词跳读：Eq 查询先查 Bloom（O(7)）→ 若 false 必不在，
+    /// 跳过整 RG（避免解压 + typed 扫描）。
+    /// 构造时机：append_columns_inner 块满时同步构建。
+    pub bloom: Option<crate::storage::bloom_filter::ColumnBloom>,
 }
 
 impl ColumnStore {
@@ -276,6 +283,7 @@ impl ColumnStore {
                             uncompressed_count: 0,
                             min_value: None,
                             max_value: None,
+                            bloom: None,
                         })
                         .collect(),
                     blooms: vec![None; num_cols],
@@ -377,6 +385,7 @@ impl ColumnStore {
                             uncompressed_count: 0,
                             min_value: None,
                             max_value: None,
+                            bloom: None,
                         })
                         .collect(),
                     blooms: vec![None; num_cols],
@@ -447,6 +456,23 @@ impl ColumnStore {
             rg.row_count += take as u32;
             offset += take;
             remaining_rows -= take;
+
+            // Phase 2.5 P3：块满时构建 Bloom（仅当前块）
+            if rg.row_count >= self.row_group_size {
+                for (col_idx, col_chunk) in rg.columns.iter_mut().enumerate() {
+                    if col_chunk.bloom.is_some() {
+                        continue; // 已构建
+                    }
+                    if let Some(data) = &col_chunk.data {
+                        if let Some(bloom) = crate::storage::bloom_filter::build_bloom_from_column(
+                            data,
+                            &col_chunk.data_type,
+                        ) {
+                            col_chunk.bloom = Some(bloom);
+                        }
+                    }
+                }
+            }
         }
 
         // 分层索引：增量维护稀疏主键索引
@@ -736,6 +762,32 @@ impl ColumnStore {
         let data = self.read_column(rg_idx, col_idx)?;
         let in_rg = (row_idx as usize % rg_size).min(data.len().saturating_sub(1));
         Ok(data.get(in_rg))
+    }
+
+    /// Phase 2.5 P4：从已加载的 typed columns 重建 Bloom Filter
+    ///
+    /// 数据库重启后 ColumnChunk::bloom 为 None（bloom 不持久化以避免
+    /// 磁盘格式兼容性问题）。本方法在 `load_data` 完成后调用，
+    /// 对所有解压后的 typed 列重建 bloom，恢复等值谓词跳读能力。
+    ///
+    /// 性能：O(N_total) per RG，与 load 串行叠加；
+    ///      10 RG × 100K 值 ≈ 5-10ms（典型场景）。
+    pub fn rebuild_blooms(&mut self) {
+        for rg in &mut self.row_groups {
+            for col in &mut rg.columns {
+                if col.bloom.is_some() {
+                    continue;
+                }
+                if let Some(data) = &col.data {
+                    if let Some(bloom) = crate::storage::bloom_filter::build_bloom_from_column(
+                        data,
+                        &col.data_type,
+                    ) {
+                        col.bloom = Some(bloom);
+                    }
+                }
+            }
+        }
     }
 
     /// 分层索引：从列存全量重建稀疏主键索引（load/导入兜底）
@@ -1105,6 +1157,7 @@ impl ColumnStore {
                     uncompressed_count,
                     min_value,
                     max_value,
+                    bloom: None,
                 });
             }
 
@@ -1242,17 +1295,32 @@ impl ColumnStore {
     }
 
     /// 惰性构建并查询 Bloom（无假阴性：false 表示该列肯定不含目标值）
+    ///
+    /// Phase 2.5 P3：优先使用 `ColumnChunk::bloom`（块满时同步构建），
+    /// 若未构建则回退到 `rg.blooms` 惰性构建路径。
     fn bloom_may_skip(&mut self, rg_idx: usize, col_idx: usize, val: &Value) -> bool {
         let rg = match self.row_groups.get_mut(rg_idx) {
             Some(rg) => rg,
             None => return false,
         };
+        let col = match rg.columns.get_mut(col_idx) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // Phase 2.5 P3 快路径：块满时已构建的 ColumnChunk::bloom
+        if let Some(bloom) = col.bloom.as_ref() {
+            if crate::storage::bloom_filter::is_bloomable(val) {
+                return !bloom.may_contain(&bloomable_key(val));
+            }
+        }
+
         let bloom_opt = match rg.blooms.get_mut(col_idx) {
             Some(b) => b,
             None => return false,
         };
         // 压缩态：不解压（保持跳过的组零解压），回退 MinMax
-        let data = match rg.columns[col_idx].data.as_ref() {
+        let data = match col.data.as_ref() {
             Some(d) => d,
             None => return false,
         };
