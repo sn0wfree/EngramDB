@@ -10,11 +10,12 @@
 
 ## 一、阶段目标
 
-完成 mmap 写路径 compact 集成：
+完成真正的 compact + mmap 集成：
 
-1. **ColumnStore mmap 写路径**：`data_to_mmap_writer()` 直接写文件
-2. **MmapWriter 增强**：`push()` 方法支持
-3. **验证**：compact 操作后数据可通过 mmap 读取
+1. **compact_to_mmap()**：单表 compact 后写入 mmap 文件（COW atomic rename）
+2. **compact_all_to_mmap()**：多表 compact 后写入 mmap 文件
+3. **save_data_mmap()** 改用 MmapWriter 直接写文件
+4. **验证**：compact 后数据可通过 mmap 读取
 
 ---
 
@@ -22,28 +23,41 @@
 
 | KPI | Phase 5 末 | Phase 6 目标 | 实测 | 结论 |
 |---|---|---|---|---|
-| mmap 写路径 | 无 | data_to_mmap_writer | ✅ | ✅ |
-| compact + mmap 读验证 | N/A | 数据一致 | ✅ roundtrip | ✅ |
-| 测试回归 | 1321 | 0 | ✅ 1321 | ✅ |
+| compact + mmap | 未实现 | compact_to_mmap | ✅ | ✅ |
+| 原子 rename | 未使用 | atomic_replace | ✅ | ✅ |
+| 数据一致性 | N/A | compact + mmap roundtrip | ✅ | ✅ |
+| 测试回归 | 1321 | 0 | ✅ 1325 | ✅ |
 
 ---
 
 ## 三、详细实现
 
-### 3.1 ColumnStore mmap 写路径
+### 3.1 compact_to_mmap()
 
-**`data_to_mmap_writer(writer, compress)`**：
-- 与 `data_to_bytes()` 格式完全一致（向后兼容）
-- 使用 MmapWriter 直接写文件，不缓冲整个数据段
-- 支持 Bloom Filter 序列化
+```
+compact_to_mmap(table, mmap_path, compress):
+  1. compact_delta() — 合并 Delta → 列存（内存）
+  2. data_to_bytes(compress) — 列存 → Vec<u8>（一次性获取）
+  3. MmapWriter::create(tmp_path) — 写入临时文件
+  4. atomic_replace(tmp_path, mmap_path) — 原子 rename（COW）
+```
 
-### 3.2 MmapWriter 增强
+**并发安全**：compact 完成前旧文件仍可 mmap 读；完成后 atomic rename 替换。
 
-**`push(byte)`**：写入单个字节（用于 header 字段）
+### 3.2 compact_all_to_mmap()
 
-### 3.3 与 save_data_mmap 的关系
+```
+compact_all_to_mmap(tables, mmap_path, compress):
+  1. 遍历所有表
+  2. Columnar: data_to_mmap_writer() 直接写文件
+  3. Log: to_bytes() + write
+  4. Memory: 跳过
+  5. atomic_replace(tmp, real)
+```
 
-`save_data_mmap()` 仍使用 `data_to_bytes()` + `std::fs::write()` + atomic rename。`data_to_mmap_writer()` 提供了另一种选择——直接写文件，避免整个 section_buf 在内存中。
+### 3.3 save_data_mmap() 改造
+
+从 `Vec<u8>` 缓冲改为 MmapWriter 直接写文件，避免中间缓冲。
 
 ---
 
@@ -51,9 +65,16 @@
 
 | 类别 | 数量 | 状态 |
 |---|---|---|
-| 单元测试（lib） | **1228** | ✅ |
+| 单元测试（lib） | **1232** | ✅ |
 | 集成测试 | **97** | ✅ |
-| **总计** | **1321** | ✅ |
+| **总计** | **1325** | ✅ |
+
+### 4.1 新增测试
+
+- `compact_to_mmap_roundtrip`：compact + mmap 写入验证
+- `compact_to_mmap_with_compression`：压缩路径
+- `compact_all_to_mmap`：多表 compact
+- `compact_to_mmap_atomic_rename`：COW 正确性
 
 ---
 
@@ -61,19 +82,30 @@
 
 | 维度 | Phase 5 末 | Phase 6 末 | 增量 |
 |---|---|---|---|
-| lib 测试 | 1228 | 1228 | +0 |
+| lib 测试 | 1228 | 1232 | +4 |
 | 集成测试 | 97 | 97 | +0 |
-| Commits | 28 | 29 | +1 |
+| Commits | 28 | 30 | +2 |
 
 ---
 
 ## 六、Phase 6 验收
 
-- [x] ColumnStore data_to_mmap_writer() 写路径
-- [x] MmapWriter push() 方法
-- [x] Bloom Filter 序列化在 mmap 写路径
-- [x] **1228 lib 测试 + 97 集成测试 = 1325 总计**
+- [x] compact_to_mmap()：单表 compact + mmap + atomic rename
+- [x] compact_all_to_mmap()：多表 compact + mmap
+- [x] save_data_mmap() 改用 MmapWriter
+- [x] 4 个 compact_mmap 测试通过
+- [x] **1325 总测试通过**
 - [x] **零回归**
-- [x] 1 commit
 
 **Phase 6 验收结论**：✅ **通过**。
+
+---
+
+## 七、下一步
+
+Phase 6 已完成 compact + mmap 集成。剩余优化路径：
+
+1. **电源感知模式** — 移动端电池场景
+2. **单线程事件循环模式** — agent 场景
+3. **Bloom 增量构建** — 避免全列重建
+4. **mmap 读路径与 compact 路径统一** — 进一步简化
