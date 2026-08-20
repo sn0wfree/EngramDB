@@ -2164,10 +2164,12 @@ impl Table {
             }
 
             // 1. 读取需要的所有列（S2-M2：克隆类型化列，scan 直出 Vector::Typed）
+            // Phase 1 M2 #1 语义化：使用 `clone_whole_owned` 表达"整列 owned"意图。
+            // 当前实现等价于 Clone::clone；Phase 3 mmap 化后可优化为 Arc 共享。
             let mut col_owned: Vec<ColumnData> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.clone());
+                col_owned.push(col_data.clone_whole_owned());
             }
 
             if col_owned.is_empty() {
@@ -2254,25 +2256,44 @@ impl Table {
         }
 
         // Delta 层：转成单行 DataChunk（量小，开销可忽略）
-        for (_, row) in self.delta_store.all_rows() {
-            if self.def.is_expired(&row) {
-                continue;
+        // Phase 1 M2 #2 零拷贝优化：用 `iter_active_indices` + `column_data()`
+        // 直接按 col-major 索引访问 Value，避免每行 Vec<Value> 分配与每 cell 克隆。
+        let delta_cols = self.delta_store.column_data();
+        let n_cols = self.def.columns.len();
+        for (rid, idx) in self.delta_store.iter_active_indices() {
+            // TTL 检查（不构造 row Vec）
+            if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
+                if let Some(cell) = delta_cols.get(ttl_col).and_then(|c| c.get(idx)) {
+                    if let Value::Timestamp(ts) = cell {
+                        if *ts < cut {
+                            continue;
+                        }
+                    }
+                }
             }
             // PREWHERE：Delta 行级筛选（匹配 scan 层语义）
             if let Some((ci, op, val)) = &skip_pred {
-                if row.get(*ci).map_or(true, |cell| !matches_predicate(cell, *op, val)) {
+                let matches = delta_cols.get(*ci)
+                    .and_then(|c| c.get(idx))
+                    .map_or(true, |cell| matches_predicate(cell, *op, val));
+                if !matches {
                     continue;
                 }
             }
             let mut columns: Vec<Vector> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
-                let v = if col_idx < row.len() { row[col_idx].clone() } else { Value::Null };
+                let v = if col_idx < n_cols {
+                    delta_cols.get(col_idx).and_then(|c| c.get(idx)).cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
                 columns.push(Vector::Flat(vec![v]));
             }
             chunks.push(DataChunk {
                 count: 1,
                 columns,
             });
+            let _ = rid;
         }
 
         Ok(chunks)
@@ -2340,10 +2361,11 @@ impl Table {
             }
 
             // S2-M3：克隆类型化列（比 to_values 便宜 4x；谓词列直扫）
+            // Phase 1 M2 #1 语义化：使用 `clone_whole_owned` 表达"整列 owned"意图。
             let mut col_owned: Vec<ColumnData> = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
                 let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.clone());
+                col_owned.push(col_data.clone_whole_owned());
             }
             if col_owned.is_empty() {
                 continue;
@@ -2354,7 +2376,7 @@ impl Table {
             // TTL 列：每 RG 克隆一份（O(N) 一次，替代逐行重建完整行 O(N×M)）
             let ttl_col_data: Option<ColumnData> = match (full_row_for_ttl, self.def.ttl_column) {
                 (true, Some(ttl_col)) => {
-                    let cd = self.column_store.read_column(rg_idx, ttl_col)?.clone();
+                    let cd = self.column_store.read_column(rg_idx, ttl_col)?.clone_whole_owned();
                     Some(cd)
                 }
                 _ => None,
@@ -2390,13 +2412,39 @@ impl Table {
         }
 
         // Delta 层
-        for (_, row) in self.delta_store.all_rows() {
-            if self.def.is_expired(&row) {
-                continue;
+        // Phase 1 M2 #2 零拷贝优化：使用 `iter_active_indices` + `column_data()`
+        // 直接按 col-major 索引访问 Value，避免每行 Vec<Value> 分配与每 cell 克隆。
+        let delta_cols = self.delta_store.column_data();
+        let n_cols = self.def.columns.len();
+        for (_rid, idx) in self.delta_store.iter_active_indices() {
+            // TTL 筛选
+            if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
+                if let Some(cell) = delta_cols.get(ttl_col).and_then(|c| c.get(idx)) {
+                    if let Value::Timestamp(ts) = cell {
+                        if *ts < cut {
+                            continue;
+                        }
+                    }
+                }
+            }
+            // PREWHERE 行级筛选
+            if let Some((ci, op, val)) = &skip_pred {
+                let matches = delta_cols.get(*ci)
+                    .and_then(|c| c.get(idx))
+                    .map_or(true, |cell| matches_predicate(cell, *op, val));
+                if !matches {
+                    continue;
+                }
             }
             let mut projected = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
-                projected.push(if col_idx < row.len() { row[col_idx].clone() } else { Value::Null });
+                projected.push(
+                    if col_idx < n_cols {
+                        delta_cols.get(col_idx).and_then(|c| c.get(idx)).cloned().unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                );
             }
             rows.push(projected);
         }

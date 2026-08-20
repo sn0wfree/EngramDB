@@ -147,6 +147,15 @@ impl ColumnData {
         (0..self.len()).map(|i| self.get(i)).collect()
     }
 
+    /// Phase 1 M2 #1 语义清晰化：克隆整列 owned
+    ///
+    /// 当前等价于 `Clone::clone`（typed 数组 + NULL bitmap 全量复制）。
+    /// 命名意图：调用方承诺"整列我都拿走"，与 `take_front` 的"部分移出"对称。
+    /// Phase 3 mmap 统一读路径落地后，可优化为 `Arc<Vec<T>>` 的 cheap clone。
+    pub fn clone_whole_owned(&self) -> ColumnData {
+        self.clone()
+    }
+
     /// 迭代值（按行，NULL → Value::Null）
     pub fn iter_values(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.len()).map(|i| self.get(i))
