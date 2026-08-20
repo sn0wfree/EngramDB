@@ -131,11 +131,14 @@ impl LogTable {
             if block.min.len() <= i {
                 block.min.push(v.clone());
                 block.max.push(v.clone());
-            } else if value_less(v, &block.min[i]) || value_greater(v, &block.max[i]) {
-                if value_less(v, &block.min[i]) {
+            } else {
+                // Phase 2 P1-C：单次比较，避免重复调用 value_less/value_greater
+                let less = value_less(v, &block.min[i]);
+                let greater = value_greater(v, &block.max[i]);
+                if less {
                     block.min[i] = v.clone();
                 }
-                if value_greater(v, &block.max[i]) {
+                if greater {
                     block.max[i] = v.clone();
                 }
             }
