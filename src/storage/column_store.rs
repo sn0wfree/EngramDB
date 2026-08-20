@@ -11,6 +11,7 @@ use crate::storage::bloom_filter::{bloomable_key, is_bloomable};
 use super::bloom::BloomFilter;
 use super::sparse_index::SparseIndex;
 use crate::Value;
+use std::sync::Arc;
 
 use super::compression;
 use super::file_format::{ColumnChunkHeader, RowGroupHeader};
@@ -138,7 +139,7 @@ pub struct ColumnChunk {
     /// 等值谓词跳读：Eq 查询先查 Bloom（O(7)）→ 若 false 必不在，
     /// 跳过整 RG（避免解压 + typed 扫描）。
     /// 构造时机：append_columns_inner 块满时同步构建。
-    pub bloom: Option<crate::storage::bloom_filter::ColumnBloom>,
+    pub bloom: Option<Arc<crate::storage::bloom_filter::ColumnBloom>>,
 }
 
 impl ColumnStore {
@@ -468,7 +469,7 @@ impl ColumnStore {
                             data,
                             &col_chunk.data_type,
                         ) {
-                            col_chunk.bloom = Some(bloom);
+                            col_chunk.bloom = Some(Arc::new(bloom));
                         }
                     }
                 }
@@ -783,11 +784,21 @@ impl ColumnStore {
                         data,
                         &col.data_type,
                     ) {
-                        col.bloom = Some(bloom);
+                        col.bloom = Some(Arc::new(bloom));
                     }
                 }
             }
         }
+    }
+
+    /// Phase 3.5 P1-B：批量获取所有列 Bloom 引用（共享 Arc）
+    ///
+    /// 调用方缓存结果，避免每次 may_contain 都过 column_store。
+    pub fn get_bloom_index(&self) -> Vec<Vec<Option<Arc<crate::storage::bloom_filter::ColumnBloom>>>> {
+        self.row_groups
+            .iter()
+            .map(|rg| rg.columns.iter().map(|col| col.bloom.clone()).collect())
+            .collect()
     }
 
     /// 分层索引：从列存全量重建稀疏主键索引（load/导入兜底）
