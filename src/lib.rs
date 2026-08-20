@@ -450,11 +450,19 @@ impl Connection {
 
     /// Phase 2.5 P2：手动触发 Auto 表分层迁移 tick
     ///
-    /// 返回所有"应迁移"的决策列表（当前 Phase 仅返回决策，数据搬迁推迟到 Phase 3）。
+    /// 返回所有"应迁移"的决策列表（决策阶段）。
     /// 通常由 `on_commit` 每 1000 次自动触发一次；用户可手动调用以立即评估。
     pub fn tier_migration_tick(&mut self) -> Vec<crate::storage::tier_migration::MigrationDecision> {
         let _ = self.flush_batches();
         self.db.tier_migration_tick()
+    }
+
+    /// Phase 3 P0：手动触发 Auto 表数据迁移（执行决策）
+    ///
+    /// 返回所有执行的迁移结果。
+    pub fn migrate_all_auto(&mut self) -> Vec<crate::storage::migration::MigrationResult> {
+        let _ = self.flush_batches();
+        self.db.migrate_all_auto()
     }
 
     /// 设置 WAL 刷盘策略

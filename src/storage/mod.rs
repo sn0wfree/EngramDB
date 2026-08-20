@@ -20,6 +20,7 @@ pub mod mmap_reader;
 pub mod heat_tracker;
 pub mod bloom_filter;
 pub mod tier_migration;
+pub mod migration;
 pub mod bloom;
 pub mod capabilities;
 pub mod insert_batcher;
@@ -382,13 +383,15 @@ impl Database {
     }
 
     /// Phase 2.5 P2：递增 commit 计数，返回是否应触发迁移 tick
+    ///
+    /// Phase 3 P0：达到阈值时自动执行迁移（不再仅返回决策）
     pub fn on_commit(&mut self) -> bool {
         self.commit_count += 1;
-        // 每 1000 次 commit 触发一次迁移 tick（默认）
-        // 用户可通过 Config 调整（Phase 2.5 后续）
         const TICK_INTERVAL: u64 = 1000;
         if self.commit_count - self.last_tier_tick_at >= TICK_INTERVAL {
             self.last_tier_tick_at = self.commit_count;
+            // Phase 3 P0：实际执行迁移
+            let _ = self.migrate_all_auto();
             true
         } else {
             false
@@ -397,10 +400,36 @@ impl Database {
 
     /// Phase 2.5 P2：执行 Auto 表分层迁移 tick
     ///
-    /// 返回所有"应迁移"的决策列表。Phase 2.5 仅返回决策，
-    /// 真正数据搬迁推迟到 Phase 3。
+    /// 返回所有"应迁移"的决策列表。Phase 3 P0 已实现实际数据搬迁，
+    /// `migrate_all_auto()` 会自动执行 tick 决策。
     pub fn tier_migration_tick(&mut self) -> Vec<tier_migration::MigrationDecision> {
         tier_migration::tick_decisions(self)
+    }
+
+    /// Phase 3 P0：执行所有 Auto 表迁移决策（实际数据搬迁）
+    ///
+    /// 默认每 1000 次 commit 自动触发一次（`on_commit()`）。
+    /// 返回执行的迁移数量和结果。
+    pub fn migrate_all_auto(&mut self) -> Vec<migration::MigrationResult> {
+        let decisions = tier_migration::tick_decisions(self);
+        let mut results = Vec::new();
+        for decision in decisions {
+            let table_id = decision.table_id;
+            // Phase 3 P0 注意：迁移过程中需重置 HeatTracker，
+            // 否则下次 tick 会立即再次触发（同 score + 同 size）
+            if let Some(table) = self.tables.get_mut(&table_id) {
+                match migration::execute_migration(table, &decision) {
+                    Ok(result) => {
+                        self.heat_tracker.reset(table_id);
+                        results.push(result);
+                    }
+                    Err(_) => {
+                        // 迁移失败保留原状态，下次 tick 重试
+                    }
+                }
+            }
+        }
+        results
     }
 
     /// 创建覆盖索引（v0.12.0 新增）
