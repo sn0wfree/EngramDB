@@ -87,7 +87,9 @@ mod tests {
     use crate::Connection;
 
     fn setup() -> Connection {
-        let path = format!("/tmp/p25_tier_{}.hdb", std::process::id());
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace(['(', ')', ':', ' '], "_");
+        let path = format!("/tmp/p25_tier_{}_{}_{}.hdb", std::process::id(), tid, line!());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path));
         Connection::open(&path).unwrap()
