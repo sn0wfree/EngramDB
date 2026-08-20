@@ -1462,12 +1462,13 @@ impl Database {
         let reader = mmap_reader::MmapReader::open(path)?;
 
         // 格式与 load_data 相同：table_count + per-table
+        // Phase 3.5：offset 用 u64（支持 > 4GB 大文件）
         if reader.len() < 4 {
             return Ok(0);
         }
         let table_count =
             u32::from_le_bytes(reader.slice(0, 4).try_into().unwrap()) as usize;
-        let mut offset = 4;
+        let mut offset: u64 = 4;
         let mut loaded = 0;
 
         for _ in 0..table_count {
@@ -1481,7 +1482,7 @@ impl Database {
                 u32::from_le_bytes(reader.slice(offset, 4).try_into().unwrap()) as usize;
             offset += 4;
 
-            if offset + data_len > reader.len() {
+            if offset + data_len as u64 > reader.len() {
                 return Err(EngramDbError::InvalidFormat("truncated mmap data body".into()));
             }
 
@@ -1506,7 +1507,7 @@ impl Database {
                 }
                 _ => {}
             }
-            offset += data_len;
+            offset += data_len as u64;
         }
 
         Ok(loaded)
