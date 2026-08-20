@@ -180,3 +180,7 @@ lto = "thin"
 [[bench]]
 name = "v018_write_bench"
 harness = false
+
+[[bench]]
+name = "wal_group_commit_bench"
+harness = false
