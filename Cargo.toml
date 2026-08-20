@@ -25,6 +25,10 @@ datafusion = ["dep:datafusion", "dep:datafusion-common", "dep:datafusion-expr"]
 # 默认 ON：M3 验证后已合入主分支（参见 docs/phase1-report.md）
 # 低选择性过滤 +71.5%，列存写入 +10.4%，其他指标正向或持平
 query-arena = ["dep:bumpalo"]
+# Phase 2 P0-A：mmap 统一读路径
+# 启用后列存热数据走 mmap 直读，OS 级页面缓存替代手工 buffer pool。
+# 注意：mmap 路径下写入需要 COW 或 careful 写入顺序（暂仅推荐在只读/冷数据场景启用）。
+mmap-read = ["dep:memmap2"]
 
 [dependencies]
 # 解析
@@ -80,6 +84,10 @@ datafusion-expr = { version = "40", optional = true }
 
 # Phase 1 M3：bumpalo 查询 arena（feature = "query-arena"）
 bumpalo = { version = "3", optional = true }
+
+# Phase 2 P0-A：mmap 统一读路径（feature = "mmap-read"）
+# 启用后列存热数据走 mmap 直读，OS 级 LRU 替代手工 buffer pool
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3.0"
@@ -186,6 +194,10 @@ lto = "thin"
 
 [[bench]]
 name = "v018_write_bench"
+harness = false
+
+[[bench]]
+name = "mmap_read_bench"
 harness = false
 
 [[bench]]

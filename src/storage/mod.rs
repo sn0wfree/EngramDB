@@ -13,6 +13,9 @@ pub mod rate_limiter;
 pub mod index;
 pub mod catalog;
 pub mod engine;
+
+#[cfg(feature = "mmap-read")]
+pub mod mmap_reader;
 pub mod bloom;
 pub mod capabilities;
 pub mod insert_batcher;

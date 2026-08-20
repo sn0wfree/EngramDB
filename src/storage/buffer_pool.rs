@@ -1,6 +1,12 @@
-//! 缓冲池（Buffer Pool）
+//! 缓冲池（Buffer Pool）— **DEPRECATED**（Phase 2 P0-A）
 //!
-//! 管理内存中的页面缓存，减少磁盘 I/O
+//! Phase 2 决策：本模块不再被任何生产代码使用（仅自身单元测试引用）。
+//! Phase 2 P0-A 引入 `MmapReader` 后，列存读路径走 mmap（OS 级页面缓存），
+//! 无需手写 LRU。计划在 Phase 2 末尾删除此模块。
+//!
+//! 如需引用本模块，会触发 `#[deprecated]` 警告，请改用 `crate::storage::mmap_reader::MmapReader`。
+
+#![deprecated(note = "Use crate::storage::mmap_reader::MmapReader instead. BufferPool is unused; planned removal in Phase 2 cleanup.")]
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
