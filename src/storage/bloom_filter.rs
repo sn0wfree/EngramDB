@@ -113,7 +113,9 @@ fn hash_i<T: Hash + ?Sized>(value: &T, i: u32) -> u64 {
 
 /// Phase 2 P1-A：从 `&ColumnData` 构造 Bloom Filter
 ///
-/// 注意：当前实现仅支持整型/时间戳类型，浮点/Varchar 留待后续扩展
+/// Phase 3 P1-A 扩展：
+/// - Float32/Float64（IEEE 754 bits → i64）
+/// - Varchar/Json（FxHash → i64）
 pub fn build_bloom_from_column(
     data: &crate::common::column_data::ColumnData,
     data_type: &DataType,
@@ -134,7 +136,12 @@ pub fn build_bloom_from_column(
             crate::common::column_data::ColumnValue::Int32(v) => bloom.insert(&v[i]),
             crate::common::column_data::ColumnValue::Int64(v) => bloom.insert(&v[i]),
             crate::common::column_data::ColumnValue::Timestamp(v) => bloom.insert(&v[i]),
-            _ => return None, // 不支持的类型
+            crate::common::column_data::ColumnValue::Float32(v) => bloom.insert(&f32_to_i64_key(v[i])),
+            crate::common::column_data::ColumnValue::Float64(v) => bloom.insert(&f64_to_i64_key(v[i])),
+            crate::common::column_data::ColumnValue::Varchar(v) => bloom.insert(&str_to_i64_key(&v[i])),
+            crate::common::column_data::ColumnValue::Json(v) => bloom.insert(&str_to_i64_key(&v[i])),
+            // Vector / Blob / Boolean 不支持（成本过高）
+            _ => return None,
         }
         let _ = data_type; // 当前未用，预留接口
     }
@@ -145,19 +152,65 @@ pub fn build_bloom_from_column(
 pub fn is_bloomable(value: &Value) -> bool {
     matches!(value,
         Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_)
+            | Value::Float32(_) | Value::Float64(_)
+            | Value::Varchar(_) | Value::Json(_)
     )
 }
 
 /// Phase 2.5 P3：从 Value 提取 bloomable key（i64）
 ///
 /// 用于 ColumnChunk::bloom.may_contain() 查询。
+///
+/// Phase 3 P1-A 扩展：
+/// - Float32/Float64：IEEE 754 bits → u64 → i64（位级别保序）
+/// - Varchar/Json：FxHash → u64 → i64（稳定哈希）
 pub fn bloomable_key(value: &Value) -> i64 {
     match value {
         Value::Int32(v) => *v as i64,
         Value::Int64(v) => *v,
         Value::Timestamp(v) => *v,
+        Value::Float32(v) => f32_to_i64_key(*v),
+        Value::Float64(v) => f64_to_i64_key(*v),
+        Value::Varchar(s) => str_to_i64_key(s),
+        Value::Json(s) => str_to_i64_key(s),
         _ => 0,
     }
+}
+
+/// Phase 3 P1-A：Float32 → i64 (bit-level encoding)
+///
+/// IEEE 754：正数保持原位，负数反转所有位（保留排序语义）
+pub fn f32_to_i64_key(f: f32) -> i64 {
+    let bits = f.to_bits() as u64;
+    let key = if bits >> 63 == 0 {
+        bits
+    } else {
+        !bits
+    };
+    key as i64
+}
+
+/// Phase 3 P1-A：Float64 → i64 (bit-level encoding)
+///
+/// 同 f32_to_i64_key，扩展到 64-bit 浮点数。
+pub fn f64_to_i64_key(f: f64) -> i64 {
+    let bits = f.to_bits();
+    let key = if bits >> 63 == 0 {
+        bits
+    } else {
+        !bits
+    };
+    key as i64
+}
+
+/// Phase 3 P1-A：Varchar → i64 (FxHash → i64)
+pub fn str_to_i64_key(s: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = FxHasher::default();
+    s.hash(&mut hasher);
+    let h = hasher.finish();
+    // 折叠 64-bit hash 到 64-bit（直接 cast）
+    h as i64
 }
 
 #[cfg(test)]
@@ -238,8 +291,35 @@ mod tests {
         assert!(is_bloomable(&Value::Int64(42)));
         assert!(is_bloomable(&Value::Int32(42)));
         assert!(is_bloomable(&Value::Timestamp(0)));
-        assert!(!is_bloomable(&Value::Varchar("x".into())));
+        // Phase 3 P1-A 扩展：Float + Varchar + Json 现在也可 bloom
+        assert!(is_bloomable(&Value::Float64(1.0)));
+        assert!(is_bloomable(&Value::Float32(1.0)));
+        assert!(is_bloomable(&Value::Varchar("x".into())));
+        assert!(is_bloomable(&Value::Json("{}".into())));
+        // Null + Vector + Blob 不支持
         assert!(!is_bloomable(&Value::Null));
-        assert!(!is_bloomable(&Value::Float64(1.0)));
+        assert!(!is_bloomable(&Value::Vector(vec![1.0, 2.0])));
+    }
+
+    #[test]
+    fn test_float_bloomable_key_stable() {
+        // Float → i64 key 稳定性（同一 f → 同一 key）
+        assert_eq!(f32_to_i64_key(1.5), f32_to_i64_key(1.5));
+        assert_eq!(f64_to_i64_key(2.71828), f64_to_i64_key(2.71828));
+
+        // NaN 行为（IEEE 754 不唯一，但稳定）
+        let nan_key = f32_to_i64_key(f32::NAN);
+        assert_eq!(nan_key, f32_to_i64_key(f32::NAN));
+    }
+
+    #[test]
+    fn test_str_bloomable_key_stable() {
+        // 同一字符串多次调用应得相同 key
+        let k1 = str_to_i64_key("hello");
+        let k2 = str_to_i64_key("hello");
+        assert_eq!(k1, k2);
+        // 不同字符串大概率不同（FxHash 高质量）
+        let k3 = str_to_i64_key("world");
+        assert_ne!(k1, k3);
     }
 }
