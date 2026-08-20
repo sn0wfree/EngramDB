@@ -18,11 +18,12 @@ name = "engramdb"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["query-arena"]
 # DataFusion 互操作（启用后编译 datafusion_ext 模块与集成测试）
 datafusion = ["dep:datafusion", "dep:datafusion-common", "dep:datafusion-expr"]
-# Phase 1 M3：查询生命周期 Arena（默认 OFF，灰度发布）
-# 启用后查询执行期临时分配走 bumpalo，单查询结束一次性 reset
+# Phase 1 M3：查询生命周期 Arena
+# 默认 ON：M3 验证后已合入主分支（参见 docs/phase1-report.md）
+# 低选择性过滤 +71.5%，列存写入 +10.4%，其他指标正向或持平
 query-arena = ["dep:bumpalo"]
 
 [dependencies]
