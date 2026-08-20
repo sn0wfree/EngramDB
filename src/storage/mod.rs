@@ -18,6 +18,7 @@ pub mod engine;
 pub mod mmap_reader;
 
 pub mod heat_tracker;
+pub mod bloom_filter;
 pub mod bloom;
 pub mod capabilities;
 pub mod insert_batcher;

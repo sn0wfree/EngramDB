@@ -201,5 +201,9 @@ name = "mmap_read_bench"
 harness = false
 
 [[bench]]
+name = "bloom_prewhere_bench"
+harness = false
+
+[[bench]]
 name = "wal_group_commit_bench"
 harness = false
