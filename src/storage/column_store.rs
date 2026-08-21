@@ -560,6 +560,26 @@ impl ColumnStore {
         Ok(col.data.as_ref().unwrap())
     }
 
+    /// 预解压指定 row group 的所有列（可变借用，一次性解压）
+    ///
+    /// 调用后可通过 `get_column` 以不可变借用获取已解压的列数据，
+    /// 避免 `read_column` 的可变借用阻止同时持有多个列引用。
+    pub fn ensure_columns_decompressed(&mut self, row_group_idx: usize, col_indices: &[usize]) -> Result<()> {
+        for &col_idx in col_indices {
+            self.read_column(row_group_idx, col_idx)?;
+        }
+        Ok(())
+    }
+
+    /// 不可变获取已解压的列数据（必须先调用 `ensure_columns_decompressed`）
+    ///
+    /// 与 `read_column` 的区别：不需要可变借用，可同时持有多个列引用。
+    pub fn get_column(&self, row_group_idx: usize, col_idx: usize) -> Option<&ColumnData> {
+        self.row_groups.get(row_group_idx)
+            .and_then(|rg| rg.columns.get(col_idx))
+            .and_then(|col| col.data.as_ref())
+    }
+
     /// 获取 row group 数量
     pub fn row_group_count(&self) -> usize {
         self.row_groups.len()
@@ -1035,6 +1055,12 @@ impl ColumnStore {
                             None => 0,
                         };
                         if compress && !serialized.is_empty() {
+                            // Step 1.3：序列化压缩前确保 Bloom 存在
+                            if col.bloom.is_none() {
+                                if let Some(data) = &col.data {
+                                    col.bloom = crate::storage::bloom_filter::build_bloom_from_column(data, &col.data_type).map(std::sync::Arc::new);
+                                }
+                            }
                             let (c, comp) = compression::compress(&serialized, &col.data_type)?;
                             (c, comp, count)
                         } else {

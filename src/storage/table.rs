@@ -2180,58 +2180,55 @@ impl Table {
                 }
             }
 
-            // 1. 读取需要的所有列（S2-M2：克隆类型化列，scan 直出 Vector::Typed）
-            // Phase 1 M2 #1 语义化：使用 `clone_whole_owned` 表达"整列 owned"意图。
-            // 当前实现等价于 Clone::clone；Phase 3 mmap 化后可优化为 Arc 共享。
-            let mut col_owned: Vec<ColumnData> = Vec::with_capacity(column_indices.len());
-            for &col_idx in column_indices {
-                let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.clone_whole_owned());
-            }
-
-            if col_owned.is_empty() {
+            // Phase 2 零拷贝：预解压所有列，然后用不可变借用替代 clone_whole_owned。
+            // 消除 O(N) 深拷贝 + O(N²) drain 移位，扫描路径仅 O(命行数) 物化。
+            if column_indices.is_empty() {
                 continue;
             }
+            self.column_store.ensure_columns_decompressed(rg_idx, column_indices)?;
 
-            let row_count = col_owned[0].len();
+            // 获取行数（从第一列读取）
+            let row_count = match self.column_store.get_column(rg_idx, column_indices[0]) {
+                Some(c) => c.len(),
+                None => continue,
+            };
 
             // PREWHERE：谓词列在输出列时，batch 内用 Typed 谓词直扫筛幸存行
-            // （零 Value 构造，只物化幸存行——1% 选择性只输出 1% 行）
             let pred_pos: Option<usize> = skip_pred
                 .as_ref()
                 .and_then(|(ci, _, _)| column_indices.iter().position(|&c| c == *ci));
 
-            // TTL 列：可能不在输出列，每 RG 克隆一份（O(N) 一次，
-            // 替代旧的逐行重建完整行 O(N×M) + 逐行 SystemTime::now()）
-            let ttl_col_data: Option<ColumnData> = match (full_row_for_ttl, self.def.ttl_column) {
-                (true, Some(ttl_col)) => {
-                    let cd = self.column_store.read_column(rg_idx, ttl_col)?.clone();
-                    Some(cd)
-                }
-                _ => None,
-            };
-            // 2. 按 batch_size 分块，逐 chunk 构造
-            // S2-M2：take_front 移出类型化子列 → Vector::Typed（零 Value 转换）
+            // TTL 列：预解压（不可变借用，不克隆）
+            let ttl_col_idx = if full_row_for_ttl { self.def.ttl_column } else { None };
+            if let Some(ttl_idx) = ttl_col_idx {
+                self.column_store.ensure_columns_decompressed(rg_idx, &[ttl_idx])?;
+            }
+
+            // 2. 按 batch_size 分块，逐 chunk 构造（零 drain，直接索引访问）
             let mut batch_start = 0;
             while batch_start < row_count {
                 let batch_len = BATCH_SIZE.min(row_count - batch_start);
+                let batch_end = batch_start + batch_len;
 
                 // PREWHERE + TTL 合流筛选：谓词幸存行 ∩ TTL 存活行
-                // TTL 之前走 O(N×M) 逐行重建完整行 + 逐行 SystemTime::now()，
-                // 现在并入同一 survivors 通道：只读一次 TTL 列（O(N)），cutoff 一次算好
                 let survivors: Option<Vec<usize>> = {
                     let mut sel: Vec<usize> = match (pred_pos, &skip_pred) {
-                        (Some(pos), Some((_, op, val))) => (0..batch_len)
-                            .filter(|&j| matches_predicate_typed(&col_owned[pos], j, *op, val))
-                            .collect(),
-                        _ => (0..batch_len).collect(),
+                        (Some(pos), Some((_, op, val))) => {
+                            let col = self.column_store.get_column(rg_idx, column_indices[pos]).unwrap();
+                            (batch_start..batch_end)
+                                .filter(|&i| matches_predicate_typed(col, i, *op, val))
+                                .collect()
+                        }
+                        _ => (batch_start..batch_end).collect(),
                     };
-                    if let (Some(ttl_col), Some(cut)) = (&ttl_col_data, ttl_cutoff) {
-                        sel.retain(|&j| ttl_col_alive(ttl_col, batch_start + j, cut));
+                    if let (Some(ttl_idx), Some(cut)) = (ttl_col_idx, ttl_cutoff) {
+                        if let Some(ttl_col) = self.column_store.get_column(rg_idx, ttl_idx) {
+                            sel.retain(|&row_idx| ttl_col_alive(ttl_col, row_idx, cut));
+                        }
                     }
-                    if ttl_col_data.is_some() {
+                    if ttl_col_idx.is_some() {
                         if sel.len() == batch_len {
-                            None // 全部存活 → 走原始无滤波快路径
+                            None // 全部存活 → 走无滤波快路径
                         } else {
                             Some(sel)
                         }
@@ -2242,24 +2239,22 @@ impl Table {
                     }
                 };
 
-                let mut columns: Vec<Vector> = Vec::with_capacity(col_owned.len());
+                let mut columns: Vec<Vector> = Vec::with_capacity(column_indices.len());
                 if let Some(sel) = &survivors {
                     if sel.is_empty() {
-                        // 本 batch 全过滤：消费列后跳过
-                        for col in &mut col_owned {
-                            col.take_front(batch_len);
-                        }
                         batch_start += batch_len;
                         continue;
                     }
-                    // 先 take_front 取本 batch，再按相对索引 gather 幸存行
-                    for col in &mut col_owned {
-                        let batch_col = col.take_front(batch_len);
-                        columns.push(Vector::Typed(batch_col.gather(sel)));
+                    // 幸存行：用 gather 按绝对索引选取（O(命中数) 物化，跳过被过滤行）
+                    for &col_idx in column_indices {
+                        let col = self.column_store.get_column(rg_idx, col_idx).unwrap();
+                        columns.push(Vector::Typed(col.gather(sel)));
                     }
                 } else {
-                    for col in &mut col_owned {
-                        columns.push(Vector::Typed(col.take_front(batch_len)));
+                    // 无过滤：用 from_range 按连续范围构造（O(batch_size)，无 drain 移位）
+                    for &col_idx in column_indices {
+                        let col = self.column_store.get_column(rg_idx, col_idx).unwrap();
+                        columns.push(Vector::Typed(col.from_range(batch_start, batch_len)));
                     }
                 }
 
@@ -2356,8 +2351,6 @@ impl Table {
         let ttl_cutoff: Option<i64> = self.def.ttl_cutoff_ms();
 
         // 谓词列在 output column_indices 中的位置
-        // - Some(pos)：谓词列是输出列之一，可做 PREWHERE 短路
-        // - None：谓词列不在输出（少见，例如 WHERE 仅引用非 SELECT 列），退化为全量扫描
         let pred_col_pos_in_output: Option<usize> = skip_pred.as_ref().and_then(|(col_idx, _, _)| {
             column_indices.iter().position(|&c| c == *col_idx)
         });
@@ -2377,27 +2370,22 @@ impl Table {
                 }
             }
 
-            // S2-M3：克隆类型化列（比 to_values 便宜 4x；谓词列直扫）
-            // Phase 1 M2 #1 语义化：使用 `clone_whole_owned` 表达"整列 owned"意图。
-            let mut col_owned: Vec<ColumnData> = Vec::with_capacity(column_indices.len());
-            for &col_idx in column_indices {
-                let col_data = self.column_store.read_column(rg_idx, col_idx)?;
-                col_owned.push(col_data.clone_whole_owned());
-            }
-            if col_owned.is_empty() {
+            // Phase 2 零拷贝：预解压所有列，用不可变借用替代 clone_whole_owned
+            if column_indices.is_empty() {
                 continue;
             }
+            self.column_store.ensure_columns_decompressed(rg_idx, column_indices)?;
 
-            let row_count = col_owned[0].len();
-
-            // TTL 列：每 RG 克隆一份（O(N) 一次，替代逐行重建完整行 O(N×M)）
-            let ttl_col_data: Option<ColumnData> = match (full_row_for_ttl, self.def.ttl_column) {
-                (true, Some(ttl_col)) => {
-                    let cd = self.column_store.read_column(rg_idx, ttl_col)?.clone_whole_owned();
-                    Some(cd)
-                }
-                _ => None,
+            let row_count = match self.column_store.get_column(rg_idx, column_indices[0]) {
+                Some(c) => c.len(),
+                None => continue,
             };
+
+            // TTL 列：预解压（不可变借用）
+            let ttl_col_idx = if full_row_for_ttl { self.def.ttl_column } else { None };
+            if let Some(ttl_idx) = ttl_col_idx {
+                self.column_store.ensure_columns_decompressed(rg_idx, &[ttl_idx])?;
+            }
 
             // 按 batch 处理：先按谓词列筛掉绝大多数行，再为幸存行构造完整 row
             for batch_start in (0..row_count).step_by(BATCH_SIZE) {
@@ -2406,7 +2394,7 @@ impl Table {
                 // 1. 找出 batch 内通过谓词的行索引（Typed 谓词列直扫，零 Value 构造）
                 let mut survivors: Vec<usize> = match (pred_col_pos_in_output, &skip_pred) {
                     (Some(pos), Some((_, op, val))) => {
-                        let col = &col_owned[pos];
+                        let col = self.column_store.get_column(rg_idx, column_indices[pos]).unwrap();
                         (batch_start..batch_end)
                             .filter(|&i| i < col.len() && matches_predicate_typed(col, i, *op, val))
                             .collect()
@@ -2414,14 +2402,20 @@ impl Table {
                     _ => (batch_start..batch_end).collect(),
                 };
                 // 2. TTL 过滤：按 TTL 列存活集剔过期行（绝对行号，零完整行重建）
-                if let (Some(ttl_col), Some(cut)) = (&ttl_col_data, ttl_cutoff) {
-                    survivors.retain(|&row_idx| ttl_col_alive(ttl_col, row_idx, cut));
+                if let (Some(ttl_idx), Some(cut)) = (ttl_col_idx, ttl_cutoff) {
+                    if let Some(ttl_col) = self.column_store.get_column(rg_idx, ttl_idx) {
+                        survivors.retain(|&row_idx| ttl_col_alive(ttl_col, row_idx, cut));
+                    }
                 }
-                // 3. 为幸存行构造完整 row（避免对被过滤行分配 Vec + 克隆 cell）
+                // 3. 为幸存行构造完整 row（直接从原始列索引访问，无 clone/drain）
                 for row_idx in survivors {
                     let mut row: Vec<Value> = Vec::with_capacity(column_indices.len());
-                    for col in &col_owned {
-                        row.push(if row_idx < col.len() { col.get(row_idx) } else { Value::Null });
+                    for &col_idx in column_indices {
+                        let v = match self.column_store.get_column(rg_idx, col_idx) {
+                            Some(col) if row_idx < col.len() => col.get(row_idx),
+                            _ => Value::Null,
+                        };
+                        row.push(v);
                     }
                     rows.push(row);
                 }

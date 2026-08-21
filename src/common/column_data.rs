@@ -240,6 +240,42 @@ impl ColumnData {
         ColumnData { values: out, nulls }
     }
 
+    /// 从连续范围 [start, start+len) 构造新 ColumnData（零 drain，直接 extend_from_slice）
+    ///
+    /// 用于扫描路径：替代 `take_front` 的 drain 操作，避免 O(N²) 移位。
+    /// 仅适用于连续范围；非连续索引请用 `gather`。
+    pub fn from_range(&self, start: usize, len: usize) -> ColumnData {
+        let end = start + len;
+        let out_values = match &self.values {
+            ColumnValue::Boolean(v) => ColumnValue::Boolean(v[start..end].to_vec()),
+            ColumnValue::Int32(v) => ColumnValue::Int32(v[start..end].to_vec()),
+            ColumnValue::Int64(v) => ColumnValue::Int64(v[start..end].to_vec()),
+            ColumnValue::Float32(v) => ColumnValue::Float32(v[start..end].to_vec()),
+            ColumnValue::Float64(v) => ColumnValue::Float64(v[start..end].to_vec()),
+            ColumnValue::Varchar(v) => ColumnValue::Varchar(v[start..end].to_vec()),
+            ColumnValue::Json(v) => ColumnValue::Json(v[start..end].to_vec()),
+            ColumnValue::Blob(v) => ColumnValue::Blob(v[start..end].to_vec()),
+            ColumnValue::Vector(v) => ColumnValue::Vector(v[start..end].to_vec()),
+            ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(v[start..end].to_vec()),
+            ColumnValue::Timestamp(v) => ColumnValue::Timestamp(v[start..end].to_vec()),
+        };
+        let nulls = match &self.nulls {
+            None => None,
+            Some(bv) => {
+                let mut nb = BitVec::new(len);
+                let mut any = false;
+                for i in start..end {
+                    if bv.test(i) {
+                        nb.set(i - start, true);
+                        any = true;
+                    }
+                }
+                if any { Some(nb) } else { None }
+            }
+        };
+        ColumnData { values: out_values, nulls }
+    }
+
     /// 追加另一列数据到尾部（两列类型必须一致）
     pub fn append(&mut self, other: &ColumnData) {        match (&mut self.values, &other.values) {
             (ColumnValue::Boolean(a), ColumnValue::Boolean(b)) => a.extend_from_slice(b),
