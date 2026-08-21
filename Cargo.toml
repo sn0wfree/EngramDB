@@ -198,6 +198,22 @@ name = "engramdb_vs_sqlite_bench"
 harness = false
 
 [[bench]]
+name = "scaling_bench"
+harness = false
+
+[[bench]]
+name = "compression_compare_bench"
+harness = false
+
+[[bench]]
+name = "concurrent_bench"
+harness = false
+
+[[bench]]
+name = "auto_migrate_bench"
+harness = false
+
+[[bench]]
 name = "v018_write_bench"
 harness = false
 
