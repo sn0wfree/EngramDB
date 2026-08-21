@@ -28,6 +28,8 @@ pub mod mmap_writer;
 pub mod compact_mmap;
 pub mod async_compress;
 pub mod bloom;
+pub mod segment;
+pub mod manifest;
 pub mod capabilities;
 pub mod insert_batcher;
 mod log_engine;

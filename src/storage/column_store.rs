@@ -585,6 +585,37 @@ impl ColumnStore {
         self.row_groups.len()
     }
 
+    /// 获取指定 row group 的引用
+    pub fn row_group(&self, idx: usize) -> &RowGroup {
+        &self.row_groups[idx]
+    }
+
+    /// 从 RowGroup 列表构造 ColumnStore（段文件加载用）
+    pub fn from_row_groups(row_groups: Vec<RowGroup>) -> Self {
+        use crate::common::types::EngineType;
+        ColumnStore {
+            table_def: TableDef {
+                id: 0,
+                name: String::new(),
+                columns: Vec::new(),
+                row_count: row_groups.iter().map(|rg| rg.row_count as u64).sum(),
+                indexes: Vec::new(),
+                cluster_key: None,
+                foreign_keys: Vec::new(),
+                engine: EngineType::Columnar,
+                next_auto_increment_id: 0,
+                ttl_seconds: None,
+                ttl_column: None,
+            },
+            row_groups,
+            row_group_size: 122_880,
+            sparse_primary: None,
+            sparse_pk_col: None,
+            sparse_sorted: false,
+            pk_value_cache: None,
+        }
+    }
+
     /// 分层索引：稀疏主键点查（列存段内）
     ///
     /// 定位 = granule 粗路由（有序二分 / 无序线性扫）+ 段内确认
