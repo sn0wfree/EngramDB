@@ -12,6 +12,7 @@ use crate::executor::vector::{DataChunk, Vector};
 
 use super::column_store::{matches_predicate, matches_predicate_typed, ColumnStore, PredicateOp};
 use super::delta_store::DeltaStore;
+use super::segment;
 use crate::search::TokenInvertedIndex;
 use super::index::skiplist::SkipListIndex;
 use super::vector_index::{HnswIndex, HnswConfig, DistanceMetric, Neighbor, SearchTrace};
@@ -165,6 +166,10 @@ pub struct Table {
     primary_index_legacy: bool,
     /// 分层索引：列存稀疏索引 granule 行数
     sparse_granule_rows: u32,
+    /// Step 2 LSM：段文件（加载到内存的 ColumnStore）
+    ///
+    /// 每个段是不可变的排序行组集合。查询时扫描段 + 列存 + Delta。
+    segments: Vec<(segment::SegmentEntry, ColumnStore)>,
 }
 
 impl Table {
@@ -203,6 +208,7 @@ impl Table {
             primary_index_legacy: false,
             sparse_granule_rows: 8192,
             auto_engine_marked: auto_marked,
+            segments: Vec::new(),
         }
     }
 
@@ -2165,6 +2171,71 @@ impl Table {
         // TTL 截止线一次算好（避免逐行 SystemTime::now()）
         let ttl_cutoff: Option<i64> = self.def.ttl_cutoff_ms();
 
+        // Step 2 LSM：先扫描段文件（不可变，zone map + Bloom 剪枝）
+        for (seg_entry, seg_store) in &mut self.segments {
+            // 段级剪枝：zone map
+            if let Some((col_idx, op, val)) = &skip_pred {
+                if !seg_entry.may_contain(*col_idx, val) {
+                    continue;
+                }
+                // 段级剪枝：Bloom（等值查询）
+                if matches!(op, PredicateOp::Eq) && !seg_entry.bloom_may_contain(*col_idx, val) {
+                    continue;
+                }
+            }
+            // 扫描段内的 ColumnStore（复用现有 RG 级剪枝逻辑）
+            for rg_idx in 0..seg_store.row_group_count() {
+                if let Some((col_idx, op, val)) = &skip_pred {
+                    if seg_store.can_skip_predicate(rg_idx, *col_idx, *op, val) {
+                        continue;
+                    }
+                }
+                if column_indices.is_empty() { continue; }
+                seg_store.ensure_columns_decompressed(rg_idx, column_indices)?;
+                let row_count = match seg_store.get_column(rg_idx, column_indices[0]) {
+                    Some(c) => c.len(),
+                    None => continue,
+                };
+                let pred_pos: Option<usize> = skip_pred
+                    .as_ref()
+                    .and_then(|(ci, _, _)| column_indices.iter().position(|&c| c == *ci));
+                let mut batch_start = 0;
+                while batch_start < row_count {
+                    let batch_len = BATCH_SIZE.min(row_count - batch_start);
+                    let batch_end = batch_start + batch_len;
+                    let survivors: Option<Vec<usize>> = {
+                        let mut sel: Vec<usize> = match (pred_pos, &skip_pred) {
+                            (Some(pos), Some((_, op, val))) => {
+                                let col = seg_store.get_column(rg_idx, column_indices[pos]).unwrap();
+                                (batch_start..batch_end)
+                                    .filter(|&i| matches_predicate_typed(col, i, *op, val))
+                                    .collect()
+                            }
+                            _ => (batch_start..batch_end).collect(),
+                        };
+                        if pred_pos.is_some() { Some(sel) } else { None }
+                    };
+                    let mut columns: Vec<Vector> = Vec::with_capacity(column_indices.len());
+                    if let Some(sel) = &survivors {
+                        if sel.is_empty() { batch_start += batch_len; continue; }
+                        for &col_idx in column_indices {
+                            let col = seg_store.get_column(rg_idx, col_idx).unwrap();
+                            columns.push(Vector::Typed(col.gather(sel)));
+                        }
+                    } else {
+                        for &col_idx in column_indices {
+                            let col = seg_store.get_column(rg_idx, col_idx).unwrap();
+                            columns.push(Vector::Typed(col.from_range(batch_start, batch_len)));
+                        }
+                    }
+                    let out_count = survivors.as_ref().map_or(batch_len, |sel| sel.len());
+                    chunks.push(DataChunk { count: out_count, columns });
+                    batch_start += batch_len;
+                }
+            }
+        }
+
+        // 列存扫描（原有逻辑）
         for rg_idx in 0..self.column_store.row_group_count() {
             // P2.4：MinMax 跳过索引 —— 整个 row group 可跳过时不解压
             if let Some((col_idx, op, val)) = &skip_pred {

@@ -99,6 +99,12 @@ pub struct Database {
     commit_count: u64,
     /// Phase 2.5 P2：上次迁移 tick 时的 commit_count（避免重复触发）
     last_tier_tick_at: u64,
+    /// Step 2 LSM：段文件目录
+    segments_dir: PathBuf,
+    /// Step 2 LSM：段文件清单
+    manifest: manifest::Manifest,
+    /// Step 2 LSM：段文件序号计数器
+    segment_counter: u64,
 }
 
 impl Database {
@@ -163,6 +169,10 @@ impl Database {
         let (ib_rows, ib_bytes, ib_timeout) =
             (config.insert_batch_rows, config.insert_batch_bytes, config.insert_batch_timeout_ms);
 
+        // Step 2 LSM：创建段文件目录
+        let segments_dir = path.with_extension("").join("segments");
+        std::fs::create_dir_all(&segments_dir)?;
+
         Ok(Self {
             path: path.to_path_buf(),
             config,
@@ -184,6 +194,9 @@ impl Database {
             heat_tracker: heat_tracker::HeatTracker::new(),
             commit_count: 0,
             last_tier_tick_at: 0,
+            segments_dir,
+            manifest: manifest::Manifest::new(),
+            segment_counter: 0,
         })
     }
 
@@ -232,7 +245,18 @@ impl Database {
             heat_tracker: heat_tracker::HeatTracker::new(),
             commit_count: 0,
             last_tier_tick_at: 0,
+            segments_dir: path.with_extension("").join("segments"),
+            manifest: manifest::Manifest::new(),
+            segment_counter: 0,
         };
+
+        // Step 2 LSM：加载段文件清单
+        let manifest_path = db.segments_dir.parent().unwrap_or(path).join("MANIFEST");
+        if let Ok(m) = manifest::Manifest::load(&manifest_path) {
+            db.segment_counter = m.segments.len() as u64;
+            db.manifest = m;
+        }
+        let _ = std::fs::create_dir_all(&db.segments_dir);
 
         // v0.12.1: 恢复 schema 与数据（顺序：catalog → data → indexes）
         // 索引依赖表结构，数据依赖表结构，故 catalog 必须最先加载
@@ -978,6 +1002,60 @@ impl Database {
             total += self.compact_table(name)?;
         }
         Ok(total)
+    }
+
+    /// Step 2 LSM：将指定表的列存刷盘为段文件
+    ///
+    /// 从 ColumnStore 提取所有 RowGroup，序列化为段文件，
+    /// 更新 Manifest。
+    pub fn flush_table_to_segment(&mut self, table_name: &str) -> Result<u64> {
+        use std::io::Write;
+
+        // 先收集需要的信息（避免借用冲突）
+        let (table_id, total_rows) = {
+            let Some(engine) = self.get_engine_table_mut(table_name) else {
+                return Err(crate::common::error::EngramDbError::TableNotFound(table_name.into()));
+            };
+            let EngineTable::Columnar(table) = engine else {
+                return Ok(0);
+            };
+            if table.column_store().row_group_count() == 0 {
+                return Ok(0);
+            }
+            (table.def().id, table.column_store().total_rows())
+        };
+
+        // 生成段文件路径
+        self.segment_counter += 1;
+        let seg_name = format!("seg_{:08}.hdb", self.segment_counter);
+        let seg_path = self.segments_dir.join(&seg_name);
+
+        // 写段文件
+        let compress = self.config.compress_on_persist;
+        let section_buf = {
+            let engine = self.get_engine_table_mut(table_name).unwrap();
+            let EngineTable::Columnar(table) = engine else { unreachable!() };
+            table.column_store_mut().data_to_bytes(compress)?
+        };
+
+        std::fs::write(&seg_path, &section_buf)?;
+        let size_bytes = section_buf.len() as u64;
+
+        // 更新 Manifest
+        let row_range = (self.manifest.table_row_count(table_id), self.manifest.table_row_count(table_id) + total_rows);
+        self.manifest.add_segment(manifest::ManifestSegment {
+            path: seg_name,
+            table_id,
+            row_range,
+            total_rows: total_rows as u32,
+            size_bytes,
+        });
+
+        // 保存 Manifest
+        let manifest_path = self.segments_dir.join("MANIFEST.json");
+        self.manifest.save(&manifest_path)?;
+
+        Ok(total_rows)
     }
 
     /// 关闭数据库
@@ -2682,5 +2760,34 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         let b = db.get_engine_table_mut("b").unwrap();
         let cb: usize = b.scan_to_chunks(&[0], None).unwrap().iter().map(|c| c.count).sum();
         assert_eq!(cb, 1);
+    }
+
+    #[test]
+    fn test_flush_to_segment() {
+        let path = temp_db_path("_flush_seg");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.create_table(TableDef::new(0, "t", vec![
+                ColumnDef::new("id", DataType::Int64),
+            ])).unwrap();
+            // 插入数据（走 delta）
+            let ids: Vec<Value> = (0..2000i64).map(Value::Int64).collect();
+            db.get_engine_table_mut("t").unwrap().insert_columns(vec![ids]).unwrap();
+            // 先 compact 到列存
+            db.compact_table("t").unwrap();
+            // 刷盘为段文件
+            let rows = db.flush_table_to_segment("t").unwrap();
+            assert_eq!(rows, 2000);
+            // Manifest 应有 1 个段
+            assert_eq!(db.manifest.segments.len(), 1);
+            assert_eq!(db.manifest.segments[0].total_rows, 2000);
+            // 段文件应存在
+            let seg_path = db.segments_dir.join(&db.manifest.segments[0].path);
+            assert!(seg_path.exists());
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path));
     }
 }
