@@ -194,6 +194,10 @@ lto = "thin"
 
 
 [[bench]]
+name = "engramdb_vs_sqlite_bench"
+harness = false
+
+[[bench]]
 name = "v018_write_bench"
 harness = false
 
