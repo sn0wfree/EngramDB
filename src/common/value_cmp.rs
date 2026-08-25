@@ -54,13 +54,14 @@ fn type_rank(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
         Value::Boolean(_) => 1,
-        Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_) => 2,
+        Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_) | Value::Date(_) | Value::Time(_) => 2,
         Value::Float32(_) | Value::Float64(_) => 3,
-        Value::Varchar(_) => 4,
-        Value::Json(_) => 5,
-        Value::Vector(_) => 6,
-        Value::VectorInt8(_) => 7,
+        Value::Varchar(_) | Value::Enum(_) => 4,
+        Value::Json(_) | Value::Jsonb(_) => 5,
+        Value::Vector(_) | Value::VectorInt8(_) => 6,
+        Value::Uuid(_) => 7,
         Value::Blob(_) => 8,
+        Value::Array(_) => 9,
     }
 }
 
@@ -90,8 +91,13 @@ fn same_type_cmp(a: &Value, b: &Value) -> Ordering {
         (Float32(x), Float32(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         (Float64(x), Float64(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         (Timestamp(x), Timestamp(y)) => x.cmp(y),
+        (Date(x), Date(y)) => x.cmp(y),
+        (Time(x), Time(y)) => x.cmp(y),
+        (Uuid(x), Uuid(y)) => x.cmp(y),
         (Varchar(x), Varchar(y)) => x.cmp(y),
         (Json(x), Json(y)) => x.cmp(y),
+        (Jsonb(x), Jsonb(y)) => x.cmp(y),
+        (Enum(x), Enum(y)) => x.cmp(y),
         // Vector/VectorInt8/Blob：序列长度优先，再按位比
         (Vector(x), Vector(y)) => {
             let len_ord = x.len().cmp(&y.len());
@@ -113,6 +119,19 @@ fn same_type_cmp(a: &Value, b: &Value) -> Ordering {
             }
             for (xi, yi) in x.iter().zip(y.iter()) {
                 let ord = xi.cmp(yi);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            Ordering::Equal
+        }
+        (Array(x), Array(y)) => {
+            let len_ord = x.len().cmp(&y.len());
+            if len_ord != Ordering::Equal {
+                return len_ord;
+            }
+            for (xi, yi) in x.iter().zip(y.iter()) {
+                let ord = total_cmp(xi, yi);
                 if ord != Ordering::Equal {
                     return ord;
                 }

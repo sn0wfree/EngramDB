@@ -433,6 +433,36 @@ fn serialize_value(val: &Value, buf: &mut Vec<u8>) {
                 buf.push(*b as u8);
             }
         }
+        // v0.22.0 新增类型
+        Value::Jsonb(s) => {
+            buf.push(12);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Date(d) => {
+            buf.push(13);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Time(t) => {
+            buf.push(14);
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Uuid(u) => {
+            buf.push(15);
+            buf.extend_from_slice(&u.to_le_bytes());
+        }
+        Value::Array(items) => {
+            buf.push(16);
+            buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for item in items {
+                serialize_value(item, buf);
+            }
+        }
+        Value::Enum(s) => {
+            buf.push(17);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
     }
 }
 
@@ -516,6 +546,55 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
             if data.len() < 5 + len { return None; }
             Some((Value::Blob(data[5..5 + len].to_vec()), 5 + len))
+        }
+        // v0.22.0 新增类型
+        12 => {
+            // Jsonb
+            if data.len() < 5 { return None; }
+            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            if data.len() < 5 + len { return None; }
+            let s = String::from_utf8_lossy(&data[5..5 + len]).to_string();
+            Some((Value::Jsonb(s), 5 + len))
+        }
+        13 => {
+            // Date (i32)
+            if data.len() < 5 { return None; }
+            let v = i32::from_le_bytes(data[1..5].try_into().unwrap());
+            Some((Value::Date(v), 5))
+        }
+        14 => {
+            // Time (i32)
+            if data.len() < 5 { return None; }
+            let v = i32::from_le_bytes(data[1..5].try_into().unwrap());
+            Some((Value::Time(v), 5))
+        }
+        15 => {
+            // Uuid (u128)
+            if data.len() < 17 { return None; }
+            let v = u128::from_le_bytes(data[1..17].try_into().unwrap());
+            Some((Value::Uuid(v), 17))
+        }
+        16 => {
+            // Array
+            if data.len() < 5 { return None; }
+            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            let mut offset = 5;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                if offset >= data.len() { return None; }
+                let (item, consumed) = deserialize_value(&data[offset..])?;
+                items.push(item);
+                offset += consumed;
+            }
+            Some((Value::Array(items), offset))
+        }
+        17 => {
+            // Enum (String)
+            if data.len() < 5 { return None; }
+            let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            if data.len() < 5 + len { return None; }
+            let s = String::from_utf8_lossy(&data[5..5 + len]).to_string();
+            Some((Value::Enum(s), 5 + len))
         }
         _ => None,
     }

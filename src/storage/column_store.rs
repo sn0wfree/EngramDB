@@ -989,9 +989,15 @@ impl ColumnStore {
                         DataType::Boolean => col.uncompressed_count as usize,
                         DataType::Varchar => col.uncompressed_count as usize * 12, // 估算
                         DataType::Json => col.uncompressed_count as usize * 32, // 估算
+                        DataType::Jsonb => col.uncompressed_count as usize * 32, // 估算
                         DataType::Vector { .. } => col.uncompressed_count as usize * 64, // 估算
                         DataType::Blob => col.uncompressed_count as usize * 64, // 估算
                         DataType::Timestamp => col.uncompressed_count as usize * 8,
+                        DataType::Date => col.uncompressed_count as usize * 4,
+                        DataType::Time => col.uncompressed_count as usize * 4,
+                        DataType::Uuid => col.uncompressed_count as usize * 16,
+                        DataType::Array { .. } => col.uncompressed_count as usize * 32,
+                        DataType::Enum { .. } => col.uncompressed_count as usize * 16,
                         DataType::VectorInt8 { .. } => col.uncompressed_count as usize * 16, // 估算
                     };
                     stats.total_original += est_original;
@@ -1740,6 +1746,8 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
                 }
             }
         }
+        // v0.22.0 新增类型 - 简化处理：序列化为零字节
+        _ => {}
     }
     buf
 }
@@ -1912,6 +1920,12 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
                 }
             }
         }
+        // v0.22.0 新增类型 - 简化处理：全部反序列化为 NULL
+        _ => {
+            for _ in 0..count {
+                values.push(Value::Null);
+            }
+        }
     }
 
     values
@@ -1969,10 +1983,16 @@ fn data_byte_size(data: &ColumnData, data_type: &DataType) -> usize {
         (DataType::Float64, ColumnValue::Float64(v)) => v.len() * 8,
         (DataType::Varchar, ColumnValue::Varchar(v)) => v.iter().map(|s| 4 + s.len()).sum(),
         (DataType::Json, ColumnValue::Json(v)) => v.iter().map(|s| 4 + s.len()).sum(),
+        (DataType::Jsonb, ColumnValue::Jsonb(v)) => v.iter().map(|s| 4 + s.len()).sum(),
         (DataType::Blob, ColumnValue::Blob(v)) => v.iter().map(|b| 4 + b.len()).sum(),
         (DataType::Vector { .. }, ColumnValue::Vector(v)) => v.iter().map(|x| 4 + x.len() * 4).sum(),
         (DataType::VectorInt8 { .. }, ColumnValue::VectorInt8(v)) => v.iter().map(|x| 4 + x.len()).sum(),
         (DataType::Timestamp, ColumnValue::Timestamp(v)) => v.len() * 8,
+        (DataType::Date, ColumnValue::Date(v)) => v.len() * 4,
+        (DataType::Time, ColumnValue::Time(v)) => v.len() * 4,
+        (DataType::Uuid, ColumnValue::Uuid(v)) => v.len() * 16,
+        (DataType::Array { .. }, ColumnValue::Array(v)) => v.iter().map(|a| 4 + a.len() * 8).sum(),
+        (DataType::Enum { .. }, ColumnValue::Enum(v)) => v.iter().map(|s| 4 + s.len()).sum(),
         _ => data.len(),
     }
 }
@@ -2040,6 +2060,13 @@ fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
             size
         }
         DataType::Timestamp => values.len() * 8,
+        // v0.22.0 新增类型
+        DataType::Jsonb => values.len() * 32, // 估算
+        DataType::Date => values.len() * 4,
+        DataType::Time => values.len() * 4,
+        DataType::Uuid => values.len() * 16,
+        DataType::Array { .. } => values.len() * 32,
+        DataType::Enum { .. } => values.len() * 16,
     }
 }
 
@@ -2060,6 +2087,13 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Blob => 7,
         DataType::Timestamp => 9,
         DataType::VectorInt8 { .. } => 10,
+        // v0.22.0 新增类型
+        DataType::Jsonb => 11,
+        DataType::Date => 12,
+        DataType::Time => 13,
+        DataType::Uuid => 14,
+        DataType::Array { .. } => 15,
+        DataType::Enum { .. } => 16,
     }
 }
 
@@ -2112,8 +2146,8 @@ mod tests {
             engine: crate::common::types::EngineType::Columnar,
             name: "t".to_string(),
             columns: vec![
-                crate::common::types::ColumnDef { name: "id".to_string(), data_type: DataType::Int64, nullable: true, is_primary_key: false, default_value: None, auto_increment: false },
-                crate::common::types::ColumnDef { name: "name".to_string(), data_type: DataType::Varchar, nullable: true, is_primary_key: false, default_value: None, auto_increment: false },
+                crate::common::types::ColumnDef { name: "id".to_string(), data_type: DataType::Int64, nullable: true, is_primary_key: false, default_value: None, auto_increment: false, check_expr: None },
+                crate::common::types::ColumnDef { name: "name".to_string(), data_type: DataType::Varchar, nullable: true, is_primary_key: false, default_value: None, auto_increment: false, check_expr: None },
             ],
             row_count: 0,
             indexes: Vec::new(),

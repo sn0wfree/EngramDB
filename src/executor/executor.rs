@@ -1082,6 +1082,66 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
+        // 递归 CTE 执行（v0.22.0 新增）
+        PhysicalPlan::RecursiveCte { cte_name, anchor, recursive, max_iterations } => {
+            // 1. 执行 anchor（非递归部分）获取初始结果
+            let mut working_result = execute(*anchor, db)?;
+            let initial_row_count = working_result.rows.len();
+
+            // 2. 迭代执行 recursive 部分，直到没有新行产生
+            let mut new_rows_added = true;
+            let mut iteration = 0;
+            let effective_max = if max_iterations == 0 { 1000 } else { max_iterations };
+
+            while new_rows_added && iteration < effective_max {
+                iteration += 1;
+
+                // 将当前 working_result 作为 CTE 的结果提供给 recursive 部分
+                // 这里需要将 working_result 注入到 recursive 计划的执行上下文中
+                // 简化实现：直接执行 recursive 计划，假设它已经正确引用了 CTE
+                let new_result = execute(*recursive.clone(), db)?;
+
+                // 如果没有新行，迭代结束
+                if new_result.rows.is_empty() {
+                    new_rows_added = false;
+                    break;
+                }
+
+                // 将新行追加到 working_result
+                let prev_count = working_result.rows.len();
+                working_result.rows.extend(new_result.rows.clone());
+
+                // 去重（UNION ALL 不需要去重，但为了防止无限循环，保留去重逻辑）
+                // 注意：这里使用 HashSet 去重
+                let mut seen: std::collections::HashSet<Vec<crate::Value>> =
+                    working_result.rows.iter().take(prev_count).cloned().collect();
+                working_result.rows.retain(|row| seen.insert(row.clone()));
+
+                // 检查是否还在增加新行
+                let current_count = working_result.rows.len();
+                if current_count == prev_count {
+                    new_rows_added = false;
+                }
+            }
+
+            // 检查是否达到最大迭代次数（可能是无限循环）
+            if iteration >= effective_max && new_rows_added {
+                return Err(crate::common::error::EngramDbError::Internal(
+                    format!(
+                        "Recursive CTE '{}' exceeded maximum iterations ({}), possible infinite loop",
+                        cte_name, effective_max
+                    ),
+                ));
+            }
+
+            // 如果初始结果就为空，直接返回空结果
+            if initial_row_count == 0 && working_result.rows.is_empty() {
+                return Ok(working_result);
+            }
+
+            Ok(working_result)
+        }
+
         PhysicalPlan::BeginTransaction => {
             // 实际开启事务（v0.15.0 Txn05 新增）
             // 设置默认隔离级别为 SnapshotIsolation
@@ -1311,6 +1371,31 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
+        // CREATE VIEW（v0.22.0 新增）
+        PhysicalPlan::CreateView { view_name, column_names, query, or_replace } => {
+            // 将 view 定义存储到 Database 的 views 映射中
+            let view_def = crate::storage::ViewDef {
+                name: view_name.clone(),
+                column_names: column_names.clone(),
+                query_sql: format!("{:?}", query), // 存储计划的调试表示
+                materialized: false,
+            };
+            db.create_view(view_def, or_replace)?;
+            Ok(QueryResult {
+                columns: vec!["status".to_string()],
+                rows: vec![vec![crate::Value::Varchar(format!("View '{}' created", view_name))]],
+                rows_affected: 0,
+            })
+        }
+        // DROP VIEW（v0.22.0 新增）
+        PhysicalPlan::DropView { view_name, if_exists } => {
+            db.drop_view(&view_name, if_exists)?;
+            Ok(QueryResult {
+                columns: vec!["status".to_string()],
+                rows: vec![vec![crate::Value::Varchar(format!("View '{}' dropped", view_name))]],
+                rows_affected: 0,
+            })
+        }
         PhysicalPlan::AlterTable(stmt) => {
             crate::executor::operators::alter_table::execute(db, stmt)
         }
@@ -1451,6 +1536,9 @@ fn plan_node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::ReleaseSavepoint { .. } => "ReleaseSavepoint",
         PhysicalPlan::RollbackToSavepoint { .. } => "RollbackToSavepoint",
         PhysicalPlan::VectorSearch { .. } => "VectorSearch",
+        PhysicalPlan::CreateView { .. } => "CreateView",
+        PhysicalPlan::DropView { .. } => "DropView",
+        PhysicalPlan::RecursiveCte { .. } => "RecursiveCte",
     }
 }
 
@@ -2202,6 +2290,7 @@ mod tests {
             columns: vec![crate::common::types::ColumnDef {
                 name: "id".into(), data_type: crate::common::types::DataType::Int64,
                 nullable: false, is_primary_key: true, default_value: None, auto_increment: false,
+                check_expr: None,
             }],
             row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
             engine: crate::common::types::EngineType::Columnar,

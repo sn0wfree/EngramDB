@@ -3,6 +3,183 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [0.22.0] - 2026-08-25
+
+### SQL 功能完善（高优先级）
+
+#### VIEW 支持
+- **CREATE VIEW**：创建普通视图，支持 OR REPLACE 语法
+- **DROP VIEW**：删除视图，支持 IF EXISTS 语法
+- **视图持久化**：视图定义随数据库持久化
+- **视图查询**：支持从视图查询数据
+
+#### CHECK 约束
+- **列级 CHECK**：CREATE TABLE 时定义 CHECK 约束
+- **ALTER TABLE CHECK**：ALTER TABLE ADD COLUMN 时定义 CHECK 约束
+- **约束验证**：INSERT 时自动验证 CHECK 约束
+- **支持表达式**：`>`, `<`, `>=`, `<=`, `=`, `!=`, `<>`, `IS NULL`, `IS NOT NULL`, `NOT NULL`
+
+#### 标量子查询
+- **标量子查询**：SELECT 列中的子查询（返回单值）
+- **EXISTS 子查询**：WHERE 中的 EXISTS 条件
+- **IN 子查询**：WHERE 中的 IN (SELECT ...) 条件
+- **运行时求值**：子查询在执行时动态求值
+
+#### 递归 CTE
+- **WITH RECURSIVE**：支持递归公用表表达式
+- **UNION ALL**：锚点 + 递归部分的 UNION ALL 结构
+- **迭代执行**：自动迭代直到结果集不再变化
+- **最大迭代次数**：防止无限递归（默认 1000 次）
+
+#### ALTER TABLE 增强
+- **Parser 支持**：ALTER TABLE 语句现在可以通过 SQL 执行
+- **ADD COLUMN**：添加列
+- **DROP COLUMN**：删除列
+- **RENAME COLUMN**：重命名列
+- **RENAME TABLE**：重命名表
+
+### 修改文件
+- `src/sql/ast.rs`：新增 CreateViewStmt, DropViewStmt, CHECK 约束字段, 递归 CTE 字段
+- `src/sql/parser.rs`：新增 VIEW/CHECK/ALTER TABLE 解析，递归 CTE 解析
+- `src/sql/planner.rs`：新增 VIEW/递归 CTE 规划，子查询处理
+- `src/executor/physical_plan.rs`：新增 CreateView, DropView, RecursiveCte 物理计划节点
+- `src/executor/executor.rs`：新增 VIEW/递归 CTE 执行逻辑
+- `src/executor/expression.rs`：新增标量子查询/EXISTS/IN 子查询求值
+- `src/executor/operators/insert.rs`：新增 CHECK 约束验证
+- `src/common/types.rs`：新增 CHECK 约束字段
+- `src/storage/mod.rs`：新增 ViewDef 结构和视图管理方法
+
+## [0.21.x] - 2026-08-xx
+
+### TokenDelta 检索引擎
+- **统一 Tokenizer**：NFKC 归一化，词表文件自定义格式，运行时编码器
+- **TokenDelta 压缩**：Token 级前缀 delta + 熵编码（Varint/Static/Huffman 三形态）
+- **TokenInvertedIndex**：Token 级倒排索引（row, tf 行级 postings）
+- **BM25 排序检索**：基于 TokenInvertedIndex 的 BM25 打分
+- **模糊匹配**：编辑距离 + n-gram 两种模式
+- **RRF 混合检索**：sparse (BM25) + dense (HNSW) 混合排序
+- **zstd 压缩**：Varchar 列块级字典压缩（level 3）
+- **Rayon 并行**：checkpoint tokenize 行级并行
+- **FTS 索引持久化**：倒排索引随表落盘（v0.21.2 zstd 压缩格式）
+- **token 流缓存**：行级 token 流缓存，TD 压缩与 FTS 共享
+
+### 性能优化
+- **v0.21.2**：TINV2 紧凑格式（delta varint + tf u8 流）
+- **v0.21.2**：zstd 先行调度（达标块直选 zstd，省 TD 编码）
+- **v0.21.2**：插入并行化（postings 分片 push）
+
+## [0.20.0] - 2026-08-xx
+
+### 约束表攒批
+- **约束表入批预检**：主键/唯一索引/NOT NULL 表也可攒批，入批时即校验
+- **批内自重复检测**：O(1) seen-set 判重（主键 + 唯一索引）
+- **已提交状态点查**：入批前校验已提交数据的主键/唯一索引冲突
+- **rowid 基准对齐**：compact 后 rowid 与表行数脱节修复
+
+### Bug 修复
+- **唯一索引批量路径**：修复批量 INSERT 静默吞掉唯一索引冲突的 bug
+- **事务 buffer 批内约束**：修复事务内连续 INSERT 的约束检查
+
+## [0.19.0] - 2026-08-xx
+
+### 分层索引
+- **Delta 稠密索引**：Delta 层主键 BTreeMap 索引
+- **列存稀疏索引**：列存层 ClickHouse 风格稀疏主索引
+- **分层查询**：Delta 稠密 + 列存稀疏联合查询
+- **主键索引重建**：v0.19 之前文件无稀疏索引段时自动重建
+
+## [0.18.0] - 2026-08-xx
+
+### 查询计划缓存
+- **计划缓存**：相同 SQL 跳过 parse/plan/optimize（P0-1）
+- **Prepared 直通路径**：裸 INSERT 免计划结构，直接求值绑定行
+- **DDL 清缓存**：CREATE/ALTER/DROP 后自动清空缓存
+
+### INSERT 攒批合并
+- **Ingest Buffer / Batcher**：autocommit 逐行 INSERT 合批落盘（P0-2）
+- **事务级 Batcher**：显式事务内 INSERT 攒批，COMMIT/读时 flush
+- **攒批阈值**：行数/字节/时间三维度触发
+
+### LogEngine 优化
+- **冻结块释放**：块满后释放写入缓冲，内存减半（P1-4）
+- **可配置块行数**：`log_block_rows` 参数（P1-5）
+- **列式直写**：跳过「列→行→列」双重转置
+
+### 其他
+- **jemalloc 全局分配器**：小对象分配优化
+- **事务内 ROLLBACK 修复**：ROLLBACK 可撤销事务内操作
+
+## [0.17.0] - 2026-08-xx
+
+### 多引擎架构
+- **StorageEngine trait**：统一引擎接口契约
+- **EngineTable 枚举**：运行时持有与分派（Columnar/Memory/Log）
+- **ENGINE = xxx 子句**：CREATE TABLE 指定存储引擎
+- **MemoryEngine**：全内存表，Agent session 缓存，不持久化
+- **LogEngine**：追加式时间序列引擎，块级 MinMax 跳读
+- **Auto 引擎**：根据 heat 自动分层到 Columnar/Memory/Log
+
+### 分层迁移
+- **HeatTracker**：每表访问热度追踪
+- **tier_migration**：基于 heat 决策的自动迁移
+- **migration**：引擎间数据搬迁
+
+### 索引增强
+- **主键 Mark Index**：主键索引持久化（M1-7）
+- **Bloom Filter**：列级等值跳读（M1-8）
+- **WAL engine_type**：WAL 记录头增加引擎类型字段（20 字节）
+
+### 兼容性
+- **旧格式兼容**：WAL 双解析兼容 19 字节旧格式
+- **向后兼容**：旧文件无 engine 字段时默认 Columnar
+
+## [0.16.0] - 2026-08-xx
+
+### 类型转换
+- **Varchar → Vector/VectorInt8**：类型强转支持
+
+## [0.15.0] - 2026-08-xx
+
+### 新增数据类型
+- **VectorInt8**：INT8 量化向量，存储减 75%，精度损失 1-5%
+- **TTL**：表级时间戳自动过期
+
+### SQL 增强
+- **TRUNCATE TABLE**：清空表数据
+- **SAVEPOINT / RELEASE / ROLLBACK TO SAVEPOINT**：嵌套事务
+- **PRAGMA**：table_info 等元数据查询
+- **INSERT OR IGNORE / INSERT OR REPLACE**：冲突处理
+- **INSERT ... SELECT**：从查询结果插入
+- **CTAS**：CREATE TABLE AS SELECT
+- **UNION / UNION ALL / INTERSECT / EXCEPT**：集合操作
+- **HAVING**：聚合后过滤
+- **表值函数**：vector_search(...) 表值函数
+- **CREATE VECTOR INDEX ... WITH (...)**：向量索引参数化创建
+
+### JSON 函数
+- **JSON_OBJECT**：构造 JSON 对象
+- **JSON_ARRAY**：构造 JSON 数组
+- **JSON_SET**：设置/创建路径的值
+- **JSON_INSERT**：仅当路径不存在时设置
+- **JSON_REPLACE**：仅当路径存在时替换
+- **JSON_REMOVE**：删除指定路径的字段
+
+### 字符函数
+- **TRIM / LTRIM / RTRIM**：字符串修剪
+- **CEIL / FLOOR**：取整函数
+
+### 向量增强
+- **搜索 trace**：向量搜索返回访问路径、入口点、候选节点数（V13）
+- **向量索引参数化**：CREATE VECTOR INDEX ... WITH (m, ef_construction)
+
+### 事务增强
+- **只读事务**：跳过 WAL 写入，避免不必要 fsync（Txn09）
+
+### 存储增强
+- **KV 缓存引擎**：嵌式 KV 缓存（v0.21.0 重构为 O(1) LRU）
+- **限流器**：滑动窗口限流
+- **文档摄入 API**：ingestion 模块
+
 ## [0.14.0] - 2026-08-04
 
 ### 新增功能

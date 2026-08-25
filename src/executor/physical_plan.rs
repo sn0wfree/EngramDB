@@ -179,6 +179,18 @@ pub enum PhysicalPlan {
         view_name: String,
         if_exists: bool,
     },
+    /// 创建普通视图（v0.22.0 新增）
+    CreateView {
+        view_name: String,
+        column_names: Vec<String>,
+        query: Box<PhysicalPlan>,
+        or_replace: bool,
+    },
+    /// 删除普通视图（v0.22.0 新增）
+    DropView {
+        view_name: String,
+        if_exists: bool,
+    },
     /// 行数元数据级短路查询（Perf01）
     ///
     /// 单表、无 WHERE、无 GROUP BY、无 HAVING、纯 COUNT(*) 等情况下，
@@ -238,6 +250,21 @@ pub enum PhysicalPlan {
         op: SetUnionOp,
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
+    },
+    /// 递归 CTE（v0.22.0 新增）
+    ///
+    /// 迭代执行直到结果集不再变化：
+    /// 1. 执行 anchor（非递归部分）获取初始结果
+    /// 2. 将结果作为 working_table 传入 recursive（递归部分）
+    /// 3. 执行 recursive，将新行追加到 working_table
+    /// 4. 重复步骤 2-3 直到没有新行产生
+    /// 5. 返回最终的 working_table
+    RecursiveCte {
+        cte_name: String,
+        anchor: Box<PhysicalPlan>,
+        recursive: Box<PhysicalPlan>,
+        /// 最大迭代次数（防止无限递归）
+        max_iterations: usize,
     },
     /// TRUNCATE TABLE（v0.15.0 新增）
     TruncateTable {

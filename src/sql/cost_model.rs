@@ -154,6 +154,12 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::VectorSearch { .. } => {
                 (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
             }
+            // v0.22.0 新增节点
+            | PhysicalPlan::CreateView { .. }
+            | PhysicalPlan::DropView { .. }
+            | PhysicalPlan::RecursiveCte { .. } => {
+                (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
+            }
         }
     }
 

@@ -87,10 +87,22 @@ pub enum ColumnValue {
     Float64(Vec<f64>),
     Varchar(Vec<String>),
     Json(Vec<String>),
+    /// v0.22.0 新增
+    Jsonb(Vec<String>),
     Blob(Vec<Vec<u8>>),
     Vector(Vec<Vec<f32>>),
     VectorInt8(Vec<Vec<i8>>),
     Timestamp(Vec<i64>),
+    /// v0.22.0 新增
+    Date(Vec<i32>),
+    /// v0.22.0 新增
+    Time(Vec<i32>),
+    /// v0.22.0 新增
+    Uuid(Vec<u128>),
+    /// v0.22.0 新增
+    Array(Vec<Vec<Value>>),
+    /// v0.22.0 新增
+    Enum(Vec<String>),
 }
 
 /// 类型化列（值数组 + NULL 位图）
@@ -135,10 +147,16 @@ impl ColumnData {
             ColumnValue::Float64(v) => Value::Float64(v[i]),
             ColumnValue::Varchar(v) => Value::Varchar(v[i].clone()),
             ColumnValue::Json(v) => Value::Json(v[i].clone()),
+            ColumnValue::Jsonb(v) => Value::Jsonb(v[i].clone()),
             ColumnValue::Blob(v) => Value::Blob(v[i].clone()),
             ColumnValue::Vector(v) => Value::Vector(v[i].clone()),
             ColumnValue::VectorInt8(v) => Value::VectorInt8(v[i].clone()),
             ColumnValue::Timestamp(v) => Value::Timestamp(v[i]),
+            ColumnValue::Date(v) => Value::Date(v[i]),
+            ColumnValue::Time(v) => Value::Time(v[i]),
+            ColumnValue::Uuid(v) => Value::Uuid(v[i]),
+            ColumnValue::Array(v) => Value::Array(v[i].clone()),
+            ColumnValue::Enum(v) => Value::Enum(v[i].clone()),
         }
     }
 
@@ -174,10 +192,16 @@ impl ColumnData {
             ColumnValue::Float64(v) => ColumnValue::Float64(v.drain(0..n).collect()),
             ColumnValue::Varchar(v) => ColumnValue::Varchar(v.drain(0..n).collect()),
             ColumnValue::Json(v) => ColumnValue::Json(v.drain(0..n).collect()),
+            ColumnValue::Jsonb(v) => ColumnValue::Jsonb(v.drain(0..n).collect()),
             ColumnValue::Blob(v) => ColumnValue::Blob(v.drain(0..n).collect()),
             ColumnValue::Vector(v) => ColumnValue::Vector(v.drain(0..n).collect()),
             ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(v.drain(0..n).collect()),
             ColumnValue::Timestamp(v) => ColumnValue::Timestamp(v.drain(0..n).collect()),
+            ColumnValue::Date(v) => ColumnValue::Date(v.drain(0..n).collect()),
+            ColumnValue::Time(v) => ColumnValue::Time(v.drain(0..n).collect()),
+            ColumnValue::Uuid(v) => ColumnValue::Uuid(v.drain(0..n).collect()),
+            ColumnValue::Array(v) => ColumnValue::Array(v.drain(0..n).collect()),
+            ColumnValue::Enum(v) => ColumnValue::Enum(v.drain(0..n).collect()),
         };
         let (out_nulls, rest_nulls) = match &self.nulls {
             None => (None, None),
@@ -218,10 +242,16 @@ impl ColumnData {
             ColumnValue::Float64(v) => ColumnValue::Float64(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Varchar(v) => ColumnValue::Varchar(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::Json(v) => ColumnValue::Json(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Jsonb(v) => ColumnValue::Jsonb(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::Blob(v) => ColumnValue::Blob(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::Vector(v) => ColumnValue::Vector(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::Timestamp(v) => ColumnValue::Timestamp(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Date(v) => ColumnValue::Date(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Time(v) => ColumnValue::Time(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Uuid(v) => ColumnValue::Uuid(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Array(v) => ColumnValue::Array(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Enum(v) => ColumnValue::Enum(indices.iter().map(|&i| v[i].clone()).collect()),
         };
         let nulls = match &self.nulls {
             None => None,
@@ -254,10 +284,16 @@ impl ColumnData {
             ColumnValue::Float64(v) => ColumnValue::Float64(v[start..end].to_vec()),
             ColumnValue::Varchar(v) => ColumnValue::Varchar(v[start..end].to_vec()),
             ColumnValue::Json(v) => ColumnValue::Json(v[start..end].to_vec()),
+            ColumnValue::Jsonb(v) => ColumnValue::Jsonb(v[start..end].to_vec()),
             ColumnValue::Blob(v) => ColumnValue::Blob(v[start..end].to_vec()),
             ColumnValue::Vector(v) => ColumnValue::Vector(v[start..end].to_vec()),
             ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(v[start..end].to_vec()),
             ColumnValue::Timestamp(v) => ColumnValue::Timestamp(v[start..end].to_vec()),
+            ColumnValue::Date(v) => ColumnValue::Date(v[start..end].to_vec()),
+            ColumnValue::Time(v) => ColumnValue::Time(v[start..end].to_vec()),
+            ColumnValue::Uuid(v) => ColumnValue::Uuid(v[start..end].to_vec()),
+            ColumnValue::Array(v) => ColumnValue::Array(v[start..end].to_vec()),
+            ColumnValue::Enum(v) => ColumnValue::Enum(v[start..end].to_vec()),
         };
         let nulls = match &self.nulls {
             None => None,
@@ -344,10 +380,16 @@ impl ColumnData {
             DataType::Float64 => (ColumnValue::Float64(Vec::with_capacity(values.len())), None),
             DataType::Varchar => (ColumnValue::Varchar(Vec::with_capacity(values.len())), None),
             DataType::Json => (ColumnValue::Json(Vec::with_capacity(values.len())), None),
+            DataType::Jsonb => (ColumnValue::Jsonb(Vec::with_capacity(values.len())), None),
             DataType::Blob => (ColumnValue::Blob(Vec::with_capacity(values.len())), None),
             DataType::Vector { .. } => (ColumnValue::Vector(Vec::with_capacity(values.len())), None),
             DataType::VectorInt8 { .. } => (ColumnValue::VectorInt8(Vec::with_capacity(values.len())), None),
             DataType::Timestamp => (ColumnValue::Timestamp(Vec::with_capacity(values.len())), None),
+            DataType::Date => (ColumnValue::Date(Vec::with_capacity(values.len())), None),
+            DataType::Time => (ColumnValue::Time(Vec::with_capacity(values.len())), None),
+            DataType::Uuid => (ColumnValue::Uuid(Vec::with_capacity(values.len())), None),
+            DataType::Array { .. } => (ColumnValue::Array(Vec::with_capacity(values.len())), None),
+            DataType::Enum { .. } => (ColumnValue::Enum(Vec::with_capacity(values.len())), None),
         };
 
         for (i, v) in values.iter().enumerate() {
@@ -401,10 +443,16 @@ impl ColumnData {
             DataType::Float64 => ColumnValue::Float64(Vec::with_capacity(count)),
             DataType::Varchar => ColumnValue::Varchar(Vec::with_capacity(count)),
             DataType::Json => ColumnValue::Json(Vec::with_capacity(count)),
+            DataType::Jsonb => ColumnValue::Jsonb(Vec::with_capacity(count)),
             DataType::Blob => ColumnValue::Blob(Vec::with_capacity(count)),
             DataType::Vector { .. } => ColumnValue::Vector(Vec::with_capacity(count)),
             DataType::VectorInt8 { .. } => ColumnValue::VectorInt8(Vec::with_capacity(count)),
             DataType::Timestamp => ColumnValue::Timestamp(Vec::with_capacity(count)),
+            DataType::Date => ColumnValue::Date(Vec::with_capacity(count)),
+            DataType::Time => ColumnValue::Time(Vec::with_capacity(count)),
+            DataType::Uuid => ColumnValue::Uuid(Vec::with_capacity(count)),
+            DataType::Array { .. } => ColumnValue::Array(Vec::with_capacity(count)),
+            DataType::Enum { .. } => ColumnValue::Enum(Vec::with_capacity(count)),
         };
 
         for i in 0..count {
@@ -539,6 +587,8 @@ impl ColumnData {
                         true
                     }
                 }
+                // v0.22.0 新增类型 - 默认 NULL 占位
+                _ => true,
             };
             if is_null {
                 push_null_placeholder(&mut arr);
@@ -590,10 +640,16 @@ impl ColumnData {
             ValueType::Float64 => ColumnValue::Float64(Vec::with_capacity(values.len())),
             ValueType::Varchar => ColumnValue::Varchar(Vec::with_capacity(values.len())),
             ValueType::Json => ColumnValue::Json(Vec::with_capacity(values.len())),
+            ValueType::Jsonb => ColumnValue::Jsonb(Vec::with_capacity(values.len())),
             ValueType::Blob => ColumnValue::Blob(Vec::with_capacity(values.len())),
             ValueType::Vector => ColumnValue::Vector(Vec::with_capacity(values.len())),
             ValueType::VectorInt8 => ColumnValue::VectorInt8(Vec::with_capacity(values.len())),
             ValueType::Timestamp => ColumnValue::Timestamp(Vec::with_capacity(values.len())),
+            ValueType::Date => ColumnValue::Date(Vec::with_capacity(values.len())),
+            ValueType::Time => ColumnValue::Time(Vec::with_capacity(values.len())),
+            ValueType::Uuid => ColumnValue::Uuid(Vec::with_capacity(values.len())),
+            ValueType::Array => ColumnValue::Array(Vec::with_capacity(values.len())),
+            ValueType::Enum => ColumnValue::Enum(Vec::with_capacity(values.len())),
         };
 
         for (i, v) in values.iter().enumerate() {
@@ -610,10 +666,16 @@ impl ColumnData {
                     ColumnValue::Float64(a) => a.push(0.0),
                     ColumnValue::Varchar(a) => a.push(String::new()),
                     ColumnValue::Json(a) => a.push(String::new()),
+                    ColumnValue::Jsonb(a) => a.push(String::new()),
                     ColumnValue::Blob(a) => a.push(Vec::new()),
                     ColumnValue::Vector(a) => a.push(Vec::new()),
                     ColumnValue::VectorInt8(a) => a.push(Vec::new()),
                     ColumnValue::Timestamp(a) => a.push(0),
+                    ColumnValue::Date(a) => a.push(0),
+                    ColumnValue::Time(a) => a.push(0),
+                    ColumnValue::Uuid(a) => a.push(0),
+                    ColumnValue::Array(a) => a.push(Vec::new()),
+                    ColumnValue::Enum(a) => a.push(String::new()),
                 }
                 continue;
             }
@@ -625,10 +687,16 @@ impl ColumnData {
                 (ColumnValue::Float64(a), Value::Float64(x)) => a.push(*x),
                 (ColumnValue::Varchar(a), Value::Varchar(x)) => a.push(x.clone()),
                 (ColumnValue::Json(a), Value::Json(x)) => a.push(x.clone()),
+                (ColumnValue::Jsonb(a), Value::Jsonb(x)) => a.push(x.clone()),
                 (ColumnValue::Blob(a), Value::Blob(x)) => a.push(x.clone()),
                 (ColumnValue::Vector(a), Value::Vector(x)) => a.push(x.clone()),
                 (ColumnValue::VectorInt8(a), Value::VectorInt8(x)) => a.push(x.clone()),
                 (ColumnValue::Timestamp(a), Value::Timestamp(x)) => a.push(*x),
+                (ColumnValue::Date(a), Value::Date(x)) => a.push(*x),
+                (ColumnValue::Time(a), Value::Time(x)) => a.push(*x),
+                (ColumnValue::Uuid(a), Value::Uuid(x)) => a.push(*x),
+                (ColumnValue::Array(a), Value::Array(x)) => a.push(x.clone()),
+                (ColumnValue::Enum(a), Value::Enum(x)) => a.push(x.clone()),
                 _ => unreachable!("probe 已保证类型一致"),
             }
         }
@@ -650,10 +718,16 @@ enum ValueType {
     Float64,
     Varchar,
     Json,
+    Jsonb,
     Blob,
     Vector,
     VectorInt8,
     Timestamp,
+    Date,
+    Time,
+    Uuid,
+    Array,
+    Enum,
 }
 
 fn value_type(v: &Value) -> Option<ValueType> {
@@ -666,10 +740,16 @@ fn value_type(v: &Value) -> Option<ValueType> {
         Value::Float64(_) => Some(ValueType::Float64),
         Value::Varchar(_) => Some(ValueType::Varchar),
         Value::Json(_) => Some(ValueType::Json),
+        Value::Jsonb(_) => Some(ValueType::Jsonb),
         Value::Blob(_) => Some(ValueType::Blob),
         Value::Vector(_) => Some(ValueType::Vector),
         Value::VectorInt8(_) => Some(ValueType::VectorInt8),
         Value::Timestamp(_) => Some(ValueType::Timestamp),
+        Value::Date(_) => Some(ValueType::Date),
+        Value::Time(_) => Some(ValueType::Time),
+        Value::Uuid(_) => Some(ValueType::Uuid),
+        Value::Array(_) => Some(ValueType::Array),
+        Value::Enum(_) => Some(ValueType::Enum),
     }
 }
 
@@ -683,10 +763,16 @@ impl ColumnValue {
             ColumnValue::Float64(v) => v.len(),
             ColumnValue::Varchar(v) => v.len(),
             ColumnValue::Json(v) => v.len(),
+            ColumnValue::Jsonb(v) => v.len(),
             ColumnValue::Blob(v) => v.len(),
             ColumnValue::Vector(v) => v.len(),
             ColumnValue::VectorInt8(v) => v.len(),
             ColumnValue::Timestamp(v) => v.len(),
+            ColumnValue::Date(v) => v.len(),
+            ColumnValue::Time(v) => v.len(),
+            ColumnValue::Uuid(v) => v.len(),
+            ColumnValue::Array(v) => v.len(),
+            ColumnValue::Enum(v) => v.len(),
         }
     }
 }
@@ -824,6 +910,43 @@ fn push_typed(arr: &mut ColumnValue, v: &Value, data_type: &DataType) -> bool {
             }
             true
         }
+        // v0.22.0 新增类型
+        (DataType::Jsonb, Value::Jsonb(s)) => {
+            if let ColumnValue::Jsonb(a) = arr {
+                a.push(s.clone());
+            }
+            true
+        }
+        (DataType::Date, Value::Date(d)) => {
+            if let ColumnValue::Date(a) = arr {
+                a.push(*d);
+            }
+            true
+        }
+        (DataType::Time, Value::Time(t)) => {
+            if let ColumnValue::Time(a) = arr {
+                a.push(*t);
+            }
+            true
+        }
+        (DataType::Uuid, Value::Uuid(u)) => {
+            if let ColumnValue::Uuid(a) = arr {
+                a.push(*u);
+            }
+            true
+        }
+        (DataType::Array { .. }, Value::Array(items)) => {
+            if let ColumnValue::Array(a) = arr {
+                a.push(items.clone());
+            }
+            true
+        }
+        (DataType::Enum { .. }, Value::Enum(s)) => {
+            if let ColumnValue::Enum(a) = arr {
+                a.push(s.clone());
+            }
+            true
+        }
         // NULL / 类型不兼容 → 占位
         _ => false,
     }
@@ -839,10 +962,16 @@ fn push_null_placeholder(arr: &mut ColumnValue) {
         ColumnValue::Float64(a) => a.push(0.0),
         ColumnValue::Varchar(a) => a.push(String::new()),
         ColumnValue::Json(a) => a.push(String::new()),
+        ColumnValue::Jsonb(a) => a.push(String::new()),
         ColumnValue::Blob(a) => a.push(Vec::new()),
         ColumnValue::Vector(a) => a.push(Vec::new()),
         ColumnValue::VectorInt8(a) => a.push(Vec::new()),
         ColumnValue::Timestamp(a) => a.push(0),
+        ColumnValue::Date(a) => a.push(0),
+        ColumnValue::Time(a) => a.push(0),
+        ColumnValue::Uuid(a) => a.push(0),
+        ColumnValue::Array(a) => a.push(Vec::new()),
+        ColumnValue::Enum(a) => a.push(String::new()),
     }
 }
 
@@ -910,6 +1039,42 @@ fn write_typed(buf: &mut Vec<u8>, values: &ColumnValue, i: usize, data_type: &Da
         }
         (DataType::Timestamp, ColumnValue::Timestamp(a)) => {
             buf.extend_from_slice(&(if is_null { 0 } else { a[i] }).to_le_bytes());
+        }
+        (DataType::Jsonb, ColumnValue::Jsonb(a)) => {
+            if is_null {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            } else {
+                buf.extend_from_slice(&(a[i].len() as u32).to_le_bytes());
+                buf.extend_from_slice(a[i].as_bytes());
+            }
+        }
+        (DataType::Date, ColumnValue::Date(a)) => {
+            buf.extend_from_slice(&(if is_null { 0 } else { a[i] }).to_le_bytes());
+        }
+        (DataType::Time, ColumnValue::Time(a)) => {
+            buf.extend_from_slice(&(if is_null { 0 } else { a[i] }).to_le_bytes());
+        }
+        (DataType::Uuid, ColumnValue::Uuid(a)) => {
+            buf.extend_from_slice(&(if is_null { 0u128 } else { a[i] }).to_le_bytes());
+        }
+        (DataType::Array { .. }, ColumnValue::Array(a)) => {
+            if is_null {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            } else {
+                buf.extend_from_slice(&(a[i].len() as u32).to_le_bytes());
+                // 数组元素以 JSON 形式简化存储
+                let json = serde_json::to_string(&a[i]).unwrap_or_default();
+                buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+                buf.extend_from_slice(json.as_bytes());
+            }
+        }
+        (DataType::Enum { .. }, ColumnValue::Enum(a)) => {
+            if is_null {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            } else {
+                buf.extend_from_slice(&(a[i].len() as u32).to_le_bytes());
+                buf.extend_from_slice(a[i].as_bytes());
+            }
         }
         _ => unreachable!("write_typed: 类型不匹配"),
     }

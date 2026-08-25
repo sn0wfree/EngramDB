@@ -494,6 +494,13 @@ mod value_tag {
     pub const BLOB: u8 = 8;
     pub const FLOAT32: u8 = 9;
     pub const TIMESTAMP: u8 = 10;
+    // v0.22.0 新增类型
+    pub const JSONB: u8 = 12;
+    pub const DATE: u8 = 13;
+    pub const TIME: u8 = 14;
+    pub const UUID: u8 = 15;
+    pub const ARRAY: u8 = 16;
+    pub const ENUM: u8 = 17;
 }
 
 /// 将单个 Value 编码为自描述字节（type_tag + data）
@@ -555,6 +562,36 @@ fn encode_value(v: &Value) -> Vec<u8> {
             buf.push(value_tag::BLOB);
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
+        }
+        // v0.22.0 新增类型
+        Value::Jsonb(s) => {
+            buf.push(value_tag::JSONB);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Date(d) => {
+            buf.push(value_tag::DATE);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Time(t) => {
+            buf.push(value_tag::TIME);
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Uuid(u) => {
+            buf.push(value_tag::UUID);
+            buf.extend_from_slice(&u.to_le_bytes());
+        }
+        Value::Array(a) => {
+            buf.push(value_tag::ARRAY);
+            // 简化：序列化为 JSON
+            let json = serde_json::to_string(&a).unwrap_or_default();
+            buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            buf.extend_from_slice(json.as_bytes());
+        }
+        Value::Enum(s) => {
+            buf.push(value_tag::ENUM);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
         }
     }
     buf
@@ -693,6 +730,75 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             let t = i64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
             offset += 8;
             Value::Timestamp(t)
+        }
+        // v0.22.0 新增类型
+        value_tag::JSONB => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated jsonb length".into()));
+            }
+            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated jsonb data".into()));
+            }
+            let s = String::from_utf8(data[offset..offset+len].to_vec())
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
+            offset += len;
+            Value::Jsonb(s)
+        }
+        value_tag::DATE => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated date value".into()));
+            }
+            let d = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            offset += 4;
+            Value::Date(d)
+        }
+        value_tag::TIME => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated time value".into()));
+            }
+            let t = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            offset += 4;
+            Value::Time(t)
+        }
+        value_tag::UUID => {
+            if offset + 16 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated uuid value".into()));
+            }
+            let u = u128::from_le_bytes(data[offset..offset+16].try_into().unwrap());
+            offset += 16;
+            Value::Uuid(u)
+        }
+        value_tag::ARRAY => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated array length".into()));
+            }
+            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated array data".into()));
+            }
+            let json_str = String::from_utf8(data[offset..offset+len].to_vec())
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
+            offset += len;
+            let items = serde_json::from_str(&json_str)
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid array json: {}", e)))?;
+            Value::Array(items)
+        }
+        value_tag::ENUM => {
+            if offset + 4 > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated enum length".into()));
+            }
+            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                return Err(EngramDbError::InvalidFormat("truncated enum data".into()));
+            }
+            let s = String::from_utf8(data[offset..offset+len].to_vec())
+                .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
+            offset += len;
+            Value::Enum(s)
         }
         _ => return Err(EngramDbError::InvalidFormat(format!("unknown value tag: {}", tag))),
     };

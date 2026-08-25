@@ -4,7 +4,7 @@
 > 对标基线：SQLite 3\.45 功能集 \+ AI Agent 场景特有需求
 > 竞品借鉴：ReasonDB HRR 架构、LanceDB 生态、sqlite\-vec 轻量模式
 > 规划日期：2026\-08\-03
-> 最近更新：新增 ReasonDB 借鉴点（文档树索引、查询 trace、混合检索、插件管线、LLM 抽象层等）
+> 最近更新：v0.21.x 功能状态同步（2026-08-25）
 > 
 > 
 
@@ -14,136 +14,136 @@
 
 ### 1\.1 数据类型（21 项）
 
-|\#|类型|v0\.12 状态|优先级|归属版本|说明|
-|---|---|---|---|---|---|
-|T01|INT / INTEGER|✅ 已有|—|—|64位有符号整数|
-|T02|BIGINT / INT64|✅ 已有|—|—|同 INTEGER|
-|T03|TINYINT / INT8|🟡 别名未支持|P2|v0\.14|1字节整数，需在类型映射中添加|
-|T04|SMALLINT / INT16|🟡 别名未支持|P2|v0\.14|2字节整数|
-|T05|INT32 / MEDIUMINT|✅ 已有|—|—|4字节整数（已在 speedtest 修复）|
-|T06|FLOAT / DOUBLE / REAL|✅ 已有|—|—|64位浮点|
-|T07|FLOAT32|🔴 缺失|P2|v0\.15|32位浮点，节省存储|
-|T08|BOOLEAN|✅ 已有|—|—|底层用 INTEGER 0/1|
-|T09|VARCHAR / TEXT / CHAR|✅ 已有|—|—|变长字符串|
-|T10|BLOB / BINARY|🔴 缺失|P1|v0\.14|二进制大对象，Agent 存原始数据|
-|T11|DATE|🔴 缺失|P2|v0\.16|日期类型（YYYY\-MM\-DD）|
-|T12|TIME|🔴 缺失|P3|v0\.17\+|时间类型（HH:MM:SS）|
-|T13|DATETIME / TIMESTAMP|🔴 缺失|P1|v0\.15|日期时间，Agent 日志/记忆刚需|
-|T14|DECIMAL / NUMERIC|🔴 缺失|P3|v0\.17\+|精确十进制，金融场景|
-|T15|JSON|🔴 缺失|P0|v0\.14|JSON 类型 \+ 路径查询，Agent 元数据刚需|
-|T16|JSONB|🔴 缺失|P2|v0\.16|二进制 JSON，解析更快|
-|T17|UUID|🔴 缺失|P3|v0\.17\+|UUID 类型，分布式 ID|
-|T18|ENUM / SET|🔴 缺失|P3|v0\.17\+|枚举类型|
-|T19|VECTOR\(dim\)|✅ 已有|—|—|向量类型（HNSW 索引）|
-|T20|VECTOR\_INT8|🔴 缺失|P1|v0\.15|INT8 量化向量，存储减 75%|
-|T21|ARRAY|🔴 缺失|P2|v0\.16|数组类型|
+|\#|类型|v0\.12 状态|当前状态|说明|
+|---|---|---|---|---|
+|T01|INT / INTEGER|✅ 已有|✅|64位有符号整数|
+|T02|BIGINT / INT64|✅ 已有|✅|同 INTEGER|
+|T03|TINYINT / INT8|🟡 别名未支持|✅|v0\.13 已支持别名|
+|T04|SMALLINT / INT16|🟡 别名未支持|🟡|仍为别名未支持|
+|T05|INT32 / MEDIUMINT|✅ 已有|✅|4字节整数|
+|T06|FLOAT / DOUBLE / REAL|✅ 已有|✅|64位浮点|
+|T07|FLOAT32|🔴 缺失|✅|v0\.14\.0 新增，32位浮点|
+|T08|BOOLEAN|✅ 已有|✅|底层用 INTEGER 0/1|
+|T09|VARCHAR / TEXT / CHAR|✅ 已有|✅|变长字符串|
+|T10|BLOB / BINARY|🔴 缺失|✅|v0\.13\.0 新增，二进制大对象|
+|T11|DATE|🔴 缺失|🔴|仍未实现|
+|T12|TIME|🔴 缺失|🔴|仍未实现|
+|T13|DATETIME / TIMESTAMP|🔴 缺失|✅|v0\.14\.0 新增，Unix 毫秒|
+|T14|DECIMAL / NUMERIC|🔴 缺失|🔴|仍未实现|
+|T15|JSON|🔴 缺失|✅|v0\.12\.0 新增，路径查询|
+|T16|JSONB|🔴 缺失|🔴|仍未实现|
+|T17|UUID|🔴 缺失|🔴|仍未实现|
+|T18|ENUM / SET|🔴 缺失|🔴|仍未实现|
+|T19|VECTOR\(dim\)|✅ 已有|✅|向量类型（HNSW 索引）|
+|T20|VECTOR\_INT8|🔴 缺失|✅|v0\.15\.0 新增，INT8 量化向量|
+|T21|ARRAY|🔴 缺失|🔴|仍未实现|
 
-**小计**：已有 5 项 \+ 部分 1 项 \+ 缺失 15 项
+**小计**：已有 11 项 + 部分 1 项 + 缺失 9 项
 
 ---
 
 ### 1\.2 DDL 语句（18 项）
 
-|\#|语句|v0\.12 状态|优先级|归属版本|说明|
-|---|---|---|---|---|---|
-|D01|CREATE TABLE|✅ 已有|—|—|基础建表|
-|D02|CREATE TABLE \.\.\. AS SELECT|🔴 缺失|P2|v0\.15|CTAS，从查询结果建表|
-|D03|CREATE TABLE IF NOT EXISTS|✅ 已有|—|—|幂等建表|
-|D04|DROP TABLE|✅ 已有|—|—|删表|
-|D05|DROP TABLE IF EXISTS|✅ 已有|—|—|幂等删表|
-|D06|ALTER TABLE ADD COLUMN|🔴 缺失|P0|v0\.14|加列，Schema 演进刚需|
-|D07|ALTER TABLE DROP COLUMN|🔴 缺失|P2|v0\.16|删列|
-|D08|ALTER TABLE RENAME COLUMN|🔴 缺失|P2|v0\.16|改列名|
-|D09|ALTER TABLE RENAME TO|🔴 缺失|P2|v0\.16|改表名|
-|D10|ALTER TABLE ALTER COLUMN|🔴 缺失|P3|v0\.17\+|改列类型|
-|D11|CREATE INDEX|✅ 已有（部分）|P0|v0\.13|当前只有 SkipList，需补 B\+Tree|
-|D12|CREATE UNIQUE INDEX|🔴 缺失|P1|v0\.14|唯一索引|
-|D13|CREATE INDEX \.\.\. WHERE|🔴 缺失|P3|v0\.17\+|部分索引|
-|D14|DROP INDEX|✅ 已有|—|—|删索引|
-|D15|CREATE VIEW / DROP VIEW|🔴 缺失|P3|v0\.17\+|视图|
-|D16|TRUNCATE TABLE|🔴 缺失|P2|v0\.15|清空表（比 DELETE 快）|
-|D17|VACUUM / COMPACT|✅ 已有|—|—|LSM 合并 / 空间回收|
-|D18|ANALYZE|🔴 缺失|P1|v0\.16|收集统计信息，CBO 基础|
+|\#|语句|v0\.12 状态|当前状态|说明|
+|---|---|---|---|---|
+|D01|CREATE TABLE|✅ 已有|✅|基础建表|
+|D02|CREATE TABLE \.\.\. AS SELECT|🔴 缺失|✅|v0\.15\.0 新增，CTAS|
+|D03|CREATE TABLE IF NOT EXISTS|✅ 已有|✅|幂等建表|
+|D04|DROP TABLE|✅ 已有|✅|删表|
+|D05|DROP TABLE IF EXISTS|✅ 已有|✅|幂等删表|
+|D06|ALTER TABLE ADD COLUMN|🔴 缺失|✅|v0\.13\.0 新增，加列|
+|D07|ALTER TABLE DROP COLUMN|🔴 缺失|🔴|仍未实现|
+|D08|ALTER TABLE RENAME COLUMN|🔴 缺失|🔴|仍未实现|
+|D09|ALTER TABLE RENAME TO|🔴 缺失|🔴|仍未实现|
+|D10|ALTER TABLE ALTER COLUMN|🔴 缺失|🔴|仍未实现|
+|D11|CREATE INDEX|✅ 已有（部分）|✅|v0\.13\.0 增强，复合索引|
+|D12|CREATE UNIQUE INDEX|🔴 缺失|✅|v0\.14\.0 新增，唯一索引|
+|D13|CREATE INDEX \.\.\. WHERE|🔴 缺失|🔴|仍未实现|
+|D14|DROP INDEX|✅ 已有|✅|删索引|
+|D15|CREATE VIEW / DROP VIEW|🔴 缺失|🔴|仍未实现|
+|D16|TRUNCATE TABLE|🔴 缺失|✅|v0\.15\.0 新增|
+|D17|VACUUM / COMPACT|✅ 已有|✅|LSM 合并 / 空间回收|
+|D18|ANALYZE|🔴 缺失|🟡|部分实现（统计信息收集）|
 
-**小计**：已有 6 项 \+ 部分 1 项 \+ 缺失 11 项
+**小计**：已有 10 项 + 部分 2 项 + 缺失 6 项
 
 ---
 
 ### 1\.3 约束（7 项）
 
-|\#|约束|v0\.12 状态|优先级|归属版本|说明|
-|---|---|---|---|---|---|
-|C01|PRIMARY KEY|✅ 已有|—|—|主键约束|
-|C02|AUTO\_INCREMENT / SERIAL|🔴 缺失|P0|v0\.14|自增主键，应用开发刚需|
-|C03|NOT NULL|🔴 缺失|P1|v0\.14|非空约束|
-|C04|UNIQUE|🔴 缺失|P1|v0\.14|唯一约束（Token key 等）|
-|C05|FOREIGN KEY \+ CASCADE|🔴 缺失|P1|v0\.14|外键 \+ 级联删除/更新|
-|C06|CHECK|🔴 缺失|P3|v0\.17\+|CHECK 约束|
-|C07|DEFAULT 值|🔴 缺失|P1|v0\.14|列默认值|
+|\#|约束|v0\.12 状态|当前状态|说明|
+|---|---|---|---|---|
+|C01|PRIMARY KEY|✅ 已有|✅|主键约束|
+|C02|AUTO\_INCREMENT / SERIAL|🔴 缺失|✅|v0\.14\.0 新增，自增主键|
+|C03|NOT NULL|🔴 缺失|✅|v0\.13\.0 新增，非空约束|
+|C04|UNIQUE|🔴 缺失|✅|v0\.14\.0 新增，唯一约束|
+|C05|FOREIGN KEY \+ CASCADE|🔴 缺失|🟡|v0\.13\.0 框架，级联未完整|
+|C06|CHECK|🔴 缺失|🔴|仍未实现|
+|C07|DEFAULT 值|🔴 缺失|🟡|部分实现（ColumnDef 有 default_value）|
 
-**小计**：已有 1 项 \+ 缺失 6 项
+**小计**：已有 4 项 + 部分 2 项 + 缺失 1 项
 
 ---
 
 ### 1\.4 DML 语句（14 项）
 
-|\#|语句|v0\.12 状态|优先级|归属版本|说明|
-|---|---|---|---|---|---|
-|M01|INSERT VALUES|✅ 已有|—|—|单行插入|
-|M02|INSERT 多行 \(VALUES \(\.\.\.\), \(\.\.\.\)\)|🟡 部分支持|P0|v0\.13|批量插入，性能关键|
-|M03|INSERT \.\.\. SELECT|🔴 缺失|P2|v0\.15|从查询结果插入|
-|M04|INSERT \.\.\. RETURNING|🔴 缺失|P0|v0\.14|返回生成的 ID|
-|M05|INSERT OR IGNORE / REPLACE / ROLLBACK|🔴 缺失|P2|v0\.15|冲突解决策略|
-|M06|UPSERT \(ON CONFLICT DO UPDATE\)|🔴 缺失|P0|v0\.14|幂等更新，缓存/计数器刚需|
-|M07|SELECT|✅ 已有|—|—|基础查询|
-|M08|UPDATE|✅ 已有|—|—|更新|
-|M09|UPDATE \.\.\. FROM|🔴 缺失|P3|v0\.17\+|关联更新|
-|M10|DELETE|✅ 已有|—|—|删除|
-|M11|DELETE \.\.\. USING|🔴 缺失|P3|v0\.17\+|关联删除|
-|M12|MERGE / UPSERT 扩展|🔴 缺失|P3|v0\.17\+|MERGE INTO|
-|M13|COPY / BULK COPY|🔴 缺失|P1|v0\.14|批量导入导出|
-|M14|REPLACE|🔴 缺失|P2|v0\.15|替换插入|
+|\#|语句|v0\.12 状态|当前状态|说明|
+|---|---|---|---|---|
+|M01|INSERT VALUES|✅ 已有|✅|单行插入|
+|M02|INSERT 多行 \(VALUES \(\.\.\.\), \(\.\.\.\)\)|🟡 部分支持|✅|v0\.13 增强，批量插入|
+|M03|INSERT \.\.\. SELECT|🔴 缺失|✅|v0\.15\.0 新增|
+|M04|INSERT \.\.\. RETURNING|🔴 缺失|✅|v0\.14\.0 新增|
+|M05|INSERT OR IGNORE / REPLACE / ROLLBACK|🔴 缺失|✅|v0\.15\.0 新增|
+|M06|UPSERT \(ON CONFLICT DO UPDATE\)|🔴 缺失|✅|v0\.14\.0 新增|
+|M07|SELECT|✅ 已有|✅|基础查询|
+|M08|UPDATE|✅ 已有|✅|更新|
+|M09|UPDATE \.\.\. FROM|🔴 缺失|🔴|仍未实现|
+|M10|DELETE|✅ 已有|✅|删除|
+|M11|DELETE \.\.\. USING|🔴 缺失|🔴|仍未实现|
+|M12|MERGE / UPSERT 扩展|🔴 缺失|🔴|仍未实现|
+|M13|COPY / BULK COPY|🔴 缺失|🟡|零拷贝列式导入（import_columns）|
+|M14|REPLACE|🔴 缺失|✅|v0\.15\.0 新增（INSERT OR REPLACE）|
 
-**小计**：已有 4 项 \+ 部分 1 项 \+ 缺失 9 项
+**小计**：已有 9 项 + 部分 2 项 + 缺失 3 项
 
 ---
 
 ### 1\.5 查询功能（30 项）
 
-|\#|功能|v0\.12 状态|优先级|归属版本|说明|
-|---|---|---|---|---|---|
-|Q01|WHERE 条件|✅ 已有|—|—|基础过滤|
-|Q02|AND / OR / NOT|✅ 已有|—|—|逻辑运算符|
-|Q03|= / \!= / \< / \> / \<= / \>=|✅ 已有|—|—|比较运算符|
-|Q04|IN \(列表\)|🔴 缺失|P1|v0\.14|IN 子句，多值匹配|
-|Q05|BETWEEN \.\.\. AND|🔴 缺失|P1|v0\.14|范围查询语法糖|
-|Q06|LIKE 模糊匹配|🔴 缺失|P1|v0\.15|字符串模糊搜索|
-|Q07|GLOB|🔴 缺失|P3|v0\.17\+|通配符匹配|
-|Q08|REGEXP|🔴 缺失|P2|v0\.16|正则匹配|
-|Q09|IS NULL / IS NOT NULL|🔴 缺失|P1|v0\.14|NULL 判断|
-|Q10|IS / IS NOT|🔴 缺失|P2|v0\.15|通用比较（含布尔）|
-|Q11|DISTINCT|🔴 缺失|P1|v0\.14|去重|
-|Q12|ORDER BY|✅ 已有|—|—|排序|
-|Q13|ORDER BY 多列|🟡 部分|P1|v0\.14|多列排序|
-|Q14|ORDER BY DESC / ASC|✅ 已有|—|—|升降序|
-|Q15|LIMIT / OFFSET|✅ 已有|—|—|分页|
-|Q16|GROUP BY|✅ 已有|—|—|分组|
-|Q17|GROUP BY 多列|🟡 部分|P1|v0\.14|多列分组|
-|Q18|HAVING|🔴 缺失|P2|v0\.15|分组后过滤|
-|Q19|INNER JOIN|🔴 缺失|P1|v0\.16|内连接|
-|Q20|LEFT / RIGHT OUTER JOIN|🔴 缺失|P1|v0\.16|外连接|
-|Q21|CROSS JOIN|🔴 缺失|P2|v0\.16|笛卡尔积|
-|Q22|FULL OUTER JOIN|🔴 缺失|P2|v0\.17\+|全外连接|
-|Q23|子查询 \(IN / EXISTS\)|🔴 缺失|P1|v0\.15|子查询|
-|Q24|标量子查询|🔴 缺失|P2|v0\.16|SELECT 列中的子查询|
-|Q25|CTE \(WITH \.\.\. AS\)|🔴 缺失|P2|v0\.16|公用表表达式|
-|Q26|递归 CTE|🔴 缺失|P3|v0\.17\+|递归查询|
-|Q27|UNION / UNION ALL|🔴 缺失|P1|v0\.15|合并查询结果|
-|Q28|INTERSECT / EXCEPT|🔴 缺失|P2|v0\.16|交集/差集|
-|Q29|CASE WHEN \.\.\. THEN \.\.\. ELSE \.\.\. END|🔴 缺失|P1|v0\.15|条件表达式|
-|Q30|SELECT \* EXCEPT / REPLACE|🔴 缺失|P3|v0\.17\+|列排除/替换|
+|\#|功能|v0\.12 状态|当前状态|说明|
+|---|---|---|---|---|
+|Q01|WHERE 条件|✅ 已有|✅|基础过滤|
+|Q02|AND / OR / NOT|✅ 已有|✅|逻辑运算符|
+|Q03|= / \!= / \< / \> / \<= / \>=|✅ 已有|✅|比较运算符|
+|Q04|IN \(列表\)|🔴 缺失|✅|v0\.13 已支持|
+|Q05|BETWEEN \.\.\. AND|🔴 缺失|✅|v0\.13 已支持|
+|Q06|LIKE 模糊匹配|🔴 缺失|✅|v0\.13 已支持|
+|Q07|GLOB|🔴 缺失|🔴|仍未实现|
+|Q08|REGEXP|🔴 缺失|🔴|仍未实现|
+|Q09|IS NULL / IS NOT NULL|🔴 缺失|✅|v0\.13 已支持|
+|Q10|IS / IS NOT|🔴 缺失|🟡|部分实现|
+|Q11|DISTINCT|🔴 缺失|✅|v0\.13\.0 新增|
+|Q12|ORDER BY|✅ 已有|✅|排序|
+|Q13|ORDER BY 多列|🟡 部分|✅|v0\.13 已支持|
+|Q14|ORDER BY DESC / ASC|✅ 已有|✅|升降序|
+|Q15|LIMIT / OFFSET|✅ 已有|✅|分页|
+|Q16|GROUP BY|✅ 已有|✅|分组|
+|Q17|GROUP BY 多列|🟡 部分|✅|v0\.13 已支持|
+|Q18|HAVING|🔴 缺失|✅|v0\.15\.0 新增|
+|Q19|INNER JOIN|🔴 缺失|✅|v0\.9\.x 已支持|
+|Q20|LEFT / RIGHT OUTER JOIN|🔴 缺失|✅|v0\.9\.x 已支持|
+|Q21|CROSS JOIN|🔴 缺失|🟡|部分实现|
+|Q22|FULL OUTER JOIN|🔴 缺失|🔴|仍未实现|
+|Q23|子查询 \(IN / EXISTS\)|🔴 缺失|🟡|部分实现|
+|Q24|标量子查询|🔴 缺失|🔴|仍未实现|
+|Q25|CTE \(WITH \.\.\. AS\)|🔴 缺失|🟡|部分实现|
+|Q26|递归 CTE|🔴 缺失|🔴|仍未实现|
+|Q27|UNION / UNION ALL|🔴 缺失|✅|v0\.15\.0 新增|
+|Q28|INTERSECT / EXCEPT|🔴 缺失|✅|v0\.15\.0 新增|
+|Q29|CASE WHEN \.\.\. THEN \.\.\. ELSE \.\.\. END|🔴 缺失|✅|v0\.13 已支持|
+|Q30|SELECT \* EXCEPT / REPLACE|🔴 缺失|🔴|仍未实现|
 
-**小计**：已有 7 项 \+ 部分 3 项 \+ 缺失 20 项
+**小计**：已有 19 项 + 部分 4 项 + 缺失 7 项
 
 ---
 

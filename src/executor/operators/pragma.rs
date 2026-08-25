@@ -311,10 +311,12 @@ mod tests {
                 crate::common::types::ColumnDef {
                     name: "id".into(), data_type: crate::common::types::DataType::Int32,
                     nullable: false, is_primary_key: true, default_value: None, auto_increment: false,
+                    check_expr: None,
                 },
                 crate::common::types::ColumnDef {
                     name: "name".into(), data_type: crate::common::types::DataType::Varchar,
                     nullable: true, is_primary_key: false, default_value: None, auto_increment: false,
+                    check_expr: None,
                 },
             ],
             row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
@@ -363,6 +365,7 @@ mod tests {
         let mk_col = |name: &str, dt: crate::common::types::DataType| crate::common::types::ColumnDef {
             name: name.into(), data_type: dt, nullable: true,
             is_primary_key: false, default_value: None, auto_increment: false,
+                    check_expr: None,
         };
         let mk_def = |name: &str, cols: Vec<crate::common::types::ColumnDef>, engine: crate::common::types::EngineType| {
             crate::common::types::TableDef {
@@ -405,10 +408,12 @@ mod tests {
                 crate::common::types::ColumnDef {
                     name: "id".into(), data_type: crate::common::types::DataType::Int32,
                     nullable: false, is_primary_key: true, default_value: None, auto_increment: false,
+                    check_expr: None,
                 },
                 crate::common::types::ColumnDef {
                     name: "v".into(), data_type: crate::common::types::DataType::Int32,
                     nullable: true, is_primary_key: false, default_value: None, auto_increment: false,
+                    check_expr: None,
                 },
             ],
             row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],

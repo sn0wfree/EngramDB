@@ -47,6 +47,16 @@ use file_format::FileHeader;
 use table::Table;
 use crate::Value;
 
+/// 视图定义（v0.22.0 新增）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ViewDef {
+    pub name: String,
+    pub column_names: Vec<String>,
+    pub query_sql: String,
+    /// 是否为物化视图（v0.22.0 新增）
+    pub materialized: bool,
+}
+
 /// 数据库实例
 pub struct Database {
     path: PathBuf,
@@ -105,6 +115,8 @@ pub struct Database {
     manifest: manifest::Manifest,
     /// Step 2 LSM：段文件序号计数器
     segment_counter: u64,
+    /// 视图定义（v0.22.0 新增）
+    views: HashMap<String, ViewDef>,
 }
 
 impl Database {
@@ -197,6 +209,7 @@ impl Database {
             segments_dir,
             manifest: manifest::Manifest::new(),
             segment_counter: 0,
+            views: HashMap::new(),
         })
     }
 
@@ -248,6 +261,7 @@ impl Database {
             segments_dir: path.with_extension("").join("segments"),
             manifest: manifest::Manifest::new(),
             segment_counter: 0,
+            views: HashMap::new(),
         };
 
         // Step 2 LSM：加载段文件清单
@@ -529,6 +543,39 @@ impl Database {
             table.def_mut().name = new_name.to_string();
         }
         Ok(())
+    }
+
+    /// 创建视图（v0.22.0 新增）
+    pub fn create_view(&mut self, view_def: ViewDef, or_replace: bool) -> Result<()> {
+        if !or_replace && self.views.contains_key(&view_def.name) {
+            return Err(EngramDbError::ConstraintViolation(
+                format!("View '{}' already exists", view_def.name)
+            ));
+        }
+        self.views.insert(view_def.name.clone(), view_def);
+        Ok(())
+    }
+
+    /// 删除视图（v0.22.0 新增）
+    pub fn drop_view(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        if !self.views.contains_key(name) {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(EngramDbError::TableNotFound(name.to_string()));
+        }
+        self.views.remove(name);
+        Ok(())
+    }
+
+    /// 获取视图定义（v0.22.0 新增）
+    pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
+        self.views.get(name)
+    }
+
+    /// 获取所有视图名称（v0.22.0 新增）
+    pub fn view_names(&self) -> Vec<String> {
+        self.views.keys().cloned().collect()
     }
 
     /// 获取表名到 ID 的映射（只读）

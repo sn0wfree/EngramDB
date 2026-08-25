@@ -197,6 +197,13 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Vector { .. } => 8,
         DataType::VectorInt8 { .. } => 9,
         DataType::Timestamp => 10,
+        // v0.22.0 新增类型
+        DataType::Jsonb => 11,
+        DataType::Date => 12,
+        DataType::Time => 13,
+        DataType::Uuid => 14,
+        DataType::Array { .. } => 15,
+        DataType::Enum { .. } => 16,
     }
 }
 
@@ -273,7 +280,7 @@ mod tests {
             TableDef {
                 id: 1,
                 name: "test".into(),
-                columns: vec![ColumnDef { name: "id".into(), data_type: DataType::Int64, nullable: false, is_primary_key: false, default_value: None, auto_increment: false }],
+                columns: vec![ColumnDef { name: "id".into(), data_type: DataType::Int64, nullable: false, is_primary_key: false, default_value: None, auto_increment: false, check_expr: None }],
                 row_count: 0,
                 indexes: vec![],
                 cluster_key: None,

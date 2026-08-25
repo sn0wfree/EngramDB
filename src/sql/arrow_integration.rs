@@ -159,10 +159,16 @@ pub fn value_type_to_arrow(value: &Value) -> ArrowDataType {
         Value::Float64(_) => ArrowDataType::Float64,
         Value::Timestamp(_) => ArrowDataType::Int64, // 简化：映射到 Int64
         Value::Varchar(_) => ArrowDataType::Utf8,
-        Value::Json(_) => ArrowDataType::Utf8,
+        Value::Json(_) | Value::Jsonb(_) => ArrowDataType::Utf8,
         Value::Vector(_) => ArrowDataType::Utf8, // 序列化为字符串表示
         Value::VectorInt8(_) => ArrowDataType::Utf8, // 序列化为字符串表示
         Value::Blob(_) => ArrowDataType::Binary,
+        // v0.22.0 新增类型
+        Value::Date(_) => ArrowDataType::Int32,
+        Value::Time(_) => ArrowDataType::Int32,
+        Value::Uuid(_) => ArrowDataType::Utf8,
+        Value::Array(_) => ArrowDataType::Utf8,
+        Value::Enum(_) => ArrowDataType::Utf8,
     }
 }
 

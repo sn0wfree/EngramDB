@@ -363,6 +363,7 @@ mod tests {
                     is_primary_key: pk,
                     default_value: None,
                     auto_increment: false,
+                    check_expr: None,
                 },
                 ColumnDef::new("v", DataType::Varchar),
             ],

@@ -592,9 +592,15 @@ fn eval_constant_cast(v: &Value, target: &crate::common::types::DataType) -> Opt
             Value::Boolean(b) => Some(Value::Varchar(b.to_string())),
             Value::Null => Some(Value::Null),
             Value::Json(s) => Some(Value::Varchar(s.clone())),
+            Value::Jsonb(s) => Some(Value::Varchar(s.clone())),
+            Value::Enum(s) => Some(Value::Varchar(s.clone())),
+            Value::Date(d) => Some(Value::Varchar(d.to_string())),
+            Value::Time(t) => Some(Value::Varchar(t.to_string())),
+            Value::Uuid(u) => Some(Value::Varchar(format!("{:032x}", u))),
             Value::Vector(_) => None,
             Value::VectorInt8(_) => None,
             Value::Blob(_) => None,
+            Value::Array(_) => None,
         },
         DataType::Json => match v {
             Value::Json(s) => Some(Value::Json(s.clone())),
@@ -618,6 +624,8 @@ fn eval_constant_cast(v: &Value, target: &crate::common::types::DataType) -> Opt
             Value::Null => Some(Value::Null),
             _ => None,
         },
+        // v0.22.0 新增类型 - 默认不转换
+        DataType::Jsonb | DataType::Date | DataType::Time | DataType::Uuid | DataType::Array { .. } | DataType::Enum { .. } => None,
     }
 }
 
@@ -1588,13 +1596,14 @@ mod tests {
         };
         assert!(matches!(fold_expression(e),
             Literal(Value::Float64(v)) if (v - 4.0).abs() < 1e-9));
-        // Float32 不支持数值折叠（as_f64 不含 Float32）→ 保留
+        // Float32 运算 → Float64（v0.22.0 支持 Float32）
         let e = BinaryOp {
             left: Box::new(Literal(Value::Float32(1.5))),
             op: Plus,
             right: Box::new(Literal(Value::Float32(2.5))),
         };
-        assert!(matches!(fold_expression(e), BinaryOp { .. }));
+        assert!(matches!(fold_expression(e),
+            Literal(Value::Float64(v)) if (v - 4.0).abs() < 1e-9));
         // 负号参与：-5 + 3 = -2
         let e = BinaryOp {
             left: Box::new(UnaryOp {

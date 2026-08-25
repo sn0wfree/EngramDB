@@ -228,6 +228,20 @@ fn decide_recommendation(data_type: &DataType, stats: &ColumnStats, total_count:
                 rationale: "blob: Uncompressed (binary data)",
             }
         }
+
+        // v0.22.0 新增类型 - 默认不压缩
+        DataType::Jsonb
+        | DataType::Date
+        | DataType::Time
+        | DataType::Uuid
+        | DataType::Array { .. }
+        | DataType::Enum { .. } => {
+            Recommendation {
+                codec: CompressionType::Uncompressed,
+                estimated_ratio: 1.0,
+                rationale: "special type: Uncompressed (no codec)",
+            }
+        }
     }
 }
 

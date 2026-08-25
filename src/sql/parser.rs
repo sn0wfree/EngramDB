@@ -498,6 +498,14 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                             false
                         }
                     });
+                    // 检测 CHECK 约束（v0.22.0 新增）
+                    let check_expr = col_def.options.iter().find_map(|o| {
+                        if let sqlast::ColumnOption::Check(expr) = &o.option {
+                            Some(expr.to_string())
+                        } else {
+                            None
+                        }
+                    });
                     cols.push(ColumnDef {
                         name: col_name,
                         data_type: dt,
@@ -505,6 +513,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                         primary_key,
                         auto_increment,
                         unique,
+                        check_expr,
                     });
                 }
             }
@@ -726,18 +735,40 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
             }))
         }
 
-        // DROP MATERIALIZED VIEW
+        // CREATE VIEW（v0.22.0 新增）
+        sqlast::Statement::CreateView {
+            name,
+            query,
+            materialized,
+            or_replace,
+            columns,
+            ..
+        } if !*materialized => {
+            let view_name = name.to_string();
+            let select_stmt = convert_query(query)?;
+            let col_names = if columns.is_empty() {
+                None
+            } else {
+                Some(columns.iter().map(|c| c.name.value.clone()).collect())
+            };
+            Ok(Statement::CreateView(CreateViewStmt {
+                view_name,
+                columns: col_names,
+                query: Box::new(select_stmt),
+                or_replace: *or_replace,
+            }))
+        }
+
+        // DROP VIEW（v0.22.0 新增，区分普通 VIEW 和 MATERIALIZED VIEW）
         sqlast::Statement::Drop {
             object_type,
             names,
             if_exists,
             ..
         } if matches!(object_type, sqlast::ObjectType::View) && names.len() == 1 => {
-            // sqlparser 不区分普通 VIEW 和 MATERIALIZED VIEW
-            // 这里我们假设 DROP VIEW 也可以删物化视图（简化处理）
-            // 实际生产中应区分，这里统一走 DropMaterializedView
             let view_name = names[0].to_string();
-            Ok(Statement::DropMaterializedView(DropMaterializedViewStmt {
+            // 默认走 DropView（普通视图）；物化视图通过 REFRESH/DROP MATERIALIZED 处理
+            Ok(Statement::DropView(DropViewStmt {
                 view_name,
                 if_exists: *if_exists,
             }))
@@ -819,6 +850,71 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 table_name: tbl_name,
                 assignments: assigns,
                 where_clause,
+            }))
+        }
+
+        // ALTER TABLE（v0.13.0 AddColumn，v0.22.0 补全 DropColumn/RenameColumn/RenameTable）
+        sqlast::Statement::AlterTable { name, operations, .. } => {
+            let table_name = name.to_string();
+            // 只处理第一个操作（sqlparser 支持多个，我们一次一个）
+            let op = operations.first().ok_or_else(|| {
+                EngramDbError::Parse("ALTER TABLE requires at least one operation".into())
+            })?;
+            let operation = match op {
+                sqlast::AlterTableOperation::AddColumn { column_def, .. } => {
+                    let col_name = column_def.name.value.clone();
+                    let dt = convert_data_type(&column_def.data_type)?;
+                    let nullable = !column_def.options.iter()
+                        .any(|o| matches!(o.option, sqlast::ColumnOption::NotNull));
+                    let primary_key = column_def.options.iter().any(|o| {
+                        matches!(o.option, sqlast::ColumnOption::Unique { is_primary: true, .. })
+                    });
+                    let auto_increment = column_def.options.iter().any(|o| {
+                        if let sqlast::ColumnOption::DialectSpecific(tokens) = &o.option {
+                            tokens.iter().any(|t| {
+                                let s = t.to_string().to_uppercase();
+                                s == "AUTO_INCREMENT" || s == "AUTOINCREMENT"
+                            })
+                        } else {
+                            false
+                        }
+                    });
+                    AlterTableOp::AddColumn {
+                        column_def: ColumnDef {
+                            name: col_name,
+                            data_type: dt,
+                            nullable,
+                            primary_key,
+                            auto_increment,
+                            unique: false,
+                    check_expr: None,
+                        },
+                        position: None,
+                    }
+                }
+                sqlast::AlterTableOperation::DropColumn { column_name, .. } => {
+                    AlterTableOp::DropColumn {
+                        column_name: column_name.value.clone(),
+                    }
+                }
+                sqlast::AlterTableOperation::RenameColumn { old_column_name, new_column_name, .. } => {
+                    AlterTableOp::RenameColumn {
+                        old_name: old_column_name.value.clone(),
+                        new_name: new_column_name.value.clone(),
+                    }
+                }
+                sqlast::AlterTableOperation::RenameTable { table_name: new_name, .. } => {
+                    AlterTableOp::RenameTable {
+                        new_name: new_name.to_string(),
+                    }
+                }
+                _ => return Err(EngramDbError::Parse(format!(
+                    "Unsupported ALTER TABLE operation: {:?}", op
+                ))),
+            };
+            Ok(Statement::AlterTable(AlterTableStmt {
+                table_name,
+                operation,
             }))
         }
 
@@ -1013,6 +1109,7 @@ fn extract_ctes(query: &sqlast::Query) -> Vec<Cte> {
                     alias: cte.alias.name.value.clone(),
                     query: Box::new(inner),
                     columns: cols,
+                    recursive: with.recursive,
                 });
             }
         }
@@ -1571,6 +1668,8 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
             Ok(DataType::Float64)
         }
         sqlast::DataType::Timestamp(_, _) | sqlast::DataType::Datetime(_) => Ok(DataType::Timestamp),
+        sqlast::DataType::Date => Ok(DataType::Date),
+        sqlast::DataType::Time(_, _) => Ok(DataType::Time),
         sqlast::DataType::Varchar(_)
         | sqlast::DataType::Char(_)
         | sqlast::DataType::Text
@@ -1582,7 +1681,14 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         sqlast::DataType::Custom(name, _) if name.0.len() == 1 && {
             let n = name.0[0].value.to_uppercase();
             n == "JSON" || n == "JSONB"
-        } => Ok(DataType::Json),
+        } => {
+            let n = name.0[0].value.to_uppercase();
+            if n == "JSONB" {
+                Ok(DataType::Jsonb)
+            } else {
+                Ok(DataType::Json)
+            }
+        }
         // 向量类型 VECTOR(dim)（v0.12.0 新增）
         sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR" => {
             // 从 modifiers 中解析维度，如 VECTOR(4) → dim=4
@@ -1593,6 +1699,27 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR_INT8" => {
             let dim = parse_dim_from_modifiers(modifiers).unwrap_or(0);
             Ok(DataType::VectorInt8 { dim })
+        }
+        // ARRAY 类型（v0.22.0 新增）
+        sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "ARRAY" => {
+            let element_type = if let Some(et) = modifiers.first() {
+                // 简化处理：默认元素类型为 Varchar
+                // 完整实现需要解析嵌套类型
+                Box::new(DataType::Varchar)
+            } else {
+                Box::new(DataType::Varchar) // 默认元素类型
+            };
+            Ok(DataType::Array { element_type })
+        }
+        // UUID 类型（v0.22.0 新增）
+        sqlast::DataType::Custom(name, _) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "UUID" => {
+            Ok(DataType::Uuid)
+        }
+        // ENUM 类型（v0.22.0 新增）
+        sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "ENUM" => {
+            // 简化处理：将 modifiers 作为枚举值
+            let values = modifiers.iter().map(|s| s.clone()).collect();
+            Ok(DataType::Enum { values })
         }
         _ => Err(EngramDbError::Parse(format!(
             "Unsupported data type: {:?}",

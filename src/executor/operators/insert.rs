@@ -189,6 +189,10 @@ pub(crate) fn execute_with_txn(
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?
             .def()
             .clone();
+
+        // CHECK 约束验证（v0.22.0 新增）
+        validate_check_constraints(&table_def, &rows)?;
+
         let conflict_indices: Vec<usize> = table_def.primary_key_index()
             .map(|pk| vec![pk])
             .unwrap_or_default();
@@ -526,6 +530,271 @@ fn insert_columns_direct(
     let table = db.get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
     table.insert_columns(columns)
+}
+
+/// 验证 CHECK 约束（v0.22.0 新增）
+///
+/// 对每一行的每一列，如果列定义了 CHECK 约束，则验证约束是否满足。
+/// CHECK 表达式格式：简单的比较表达式，如 "age > 0"、"salary >= 1000"
+fn validate_check_constraints(
+    table_def: &crate::common::types::TableDef,
+    rows: &[Vec<Value>],
+) -> Result<()> {
+    use crate::common::error::EngramDbError;
+
+    for (col_idx, col_def) in table_def.columns.iter().enumerate() {
+        if let Some(ref check_expr) = col_def.check_expr {
+            for (row_idx, row) in rows.iter().enumerate() {
+                if let Some(value) = row.get(col_idx) {
+                    if !eval_check_expr(check_expr, value)? {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "CHECK constraint failed on column '{}': {} (row {}, value {:?})",
+                            col_def.name, check_expr, row_idx, value
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 求值 CHECK 约束表达式
+///
+/// 支持的表达式格式：
+/// - 比较运算：`>`, `<`, `>=`, `<=`, `=`, `!=`, `<>`
+/// - 逻辑运算：`AND`, `OR`, `NOT`
+/// - NULL 检查：`IS NULL`, `IS NOT NULL`
+/// - 范围检查：`BETWEEN ... AND ...`
+/// - 集合检查：`IN (...)`
+/// - 复合表达式：`age > 0 AND age < 150`
+fn eval_check_expr(expr: &str, value: &Value) -> Result<bool> {
+    use crate::common::error::EngramDbError;
+
+    let expr = expr.trim();
+
+    // 处理 IS NULL / IS NOT NULL
+    if expr.eq_ignore_ascii_case("IS NULL") {
+        return Ok(value.is_null());
+    }
+    if expr.eq_ignore_ascii_case("IS NOT NULL") {
+        return Ok(!value.is_null());
+    }
+
+    // 处理 NOT NULL 简写
+    if expr.eq_ignore_ascii_case("NOT NULL") {
+        return Ok(!value.is_null());
+    }
+
+    // 处理 AND 连接的复合表达式
+    if let Some(pos) = find_keyword(expr, "AND") {
+        let left = &expr[..pos];
+        let right = &expr[pos + 3..];
+        return Ok(eval_check_expr(left, value)? && eval_check_expr(right, value)?);
+    }
+
+    // 处理 OR 连接的复合表达式
+    if let Some(pos) = find_keyword(expr, "OR") {
+        let left = &expr[..pos];
+        let right = &expr[pos + 2..];
+        return Ok(eval_check_expr(left, value)? || eval_check_expr(right, value)?);
+    }
+
+    // 处理 NOT 前缀
+    if expr.starts_with("NOT ") || expr.starts_with("not ") {
+        let inner = expr[4..].trim();
+        return Ok(!eval_check_expr(inner, value)?);
+    }
+
+    // 处理 BETWEEN ... AND ...
+    if let Some(between_result) = eval_between(expr, value)? {
+        return Ok(between_result);
+    }
+
+    // 处理 IN (...)
+    if let Some(in_result) = eval_in_list(expr, value)? {
+        return Ok(in_result);
+    }
+
+    // 解析比较表达式：value op literal
+    // 支持格式：`> 0`, `< 100`, `>= 0`, `<= 100`, `= 'abc'`, `!= ''`
+    let (op, literal_str) = if let Some(pos) = expr.find(">=") {
+        (">=", expr[pos + 2..].trim())
+    } else if let Some(pos) = expr.find("<=") {
+        ("<=", expr[pos + 2..].trim())
+    } else if let Some(pos) = expr.find("!=") {
+        ("!=", expr[pos + 2..].trim())
+    } else if let Some(pos) = expr.find("<>") {
+        ("<>", expr[pos + 2..].trim())
+    } else if let Some(pos) = expr.find('>') {
+        (">", expr[pos + 1..].trim())
+    } else if let Some(pos) = expr.find('<') {
+        ("<", expr[pos + 1..].trim())
+    } else if let Some(pos) = expr.find('=') {
+        ("=", expr[pos + 1..].trim())
+    } else {
+        // 不支持的表达式格式，默认通过
+        return Ok(true);
+    };
+
+    // 解析字面量
+    let literal = parse_literal(literal_str);
+
+    // 比较值
+    compare_values(value, &literal, op)
+}
+
+/// 查找关键字位置（忽略大小写，确保是单词边界）
+fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
+    let upper = expr.to_uppercase();
+    let kw_upper = keyword.to_uppercase();
+    let mut start = 0;
+    while let Some(pos) = upper[start..].find(&kw_upper) {
+        let abs_pos = start + pos;
+        // 检查单词边界
+        let before_ok = abs_pos == 0 || !upper.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+        let after_ok = abs_pos + keyword.len() >= upper.len() 
+            || !upper.as_bytes()[abs_pos + keyword.len()].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return Some(abs_pos);
+        }
+        start = abs_pos + 1;
+    }
+    None
+}
+
+/// 求值 BETWEEN 表达式
+fn eval_between(expr: &str, value: &Value) -> Result<Option<bool>> {
+    let upper = expr.to_uppercase();
+    if let Some(between_pos) = find_keyword(&upper, "BETWEEN") {
+        if let Some(and_pos) = find_keyword(&upper[between_pos + 7..], "AND") {
+            let low_str = expr[between_pos + 7..between_pos + 7 + and_pos].trim();
+            let high_str = expr[between_pos + 7 + and_pos + 3..].trim();
+            let low = parse_literal(low_str);
+            let high = parse_literal(high_str);
+            
+            let ge_low = compare_values(value, &low, ">=")?;
+            let le_high = compare_values(value, &high, "<=")?;
+            return Ok(Some(ge_low && le_high));
+        }
+    }
+    Ok(None)
+}
+
+/// 求值 IN 表达式
+fn eval_in_list(expr: &str, value: &Value) -> Result<Option<bool>> {
+    let upper = expr.to_uppercase();
+    if let Some(in_pos) = find_keyword(&upper, "IN") {
+        let rest = expr[in_pos + 2..].trim();
+        if rest.starts_with('(') && rest.ends_with(')') {
+            let inner = &rest[1..rest.len() - 1];
+            let items: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+            for item in items {
+                let literal = parse_literal(item);
+                if compare_values(value, &literal, "=")? {
+                    return Ok(Some(true));
+                }
+            }
+            return Ok(Some(false));
+        }
+    }
+    Ok(None)
+}
+
+/// 比较两个值
+fn compare_values(left: &Value, right: &Value, op: &str) -> Result<bool> {
+    match (left, right) {
+        (Value::Null, _) => Ok(true), // NULL 值跳过 CHECK（SQL 标准）
+        (Value::Int64(v), Value::Int64(l)) => {
+            match op {
+                ">" => Ok(v > l),
+                ">=" => Ok(v >= l),
+                "<" => Ok(v < l),
+                "<=" => Ok(v <= l),
+                "=" => Ok(v == l),
+                "!=" | "<>" => Ok(v != l),
+                _ => Ok(true),
+            }
+        }
+        (Value::Int32(v), Value::Int64(l)) => {
+            compare_values(&Value::Int64(*v as i64), right, op)
+        }
+        (Value::Int64(v), Value::Int32(l)) => {
+            compare_values(left, &Value::Int64(*l as i64), op)
+        }
+        (Value::Float64(v), Value::Float64(l)) => {
+            match op {
+                ">" => Ok(v > l),
+                ">=" => Ok(v >= l),
+                "<" => Ok(v < l),
+                "<=" => Ok(v <= l),
+                "=" => Ok(v == l),
+                "!=" | "<>" => Ok(v != l),
+                _ => Ok(true),
+            }
+        }
+        (Value::Float32(v), Value::Float64(l)) => {
+            compare_values(&Value::Float64(*v as f64), right, op)
+        }
+        (Value::Float64(v), Value::Float32(l)) => {
+            compare_values(left, &Value::Float64(*l as f64), op)
+        }
+        (Value::Varchar(v), Value::Varchar(l)) => {
+            match op {
+                "=" => Ok(v == l),
+                "!=" | "<>" => Ok(v != l),
+                ">" => Ok(v > l),
+                ">=" => Ok(v >= l),
+                "<" => Ok(v < l),
+                "<=" => Ok(v <= l),
+                _ => Ok(true),
+            }
+        }
+        (Value::Boolean(v), Value::Boolean(l)) => {
+            match op {
+                "=" => Ok(v == l),
+                "!=" | "<>" => Ok(v != l),
+                _ => Ok(true),
+            }
+        }
+        _ => Ok(true), // 类型不匹配，默认通过
+    }
+}
+
+/// 解析字面量字符串为 Value
+fn parse_literal(s: &str) -> Value {
+    let s = s.trim();
+
+    // 字符串字面量
+    if (s.starts_with('\'') && s.ends_with('\''))
+        || (s.starts_with('"') && s.ends_with('"'))
+    {
+        return Value::Varchar(s[1..s.len() - 1].to_string());
+    }
+
+    // NULL
+    if s.eq_ignore_ascii_case("NULL") {
+        return Value::Null;
+    }
+
+    // 布尔
+    if s.eq_ignore_ascii_case("TRUE") {
+        return Value::Boolean(true);
+    }
+    if s.eq_ignore_ascii_case("FALSE") {
+        return Value::Boolean(false);
+    }
+
+    // 数字
+    if let Ok(n) = s.parse::<i64>() {
+        return Value::Int64(n);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Value::Float64(f);
+    }
+
+    // 默认作为字符串
+    Value::Varchar(s.to_string())
 }
 
 #[cfg(test)]

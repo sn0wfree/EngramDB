@@ -220,11 +220,12 @@ fn estimate_value_size(v: &Value) -> usize {
         Value::Int64(_) => 8,
         Value::Float32(_) => 4,
         Value::Float64(_) => 8,
-        Value::Varchar(s) | Value::Json(s) => s.len() + 24, // String overhead
+        Value::Varchar(s) | Value::Json(s) | Value::Jsonb(s) | Value::Enum(s) => s.len() + 24, // String overhead
         Value::Vector(v) => v.len() * 4 + 24,
         Value::VectorInt8(v) => v.len() + 24,
         Value::Blob(b) => b.len() + 24,
-        Value::Timestamp(_) => 8,
+        Value::Timestamp(_) | Value::Date(_) | Value::Time(_) | Value::Uuid(_) => 16,
+        Value::Array(a) => a.len() * 8 + 24,
     }
 }
 
@@ -256,6 +257,7 @@ mod tests {
                     is_primary_key: true,
                     auto_increment: false,
                     default_value: None,
+                    check_expr: None,
                 },
                 ColumnDef {
                     name: "v".to_string(),
@@ -264,6 +266,7 @@ mod tests {
                     is_primary_key: false,
                     auto_increment: false,
                     default_value: None,
+                    check_expr: None,
                 },
             ],
             row_count: 0,

@@ -2,32 +2,53 @@
 
 > 目标：从当前 MVP 级 SQL 能力，演进为支持标准 SQL 的嵌入式分析型数据库引擎
 > 定位：SQLite 兼容度优先 + DuckDB 级分析能力 + EngramDB 专属压缩/索引优化
+> 最后更新：2026-08-25（v0.21.x 状态同步）
 
 ---
 
 ## 一、现状评估
 
-### 已有能力（MVP 级）
+### 已有能力（v0.21.x）
 
-| 模块 | 代码量 | 状态 | 说明 |
-|------|--------|------|------|
-| SQL 解析器 | 438 行 | ⚠️ 基础 | 手写递归下降，仅支持 CREATE TABLE / INSERT / SELECT / 事务 |
-| AST | 123 行 | ⚠️ 基础 | 覆盖核心 Statement 和 Expression，缺大量语法节点 |
-| 查询优化器 | 13 行 | ❌ 空壳 | 仅有模块骨架，无任何优化规则 |
-| 查询规划器 | 138 行 | ⚠️ 基础 | 简单的 SQL → PhysicalPlan 映射，无优化 |
-| 执行引擎 | ~800 行 | ✅ 可用 | 向量化执行，含 TableScan/Filter/Projection/Aggregate/Insert |
-| 表达式计算 | 24 行 | ❌ 极弱 | 仅支持最基础的字面量和列引用 |
-| 元数据/Catalog | — | ❌ 缺失 | 无独立 Catalog 层，表信息直接存存储层 |
-| 类型系统 | — | ⚠️ 基础 | 有 DataType 定义，缺类型推导和隐式转换 |
+| 模块 | 状态 | 说明 |
+|------|------|------|
+| SQL 解析器 | ✅ 完整 | 基于 sqlparser-rs，支持 ANSI SQL:2016 |
+| AST | ✅ 完整 | 覆盖 Statement 和 Expression，支持多引擎/多语法 |
+| 查询优化器 | ✅ 可用 | RBO 规则优化 + CBO 成本优化 + Join 顺序优化 |
+| 查询规划器 | ✅ 可用 | AST → PhysicalPlan，支持计划缓存 |
+| 执行引擎 | ✅ 完整 | 向量化执行，13 种算子（含 Window/HashJoin/Union） |
+| 表达式计算 | ✅ 完整 | 支持 50+ 内置函数、JSON 函数、向量函数 |
+| 元数据/Catalog | ✅ 可用 | Catalog 持久化，PRAGMA 查询 |
+| 类型系统 | ✅ 可用 | 11 种数据类型，类型推导 + 隐式转换 |
 
-### 核心差距
+### 已实现的 SQL 特性
 
-1. **语法覆盖不足**：缺 UPDATE / DELETE / ALTER / DROP / CREATE INDEX / JOIN / 子查询 / CTE / Window 等
-2. **表达式能力弱**：缺函数、算术运算、比较运算、逻辑运算的完整实现
-3. **无优化器**：SQL 直接生成物理计划，无 RBO / CBO
-4. **执行算子不全**：缺 HashJoin / Sort / Limit / Window / Union 等
-5. **无 Catalog 抽象**：元数据管理与存储层耦合
-6. **无类型推导**：表达式类型在编译期无法确定
+**DDL**：CREATE TABLE（含 ENGINE 子句）、DROP TABLE、ALTER TABLE ADD COLUMN、CREATE INDEX、CREATE UNIQUE INDEX、TRUNCATE TABLE、CTAS
+
+**DML**：INSERT（多行/RETURNING/UPSERT/INSERT OR IGNORE/REPLACE）、UPDATE、DELETE、INSERT...SELECT
+
+**查询**：WHERE、AND/OR/NOT、比较运算符、IN、BETWEEN、LIKE、IS NULL、DISTINCT、ORDER BY（多列）、LIMIT/OFFSET、GROUP BY（多列）、HAVING、INNER JOIN、LEFT/RIGHT OUTER JOIN、UNION/UNION ALL/INTERSECT/EXCEPT、CASE WHEN
+
+**聚合**：COUNT/COUNT(DISTINCT)/SUM/AVG/MIN/MAX
+
+**窗口函数**：ROW_NUMBER/RANK/DENSE_RANK、LAG/LEAD、SUM/AVG OVER
+
+**事务**：BEGIN/COMMIT/ROLLBACK、SAVEPOINT/RELEASE/ROLLBACK TO SAVEPOINT、只读事务
+
+**JSON 函数**：JSON_EXTRACT、JSON_CONTAINS、JSON_OBJECT、JSON_ARRAY、JSON_SET、JSON_INSERT、JSON_REPLACE、JSON_REMOVE
+
+**向量函数**：VECTOR_DISTANCE（L2/内积/余弦）、vector_search 表值函数
+
+**其他**：PRAGMA、EXPLAIN、Prepared Statement、计划缓存
+
+### 待完善
+
+1. **FULL OUTER JOIN**：未实现
+2. **标量子查询**：部分实现
+3. **递归 CTE**：未实现
+4. **CHECK 约束**：未实现
+5. **ALTER TABLE DROP/RENAME COLUMN**：未实现
+6. **VIEW**：未实现
 
 ---
 

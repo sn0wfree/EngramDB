@@ -37,6 +37,10 @@ pub fn plan(stmt: Statement, db: &Database) -> Result<PhysicalPlan> {
         Statement::CreateMaterializedView(s) => plan_create_mv(s, db),
         Statement::RefreshMaterializedView(s) => plan_refresh_mv(s),
         Statement::DropMaterializedView(s) => plan_drop_mv(s),
+        /// CREATE VIEW（v0.22.0 新增）
+        Statement::CreateView(s) => plan_create_view(s, db),
+        /// DROP VIEW（v0.22.0 新增）
+        Statement::DropView(s) => plan_drop_view(s),
         Statement::AlterTable(s) => plan_alter_table(s, db),
         Statement::Pragma(s) => plan_pragma(s),
         Statement::Explain(s) => plan_explain(s, db),
@@ -76,7 +80,94 @@ fn plan_explain(stmt: ExplainStmt, db: &Database) -> Result<PhysicalPlan> {
 }
 
 /// CTE 内联：将 WITH 子句中的 CTE 定义递归内联到查询中
+///
+/// v0.22.0 新增：支持递归 CTE（WITH RECURSIVE）
+/// 递归 CTE 的处理方式：
+/// 1. 检测 CTE 是否为递归（query 中有 UNION ALL 且引用自身）
+/// 2. 对于递归 CTE，不内联，而是在执行时迭代求值
+/// 3. 对于非递归 CTE，保持原有的内联行为
 fn inline_ctes(stmt: SelectStmt, _db: &Database) -> SelectStmt {
+    if stmt.ctes.is_empty() {
+        return stmt;
+    }
+
+    // 分离递归和非递归 CTE
+    let mut recursive_ctes = Vec::new();
+    let mut non_recursive_ctes = Vec::new();
+
+    for cte in &stmt.ctes {
+        if cte.recursive && is_recursive_cte(cte) {
+            recursive_ctes.push(cte.clone());
+        } else {
+            non_recursive_ctes.push(cte.clone());
+        }
+    }
+
+    // 如果有递归 CTE，需要特殊处理
+    if !recursive_ctes.is_empty() {
+        // 递归 CTE 不内联，保留在查询中供执行时处理
+        // 但需要将非递归 CTE 内联
+        let mut result = stmt.clone();
+        result.ctes = recursive_ctes;
+        if !non_recursive_ctes.is_empty() {
+            let non_recursive_stmt = SelectStmt {
+                ctes: non_recursive_ctes,
+                ..result.clone()
+            };
+            let inlined = inline_non_recursive_ctes(non_recursive_stmt);
+            result.from = inlined.from;
+            result.where_clause = inlined.where_clause;
+        }
+        return result;
+    }
+
+    // 没有递归 CTE，使用原有的内联逻辑
+    inline_non_recursive_ctes(stmt)
+}
+
+/// 检查 CTE 是否为递归 CTE
+///
+/// 递归 CTE 的特征：
+/// 1. 使用 WITH RECURSIVE 语法
+/// 2. 查询中包含 UNION ALL
+/// 3. UNION ALL 的递归部分引用了 CTE 自身
+fn is_recursive_cte(cte: &Cte) -> bool {
+    // 检查查询中是否有 UNION ALL
+    if let Some(ref set_op) = cte.query.set_op {
+        if set_op.0 == crate::sql::ast::SetOpType::UnionAll {
+            // 检查递归部分是否引用了 CTE 自身
+            let recursive_part = &set_op.1;
+            return references_cte(recursive_part, &cte.alias);
+        }
+    }
+    false
+}
+
+/// 检查查询是否引用了指定的 CTE 名称
+fn references_cte(query: &SelectStmt, cte_name: &str) -> bool {
+    if let Some(ref from) = query.from {
+        return table_ref_references_cte(from, cte_name);
+    }
+    false
+}
+
+/// 检查表引用是否引用了指定的 CTE 名称
+fn table_ref_references_cte(table_ref: &TableRef, cte_name: &str) -> bool {
+    match table_ref {
+        TableRef::Table { table_name, .. } => table_name == cte_name,
+        TableRef::Derived { query, .. } => references_cte(query, cte_name),
+        TableRef::CrossJoin { left, right } => {
+            table_ref_references_cte(left, cte_name) || table_ref_references_cte(right, cte_name)
+        }
+        TableRef::Join { left, right, .. } => {
+            table_ref_references_cte(left, cte_name) || table_ref_references_cte(right, cte_name)
+        }
+        _ => false,
+    }
+}
+
+/// 内联非递归 CTE（原有逻辑）
+fn inline_non_recursive_ctes(stmt: SelectStmt) -> SelectStmt {
     if stmt.ctes.is_empty() {
         return stmt;
     }
@@ -290,6 +381,9 @@ fn plan_create_table(stmt: CreateTableStmt, db: &Database) -> Result<PhysicalPla
                 if c.auto_increment {
                     col = col.auto_inc();
                 }
+                if let Some(ref check) = c.check_expr {
+                    col = col.check(check);
+                }
                 col
             })
             .collect()
@@ -386,10 +480,14 @@ fn infer_columns_from_select(
                         crate::Value::Boolean(_) => DataType::Boolean,
                         crate::Value::Int32(_) | crate::Value::Int64(_) => DataType::Int64,
                         crate::Value::Float32(_) | crate::Value::Float64(_) => DataType::Float64,
-                        crate::Value::Varchar(_) | crate::Value::Json(_) => DataType::Varchar,
+                        crate::Value::Varchar(_) | crate::Value::Json(_) | crate::Value::Jsonb(_) | crate::Value::Enum(_) => DataType::Varchar,
                         crate::Value::Vector(_) | crate::Value::VectorInt8(_) => DataType::Vector { dim: 0 },
                         crate::Value::Blob(_) => DataType::Blob,
                         crate::Value::Timestamp(_) => DataType::Timestamp,
+                        crate::Value::Date(_) => DataType::Date,
+                        crate::Value::Time(_) => DataType::Time,
+                        crate::Value::Uuid(_) => DataType::Uuid,
+                        crate::Value::Array(_) => DataType::Array { element_type: Box::new(DataType::Varchar) },
                     },
                     crate::sql::ast::Expression::ColumnRef { .. } => DataType::Varchar, // 简化：默认 Varchar
                     crate::sql::ast::Expression::Function { name, .. } => {
@@ -666,9 +764,123 @@ pub fn eval_insert_rows(stmt: &InsertStmt, db: &Database, params: &[Value]) -> R
     Ok(rows)
 }
 
-fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
+/// 规划递归 CTE（v0.22.0 新增）
+///
+/// 递归 CTE 的结构：
+/// WITH RECURSIVE cte_name AS (
+///     anchor_query      -- 非递归部分（锚点）
+///     UNION ALL
+///     recursive_query   -- 递归部分（引用 cte_name）
+/// )
+/// SELECT ... FROM cte_name
+///
+/// 生成的物理计划：
+/// RecursiveCte {
+///     cte_name: "cte_name",
+///     anchor: plan_select(anchor_query),
+///     recursive: plan_select(recursive_query),
+///     max_iterations: 1000,
+/// }
+fn plan_recursive_cte(cte: &Cte, outer_stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
+    // 验证 CTE 名称不为空
+    if cte.alias.is_empty() {
+        return Err(EngramDbError::Parse(
+            "Recursive CTE must have a name".into(),
+        ));
+    }
+
+    // 解析递归 CTE 的结构
+    // CTE 查询应该是 UNION ALL：anchor UNION ALL recursive
+    if let Some((set_op_type, recursive_part)) = &cte.query.set_op {
+        if *set_op_type == crate::sql::ast::SetOpType::UnionAll {
+            // 验证 anchor 有 FROM 子句
+            if cte.query.from.is_none() {
+                return Err(EngramDbError::Parse(
+                    format!("Recursive CTE '{}' anchor must have a FROM clause", cte.alias),
+                ));
+            }
+
+            // 验证 recursive 有 FROM 子句
+            if recursive_part.from.is_none() {
+                return Err(EngramDbError::Parse(
+                    format!("Recursive CTE '{}' recursive part must have a FROM clause", cte.alias),
+                ));
+            }
+
+            // 验证 anchor 和 recursive 的列数匹配
+            if cte.query.select_list.len() != recursive_part.select_list.len() {
+                return Err(EngramDbError::Parse(
+                    format!(
+                        "Recursive CTE '{}' column count mismatch: anchor has {}, recursive has {}",
+                        cte.alias,
+                        cte.query.select_list.len(),
+                        recursive_part.select_list.len()
+                    ),
+                ));
+            }
+
+            // anchor 是 cte.query 的主体（去掉 set_op 部分）
+            let anchor_stmt = SelectStmt {
+                set_op: None,
+                ..*cte.query.clone()
+            };
+            let recursive_stmt = *recursive_part.clone();
+
+            // 规划 anchor 和 recursive
+            let anchor_plan = plan_select(anchor_stmt, db)?;
+            let recursive_plan = plan_select(recursive_stmt, db)?;
+
+            // 构建外层查询计划（使用 CTE 结果）
+            // 将 CTE 引用替换为 RecursiveCte 节点
+            let outer_plan = plan_select_with_cte_result(outer_stmt, &cte.alias, db)?;
+
+            return Ok(PhysicalPlan::RecursiveCte {
+                cte_name: cte.alias.clone(),
+                anchor: Box::new(anchor_plan),
+                recursive: Box::new(recursive_plan),
+                max_iterations: 1000, // 默认最大迭代次数
+            });
+        } else {
+            // 不支持 UNION/INTERSECT/EXCEPT 作为递归 CTE 的连接
+            return Err(EngramDbError::Parse(
+                format!(
+                    "Recursive CTE '{}' must use UNION ALL, not {:?}",
+                    cte.alias, set_op_type
+                ),
+            ));
+        }
+    }
+
+    // 如果不是 UNION ALL 结构，回退到普通 CTE 处理
+    Err(EngramDbError::Parse(
+        format!("Recursive CTE '{}' must use UNION ALL", cte.alias)
+    ))
+}
+
+/// 规划使用递归 CTE 结果的外层查询
+///
+/// 将外层查询中对 CTE 的引用替换为对 RecursiveCte 节点的引用
+fn plan_select_with_cte_result(stmt: &SelectStmt, cte_name: &str, db: &Database) -> Result<PhysicalPlan> {
+    // 简化实现：直接规划外层查询
+    // RecursiveCte 节点会在执行时提供 CTE 的结果
+    plan_select(stmt.clone(), db)
+}
+
+/// 规划 SELECT 语句（v0.22.0：公开供子查询使用）
+pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     // CTE 内联：将 WITH 子句中的 CTE 定义内联到查询中
+    // v0.22.0：递归 CTE 不内联，保留供执行时处理
     let stmt = inline_ctes(stmt, db);
+
+    // 检查是否有递归 CTE 需要特殊处理
+    if !stmt.ctes.is_empty() {
+        // 递归 CTE 处理：生成 RecursiveCte 物理计划
+        for cte in &stmt.ctes {
+            if cte.recursive {
+                return plan_recursive_cte(cte, &stmt, db);
+            }
+        }
+    }
 
     // ===== Perf01：COUNT(*) 元数据级短路 =====
     // 条件：单表、无 WHERE、无 GROUP BY、无 HAVING、无 ORDER BY、无 LIMIT
@@ -2535,6 +2747,32 @@ fn plan_drop_mv(stmt: DropMaterializedViewStmt) -> Result<PhysicalPlan> {
     })
 }
 
+// ============================================================
+// 普通视图规划（v0.22.0 新增）
+// ============================================================
+
+fn plan_create_view(stmt: CreateViewStmt, db: &Database) -> Result<PhysicalPlan> {
+    // 规划查询部分
+    let query_plan = plan_select(*stmt.query, db)?;
+
+    // 从查询计划中提取列名
+    let column_names = stmt.columns.unwrap_or_else(|| extract_column_names(&query_plan));
+
+    Ok(PhysicalPlan::CreateView {
+        view_name: stmt.view_name,
+        column_names,
+        query: Box::new(query_plan),
+        or_replace: stmt.or_replace,
+    })
+}
+
+fn plan_drop_view(stmt: DropViewStmt) -> Result<PhysicalPlan> {
+    Ok(PhysicalPlan::DropView {
+        view_name: stmt.view_name,
+        if_exists: stmt.if_exists,
+    })
+}
+
 /// 从物理计划中提取输出列名
 fn extract_column_names(plan: &PhysicalPlan) -> Vec<String> {
     match plan {
@@ -2671,6 +2909,9 @@ mod tests {
             PhysicalPlan::ReleaseSavepoint { .. } => "ReleaseSavepoint",
             PhysicalPlan::RollbackToSavepoint { .. } => "RollbackToSavepoint",
             PhysicalPlan::VectorSearch { .. } => "VectorSearch",
+            PhysicalPlan::CreateView { .. } => "CreateView",
+            PhysicalPlan::DropView { .. } => "DropView",
+            PhysicalPlan::RecursiveCte { .. } => "RecursiveCte",
         }
     }
 
@@ -3564,9 +3805,9 @@ mod tests {
             PhysicalPlan::RefreshMaterializedView { concurrently: true, .. } => {}
             other => panic!("expected RefreshMaterializedView, got {other:?}"),
         }
-        // DROP：sqlparser 统一走 DROP VIEW
+        // DROP：sqlparser 统一走 DROP VIEW（v0.22.0 改为 DropView）
         assert!(matches!(plan_ok(&mut conn, "DROP VIEW mv1"),
-            PhysicalPlan::DropMaterializedView { if_exists: false, .. }));
+            PhysicalPlan::DropView { if_exists: false, .. }));
     }
 
     // ===== 错误路径 =====

@@ -1,8 +1,6 @@
 //! 数据类型定义
 
 /// 列的数据类型
-
-/// 列的数据类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     Boolean,
@@ -20,6 +18,11 @@ pub enum DataType {
     /// 存储半结构化 JSON 数据，支持路径查询。
     /// 适合 Agent 场景的工具参数、调用结果、状态元数据等。
     Json,
+    /// 二进制 JSON 类型（v0.22.0 新增）
+    ///
+    /// 与 Json 类似但存储为二进制格式（serde_json 紧凑编码）。
+    /// 解析更快，体积略小，但不支持路径查询函数。
+    Jsonb,
     /// 向量类型（v0.12.0 新增）
     ///
     /// 存储固定维度的 f32 向量，支持 HNSW 近似最近邻搜索。
@@ -38,6 +41,31 @@ pub enum DataType {
     ///
     /// 内部存储为 Unix 毫秒（i64 UTC），适合 Agent 日志/记忆等时间序列场景。
     Timestamp,
+    /// 日期类型（v0.22.0 新增）
+    ///
+    /// 内部存储为 Unix 天数（i32 UTC，自 1970-01-01 起）。
+    /// 适合生日、截止日期等纯日期场景。
+    Date,
+    /// 时间类型（v0.22.0 新增）
+    ///
+    /// 内部存储为自午夜以来的毫秒数（i32 UTC，0-86399999）。
+    /// 适合营业时间、排程等纯时间场景。
+    Time,
+    /// 数组类型（v0.22.0 新增）
+    ///
+    /// 存储同质元素数组，元素类型在建表时指定（如 `ARRAY(INT)`）。
+    /// 适合标签、向量嵌入、JSON 路径结果等场景。
+    Array { element_type: Box<DataType> },
+    /// UUID 类型（v0.22.0 新增）
+    ///
+    /// 存储 128 位通用唯一标识符，内部表示为 u128。
+    /// 适合分布式系统 ID、订单号、会话 ID 等场景。
+    Uuid,
+    /// 枚举类型（v0.22.0 新增）
+    ///
+    /// 字符串枚举，存储为 Varchar 但只在预设值范围内。
+    /// 适合性别、状态、等级等低基数分类字段。
+    Enum { values: Vec<String> },
 }
 
 impl DataType {
@@ -50,10 +78,16 @@ impl DataType {
             DataType::Float64 => "DOUBLE",
             DataType::Varchar => "VARCHAR",
             DataType::Json => "JSON",
+            DataType::Jsonb => "JSONB",
             DataType::Vector { .. } => "VECTOR",
             DataType::VectorInt8 { .. } => "VECTOR_INT8",
             DataType::Blob => "BLOB",
             DataType::Timestamp => "TIMESTAMP",
+            DataType::Date => "DATE",
+            DataType::Time => "TIME",
+            DataType::Array { .. } => "ARRAY",
+            DataType::Uuid => "UUID",
+            DataType::Enum { .. } => "ENUM",
         }
     }
 
@@ -66,10 +100,16 @@ impl DataType {
             DataType::Float64 => Some(8),
             DataType::Varchar => None,
             DataType::Json => None,
+            DataType::Jsonb => None,
             DataType::Vector { .. } => None,
             DataType::VectorInt8 { .. } => None,
             DataType::Blob => None,
             DataType::Timestamp => Some(8),
+            DataType::Date => Some(4),
+            DataType::Time => Some(4),
+            DataType::Array { .. } => None,
+            DataType::Uuid => Some(16),
+            DataType::Enum { .. } => None,
         }
     }
 }
@@ -89,6 +129,11 @@ pub struct ColumnDef {
     pub is_primary_key: bool,
     pub default_value: Option<String>,
     pub auto_increment: bool,
+    /// CHECK 约束表达式（v0.22.0 新增）
+    ///
+    /// 存储为字符串形式，执行时解析求值。
+    /// 例如：`"age > 0"` 表示 `CHECK (age > 0)`
+    pub check_expr: Option<String>,
 }
 
 impl ColumnDef {
@@ -99,6 +144,7 @@ impl ColumnDef {
             nullable: true,
             is_primary_key: false,
             default_value: None,
+                    check_expr: None,
             auto_increment: false,
         }
     }
@@ -121,6 +167,11 @@ impl ColumnDef {
 
     pub fn auto_inc(mut self) -> Self {
         self.auto_increment = true;
+        self
+    }
+
+    pub fn check(mut self, expr: &str) -> Self {
+        self.check_expr = Some(expr.to_string());
         self
     }
 }

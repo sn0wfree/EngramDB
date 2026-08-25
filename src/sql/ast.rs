@@ -25,6 +25,10 @@ pub enum Statement {
     CreateMaterializedView(CreateMaterializedViewStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
     DropMaterializedView(DropMaterializedViewStmt),
+    /// CREATE VIEW（v0.22.0 新增）
+    CreateView(CreateViewStmt),
+    /// DROP VIEW（v0.22.0 新增）
+    DropView(DropViewStmt),
     AlterTable(AlterTableStmt),
     Pragma(PragmaStmt),
     Explain(ExplainStmt),
@@ -99,6 +103,8 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     /// 列级 UNIQUE 约束（v0.14.0 新增）
     pub unique: bool,
+    /// CHECK 约束表达式（v0.22.0 新增）
+    pub check_expr: Option<String>,
 }
 
 /// INSERT 语句
@@ -205,6 +211,23 @@ pub struct RefreshMaterializedViewStmt {
 /// DROP MATERIALIZED VIEW 语句
 #[derive(Debug, Clone)]
 pub struct DropMaterializedViewStmt {
+    pub view_name: String,
+    pub if_exists: bool,
+}
+
+/// CREATE VIEW 语句（v0.22.0 新增）
+#[derive(Debug, Clone)]
+pub struct CreateViewStmt {
+    pub view_name: String,
+    pub columns: Option<Vec<String>>,
+    /// 视图定义查询
+    pub query: Box<SelectStmt>,
+    pub or_replace: bool,
+}
+
+/// DROP VIEW 语句（v0.22.0 新增）
+#[derive(Debug, Clone)]
+pub struct DropViewStmt {
     pub view_name: String,
     pub if_exists: bool,
 }
@@ -344,6 +367,8 @@ pub struct Cte {
     pub alias: String,
     pub query: Box<SelectStmt>,
     pub columns: Vec<String>,
+    /// 是否为递归 CTE（v0.22.0 新增）
+    pub recursive: bool,
 }
 
 /// 窗口规范（OVER 子句）

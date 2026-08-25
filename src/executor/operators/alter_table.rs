@@ -13,10 +13,19 @@ pub fn execute(db: &mut Database, stmt: AlterTableStmt) -> Result<QueryResult> {
                 is_primary_key: column_def.primary_key,
                 default_value: None,
                 auto_increment: false,
+                check_expr: None,
             };
-            db.get_table_mut(&stmt.table_name)
-                .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?
-                .def_mut().columns.push(def);
+            let table = db.get_table_mut(&stmt.table_name)
+                .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
+            
+            // 检查列名是否已存在
+            if table.def().columns.iter().any(|c| c.name == def.name) {
+                return Err(EngramDbError::ConstraintViolation(
+                    format!("Column '{}' already exists in table '{}'", def.name, stmt.table_name)
+                ));
+            }
+            
+            table.def_mut().columns.push(def);
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
                 rows: vec![vec![crate::Value::Varchar(format!("Column added to {}", stmt.table_name))]],
@@ -28,6 +37,21 @@ pub fn execute(db: &mut Database, stmt: AlterTableStmt) -> Result<QueryResult> {
                 .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
             let col_idx = table.def().column_index(&column_name)
                 .ok_or_else(|| EngramDbError::ColumnNotFound(column_name.clone()))?;
+            
+            // 检查是否是主键列
+            if table.def().columns[col_idx].is_primary_key {
+                return Err(EngramDbError::ConstraintViolation(
+                    format!("Cannot drop primary key column '{}'", column_name)
+                ));
+            }
+            
+            // 检查是否是唯一列（有唯一索引）
+            if table.def().indexes.iter().any(|idx| idx.key_columns.contains(&col_idx)) {
+                return Err(EngramDbError::ConstraintViolation(
+                    format!("Cannot drop column '{}' with index, drop index first", column_name)
+                ));
+            }
+            
             table.def_mut().columns.remove(col_idx);
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
@@ -38,6 +62,14 @@ pub fn execute(db: &mut Database, stmt: AlterTableStmt) -> Result<QueryResult> {
         AlterTableOp::RenameColumn { old_name, new_name } => {
             let table = db.get_table_mut(&stmt.table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
+            
+            // 检查新列名是否已存在
+            if table.def().columns.iter().any(|c| c.name == new_name) {
+                return Err(EngramDbError::ConstraintViolation(
+                    format!("Column '{}' already exists in table '{}'", new_name, stmt.table_name)
+                ));
+            }
+            
             let col = table.def_mut().columns.iter_mut()
                 .find(|c| c.name == old_name)
                 .ok_or_else(|| EngramDbError::ColumnNotFound(old_name.clone()))?;
@@ -68,6 +100,7 @@ mod tests {
         crate::common::types::ColumnDef {
             name: name.into(), data_type: dt, nullable: true,
             is_primary_key: false, default_value: None, auto_increment: false,
+                    check_expr: None,
         }
     }
 
@@ -96,6 +129,7 @@ mod tests {
                 column_def: ColumnDef {
                     name: "c".into(), data_type: crate::common::types::DataType::Int64,
                     nullable: true, primary_key: false, auto_increment: false, unique: false,
+                    check_expr: None,
                 },
                 position: None,
             },
@@ -117,6 +151,7 @@ mod tests {
                 column_def: ColumnDef {
                     name: "c".into(), data_type: crate::common::types::DataType::Int32,
                     nullable: true, primary_key: false, auto_increment: false, unique: false,
+                    check_expr: None,
                 },
                 position: None,
             },

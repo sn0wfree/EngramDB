@@ -115,8 +115,18 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
         DataType::Float64 => compress_float64(data),
         DataType::Timestamp => compress_timestamp(data),
         DataType::Varchar => compress_varchar(data),
-        // JSON 和 Vector 暂不压缩，直接存储
-        DataType::Json | DataType::Vector { .. } | DataType::VectorInt8 { .. } | DataType::Blob => {
+        // v0.22.0 新增类型压缩支持
+        DataType::Date => compress_integer::<i32>(data), // Date 存储为 i32（天数）
+        DataType::Time => compress_integer::<i32>(data), // Time 存储为 i32（毫秒）
+        DataType::Jsonb => compress_varchar(data), // JSONB 类似 Varchar（String）
+        DataType::Enum { .. } => compress_varchar(data), // Enum 存储为 String
+        // Vector、Blob、Array 暂不压缩（二进制数据）
+        DataType::Json
+        | DataType::Vector { .. }
+        | DataType::VectorInt8 { .. }
+        | DataType::Blob
+        | DataType::Uuid
+        | DataType::Array { .. } => {
             Ok((CompressionType::Uncompressed, data.to_vec()))
         }
     }

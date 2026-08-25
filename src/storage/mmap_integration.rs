@@ -99,6 +99,7 @@ mod tests {
                 is_primary_key: true,
                 auto_increment: false,
                 default_value: None,
+                check_expr: None,
             }],
             row_count: 0,
             indexes: vec![],

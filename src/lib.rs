@@ -622,6 +622,11 @@ pub enum Value {
     Float64(f64),
     Varchar(String),
     Json(String),
+    /// 二进制 JSON（v0.22.0 新增）
+    ///
+    /// 存储为 serde_json 紧凑编码（实际仍是 String，但语义是结构化 JSON）。
+    /// 与 Json 的区别：路径查询时直接二进制解析，无中间转换。
+    Jsonb(String),
     Vector(Vec<f32>),
     /// INT8 量化向量（v0.15.0 新增）
     ///
@@ -630,6 +635,29 @@ pub enum Value {
     Blob(Vec<u8>),
     /// Unix 毫秒时间戳（UTC，v0.14.0 新增）
     Timestamp(i64),
+    /// 日期（v0.22.0 新增）
+    ///
+    /// 内部存储为 Unix 天数（i32 UTC，自 1970-01-01 起）。
+    /// 范围：约 5882-11-04 至 5879-06-05。
+    Date(i32),
+    /// 时间（v0.22.0 新增）
+    ///
+    /// 内部存储为自午夜以来的毫秒数（i32 UTC，0-86399999）。
+    /// 范围：00:00:00.000 至 23:59:59.999。
+    Time(i32),
+    /// 数组（v0.22.0 新增）
+    ///
+    /// 存储同质元素数组，元素类型由列定义决定。
+    Array(Vec<Value>),
+    /// UUID（v0.22.0 新增）
+    ///
+    /// 128 位通用唯一标识符，内部表示为 u128。
+    Uuid(u128),
+    /// 枚举值（v0.22.0 新增）
+    ///
+    /// 字符串枚举，存储为 String。
+    /// 列定义中的 values 列表限制取值范围。
+    Enum(String),
 }
 
 /// 混合搜索结果（向量相似度 + 标量过滤后的行数据）
@@ -663,10 +691,16 @@ impl Ord for Value {
                 Value::Float64(_) => 5,
                 Value::Varchar(_) => 6,
                 Value::Json(_) => 7,
-                Value::Vector(_) => 8,
-                Value::VectorInt8(_) => 9,
-                Value::Blob(_) => 10,
-                Value::Timestamp(_) => 11,
+                Value::Jsonb(_) => 8,
+                Value::Vector(_) => 9,
+                Value::VectorInt8(_) => 10,
+                Value::Blob(_) => 11,
+                Value::Timestamp(_) => 12,
+                Value::Date(_) => 13,
+                Value::Time(_) => 14,
+                Value::Array(_) => 15,
+                Value::Uuid(_) => 16,
+                Value::Enum(_) => 17,
             }
         }
         let ord = variant_rank(self).cmp(&variant_rank(other));
@@ -681,8 +715,13 @@ impl Ord for Value {
             (Value::Float32(a), Value::Float32(b)) => a.to_bits().cmp(&b.to_bits()),
             (Value::Float64(a), Value::Float64(b)) => a.to_bits().cmp(&b.to_bits()),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+            (Value::Date(a), Value::Date(b)) => a.cmp(b),
+            (Value::Time(a), Value::Time(b)) => a.cmp(b),
+            (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Jsonb(a), Value::Jsonb(b)) => a.cmp(b),
+            (Value::Enum(a), Value::Enum(b)) => a.cmp(b),
             (Value::Vector(a), Value::Vector(b)) => {
                 let len_ord = a.len().cmp(&b.len());
                 if len_ord != std::cmp::Ordering::Equal {
@@ -697,6 +736,19 @@ impl Ord for Value {
                 std::cmp::Ordering::Equal
             }
             (Value::VectorInt8(a), Value::VectorInt8(b)) => {
+                let len_ord = a.len().cmp(&b.len());
+                if len_ord != std::cmp::Ordering::Equal {
+                    return len_ord;
+                }
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let ord = x.cmp(y);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            }
+            (Value::Array(a), Value::Array(b)) => {
                 let len_ord = a.len().cmp(&b.len());
                 if len_ord != std::cmp::Ordering::Equal {
                     return len_ord;
@@ -728,6 +780,8 @@ impl std::hash::Hash for Value {
             Value::Float64(f) => f.to_bits().hash(state),
             Value::Varchar(s) => s.hash(state),
             Value::Json(s) => s.hash(state),
+            Value::Jsonb(s) => s.hash(state),
+            Value::Enum(s) => s.hash(state),
             Value::Vector(v) => {
                 v.len().hash(state);
                 for x in v {
@@ -742,6 +796,15 @@ impl std::hash::Hash for Value {
             }
             Value::Blob(b) => b.hash(state),
             Value::Timestamp(t) => t.hash(state),
+            Value::Date(d) => d.hash(state),
+            Value::Time(t) => t.hash(state),
+            Value::Uuid(u) => u.hash(state),
+            Value::Array(a) => {
+                a.len().hash(state);
+                for x in a {
+                    x.hash(state);
+                }
+            }
         }
     }
 }
@@ -756,6 +819,8 @@ impl Value {
             Value::Int32(v) => Some(*v as i64),
             Value::Int64(v) => Some(*v),
             Value::Timestamp(v) => Some(*v),
+            Value::Date(v) => Some(*v as i64),
+            Value::Time(v) => Some(*v as i64),
             _ => None,
         }
     }
@@ -764,7 +829,11 @@ impl Value {
         match self {
             Value::Int32(v) => Some(*v as f64),
             Value::Int64(v) => Some(*v as f64),
+            Value::Float32(v) => Some(*v as f64),
             Value::Float64(v) => Some(*v),
+            Value::Timestamp(v) => Some(*v as f64),
+            Value::Date(v) => Some(*v as f64),
+            Value::Time(v) => Some(*v as f64),
             _ => None,
         }
     }
@@ -773,6 +842,8 @@ impl Value {
         match self {
             Value::Varchar(v) => Some(v),
             Value::Json(v) => Some(v),
+            Value::Jsonb(v) => Some(v),
+            Value::Enum(v) => Some(v),
             _ => None,
         }
     }
@@ -781,6 +852,7 @@ impl Value {
     pub fn as_json_value(&self) -> Option<serde_json::Value> {
         match self {
             Value::Json(s) => serde_json::from_str(s).ok(),
+            Value::Jsonb(s) => serde_json::from_str(s).ok(),
             Value::Varchar(s) => serde_json::from_str(s).ok(),
             _ => None,
         }
@@ -801,6 +873,38 @@ impl Value {
             _ => None,
         }
     }
+
+    /// 获取数组引用
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Value::Array(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// 获取 UUID 值
+    pub fn as_uuid(&self) -> Option<u128> {
+        match self {
+            Value::Uuid(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// 获取日期值（自 1970-01-01 起的天数）
+    pub fn as_date(&self) -> Option<i32> {
+        match self {
+            Value::Date(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// 获取时间值（自午夜起的毫秒数）
+    pub fn as_time(&self) -> Option<i32> {
+        match self {
+            Value::Time(v) => Some(*v),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Value {
@@ -814,10 +918,16 @@ impl std::fmt::Display for Value {
             Value::Float64(v) => write!(f, "{}", v),
             Value::Varchar(v) => write!(f, "\"{}\"", v),
             Value::Json(v) => write!(f, "'{}'", v),
+            Value::Jsonb(v) => write!(f, "'{}'", v),
             Value::Vector(v) => write!(f, "vector[{}]", v.len()),
             Value::VectorInt8(v) => write!(f, "vector_int8[{}]", v.len()),
             Value::Blob(b) => write!(f, "blob[{}]", b.len()),
             Value::Timestamp(t) => write!(f, "ts({})", t),
+            Value::Date(d) => write!(f, "date({})", d),
+            Value::Time(t) => write!(f, "time({})", t),
+            Value::Array(a) => write!(f, "array[{}]", a.len()),
+            Value::Uuid(u) => write!(f, "uuid({:032x})", u),
+            Value::Enum(v) => write!(f, "'{}'", v),
         }
     }
 }
