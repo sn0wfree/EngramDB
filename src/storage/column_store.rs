@@ -982,6 +982,7 @@ impl ColumnStore {
                     stats.total_compressed += col.compressed_data.len();
                     // 估算原始大小（通过 uncompressed_count）
                     let est_original = match col.data_type {
+                        DataType::Int16 => col.uncompressed_count as usize * 2,
                         DataType::Int32 => col.uncompressed_count as usize * 4,
                         DataType::Int64 => col.uncompressed_count as usize * 8,
                         DataType::Float32 => col.uncompressed_count as usize * 4,
@@ -999,6 +1000,7 @@ impl ColumnStore {
                         DataType::Array { .. } => col.uncompressed_count as usize * 32,
                         DataType::Enum { .. } => col.uncompressed_count as usize * 16,
                         DataType::VectorInt8 { .. } => col.uncompressed_count as usize * 16, // 估算
+                        DataType::Decimal { .. } => col.uncompressed_count as usize * 17,
                     };
                     stats.total_original += est_original;
                 } else {
@@ -1647,6 +1649,16 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
                 }
             }
         }
+        DataType::Int16 => {
+            for v in values {
+                match v {
+                    Value::Int16(i) => buf.extend_from_slice(&i.to_le_bytes()),
+                    Value::Int32(i) => buf.extend_from_slice(&(*i as i16).to_le_bytes()),
+                    Value::Int64(i) => buf.extend_from_slice(&(*i as i16).to_le_bytes()),
+                    _ => buf.extend_from_slice(&0i16.to_le_bytes()),
+                }
+            }
+        }
         DataType::Int64 => {
             for v in values {
                 match v {
@@ -1746,6 +1758,17 @@ pub fn serialize_values(values: &[Value], data_type: &DataType) -> Vec<u8> {
                 }
             }
         }
+        DataType::Decimal { .. } => {
+            for v in values {
+                if let Value::Decimal(val, scale) = v {
+                    buf.extend_from_slice(&val.to_le_bytes());
+                    buf.push(*scale);
+                } else {
+                    buf.extend_from_slice(&0i128.to_le_bytes());
+                    buf.push(0);
+                }
+            }
+        }
         // v0.22.0 新增类型 - 简化处理：序列化为零字节
         _ => {}
     }
@@ -1777,6 +1800,17 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
                     let val = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                     values.push(Value::Int32(val));
                     offset += 4;
+                } else {
+                    values.push(Value::Null);
+                }
+            }
+        }
+        DataType::Int16 => {
+            for _ in 0..count {
+                if offset + 2 <= data.len() {
+                    let val = i16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
+                    values.push(Value::Int16(val));
+                    offset += 2;
                 } else {
                     values.push(Value::Null);
                 }
@@ -1920,6 +1954,18 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
                 }
             }
         }
+        DataType::Decimal { .. } => {
+            for _ in 0..count {
+                if offset + 17 <= data.len() {
+                    let val = i128::from_le_bytes(data[offset..offset + 16].try_into().unwrap());
+                    let scale = data[offset + 16];
+                    values.push(Value::Decimal(val, scale));
+                    offset += 17;
+                } else {
+                    values.push(Value::Null);
+                }
+            }
+        }
         // v0.22.0 新增类型 - 简化处理：全部反序列化为 NULL
         _ => {
             for _ in 0..count {
@@ -1977,6 +2023,7 @@ fn bytes_to_values(data: &[u8], data_type: &DataType, count: usize) -> Vec<Value
 fn data_byte_size(data: &ColumnData, data_type: &DataType) -> usize {
     match (data_type, &data.values) {
         (DataType::Boolean, ColumnValue::Boolean(v)) => v.len(),
+        (DataType::Int16, ColumnValue::Int16(v)) => v.len() * 2,
         (DataType::Int32, ColumnValue::Int32(v)) => v.len() * 4,
         (DataType::Int64, ColumnValue::Int64(v)) => v.len() * 8,
         (DataType::Float32, ColumnValue::Float32(v)) => v.len() * 4,
@@ -1993,6 +2040,7 @@ fn data_byte_size(data: &ColumnData, data_type: &DataType) -> usize {
         (DataType::Uuid, ColumnValue::Uuid(v)) => v.len() * 16,
         (DataType::Array { .. }, ColumnValue::Array(v)) => v.iter().map(|a| 4 + a.len() * 8).sum(),
         (DataType::Enum { .. }, ColumnValue::Enum(v)) => v.iter().map(|s| 4 + s.len()).sum(),
+        (DataType::Decimal { .. }, ColumnValue::Decimal(v)) => v.len() * 17,
         _ => data.len(),
     }
 }
@@ -2000,6 +2048,7 @@ fn data_byte_size(data: &ColumnData, data_type: &DataType) -> usize {
 fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
     match data_type {
         DataType::Boolean => values.len(),
+        DataType::Int16 => values.len() * 2,
         DataType::Int32 => values.len() * 4,
         DataType::Int64 => values.len() * 8,
         DataType::Float32 => values.len() * 4,
@@ -2067,6 +2116,7 @@ fn values_byte_size(values: &[Value], data_type: &DataType) -> usize {
         DataType::Uuid => values.len() * 16,
         DataType::Array { .. } => values.len() * 32,
         DataType::Enum { .. } => values.len() * 16,
+        DataType::Decimal { .. } => values.len() * 17,
     }
 }
 
@@ -2094,6 +2144,8 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Uuid => 14,
         DataType::Array { .. } => 15,
         DataType::Enum { .. } => 16,
+        DataType::Int16 => 17,
+        DataType::Decimal { .. } => 18,
     }
 }
 
@@ -2110,6 +2162,8 @@ fn u8_to_data_type(b: u8) -> DataType {
         7 => DataType::Blob,
         9 => DataType::Timestamp,
         10 => DataType::VectorInt8 { dim: 0 },
+        17 => DataType::Int16,
+        18 => DataType::Decimal { scale: 0 },
         _ => DataType::Varchar,
     }
 }

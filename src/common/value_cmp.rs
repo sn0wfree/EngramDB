@@ -54,26 +54,30 @@ fn type_rank(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
         Value::Boolean(_) => 1,
-        Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_) | Value::Date(_) | Value::Time(_) => 2,
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_) | Value::Date(_) | Value::Time(_) => 2,
         Value::Float32(_) | Value::Float64(_) => 3,
-        Value::Varchar(_) | Value::Enum(_) => 4,
-        Value::Json(_) | Value::Jsonb(_) => 5,
-        Value::Vector(_) | Value::VectorInt8(_) => 6,
-        Value::Uuid(_) => 7,
-        Value::Blob(_) => 8,
-        Value::Array(_) => 9,
+        Value::Decimal(_, _) => 4,
+        Value::Varchar(_) | Value::Enum(_) => 5,
+        Value::Json(_) | Value::Jsonb(_) => 6,
+        Value::Vector(_) | Value::VectorInt8(_) => 7,
+        Value::Uuid(_) => 8,
+        Value::Blob(_) => 9,
+        Value::Array(_) => 10,
     }
 }
 
 /// 数值拓宽（i64 / f64），跨类型比较的统一通路
 ///
-/// 返回 (rank, i64, f64)：rank 0 = 整数家族（Int32/Int64/Timestamp），
-/// rank 1 = 浮点家族（Float32/Float64）。rank 不同 → 走 f64 拓宽。
+/// 返回 (rank, i64, f64)：rank 0 = 整数家族（Int16/Int32/Int64/Timestamp），
+/// rank 1 = 浮点家族（Float32/Float64），rank 2 = Decimal。
 fn numeric_widen(v: &Value) -> Option<(u8, Option<i64>, Option<f64>)> {
     match v {
+        Value::Int16(x) => Some((0, Some(*x as i64), Some(*x as f64))),
         Value::Int32(x) => Some((0, Some(*x as i64), Some(*x as f64))),
         Value::Int64(x) => Some((0, Some(*x), Some(*x as f64))),
         Value::Timestamp(x) => Some((0, Some(*x), Some(*x as f64))),
+        Value::Date(x) => Some((0, Some(*x as i64), Some(*x as f64))),
+        Value::Time(x) => Some((0, Some(*x as i64), Some(*x as f64))),
         Value::Float32(x) => Some((1, None, Some(*x as f64))),
         Value::Float64(x) => Some((1, None, Some(*x))),
         _ => None,
@@ -86,6 +90,7 @@ fn same_type_cmp(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Null, Null) => Ordering::Equal,
         (Boolean(x), Boolean(y)) => x.cmp(y),
+        (Int16(x), Int16(y)) => x.cmp(y),
         (Int32(x), Int32(y)) => x.cmp(y),
         (Int64(x), Int64(y)) => x.cmp(y),
         (Float32(x), Float32(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
@@ -98,6 +103,14 @@ fn same_type_cmp(a: &Value, b: &Value) -> Ordering {
         (Json(x), Json(y)) => x.cmp(y),
         (Jsonb(x), Jsonb(y)) => x.cmp(y),
         (Enum(x), Enum(y)) => x.cmp(y),
+        (Decimal(x, sx), Decimal(y, sy)) => {
+            // 比较 Decimal：先比较 scale，再比较 value
+            let scale_ord = sx.cmp(sy);
+            if scale_ord != Ordering::Equal {
+                return scale_ord;
+            }
+            x.cmp(y)
+        },
         // Vector/VectorInt8/Blob：序列长度优先，再按位比
         (Vector(x), Vector(y)) => {
             let len_ord = x.len().cmp(&y.len());

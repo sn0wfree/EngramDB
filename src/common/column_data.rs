@@ -81,6 +81,7 @@ impl BitVec {
 #[derive(Debug, Clone)]
 pub enum ColumnValue {
     Boolean(Vec<bool>),
+    Int16(Vec<i16>),
     Int32(Vec<i32>),
     Int64(Vec<i64>),
     Float32(Vec<f32>),
@@ -92,6 +93,8 @@ pub enum ColumnValue {
     Blob(Vec<Vec<u8>>),
     Vector(Vec<Vec<f32>>),
     VectorInt8(Vec<Vec<i8>>),
+    /// v0.22.0 新增
+    Decimal(Vec<(i128, u8)>),
     Timestamp(Vec<i64>),
     /// v0.22.0 新增
     Date(Vec<i32>),
@@ -141,6 +144,7 @@ impl ColumnData {
         }
         match &self.values {
             ColumnValue::Boolean(v) => Value::Boolean(v[i]),
+            ColumnValue::Int16(v) => Value::Int16(v[i]),
             ColumnValue::Int32(v) => Value::Int32(v[i]),
             ColumnValue::Int64(v) => Value::Int64(v[i]),
             ColumnValue::Float32(v) => Value::Float32(v[i]),
@@ -151,6 +155,7 @@ impl ColumnData {
             ColumnValue::Blob(v) => Value::Blob(v[i].clone()),
             ColumnValue::Vector(v) => Value::Vector(v[i].clone()),
             ColumnValue::VectorInt8(v) => Value::VectorInt8(v[i].clone()),
+            ColumnValue::Decimal(v) => Value::Decimal(v[i].0, v[i].1),
             ColumnValue::Timestamp(v) => Value::Timestamp(v[i]),
             ColumnValue::Date(v) => Value::Date(v[i]),
             ColumnValue::Time(v) => Value::Time(v[i]),
@@ -186,6 +191,7 @@ impl ColumnData {
         let n = n.min(self.len());
         let out_values = match &mut self.values {
             ColumnValue::Boolean(v) => ColumnValue::Boolean(v.drain(0..n).collect()),
+            ColumnValue::Int16(v) => ColumnValue::Int16(v.drain(0..n).collect()),
             ColumnValue::Int32(v) => ColumnValue::Int32(v.drain(0..n).collect()),
             ColumnValue::Int64(v) => ColumnValue::Int64(v.drain(0..n).collect()),
             ColumnValue::Float32(v) => ColumnValue::Float32(v.drain(0..n).collect()),
@@ -196,6 +202,7 @@ impl ColumnData {
             ColumnValue::Blob(v) => ColumnValue::Blob(v.drain(0..n).collect()),
             ColumnValue::Vector(v) => ColumnValue::Vector(v.drain(0..n).collect()),
             ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(v.drain(0..n).collect()),
+            ColumnValue::Decimal(v) => ColumnValue::Decimal(v.drain(0..n).collect()),
             ColumnValue::Timestamp(v) => ColumnValue::Timestamp(v.drain(0..n).collect()),
             ColumnValue::Date(v) => ColumnValue::Date(v.drain(0..n).collect()),
             ColumnValue::Time(v) => ColumnValue::Time(v.drain(0..n).collect()),
@@ -236,6 +243,7 @@ impl ColumnData {
     /// 按索引收集子列（S2-M2：SelectionVector 应用，类型数组直接 gather）
     pub fn gather(&self, indices: &[usize]) -> ColumnData {        let out = match &self.values {
             ColumnValue::Boolean(v) => ColumnValue::Boolean(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Int16(v) => ColumnValue::Int16(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Int32(v) => ColumnValue::Int32(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Int64(v) => ColumnValue::Int64(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Float32(v) => ColumnValue::Float32(indices.iter().map(|&i| v[i]).collect()),
@@ -246,6 +254,7 @@ impl ColumnData {
             ColumnValue::Blob(v) => ColumnValue::Blob(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::Vector(v) => ColumnValue::Vector(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Decimal(v) => ColumnValue::Decimal(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Timestamp(v) => ColumnValue::Timestamp(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Date(v) => ColumnValue::Date(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Time(v) => ColumnValue::Time(indices.iter().map(|&i| v[i]).collect()),
@@ -278,6 +287,7 @@ impl ColumnData {
         let end = start + len;
         let out_values = match &self.values {
             ColumnValue::Boolean(v) => ColumnValue::Boolean(v[start..end].to_vec()),
+            ColumnValue::Int16(v) => ColumnValue::Int16(v[start..end].to_vec()),
             ColumnValue::Int32(v) => ColumnValue::Int32(v[start..end].to_vec()),
             ColumnValue::Int64(v) => ColumnValue::Int64(v[start..end].to_vec()),
             ColumnValue::Float32(v) => ColumnValue::Float32(v[start..end].to_vec()),
@@ -288,6 +298,7 @@ impl ColumnData {
             ColumnValue::Blob(v) => ColumnValue::Blob(v[start..end].to_vec()),
             ColumnValue::Vector(v) => ColumnValue::Vector(v[start..end].to_vec()),
             ColumnValue::VectorInt8(v) => ColumnValue::VectorInt8(v[start..end].to_vec()),
+            ColumnValue::Decimal(v) => ColumnValue::Decimal(v[start..end].to_vec()),
             ColumnValue::Timestamp(v) => ColumnValue::Timestamp(v[start..end].to_vec()),
             ColumnValue::Date(v) => ColumnValue::Date(v[start..end].to_vec()),
             ColumnValue::Time(v) => ColumnValue::Time(v[start..end].to_vec()),
@@ -315,6 +326,7 @@ impl ColumnData {
     /// 追加另一列数据到尾部（两列类型必须一致）
     pub fn append(&mut self, other: &ColumnData) {        match (&mut self.values, &other.values) {
             (ColumnValue::Boolean(a), ColumnValue::Boolean(b)) => a.extend_from_slice(b),
+            (ColumnValue::Int16(a), ColumnValue::Int16(b)) => a.extend_from_slice(b),
             (ColumnValue::Int32(a), ColumnValue::Int32(b)) => a.extend_from_slice(b),
             (ColumnValue::Int64(a), ColumnValue::Int64(b)) => a.extend_from_slice(b),
             (ColumnValue::Float32(a), ColumnValue::Float32(b)) => a.extend_from_slice(b),
@@ -324,6 +336,7 @@ impl ColumnData {
             (ColumnValue::Blob(a), ColumnValue::Blob(b)) => a.extend_from_slice(b),
             (ColumnValue::Vector(a), ColumnValue::Vector(b)) => a.extend_from_slice(b),
             (ColumnValue::VectorInt8(a), ColumnValue::VectorInt8(b)) => a.extend_from_slice(b),
+            (ColumnValue::Decimal(a), ColumnValue::Decimal(b)) => a.extend_from_slice(b),
             (ColumnValue::Timestamp(a), ColumnValue::Timestamp(b)) => a.extend_from_slice(b),
             _ => unreachable!("append: 列类型不一致"),
         }
@@ -374,6 +387,7 @@ impl ColumnData {
     pub fn from_values_typed(values: &[Value], data_type: &DataType) -> ColumnData {
         let (mut arr, mut nulls): (ColumnValue, Option<BitVec>) = match data_type {
             DataType::Boolean => (ColumnValue::Boolean(Vec::with_capacity(values.len())), None),
+            DataType::Int16 => (ColumnValue::Int16(Vec::with_capacity(values.len())), None),
             DataType::Int32 => (ColumnValue::Int32(Vec::with_capacity(values.len())), None),
             DataType::Int64 => (ColumnValue::Int64(Vec::with_capacity(values.len())), None),
             DataType::Float32 => (ColumnValue::Float32(Vec::with_capacity(values.len())), None),
@@ -384,6 +398,7 @@ impl ColumnData {
             DataType::Blob => (ColumnValue::Blob(Vec::with_capacity(values.len())), None),
             DataType::Vector { .. } => (ColumnValue::Vector(Vec::with_capacity(values.len())), None),
             DataType::VectorInt8 { .. } => (ColumnValue::VectorInt8(Vec::with_capacity(values.len())), None),
+            DataType::Decimal { .. } => (ColumnValue::Decimal(Vec::with_capacity(values.len())), None),
             DataType::Timestamp => (ColumnValue::Timestamp(Vec::with_capacity(values.len())), None),
             DataType::Date => (ColumnValue::Date(Vec::with_capacity(values.len())), None),
             DataType::Time => (ColumnValue::Time(Vec::with_capacity(values.len())), None),
@@ -437,6 +452,7 @@ impl ColumnData {
 
         let mut arr: ColumnValue = match data_type {
             DataType::Boolean => ColumnValue::Boolean(Vec::with_capacity(count)),
+            DataType::Int16 => ColumnValue::Int16(Vec::with_capacity(count)),
             DataType::Int32 => ColumnValue::Int32(Vec::with_capacity(count)),
             DataType::Int64 => ColumnValue::Int64(Vec::with_capacity(count)),
             DataType::Float32 => ColumnValue::Float32(Vec::with_capacity(count)),
@@ -447,6 +463,7 @@ impl ColumnData {
             DataType::Blob => ColumnValue::Blob(Vec::with_capacity(count)),
             DataType::Vector { .. } => ColumnValue::Vector(Vec::with_capacity(count)),
             DataType::VectorInt8 { .. } => ColumnValue::VectorInt8(Vec::with_capacity(count)),
+            DataType::Decimal { .. } => ColumnValue::Decimal(Vec::with_capacity(count)),
             DataType::Timestamp => ColumnValue::Timestamp(Vec::with_capacity(count)),
             DataType::Date => ColumnValue::Date(Vec::with_capacity(count)),
             DataType::Time => ColumnValue::Time(Vec::with_capacity(count)),
@@ -634,6 +651,7 @@ impl ColumnData {
         let mut bitvec = if has_null { Some(BitVec::new(values.len())) } else { None };
         let mut values_vec: ColumnValue = match t {
             ValueType::Boolean => ColumnValue::Boolean(Vec::with_capacity(values.len())),
+            ValueType::Int16 => ColumnValue::Int16(Vec::with_capacity(values.len())),
             ValueType::Int32 => ColumnValue::Int32(Vec::with_capacity(values.len())),
             ValueType::Int64 => ColumnValue::Int64(Vec::with_capacity(values.len())),
             ValueType::Float32 => ColumnValue::Float32(Vec::with_capacity(values.len())),
@@ -644,6 +662,7 @@ impl ColumnData {
             ValueType::Blob => ColumnValue::Blob(Vec::with_capacity(values.len())),
             ValueType::Vector => ColumnValue::Vector(Vec::with_capacity(values.len())),
             ValueType::VectorInt8 => ColumnValue::VectorInt8(Vec::with_capacity(values.len())),
+            ValueType::Decimal => ColumnValue::Decimal(Vec::with_capacity(values.len())),
             ValueType::Timestamp => ColumnValue::Timestamp(Vec::with_capacity(values.len())),
             ValueType::Date => ColumnValue::Date(Vec::with_capacity(values.len())),
             ValueType::Time => ColumnValue::Time(Vec::with_capacity(values.len())),
@@ -660,6 +679,7 @@ impl ColumnData {
                 }
                 match &mut values_vec {
                     ColumnValue::Boolean(a) => a.push(false),
+                    ColumnValue::Int16(a) => a.push(0),
                     ColumnValue::Int32(a) => a.push(0),
                     ColumnValue::Int64(a) => a.push(0),
                     ColumnValue::Float32(a) => a.push(0.0),
@@ -670,6 +690,7 @@ impl ColumnData {
                     ColumnValue::Blob(a) => a.push(Vec::new()),
                     ColumnValue::Vector(a) => a.push(Vec::new()),
                     ColumnValue::VectorInt8(a) => a.push(Vec::new()),
+                    ColumnValue::Decimal(a) => a.push((0, 0)),
                     ColumnValue::Timestamp(a) => a.push(0),
                     ColumnValue::Date(a) => a.push(0),
                     ColumnValue::Time(a) => a.push(0),
@@ -681,6 +702,7 @@ impl ColumnData {
             }
             match (&mut values_vec, v) {
                 (ColumnValue::Boolean(a), Value::Boolean(x)) => a.push(*x),
+                (ColumnValue::Int16(a), Value::Int16(x)) => a.push(*x),
                 (ColumnValue::Int32(a), Value::Int32(x)) => a.push(*x),
                 (ColumnValue::Int64(a), Value::Int64(x)) => a.push(*x),
                 (ColumnValue::Float32(a), Value::Float32(x)) => a.push(*x),
@@ -691,6 +713,7 @@ impl ColumnData {
                 (ColumnValue::Blob(a), Value::Blob(x)) => a.push(x.clone()),
                 (ColumnValue::Vector(a), Value::Vector(x)) => a.push(x.clone()),
                 (ColumnValue::VectorInt8(a), Value::VectorInt8(x)) => a.push(x.clone()),
+                (ColumnValue::Decimal(a), Value::Decimal(x, s)) => a.push((*x, *s)),
                 (ColumnValue::Timestamp(a), Value::Timestamp(x)) => a.push(*x),
                 (ColumnValue::Date(a), Value::Date(x)) => a.push(*x),
                 (ColumnValue::Time(a), Value::Time(x)) => a.push(*x),
@@ -712,6 +735,7 @@ impl ColumnData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueType {
     Boolean,
+    Int16,
     Int32,
     Int64,
     Float32,
@@ -722,6 +746,7 @@ enum ValueType {
     Blob,
     Vector,
     VectorInt8,
+    Decimal,
     Timestamp,
     Date,
     Time,
@@ -734,6 +759,7 @@ fn value_type(v: &Value) -> Option<ValueType> {
     match v {
         Value::Null => None,
         Value::Boolean(_) => Some(ValueType::Boolean),
+        Value::Int16(_) => Some(ValueType::Int16),
         Value::Int32(_) => Some(ValueType::Int32),
         Value::Int64(_) => Some(ValueType::Int64),
         Value::Float32(_) => Some(ValueType::Float32),
@@ -744,6 +770,7 @@ fn value_type(v: &Value) -> Option<ValueType> {
         Value::Blob(_) => Some(ValueType::Blob),
         Value::Vector(_) => Some(ValueType::Vector),
         Value::VectorInt8(_) => Some(ValueType::VectorInt8),
+        Value::Decimal(_, _) => Some(ValueType::Decimal),
         Value::Timestamp(_) => Some(ValueType::Timestamp),
         Value::Date(_) => Some(ValueType::Date),
         Value::Time(_) => Some(ValueType::Time),
@@ -757,6 +784,7 @@ impl ColumnValue {
     pub fn len(&self) -> usize {
         match self {
             ColumnValue::Boolean(v) => v.len(),
+            ColumnValue::Int16(v) => v.len(),
             ColumnValue::Int32(v) => v.len(),
             ColumnValue::Int64(v) => v.len(),
             ColumnValue::Float32(v) => v.len(),
@@ -767,6 +795,7 @@ impl ColumnValue {
             ColumnValue::Blob(v) => v.len(),
             ColumnValue::Vector(v) => v.len(),
             ColumnValue::VectorInt8(v) => v.len(),
+            ColumnValue::Decimal(v) => v.len(),
             ColumnValue::Timestamp(v) => v.len(),
             ColumnValue::Date(v) => v.len(),
             ColumnValue::Time(v) => v.len(),
@@ -811,6 +840,30 @@ fn push_typed(arr: &mut ColumnValue, v: &Value, data_type: &DataType) -> bool {
         (DataType::Int64, Value::Int64(i)) => {
             if let ColumnValue::Int64(a) = arr {
                 a.push(*i);
+            }
+            true
+        }
+        (DataType::Int16, Value::Int16(i)) => {
+            if let ColumnValue::Int16(a) = arr {
+                a.push(*i);
+            }
+            true
+        }
+        (DataType::Int16, Value::Int32(i)) => {
+            if let ColumnValue::Int16(a) = arr {
+                a.push(*i as i16);
+            }
+            true
+        }
+        (DataType::Int16, Value::Int64(i)) => {
+            if let ColumnValue::Int16(a) = arr {
+                a.push(*i as i16);
+            }
+            true
+        }
+        (DataType::Decimal { .. }, Value::Decimal(x, s)) => {
+            if let ColumnValue::Decimal(a) = arr {
+                a.push((*x, *s));
             }
             true
         }
@@ -956,6 +1009,7 @@ fn push_typed(arr: &mut ColumnValue, v: &Value, data_type: &DataType) -> bool {
 fn push_null_placeholder(arr: &mut ColumnValue) {
     match arr {
         ColumnValue::Boolean(a) => a.push(false),
+        ColumnValue::Int16(a) => a.push(0),
         ColumnValue::Int32(a) => a.push(0),
         ColumnValue::Int64(a) => a.push(0),
         ColumnValue::Float32(a) => a.push(0.0),
@@ -966,6 +1020,7 @@ fn push_null_placeholder(arr: &mut ColumnValue) {
         ColumnValue::Blob(a) => a.push(Vec::new()),
         ColumnValue::Vector(a) => a.push(Vec::new()),
         ColumnValue::VectorInt8(a) => a.push(Vec::new()),
+        ColumnValue::Decimal(a) => a.push((0, 0)),
         ColumnValue::Timestamp(a) => a.push(0),
         ColumnValue::Date(a) => a.push(0),
         ColumnValue::Time(a) => a.push(0),
@@ -980,6 +1035,9 @@ fn write_typed(buf: &mut Vec<u8>, values: &ColumnValue, i: usize, data_type: &Da
     match (data_type, values) {
         (DataType::Boolean, ColumnValue::Boolean(a)) => {
             buf.push(if is_null { 2 } else if a[i] { 1 } else { 0 });
+        }
+        (DataType::Int16, ColumnValue::Int16(a)) => {
+            buf.extend_from_slice(&(if is_null { 0i16 } else { a[i] }).to_le_bytes());
         }
         (DataType::Int32, ColumnValue::Int32(a)) => {
             buf.extend_from_slice(&(if is_null { 0 } else { a[i] }).to_le_bytes());
@@ -1035,6 +1093,15 @@ fn write_typed(buf: &mut Vec<u8>, values: &ColumnValue, i: usize, data_type: &Da
                 for b in &a[i] {
                     buf.push(*b as u8);
                 }
+            }
+        }
+        (DataType::Decimal { .. }, ColumnValue::Decimal(a)) => {
+            if is_null {
+                buf.extend_from_slice(&0i128.to_le_bytes());
+                buf.push(0);
+            } else {
+                buf.extend_from_slice(&a[i].0.to_le_bytes());
+                buf.push(a[i].1);
             }
         }
         (DataType::Timestamp, ColumnValue::Timestamp(a)) => {

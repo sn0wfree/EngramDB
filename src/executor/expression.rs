@@ -3696,6 +3696,7 @@ fn eval_typeof(vec: &Vector) -> Result<Vector> {
         let type_name = match v {
             Value::Null => "null",
             Value::Boolean(_) => "boolean",
+            Value::Int16(_) => "int16",
             Value::Int32(_) => "int32",
             Value::Int64(_) => "int64",
             Value::Float32(_) => "float32",
@@ -3707,6 +3708,7 @@ fn eval_typeof(vec: &Vector) -> Result<Vector> {
             Value::Vector(_) => "vector",
             Value::VectorInt8(_) => "vector_int8",
             Value::Blob(_) => "blob",
+            Value::Decimal(_, _) => "decimal",
             Value::Date(_) => "date",
             Value::Time(_) => "time",
             Value::Uuid(_) => "uuid",
@@ -4134,6 +4136,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
     match v {
         Value::Null => serde_json::Value::Null,
         Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Int16(n) => serde_json::Value::from(*n as i64),
         Value::Int32(n) => serde_json::Value::from(*n),
         Value::Int64(n) => serde_json::Value::from(*n),
         Value::Float32(n) => serde_json::Value::from(*n as f64),
@@ -4148,6 +4151,15 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         // v0.22.0 新增类型
         Value::Jsonb(s) => {
             serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        }
+        Value::Decimal(v, s) => {
+            if *s == 0 {
+                serde_json::Value::String(v.to_string())
+            } else {
+                let magnitude = 10i128.pow(*s as u32);
+                let scaled = (*v as f64) / (magnitude as f64);
+                serde_json::Value::Number(serde_json::Number::from_f64(scaled).unwrap_or(serde_json::Number::from(0u64)))
+            }
         }
         Value::Date(d) => serde_json::Value::from(*d),
         Value::Time(t) => serde_json::Value::from(*t),

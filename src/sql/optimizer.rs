@@ -557,10 +557,21 @@ fn eval_constant_cast(v: &Value, target: &crate::common::types::DataType) -> Opt
     match target {
         DataType::Boolean => match v {
             Value::Boolean(b) => Some(Value::Boolean(*b)),
+            Value::Int16(i) => Some(Value::Boolean(*i != 0)),
             Value::Int32(i) => Some(Value::Boolean(*i != 0)),
             Value::Int64(i) => Some(Value::Boolean(*i != 0)),
+            Value::Decimal(d, _) => Some(Value::Boolean(*d != 0)),
             _ => None,
         },
+        DataType::Int16 => {
+            if let Some(i) = v.as_i64() {
+                Some(Value::Int16(i as i16))
+            } else if let Some(f) = v.as_f64() {
+                Some(Value::Int16(f as i16))
+            } else {
+                None
+            }
+        }
         DataType::Int32 => {
             if let Some(i) = v.as_i64() {
                 Some(Value::Int32(i as i32))
@@ -579,13 +590,24 @@ fn eval_constant_cast(v: &Value, target: &crate::common::types::DataType) -> Opt
                 None
             }
         }
+        DataType::Decimal { .. } => {
+            if let Some(i) = v.as_i64() {
+                Some(Value::Decimal(i as i128, 0))
+            } else if let Some(f) = v.as_f64() {
+                Some(Value::Decimal((f * 1e9) as i128, 9))
+            } else {
+                None
+            }
+        }
         DataType::Float32 => v.as_f64().map(|f| Value::Float32(f as f32)),
         DataType::Float64 => v.as_f64().map(Value::Float64),
         DataType::Timestamp => v.as_i64().map(Value::Timestamp),
         DataType::Varchar => match v {
             Value::Varchar(s) => Some(Value::Varchar(s.clone())),
+            Value::Int16(i) => Some(Value::Varchar(i.to_string())),
             Value::Int32(i) => Some(Value::Varchar(i.to_string())),
             Value::Int64(i) => Some(Value::Varchar(i.to_string())),
+            Value::Decimal(d, s) => Some(Value::Varchar(format!("{}", *d as f64 / 10f64.powi(*s as i32)))),
             Value::Float64(f) => Some(Value::Varchar(f.to_string())),
             Value::Float32(f) => Some(Value::Varchar(f.to_string())),
             Value::Timestamp(t) => Some(Value::Varchar(t.to_string())),

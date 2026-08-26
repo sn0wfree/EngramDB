@@ -109,6 +109,7 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
 
     match data_type {
         DataType::Boolean => compress_boolean(data),
+        DataType::Int16 => compress_integer::<i16>(data),
         DataType::Int32 => compress_integer::<i32>(data),
         DataType::Int64 => compress_integer::<i64>(data),
         DataType::Float32 => compress_float32(data),
@@ -120,6 +121,7 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
         DataType::Time => compress_time(data), // Time 存储为 i32（毫秒），Delta
         DataType::Jsonb => compress_varchar(data), // JSONB 类似 Varchar（String）
         DataType::Enum { .. } => compress_varchar(data), // Enum 存储为 String
+        DataType::Decimal { .. } => compress_varchar(data), // Decimal 序列化后类似 Varchar
         // Vector、Blob、Array 暂不压缩（二进制数据）
         DataType::Json
         | DataType::Vector { .. }
@@ -312,6 +314,53 @@ impl IntegerCodec for i64 {
     }
 }
 
+impl IntegerCodec for i16 {
+    fn fixed_size() -> usize { 2 }
+
+    fn from_le_bytes(bytes: &[u8]) -> Self {
+        i16::from_le_bytes(bytes[..2].try_into().unwrap())
+    }
+
+    fn to_le_bytes_vec(values: &[Self]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn try_delta(data: &[u8]) -> Option<(CompressionType, Vec<u8>)> {
+        if data.len() % 2 != 0 {
+            return None;
+        }
+        let values: Vec<i32> = data.chunks_exact(2)
+            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as i32)
+            .collect();
+        let encoded = delta::encode_i32(&values);
+        if encoded.len() < data.len() {
+            Some((CompressionType::Delta, encoded))
+        } else {
+            None
+        }
+    }
+
+    fn try_for_bitpack(data: &[u8]) -> Option<(CompressionType, Vec<u8>)> {
+        if data.len() % 2 != 0 {
+            return None;
+        }
+        let values: Vec<i32> = data.chunks_exact(2)
+            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as i32)
+            .collect();
+        let min_val = values.iter().min().copied().unwrap_or(0);
+        let uvalues: Vec<u64> = values.iter().map(|&v| (v as i64 - min_val as i64) as u64).collect();
+        let encoded = for_encoding::encode_for_bitpack(&uvalues);
+        let mut result = Vec::with_capacity(2 + encoded.len());
+        result.extend_from_slice(&(min_val as i16).to_le_bytes());
+        result.extend_from_slice(&encoded);
+        if result.len() < data.len() {
+            Some((CompressionType::ForBitPack, result))
+        } else {
+            None
+        }
+    }
+}
+
 fn compress_integer<T: IntegerCodec>(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
     let mut best = (CompressionType::Uncompressed, data.to_vec());
     let mut best_size = data.len();
@@ -443,14 +492,14 @@ fn decompress_delta(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> {
     // delta::encode_i32 内部转 i64 编码，decode_i64 可正确解码两者。
     // 关键：输出字节宽度必须匹配列真实类型，否则 deserialize_values 步长错位。
     if let Some(values) = delta::decode_i64(data) {
-        match data_type {
-            DataType::Int32 | DataType::Date | DataType::Time => {
-                // Int32/Date/Time 列：每值 4 字节
-                Ok(values.iter().flat_map(|v| (*v as i32).to_le_bytes()).collect())
-            }
-            // Int64（及其它整数宽度的兜底）：每值 8 字节
-            _ => Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
+    match data_type {
+        DataType::Int32 | DataType::Int16 | DataType::Date | DataType::Time => {
+            // Int32/Int16/Date/Time 列：每值 4 字节
+            Ok(values.iter().flat_map(|v| (*v as i32).to_le_bytes()).collect())
         }
+        // Int64（及其它整数宽度的兜底）：每值 8 字节
+        _ => Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
+    }
     } else {
         Ok(data.to_vec())
     }
@@ -466,6 +515,21 @@ fn decompress_for_bitpack(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> 
     //   i64 列：[min_val: 8 bytes (i64 LE)][for_bitpack data...]
     // for_bitpack data 内部：[base: 8B][count: 4B][bit_width: 1B][packed...]
     match data_type {
+        DataType::Int16 => {
+            if data.len() < 2 {
+                return Ok(data.to_vec());
+            }
+            let min_val = i16::from_le_bytes(data[0..2].try_into().unwrap());
+            let uvalues = for_encoding::decode_for_bitpack(&data[2..]);
+            if uvalues.is_empty() {
+                return Ok(Vec::new());
+            }
+            let values: Vec<i16> = uvalues
+                .iter()
+                .map(|&u| (min_val as i64 + u as i64) as i16)
+                .collect();
+            Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
         DataType::Int32 => {
             if data.len() < 4 {
                 return Ok(data.to_vec());

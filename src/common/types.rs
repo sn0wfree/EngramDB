@@ -4,6 +4,10 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     Boolean,
+    /// 16位整数（v0.22.0 新增）
+    ///
+    /// 2 字节存储，适合年龄、数量、状态码等小范围整数。
+    Int16,
     Int32,
     Int64,
     /// 单精度浮点数（v0.14.0 新增）
@@ -37,6 +41,12 @@ pub enum DataType {
     VectorInt8 { dim: usize },
     /// BLOB 二进制数据（v0.13.0 新增）
     Blob,
+    /// 精确十进制（v0.22.0 新增）
+    ///
+    /// 存储为 (i128, u8)，表示 value 和 scale。
+    /// scale 表示小数位数（0-38）。
+    /// 适合金融计算、货币、精确度量等场景。
+    Decimal { scale: u8 },
     /// 时间戳（v0.14.0 新增）
     ///
     /// 内部存储为 Unix 毫秒（i64 UTC），适合 Agent 日志/记忆等时间序列场景。
@@ -72,6 +82,7 @@ impl DataType {
     pub fn name(&self) -> &'static str {
         match self {
             DataType::Boolean => "BOOLEAN",
+            DataType::Int16 => "SMALLINT",
             DataType::Int32 => "INT",
             DataType::Int64 => "BIGINT",
             DataType::Float32 => "FLOAT",
@@ -82,6 +93,7 @@ impl DataType {
             DataType::Vector { .. } => "VECTOR",
             DataType::VectorInt8 { .. } => "VECTOR_INT8",
             DataType::Blob => "BLOB",
+            DataType::Decimal { .. } => "DECIMAL",
             DataType::Timestamp => "TIMESTAMP",
             DataType::Date => "DATE",
             DataType::Time => "TIME",
@@ -94,6 +106,7 @@ impl DataType {
     pub fn fixed_size(&self) -> Option<usize> {
         match self {
             DataType::Boolean => Some(1),
+            DataType::Int16 => Some(2),
             DataType::Int32 => Some(4),
             DataType::Int64 => Some(8),
             DataType::Float32 => Some(4),
@@ -104,6 +117,7 @@ impl DataType {
             DataType::Vector { .. } => None,
             DataType::VectorInt8 { .. } => None,
             DataType::Blob => None,
+            DataType::Decimal { .. } => Some(16), // (i128, scale)
             DataType::Timestamp => Some(8),
             DataType::Date => Some(4),
             DataType::Time => Some(4),

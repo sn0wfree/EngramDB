@@ -169,6 +169,8 @@ pub fn value_type_to_arrow(value: &Value) -> ArrowDataType {
         Value::Uuid(_) => ArrowDataType::Utf8,
         Value::Array(_) => ArrowDataType::Utf8,
         Value::Enum(_) => ArrowDataType::Utf8,
+        Value::Int16(_) => ArrowDataType::Int32,
+        Value::Decimal(_, _) => ArrowDataType::Float64,
     }
 }
 

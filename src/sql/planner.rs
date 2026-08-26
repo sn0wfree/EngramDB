@@ -478,7 +478,8 @@ fn infer_columns_from_select(
                     crate::sql::ast::Expression::Literal(v) => match v {
                         crate::Value::Null => DataType::Varchar,
                         crate::Value::Boolean(_) => DataType::Boolean,
-                        crate::Value::Int32(_) | crate::Value::Int64(_) => DataType::Int64,
+                        crate::Value::Int16(_) | crate::Value::Int32(_) | crate::Value::Int64(_) => DataType::Int64,
+                        crate::Value::Decimal(_, _) => DataType::Decimal { scale: 0 },
                         crate::Value::Float32(_) | crate::Value::Float64(_) => DataType::Float64,
                         crate::Value::Varchar(_) | crate::Value::Json(_) | crate::Value::Jsonb(_) | crate::Value::Enum(_) => DataType::Varchar,
                         crate::Value::Vector(_) | crate::Value::VectorInt8(_) => DataType::Vector { dim: 0 },

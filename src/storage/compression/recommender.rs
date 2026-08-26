@@ -152,7 +152,7 @@ fn decide_recommendation(data_type: &DataType, stats: &ColumnStats, total_count:
             rationale: "boolean: BooleanPack bit-packing",
         },
 
-        DataType::Int32 | DataType::Int64 => {
+        DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             recommend_integer(stats, total_count)
         }
 
@@ -235,7 +235,8 @@ fn decide_recommendation(data_type: &DataType, stats: &ColumnStats, total_count:
         | DataType::Time
         | DataType::Uuid
         | DataType::Array { .. }
-        | DataType::Enum { .. } => {
+        | DataType::Enum { .. }
+        | DataType::Decimal { .. } => {
             Recommendation {
                 codec: CompressionType::Uncompressed,
                 estimated_ratio: 1.0,

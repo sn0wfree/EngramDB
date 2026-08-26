@@ -616,6 +616,8 @@ fn count_placeholder_in_expr(expr: &sql::ast::Expression, max_idx: &mut usize) {
 pub enum Value {
     Null,
     Boolean(bool),
+    /// 16位整数（v0.22.0 新增）
+    Int16(i16),
     Int32(i32),
     Int64(i64),
     Float32(f32),
@@ -633,6 +635,12 @@ pub enum Value {
     /// 存储空间减少 75%（4x 压缩），每个向量附带独立的 scale/offset。
     VectorInt8(Vec<i8>),
     Blob(Vec<u8>),
+    /// 精确十进制（v0.22.0 新增）
+    ///
+    /// 存储为 (i128, u8)，表示 value 和 scale。
+    /// scale 表示小数位数（0-38）。
+    /// 适合金融计算、货币、精确度量等场景。
+    Decimal(i128, u8),
     /// Unix 毫秒时间戳（UTC，v0.14.0 新增）
     Timestamp(i64),
     /// 日期（v0.22.0 新增）
@@ -685,22 +693,24 @@ impl Ord for Value {
             match v {
                 Value::Null => 0,
                 Value::Boolean(_) => 1,
-                Value::Int32(_) => 2,
-                Value::Int64(_) => 3,
-                Value::Float32(_) => 4,
-                Value::Float64(_) => 5,
-                Value::Varchar(_) => 6,
-                Value::Json(_) => 7,
-                Value::Jsonb(_) => 8,
-                Value::Vector(_) => 9,
-                Value::VectorInt8(_) => 10,
-                Value::Blob(_) => 11,
-                Value::Timestamp(_) => 12,
-                Value::Date(_) => 13,
-                Value::Time(_) => 14,
-                Value::Array(_) => 15,
-                Value::Uuid(_) => 16,
-                Value::Enum(_) => 17,
+                Value::Int16(_) => 2,
+                Value::Int32(_) => 3,
+                Value::Int64(_) => 4,
+                Value::Float32(_) => 5,
+                Value::Float64(_) => 6,
+                Value::Decimal(_, _) => 7,
+                Value::Varchar(_) => 8,
+                Value::Json(_) => 9,
+                Value::Jsonb(_) => 10,
+                Value::Vector(_) => 11,
+                Value::VectorInt8(_) => 12,
+                Value::Blob(_) => 13,
+                Value::Timestamp(_) => 14,
+                Value::Date(_) => 15,
+                Value::Time(_) => 16,
+                Value::Array(_) => 17,
+                Value::Uuid(_) => 18,
+                Value::Enum(_) => 19,
             }
         }
         let ord = variant_rank(self).cmp(&variant_rank(other));
@@ -710,10 +720,19 @@ impl Ord for Value {
         match (self, other) {
             (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::Int16(a), Value::Int16(b)) => a.cmp(b),
             (Value::Int32(a), Value::Int32(b)) => a.cmp(b),
             (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
             (Value::Float32(a), Value::Float32(b)) => a.to_bits().cmp(&b.to_bits()),
             (Value::Float64(a), Value::Float64(b)) => a.to_bits().cmp(&b.to_bits()),
+            (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
+                // 比较 Decimal：先比较 scale，再比较 value
+                let scale_ord = sa.cmp(sb);
+                if scale_ord != std::cmp::Ordering::Equal {
+                    return scale_ord;
+                }
+                a.cmp(b)
+            }
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Date(a), Value::Date(b)) => a.cmp(b),
             (Value::Time(a), Value::Time(b)) => a.cmp(b),
@@ -774,10 +793,15 @@ impl std::hash::Hash for Value {
         match self {
             Value::Null => {}
             Value::Boolean(b) => b.hash(state),
+            Value::Int16(i) => i.hash(state),
             Value::Int32(i) => i.hash(state),
             Value::Int64(i) => i.hash(state),
             Value::Float32(f) => f.to_bits().hash(state),
             Value::Float64(f) => f.to_bits().hash(state),
+            Value::Decimal(v, s) => {
+                v.hash(state);
+                s.hash(state);
+            }
             Value::Varchar(s) => s.hash(state),
             Value::Json(s) => s.hash(state),
             Value::Jsonb(s) => s.hash(state),
@@ -816,17 +840,23 @@ impl Value {
 
     pub fn as_i64(&self) -> Option<i64> {
         match self {
+            Value::Int16(v) => Some(*v as i64),
             Value::Int32(v) => Some(*v as i64),
             Value::Int64(v) => Some(*v),
             Value::Timestamp(v) => Some(*v),
             Value::Date(v) => Some(*v as i64),
             Value::Time(v) => Some(*v as i64),
+            Value::Decimal(v, s) => {
+                let magnitude = 10i128.pow(*s as u32);
+                (*v / magnitude).try_into().ok()
+            }
             _ => None,
         }
     }
 
     pub fn as_f64(&self) -> Option<f64> {
         match self {
+            Value::Int16(v) => Some(*v as f64),
             Value::Int32(v) => Some(*v as f64),
             Value::Int64(v) => Some(*v as f64),
             Value::Float32(v) => Some(*v as f64),
@@ -834,6 +864,7 @@ impl Value {
             Value::Timestamp(v) => Some(*v as f64),
             Value::Date(v) => Some(*v as f64),
             Value::Time(v) => Some(*v as f64),
+            Value::Decimal(v, s) => Some(*v as f64 / 10f64.powi(*s as i32)),
             _ => None,
         }
     }
@@ -912,10 +943,26 @@ impl std::fmt::Display for Value {
         match self {
             Value::Null => write!(f, "NULL"),
             Value::Boolean(v) => write!(f, "{}", v),
+            Value::Int16(v) => write!(f, "{}", v),
             Value::Int32(v) => write!(f, "{}", v),
             Value::Int64(v) => write!(f, "{}", v),
             Value::Float32(v) => write!(f, "{}", v),
             Value::Float64(v) => write!(f, "{}", v),
+            Value::Decimal(v, s) => {
+                // 按 scale 输出小数点
+                if *s == 0 {
+                    write!(f, "{}", v)
+                } else {
+                    let scale_factor = 10i128.pow(*s as u32);
+                    let integer_part = v / scale_factor;
+                    let fractional_part = (v % scale_factor).abs();
+                    if fractional_part == 0 {
+                        write!(f, "{}", integer_part)
+                    } else {
+                        write!(f, "{}.{:0width$}", integer_part, fractional_part, width = *s as usize)
+                    }
+                }
+            }
             Value::Varchar(v) => write!(f, "\"{}\"", v),
             Value::Json(v) => write!(f, "'{}'", v),
             Value::Jsonb(v) => write!(f, "'{}'", v),

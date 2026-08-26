@@ -1661,11 +1661,23 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         | sqlast::DataType::Integer(_)
         | sqlast::DataType::BigInt(_)
         | sqlast::DataType::Int64 => Ok(DataType::Int64),
-        sqlast::DataType::SmallInt(_) => Ok(DataType::Int32),
+        sqlast::DataType::SmallInt(_) => Ok(DataType::Int16),
         sqlast::DataType::TinyInt(_) => Ok(DataType::Int32),
         sqlast::DataType::Float4 => Ok(DataType::Float32),
         sqlast::DataType::Float(_) | sqlast::DataType::Double | sqlast::DataType::Float64 => {
             Ok(DataType::Float64)
+        }
+        sqlast::DataType::Numeric(precision) => {
+            Ok(DataType::Decimal { scale: 0 })
+        }
+        sqlast::DataType::Decimal(info) => {
+            match info {
+                sqlast::ExactNumberInfo::None => Ok(DataType::Decimal { scale: 0 }),
+                sqlast::ExactNumberInfo::Precision(_) => Ok(DataType::Decimal { scale: 0 }),
+                sqlast::ExactNumberInfo::PrecisionAndScale(_, s) => {
+                    Ok(DataType::Decimal { scale: *s as u8 })
+                }
+            }
         }
         sqlast::DataType::Timestamp(_, _) | sqlast::DataType::Datetime(_) => Ok(DataType::Timestamp),
         sqlast::DataType::Date => Ok(DataType::Date),

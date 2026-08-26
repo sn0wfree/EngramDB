@@ -204,6 +204,8 @@ fn data_type_to_u8(dt: &DataType) -> u8 {
         DataType::Uuid => 14,
         DataType::Array { .. } => 15,
         DataType::Enum { .. } => 16,
+        DataType::Int16 => 17,
+        DataType::Decimal { .. } => 18,
     }
 }
 

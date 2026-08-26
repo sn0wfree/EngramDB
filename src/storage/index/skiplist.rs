@@ -593,6 +593,16 @@ fn encode_value(v: &Value) -> Vec<u8> {
             buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
+        Value::Int16(i) => {
+            buf.push(value_tag::INT32);
+            buf.extend_from_slice(&(*i as i32).to_le_bytes());
+        }
+        Value::Decimal(v, s) => {
+            buf.push(value_tag::VARCHAR);
+            let repr = format!("{}:{}", v, s);
+            buf.extend_from_slice(&(repr.len() as u32).to_le_bytes());
+            buf.extend_from_slice(repr.as_bytes());
+        }
     }
     buf
 }

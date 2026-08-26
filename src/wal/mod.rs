@@ -463,6 +463,15 @@ fn serialize_value(val: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
+        Value::Int16(i) => {
+            buf.push(18);
+            buf.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::Decimal(v, s) => {
+            buf.push(19);
+            buf.extend_from_slice(&v.to_le_bytes());
+            buf.push(*s);
+        }
     }
 }
 
@@ -595,6 +604,17 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
             if data.len() < 5 + len { return None; }
             let s = String::from_utf8_lossy(&data[5..5 + len]).to_string();
             Some((Value::Enum(s), 5 + len))
+        }
+        18 => {
+            if data.len() < 3 { return None; }
+            let v = i16::from_le_bytes(data[1..3].try_into().unwrap());
+            Some((Value::Int16(v), 3))
+        }
+        19 => {
+            if data.len() < 18 { return None; }
+            let v = i128::from_le_bytes(data[1..17].try_into().unwrap());
+            let s = data[17];
+            Some((Value::Decimal(v, s), 18))
         }
         _ => None,
     }

@@ -216,6 +216,7 @@ fn estimate_value_size(v: &Value) -> usize {
     match v {
         Value::Null => 8,
         Value::Boolean(_) => 1,
+        Value::Int16(_) => 2,
         Value::Int32(_) => 4,
         Value::Int64(_) => 8,
         Value::Float32(_) => 4,
@@ -225,6 +226,7 @@ fn estimate_value_size(v: &Value) -> usize {
         Value::VectorInt8(v) => v.len() + 24,
         Value::Blob(b) => b.len() + 24,
         Value::Timestamp(_) | Value::Date(_) | Value::Time(_) | Value::Uuid(_) => 16,
+        Value::Decimal(_, _) => 17,
         Value::Array(a) => a.len() * 8 + 24,
     }
 }
