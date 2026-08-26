@@ -14,8 +14,9 @@
 - 🔍 **多维度索引**：稀疏主索引 + 跳表二级索引 + 位图索引 + 布隆过滤器 + HNSW 向量索引 + 倒排索引（FTS）
 - 🚀 **向量化执行**：基于 DataChunk 的向量化查询引擎（1024 行/chunk），查询计划缓存
 - 🧠 **AI Agent 友好**：JSON 类型 + Vector 类型 + HNSW 语义检索 + 全文检索（BM25）+ 混合检索
-- 📊 **丰富类型**：BOOLEAN/INT32/INT64/FLOAT32/FLOAT64/VARCHAR/JSON/VECTOR/VECTOR_INT8/BLOB/TIMESTAMP
+- 📊 **丰富类型**：BOOLEAN/INT32/INT64/FLOAT32/FLOAT64/VARCHAR/JSON/JSONB/VECTOR/VECTOR_INT8/BLOB/TIMESTAMP/**DATE**/**TIME**/**ARRAY**/**UUID**/**ENUM**
 - 📋 **完整 SQL**：VIEW/CHECK约束/标量子查询/递归CTE/ALTER TABLE
+- 🔧 **类型转换**：DATE_TO_STRING/TIME_TO_STRING/UUID_TO_STRING 等内置函数
 - 🦀 **Rust 实现**：内存安全、零成本抽象、jemalloc 全局分配器
 
 ## 架构概览
@@ -168,7 +169,7 @@ CREATE TABLE table_name (
 );
 ```
 
-**支持类型**：`INT`, `BIGINT`, `DOUBLE`, `VARCHAR`, `BOOLEAN`, `JSON`, `VECTOR`
+**支持类型**：`INT`, `BIGINT`, `DOUBLE`, `FLOAT32`, `VARCHAR`, `BOOLEAN`, `JSON`, `JSONB`, `VECTOR`, `VECTOR_INT8`, `BLOB`, `TIMESTAMP`, `DATE`, `TIME`, `ARRAY`, `UUID`, `ENUM`
 
 ### DML
 ```sql

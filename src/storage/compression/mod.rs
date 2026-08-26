@@ -116,8 +116,8 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
         DataType::Timestamp => compress_timestamp(data),
         DataType::Varchar => compress_varchar(data),
         // v0.22.0 新增类型压缩支持
-        DataType::Date => compress_integer::<i32>(data), // Date 存储为 i32（天数）
-        DataType::Time => compress_integer::<i32>(data), // Time 存储为 i32（毫秒）
+        DataType::Date => compress_date(data), // Date 存储为 i32（天数），DoubleDelta
+        DataType::Time => compress_time(data), // Time 存储为 i32（毫秒），Delta
         DataType::Jsonb => compress_varchar(data), // JSONB 类似 Varchar（String）
         DataType::Enum { .. } => compress_varchar(data), // Enum 存储为 String
         // Vector、Blob、Array 暂不压缩（二进制数据）
@@ -353,6 +353,34 @@ fn compress_timestamp(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
     compress_integer::<i64>(data)
 }
 
+/// Date 专用压缩（v0.22.0）：i32 天数，先试 DoubleDelta（日期单调递增时压缩率极高）
+fn compress_date(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
+    if data.len() % 4 != 0 {
+        return Ok((CompressionType::Uncompressed, data.to_vec()));
+    }
+    // 将 i32 天数转为 i64 以复用 DoubleDelta 编码
+    let values_i32 = match bytes_to_i32(data) {
+        Some(v) => v,
+        None => return Ok((CompressionType::Uncompressed, data.to_vec())),
+    };
+    let values_i64: Vec<i64> = values_i32.iter().map(|&v| v as i64).collect();
+    if let Some((ctype, encoded)) = double_delta::encode_i64(&values_i64) {
+        if encoded.len() < data.len() {
+            return Ok((ctype, encoded));
+        }
+    }
+    compress_integer::<i32>(data)
+}
+
+/// Time 专用压缩（v0.22.0）：i32 毫秒，先试 Delta（一天内时间变化通常有规律）
+fn compress_time(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
+    // Time 与 Date 存储格式相同（i32），用 Delta 压缩
+    if data.len() % 4 != 0 {
+        return Ok((CompressionType::Uncompressed, data.to_vec()));
+    }
+    compress_integer::<i32>(data)
+}
+
 fn decompress_double_delta(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> {
     match data_type {
         DataType::Timestamp | DataType::Int64 => {
@@ -360,6 +388,14 @@ fn decompress_double_delta(data: &[u8], data_type: &DataType) -> Result<Vec<u8>>
             let values = double_delta::decode_i64(data, max_count)
                 .ok_or_else(|| crate::common::error::EngramDbError::Parse("DoubleDelta decompress failed".into()))?;
             let result: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            Ok(result)
+        }
+        DataType::Date => {
+            // Date 是 i32 天数，编码时转 i64
+            let max_count = data.len() + 2;
+            let values = double_delta::decode_i64(data, max_count)
+                .ok_or_else(|| crate::common::error::EngramDbError::Parse("DoubleDelta decompress failed".into()))?;
+            let result: Vec<u8> = values.iter().flat_map(|v| (*v as i32).to_le_bytes()).collect();
             Ok(result)
         }
         _ => Ok(data.to_vec()),
@@ -408,8 +444,8 @@ fn decompress_delta(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> {
     // 关键：输出字节宽度必须匹配列真实类型，否则 deserialize_values 步长错位。
     if let Some(values) = delta::decode_i64(data) {
         match data_type {
-            DataType::Int32 => {
-                // Int32 列：每值 4 字节
+            DataType::Int32 | DataType::Date | DataType::Time => {
+                // Int32/Date/Time 列：每值 4 字节
                 Ok(values.iter().flat_map(|v| (*v as i32).to_le_bytes()).collect())
             }
             // Int64（及其它整数宽度的兜底）：每值 8 字节
