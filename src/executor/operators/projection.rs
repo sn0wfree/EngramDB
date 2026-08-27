@@ -6,8 +6,8 @@
 use crate::common::error::Result;
 use crate::sql::ast::Expression;
 
-use super::super::vector::DataChunk;
-use super::super::expression::eval_vectorized;
+use super::super::vector::{DataChunk, Vector};
+use super::super::expression::{eval_vectorized, eval_vectorized_with_db, contains_subquery};
 
 /// 执行投影（支持表达式计算）
 ///
@@ -27,6 +27,59 @@ pub fn execute(
         if !projected.is_empty() {
             result.push(projected);
         }
+    }
+    let _ = column_names;
+    Ok(result)
+}
+
+/// 执行投影（支持数据库上下文，处理含子查询的表达式）
+///
+/// 表达式含关联子查询时逐行求值：每行构造外层上下文并独立求解。
+pub fn execute_with_db(
+    input: &[DataChunk],
+    expressions: &[Expression],
+    input_columns: &[String],
+    column_names: &[String],
+    db: &mut crate::storage::Database,
+) -> Result<Vec<DataChunk>> {
+    let per_row = input.iter().any(|c| c.count > 0)
+        && expressions.iter().any(contains_subquery);
+
+    let mut result = Vec::new();
+
+    if !per_row {
+        // 无延迟子查询：整批求值，仅传入 db 供非关联子查询使用
+        for chunk in input {
+            let mut columns = Vec::with_capacity(expressions.len());
+            for expr in expressions {
+                columns.push(eval_vectorized_with_db(expr, chunk, input_columns, Some(db), None)?);
+            }
+            result.push(DataChunk { count: chunk.count, columns });
+        }
+        let _ = column_names;
+        return Ok(result);
+    }
+
+    // 关联路径：逐行求值
+    for chunk in input {
+        let n_out = expressions.len();
+        let mut out_cols: Vec<Vec<crate::Value>> = vec![Vec::with_capacity(chunk.count); n_out];
+        for i in 0..chunk.count {
+            let outer_row: Vec<(String, crate::Value)> = input_columns.iter()
+                .zip(chunk.columns.iter())
+                .map(|(name, col)| (name.clone(), col.get(i)))
+                .collect();
+            let single = DataChunk {
+                count: 1,
+                columns: chunk.columns.iter().map(|c| Vector::Flat(vec![c.get(i)])).collect(),
+            };
+            for (j, expr) in expressions.iter().enumerate() {
+                let vec = eval_vectorized_with_db(expr, &single, input_columns, Some(db), Some(&outer_row))?;
+                out_cols[j].push(vec.get(0));
+            }
+        }
+        let columns: Vec<Vector> = out_cols.into_iter().map(Vector::Flat).collect();
+        result.push(DataChunk { count: chunk.count, columns });
     }
     let _ = column_names;
     Ok(result)

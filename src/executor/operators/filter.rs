@@ -10,7 +10,7 @@ use crate::common::error::Result;
 use crate::sql::ast::Expression;
 
 use super::super::vector::{DataChunk, LazyDataChunk, SelectionVector};
-use super::super::expression::{eval_vectorized, boolean_to_selection};
+use super::super::expression::{eval_vectorized, eval_vectorized_with_db, boolean_to_selection};
 
 /// 执行过滤（向量化 + SelectionVector 懒物化）
 ///
@@ -35,6 +35,82 @@ pub fn execute(
     Ok(result)
 }
 
+/// 执行过滤（支持子查询和关联子查询）
+///
+/// 条件含子查询（静态解析期保留下的关联子查询）时，退化为逐行求值：
+/// 每行构造外层上下文 (列名, 值) 对与单行 DataChunk，独立求解条件。
+pub fn execute_with_db(
+    input: &[DataChunk],
+    condition: &Expression,
+    column_names: &[String],
+    db: &mut crate::storage::Database,
+) -> Result<Vec<DataChunk>> {
+    let per_row = input.iter().any(|c| c.count > 0)
+        && super::super::expression::contains_subquery(condition);
+
+    if !per_row {
+        // 无延迟子查询：整批向量化即可
+        let mut result = Vec::new();
+        for chunk in input {
+            let filtered = filter_chunk_with_db(chunk, condition, column_names, db)?;
+            if !filtered.is_empty() {
+                result.push(filtered);
+            }
+        }
+        return Ok(result);
+    }
+
+    // 关联路径：逐行求值
+    let mut result = Vec::new();
+    for chunk in input {
+        let selected = filter_chunk_correlated(chunk, condition, column_names, db)?;
+        if !selected.is_empty() {
+            let n_cols = chunk.num_columns();
+            let mut out_columns = Vec::with_capacity(n_cols);
+            for c in &chunk.columns {
+                let vals: Vec<crate::Value> =
+                    selected.iter().map(|&i| c.get(i)).collect();
+                out_columns.push(super::super::vector::Vector::Flat(vals));
+            }
+            result.push(DataChunk { count: selected.len(), columns: out_columns });
+        }
+    }
+    Ok(result)
+}
+
+/// 关联过滤：返回被选中的行号列表
+fn filter_chunk_correlated(
+    chunk: &DataChunk,
+    condition: &Expression,
+    column_names: &[String],
+    db: &mut crate::storage::Database,
+) -> Result<Vec<usize>> {
+    use super::super::expression::{eval_vectorized_with_db, boolean_to_selection};
+    use super::super::vector::Vector;
+    use crate::Value;
+
+    let mut selected = Vec::new();
+    for i in 0..chunk.count {
+        // 构造外层行上下文：与列名一一对应
+        let outer_row: Vec<(String, Value)> = column_names.iter()
+            .zip(chunk.columns.iter())
+            .take(chunk.columns.len())
+            .map(|(name, col)| (name.clone(), col.get(i)))
+            .collect();
+        // 单行 chunk
+        let single = DataChunk {
+            count: 1,
+            columns: chunk.columns.iter().map(|c| Vector::Flat(vec![c.get(i)])).collect(),
+        };
+        let bvec = eval_vectorized_with_db(condition, &single, column_names, Some(db), Some(&outer_row))?;
+        let sel = boolean_to_selection(&bvec);
+        if !sel.is_empty() && sel[0] == 0 {
+            selected.push(i);
+        }
+    }
+    Ok(selected)
+}
+
 /// 过滤单个 DataChunk（内部使用懒物化）
 fn filter_chunk(
     chunk: &DataChunk,
@@ -43,6 +119,32 @@ fn filter_chunk(
 ) -> Result<DataChunk> {
     // 步骤 1：向量化求值条件表达式
     let bool_vec = eval_vectorized(condition, chunk, column_names)?;
+
+    // 步骤 2：布尔 Vector → 选择索引
+    let selected_indices = boolean_to_selection(&bool_vec);
+
+    // 步骤 3：应用选择向量
+    if selected_indices.len() == chunk.count {
+        // 全通过，直接返回原 chunk
+        Ok(chunk.clone())
+    } else if selected_indices.is_empty() {
+        // 全过滤，返回空 chunk
+        Ok(DataChunk::new(chunk.num_columns()))
+    } else {
+        let sel = SelectionVector::from_indices(selected_indices);
+        Ok(sel.apply_to_chunk(chunk))
+    }
+}
+
+/// 过滤单个 DataChunk（支持子查询）
+fn filter_chunk_with_db(
+    chunk: &DataChunk,
+    condition: &Expression,
+    column_names: &[String],
+    db: &mut crate::storage::Database,
+) -> Result<DataChunk> {
+    // 步骤 1：向量化求值条件表达式
+    let bool_vec = eval_vectorized_with_db(condition, chunk, column_names, Some(db), None)?;
 
     // 步骤 2：布尔 Vector → 选择索引
     let selected_indices = boolean_to_selection(&bool_vec);

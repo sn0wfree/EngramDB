@@ -80,6 +80,11 @@ fn numeric_widen(v: &Value) -> Option<(u8, Option<i64>, Option<f64>)> {
         Value::Time(x) => Some((0, Some(*x as i64), Some(*x as f64))),
         Value::Float32(x) => Some((1, None, Some(*x as f64))),
         Value::Float64(x) => Some((1, None, Some(*x))),
+        // Decimal：定点 → 浮点家族（v0.22.1）；与整数跨家族走 f64 拓宽
+        Value::Decimal(x, s) => {
+            let scaled = *x as f64 / 10f64.powi(*s as i32);
+            Some((1, None, Some(scaled)))
+        }
         _ => None,
     }
 }
@@ -104,12 +109,18 @@ fn same_type_cmp(a: &Value, b: &Value) -> Ordering {
         (Jsonb(x), Jsonb(y)) => x.cmp(y),
         (Enum(x), Enum(y)) => x.cmp(y),
         (Decimal(x, sx), Decimal(y, sy)) => {
-            // 比较 Decimal：先比较 scale，再比较 value
-            let scale_ord = sx.cmp(sy);
-            if scale_ord != Ordering::Equal {
-                return scale_ord;
+            // scale 对齐后比数值（19.9@s1 == 19.90@s2）（v0.22.1 修正）
+            match sx.cmp(sy) {
+                Ordering::Equal => x.cmp(y),
+                Ordering::Less => {
+                    let xa = x * 10i128.pow((*sy - *sx) as u32);
+                    xa.cmp(y)
+                }
+                Ordering::Greater => {
+                    let ya = y * 10i128.pow((*sx - *sy) as u32);
+                    x.cmp(&ya)
+                }
             }
-            x.cmp(y)
         },
         // Vector/VectorInt8/Blob：序列长度优先，再按位比
         (Vector(x), Vector(y)) => {
@@ -205,6 +216,43 @@ pub fn total_eq(a: &Value, b: &Value) -> bool {
         return false;
     }
     total_cmp(a, b) == Ordering::Equal
+}
+
+/// 解析十进制字符串为定点 i128（按 scale 缩放）
+///
+/// "19.99" + scale=2 → 1999；"42" + scale=2 → 4200；"-0.5" + scale=2 → -50
+/// 小数位超过 scale 时截断；不足时补零。
+pub fn parse_decimal_str(s: &str, scale: u8) -> Option<i128> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    for c in int_part.chars().chain(frac_part.chars()) {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+    }
+    let mut scaled = String::with_capacity(int_part.len() + 1 + scale as usize);
+    scaled.push_str(if int_part.is_empty() { "0" } else { int_part });
+    let slen = scale as usize;
+    if frac_part.len() >= slen {
+        scaled.push_str(&frac_part[..slen]);
+    } else {
+        scaled.push_str(frac_part);
+        for _ in frac_part.len()..slen {
+            scaled.push('0');
+        }
+    }
+    let n: i128 = scaled.parse().ok()?;
+    Some(if neg { -n } else { n })
 }
 
 #[cfg(test)]

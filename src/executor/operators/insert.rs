@@ -7,9 +7,45 @@
 use log::{error, warn, info, debug, trace};
 
 use crate::common::error::{Result, EngramDbError};
+use crate::common::types::DataType;
 use crate::storage::Database;
 use crate::txn::{ApplyOp, IsolationLevel};
 use crate::Value;
+
+/// 按列定义强转插入行（v0.22.1 新增）
+///
+/// SQL 字面量解析产物（Int64/Float64）与目标列类型（Int16/Decimal 等）
+/// 不一致时，统一在此转换为精确存储类型。
+/// 仅处理新类型（Int16/Decimal），既有类型保持历史行为不转换。
+pub(crate) fn coerce_rows_to_column_types(
+    db: &Database,
+    table_name: &str,
+    rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>> {
+    let table = match db.get_engine_table(table_name) {
+        Some(t) => t,
+        None => return Err(EngramDbError::TableNotFound(table_name.into())),
+    };
+    let types: Vec<DataType> = table.def().columns.iter().map(|c| c.data_type.clone()).collect();
+    let mut rows = rows;
+    for row in rows.iter_mut() {
+        for (val, ty) in row.iter_mut().zip(types.iter()) {
+            if val.is_null() {
+                continue;
+            }
+            let needs_cast = match ty {
+                DataType::Int16 => !matches!(val, Value::Int16(_)),
+                DataType::Decimal { .. } => !matches!(val, Value::Decimal(_, _)),
+                _ => false,
+            };
+            if needs_cast {
+                *val = crate::executor::expression::cast_value_public(val, ty);
+            }
+        }
+    }
+    Ok(rows)
+}
+
 
 /// 执行行式插入（根据配置选择事务/非事务路径）
 ///
@@ -21,7 +57,10 @@ pub fn execute(
     bypass_batch: bool,
 ) -> Result<u64> {
     trace!("insert::execute called: table_name={}, rows_count={}", table_name, rows.len());
-    
+
+    // 类型强转：字面量按列定义转换（如 100 → Int16、19.99 → Decimal）
+    let rows = coerce_rows_to_column_types(db, table_name, rows)?;
+
     // 防御性检查：事务路径需要 txn_manager 已初始化
     if db.config().enable_transaction {
         debug!("Transaction path enabled, checking txn_manager readiness...");
@@ -497,6 +536,31 @@ pub fn execute_columns(
     let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
     if num_rows == 0 {
         return Ok(0);
+    }
+
+    // 类型强转（v0.22.1）：Int16/Decimal 目标列的字面量收窄
+    let mut columns = columns;
+    if let Some(table) = db.get_engine_table(table_name) {
+        let types: Vec<DataType> = table.def().columns.iter().map(|c| c.data_type.clone()).collect();
+        for (col_idx, col) in columns.iter_mut().enumerate() {
+            let ty = match types.get(col_idx) {
+                Some(t) => t,
+                None => continue,
+            };
+            for v in col.iter_mut() {
+                if v.is_null() {
+                    continue;
+                }
+                let needs_cast = match ty {
+                    DataType::Int16 => !matches!(v, Value::Int16(_)),
+                    DataType::Decimal { .. } => !matches!(v, Value::Decimal(_, _)),
+                    _ => false,
+                };
+                if needs_cast {
+                    *v = crate::executor::expression::cast_value_public(v, ty);
+                }
+            }
+        }
     }
 
     // 防御性检查：事务路径需要 txn_manager 已初始化（与 execute() 一致）

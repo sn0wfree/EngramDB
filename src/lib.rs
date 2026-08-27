@@ -3998,4 +3998,127 @@ mod multi_engine_tests {
         assert_eq!(chunks[0].count, 1);
         assert!(ops.lookup_primary_key(&Value::Int64(1)).is_some());
     }
+
+    #[test]
+    fn test_smallint_type() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val SMALLINT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, -50)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 0)").unwrap();
+
+        // 查询 SMALLINT 列
+        let result = conn.execute("SELECT val FROM t ORDER BY id").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0], Value::Int16(100));
+        assert_eq!(result.rows[1][0], Value::Int16(-50));
+        assert_eq!(result.rows[2][0], Value::Int16(0));
+
+        // WHERE 条件过滤
+        let result = conn.execute("SELECT id FROM t WHERE val > 0").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+
+        // 聚合函数
+        let result = conn.execute("SELECT SUM(val) FROM t").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        // SUM(100 + -50 + 0) = 50（本实现 SUM 统一返回 Float64）
+        assert_eq!(result.rows[0][0], Value::Float64(50.0));
+    }
+
+    #[test]
+    fn test_decimal_type() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, price DECIMAL(10, 2))").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 19)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 42)").unwrap();
+
+        // 查询 DECIMAL 列
+        let result = conn.execute("SELECT price FROM t ORDER BY id").unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        // WHERE 条件过滤
+        let result = conn.execute("SELECT id FROM t WHERE price > 20").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(2));
+    }
+
+    #[test]
+    fn test_correlated_scalar_subquery() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, value TEXT)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 1, 'z')").unwrap();
+
+        // 关联标量子查询：每个 t1 行获取对应的 t2 值
+        let result = conn.execute(
+            "SELECT name, (SELECT value FROM t2 WHERE t2.t1_id = t1.id LIMIT 1) FROM t1 ORDER BY id"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][1], Value::Varchar("x".to_string()));
+        assert_eq!(result.rows[1][1], Value::Varchar("y".to_string()));
+        assert_eq!(result.rows[2][1], Value::Null); // t1.id=3 在 t2 中无匹配
+    }
+
+    #[test]
+    fn test_correlated_exists_subquery() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        // t1_id=1、t1_id=2 各有匹配；t1_id=3 无匹配
+        conn.execute("INSERT INTO t2 VALUES (1, 1), (2, 2)").unwrap();
+
+        // 关联 EXISTS 子查询：只返回在 t2 中有匹配的 t1 行
+        let result = conn.execute(
+            "SELECT name FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id) ORDER BY id"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], Value::Varchar("a".to_string()));
+        assert_eq!(result.rows[1][0], Value::Varchar("b".to_string()));
+    }
+
+    #[test]
+    fn test_correlated_in_subquery() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 1), (2, 1)").unwrap();
+
+        // 关联 IN 子查询：返回在 t2 中有匹配的 t1 行
+        let result = conn.execute(
+            "SELECT name FROM t1 WHERE t1.id IN (SELECT t1_id FROM t2) ORDER BY id"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Varchar("a".to_string()));
+    }
+
+    #[test]
+    fn test_uncorrelated_subquery_still_works() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INT PRIMARY KEY, val INT)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT PRIMARY KEY, val INT)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 5), (2, 15)").unwrap();
+
+        // 非关联标量子查询
+        let result = conn.execute("SELECT (SELECT COUNT(*) FROM t2) FROM t1 LIMIT 1").unwrap();
+        assert_eq!(result.rows[0][0], Value::Int64(2));
+
+        // 非关联 EXISTS（外层带 FROM；引擎不支持无 FROM SELECT）
+        let result = conn.execute(
+            "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.val > t1.val) ORDER BY id"
+        ).unwrap();
+        // val=10 < 15 匹配；val=20、30 无匹配
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int64(1));
+
+        // 非关联 IN
+        let result = conn.execute(
+            "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id"
+        ).unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
 }

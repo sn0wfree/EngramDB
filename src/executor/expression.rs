@@ -13,9 +13,390 @@ use crate::common::error::{EngramDbError, Result};
 use crate::common::value_cmp::{total_cmp, total_eq};
 use crate::Value;
 use rand::Rng;
+use std::collections::HashMap;
 use crate::sql::ast::{Expression, BinaryOperator, UnaryOperator, DataType};
 
 use super::vector::{DataChunk, Vector};
+
+// ============================================================================
+// 关联子查询支持（v0.22.1）
+//
+// 采用「哨兵列名」方案：
+// 1. 静态解析期（resolve_subqueries_in_expr）：已知外层作用域后，将子查询中
+//    匹配外层列的 ColumnRef 改写为哨兵名 `__engram_outer_<key>`。
+//    有改写 → 关联子查询 → 保留表达式推迟到运行时；无改写 → 非关联 →
+//    立即静态求值为字面量（零运行时开销）。
+// 2. 运行时（filter/projection 的 *_with_db 路径）：逐行构造外层行上下文
+//    (列名, 值) 对，bind_outer_columns 将哨兵引用替换为该行的字面量，
+//    再规划执行子查询。每行独立求解，正确处理关联语义。
+// ============================================================================
+
+/// 哨兵列名前缀：标识"此处实际是外层查询的某列值"
+pub const OUTER_SENTINEL_PREFIX: &str = "__engram_outer_";
+
+/// 外层作用域信息（静态解析期由物理计划收集）
+#[derive(Debug, Clone, Default)]
+pub struct OuterScope {
+    /// 外层可见的输出列名（含 join 产生的 "t.c" 形式）
+    pub cols: Vec<String>,
+    /// 外层 FROM 引用的表名/别名
+    pub tables: Vec<String>,
+}
+
+impl OuterScope {
+    pub fn is_empty(&self) -> bool {
+        self.cols.is_empty() && self.tables.is_empty()
+    }
+}
+
+/// 将子查询中匹配外层作用域的 ColumnRef 改写为哨兵名
+///
+/// 返回 true 表示至少改写了一处（即这是一个关联子查询）。
+/// 哨兵键取原始引用形态："t.c"（带限定）或 "c"（裸列名）。
+pub fn normalize_outer_refs(
+    stmt: &mut crate::sql::ast::SelectStmt,
+    scope: &OuterScope,
+    db: &crate::storage::Database,
+) -> bool {
+    if scope.is_empty() {
+        return false;
+    }
+    // 内层作用域遮蔽集：子查询 FROM 链上所有表名与 schema 列名
+    let shadowed = collect_shadowed_columns(stmt);
+    let mut changed = false;
+    for item in stmt.select_list.iter_mut() {
+        if let crate::sql::ast::SelectItem::Expression(e, _) = item {
+            changed |= normalize_outer_refs_in_expr(e, scope, db, &shadowed);
+        }
+    }
+    for gb in stmt.group_by.iter_mut() {
+        changed |= normalize_outer_refs_in_expr(gb, scope, db, &shadowed);
+    }
+    if let Some(h) = stmt.having.as_mut() {
+        changed |= normalize_outer_refs_in_expr(h, scope, db, &shadowed);
+    }
+    if let Some(w) = stmt.where_clause.as_mut() {
+        changed |= normalize_outer_refs_in_expr(w, scope, db, &shadowed);
+    }
+    for ob in stmt.order_by.iter_mut() {
+        changed |= normalize_outer_refs_in_expr(&mut ob.expr, scope, db, &shadowed);
+    }
+    changed
+}
+
+/// 递归收集子查询内部可见的表名与 schema 列名（用于裸列名遮蔽判定）
+fn collect_shadowed_columns(
+    stmt: &crate::sql::ast::SelectStmt,
+) -> std::collections::HashSet<String> {
+    fn walk_tr(tr: &crate::sql::ast::TableRef, out: &mut std::collections::HashSet<String>) {
+        use crate::sql::ast::TableRef;
+        match tr {
+            TableRef::Table { table_name, alias } => {
+                out.insert(table_name.clone());
+                if let Some(a) = alias {
+                    out.insert(a.clone());
+                }
+            }
+            TableRef::Derived { alias, .. } => {
+                out.insert(alias.clone());
+            }
+            TableRef::Join { left, right, .. } => {
+                walk_tr(left, out);
+                walk_tr(right, out);
+            }
+            TableRef::CrossJoin { left, right } => {
+                walk_tr(left, out);
+                walk_tr(right, out);
+            }
+            _ => {}
+        }
+    }
+
+    let mut tables = std::collections::HashSet::new();
+    if let Some(from) = &stmt.from {
+        walk_tr(from, &mut tables);
+    }
+
+    let mut cols = std::collections::HashSet::new();
+    // 表达式级自引用列（本轮 where/select 等裸列若出现在表达式里通常就是内层列）
+    let mut add_expr_cols = |e: &Expression| collect_column_names(e, &mut cols);
+    for item in &stmt.select_list {
+        if let crate::sql::ast::SelectItem::Expression(e, _) = item {
+            add_expr_cols(e);
+        }
+    }
+    if let Some(w) = &stmt.where_clause {
+        add_expr_cols(w);
+    }
+
+    cols
+}
+
+/// 临时：表达式裸列名收集
+fn collect_column_names(e: &Expression, out: &mut std::collections::HashSet<String>) {
+    match e {
+        Expression::ColumnRef { column, .. } => {
+            out.insert(column.clone());
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            collect_column_names(left, out);
+            collect_column_names(right, out);
+        }
+        Expression::UnaryOp { expr, .. } => collect_column_names(expr, out),
+        Expression::IsNull(x) | Expression::IsNotNull(x) => collect_column_names(x, out),
+        Expression::Cast { expr, .. } => collect_column_names(expr, out),
+        Expression::InList { expr, list } => {
+            collect_column_names(expr, out);
+            for i in list {
+                collect_column_names(i, out);
+            }
+        }
+        Expression::InSubquery { expr, .. } => collect_column_names(expr, out),
+        Expression::Like { expr, pattern } => {
+            collect_column_names(expr, out);
+            collect_column_names(pattern, out);
+        }
+        Expression::Case { when_then, else_expr } => {
+            for (w, t) in when_then {
+                collect_column_names(w, out);
+                collect_column_names(t, out);
+            }
+            if let Some(el) = else_expr {
+                collect_column_names(el, out);
+            }
+        }
+        Expression::Function { args, .. } => {
+            for a in args {
+                collect_column_names(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn outer_key_matches(
+    key: &str,
+    table: &Option<String>,
+    column: &str,
+    scope: &OuterScope,
+) -> bool {
+    match table {
+        Some(t) => {
+            (scope.tables.iter().any(|x| x == t) && scope.cols.iter().any(|x| x == column))
+                || scope.cols.iter().any(|x| x == key)
+        }
+        None => scope.cols.iter().any(|x| x == column),
+    }
+}
+
+pub(crate) fn normalize_outer_refs_in_expr(
+    e: &mut Expression,
+    scope: &OuterScope,
+    _db: &crate::storage::Database,
+    shadowed: &std::collections::HashSet<String>,
+) -> bool {
+    match e {
+        Expression::ColumnRef { table, column } => {
+            // 幂等：已是本模块注入的哨兵 → 视为关联（重复 resolve 时保持延迟语义）
+            if table.is_none() && column.starts_with(OUTER_SENTINEL_PREFIX) {
+                return true;
+            }
+            let key = match table {
+                Some(t) => format!("{}.{}", t, column),
+                None => column.clone(),
+            };
+            // 裸列名遮蔽保护：同名列属于内层作用域时不改写，
+            // 仅当它不属于内层可见列集且命中外层输出列时才绑定
+            let is_shadowed = table.is_none() && shadowed.contains(column);
+            if !is_shadowed && outer_key_matches(&key, table, column, scope) {
+                *column = format!("{}{}", OUTER_SENTINEL_PREFIX, key);
+                *table = None;
+                true
+            } else {
+                false
+            }
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            normalize_outer_refs_in_expr(left, scope, _db, shadowed)
+                | normalize_outer_refs_in_expr(right, scope, _db, shadowed)
+        }
+        Expression::UnaryOp { expr, .. } => normalize_outer_refs_in_expr(expr, scope, _db, shadowed),
+        Expression::IsNull(inner) | Expression::IsNotNull(inner) => {
+            normalize_outer_refs_in_expr(inner, scope, _db, shadowed)
+        }
+        Expression::Cast { expr, .. } => normalize_outer_refs_in_expr(expr, scope, _db, shadowed),
+        Expression::InList { expr, list } => {
+            let mut c = normalize_outer_refs_in_expr(expr, scope, _db, shadowed);
+            for item in list.iter_mut() {
+                c |= normalize_outer_refs_in_expr(item, scope, _db, shadowed);
+            }
+            c
+        }
+        Expression::InSubquery { expr, .. } => normalize_outer_refs_in_expr(expr, scope, _db, shadowed),
+        Expression::Like { expr, pattern } => {
+            normalize_outer_refs_in_expr(expr, scope, _db, shadowed)
+                | normalize_outer_refs_in_expr(pattern, scope, _db, shadowed)
+        }
+        Expression::Case { when_then, else_expr } => {
+            let mut c = false;
+            for (w, t) in when_then.iter_mut() {
+                c |= normalize_outer_refs_in_expr(w, scope, _db, shadowed);
+                c |= normalize_outer_refs_in_expr(t, scope, _db, shadowed);
+            }
+            if let Some(el) = else_expr.as_mut() {
+                c |= normalize_outer_refs_in_expr(el, scope, _db, shadowed);
+            }
+            c
+        }
+        Expression::Function { args, .. } => {
+            let mut c = false;
+            for a in args.iter_mut() {
+                c |= normalize_outer_refs_in_expr(a, scope, _db, shadowed);
+            }
+            c
+        }
+        _ => false,
+    }
+}
+
+/// 将哨兵引用替换为外部行实际值（运行时逐行调用）
+///
+/// 返回 true 表示至少绑定了一处哨兵；未发现任何哨兵时返回原样克隆。
+pub fn bind_outer_columns(
+    subquery: &crate::sql::ast::SelectStmt,
+    outer_row: &[(String, Value)],
+) -> crate::sql::ast::SelectStmt {
+    use std::collections::HashMap;
+
+    // 构建哨兵映射表：`__engram_outer_<key>` → 行值
+    let bindings: HashMap<String, &Value> = outer_row.iter()
+        .map(|(k, v)| (format!("{}{}", OUTER_SENTINEL_PREFIX, k), v))
+        .collect();
+    // 同时保留原始 key 视图，便于按原始引用查找（上游可能直接传 "t.c"/"c"）
+    let raw: HashMap<&str, &Value> = outer_row.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    let mut sub = subquery.clone();
+    #[cfg(feature="never")] eprintln!("DBG bind keys={:?} wc_has_sentinel={}", outer_row.iter().map(|(k,_)|k.clone()).collect::<Vec<_>>().join(","), sub.where_clause.as_ref().map(has_sentinel).unwrap_or(false));
+
+    for item in sub.select_list.iter_mut() {
+        if let crate::sql::ast::SelectItem::Expression(e, _) = item {
+            bind_sentinels_in_expr(e, &bindings, &raw);
+        }
+    }
+    for gb in sub.group_by.iter_mut() {
+        bind_sentinels_in_expr(gb, &bindings, &raw);
+    }
+    if let Some(h) = sub.having.as_mut() {
+        bind_sentinels_in_expr(h, &bindings, &raw);
+    }
+    if let Some(w) = sub.where_clause.as_mut() {
+        bind_sentinels_in_expr(w, &bindings, &raw);
+    }
+
+    sub
+}
+
+type BindMap<'a> = HashMap<String, &'a Value>;
+
+/// 哨兵列查找：后缀与运行时键存在多种形态差异（限定/裸名）时的三级回退
+///
+/// 1. 后缀精确匹配（"t1.id" 或 "id" 均直接命中）
+/// 2. 后缀含点：取点后裸名再试（"t1.id" → "id"）
+/// 3. 裸名失败：任一键的最后一段等于后缀（"t1.id" 命中键 "t1.id"）
+fn lookup_sentinel_value<'a>(
+    column: &str,
+    raw: &HashMap<&'a str, &'a Value>,
+) -> Option<&'a Value> {
+    let suffix = column.strip_prefix(OUTER_SENTINEL_PREFIX)?;
+    if let Some(v) = raw.get(suffix) {
+        return Some(v);
+    }
+    if let Some((_, bare)) = suffix.rsplit_once('.') {
+        if let Some(v) = raw.get(bare) {
+            return Some(v);
+        }
+    }
+    for (k, v) in raw.iter() {
+        let last_seg = k.rsplit('.').next().unwrap_or(k);
+        if last_seg == suffix {
+            return Some(*v);
+        }
+    }
+    None
+}
+
+fn bind_sentinels_in_expr<'a>(e: &mut Expression, sentinels: &BindMap<'a>, raw: &HashMap<&'a str, &'a Value>) {
+    match e {
+        Expression::ColumnRef { table: None, column } => {
+            // 仅替换哨兵列（非哨兵的内层列一律不动，避免误绑定）
+            if column.starts_with(OUTER_SENTINEL_PREFIX) {
+                if let Some(v) = lookup_sentinel_value(column, raw).or_else(|| sentinels.get(column).copied()) {
+                    *e = Expression::Literal(v.clone());
+                }
+            }
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            bind_sentinels_in_expr(left, sentinels, raw);
+            bind_sentinels_in_expr(right, sentinels, raw);
+        }
+        Expression::UnaryOp { expr, .. } => bind_sentinels_in_expr(expr, sentinels, raw),
+        Expression::IsNull(inner) | Expression::IsNotNull(inner) => {
+            bind_sentinels_in_expr(inner, sentinels, raw)
+        }
+        Expression::Cast { expr, .. } => bind_sentinels_in_expr(expr, sentinels, raw),
+        Expression::InList { expr, list } => {
+            bind_sentinels_in_expr(expr, sentinels, raw);
+            for item in list.iter_mut() {
+                bind_sentinels_in_expr(item, sentinels, raw);
+            }
+        }
+        Expression::InSubquery { expr, .. } => bind_sentinels_in_expr(expr, sentinels, raw),
+        Expression::Like { expr, pattern } => {
+            bind_sentinels_in_expr(expr, sentinels, raw);
+            bind_sentinels_in_expr(pattern, sentinels, raw);
+        }
+        Expression::Case { when_then, else_expr } => {
+            for (w, t) in when_then.iter_mut() {
+                bind_sentinels_in_expr(w, sentinels, raw);
+                bind_sentinels_in_expr(t, sentinels, raw);
+            }
+            if let Some(el) = else_expr.as_mut() {
+                bind_sentinels_in_expr(el, sentinels, raw);
+            }
+        }
+        Expression::Function { args, .. } => {
+            for a in args.iter_mut() {
+                bind_sentinels_in_expr(a, sentinels, raw);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 检查表达式是否包含子查询节点
+pub fn contains_subquery(expr: &Expression) -> bool {
+    match expr {
+        Expression::Subquery(_) | Expression::Exists { .. } | Expression::InSubquery { .. } => true,
+        Expression::BinaryOp { left, right, .. } => {
+            contains_subquery(left) || contains_subquery(right)
+        }
+        Expression::UnaryOp { expr, .. } => contains_subquery(expr),
+        Expression::IsNull(inner) | Expression::IsNotNull(inner) => contains_subquery(inner),
+        Expression::Cast { expr, .. } => contains_subquery(expr),
+        Expression::InList { expr, list } => {
+            contains_subquery(expr) || list.iter().any(contains_subquery)
+        }
+        Expression::Like { expr, pattern } => {
+            contains_subquery(expr) || contains_subquery(pattern)
+        }
+        Expression::Case { when_then, else_expr } => {
+            when_then.iter().any(|(w, t)| contains_subquery(w) || contains_subquery(t))
+                || else_expr.as_ref().map_or(false, |e| contains_subquery(e))
+        }
+        Expression::Function { args, .. } => args.iter().any(contains_subquery),
+        _ => false,
+    }
+}
 
 /// 向量化求值表达式
 ///
@@ -26,7 +407,7 @@ pub fn eval_vectorized(
     chunk: &DataChunk,
     column_names: &[String],
 ) -> Result<Vector> {
-    eval_vectorized_with_db(expr, chunk, column_names, None)
+    eval_vectorized_with_db(expr, chunk, column_names, None, None)
 }
 
 /// 向量化求值表达式（支持子查询）
@@ -34,11 +415,13 @@ pub fn eval_vectorized(
 /// 对整个 DataChunk 批量计算，返回结果 Vector。
 /// column_names 用于解析 ColumnRef。
 /// db 参数用于执行子查询（如果存在）。
+/// outer_row 参数用于关联子查询的上下文（外部行的列名-值对）。
 pub fn eval_vectorized_with_db(
     expr: &Expression,
     chunk: &DataChunk,
     column_names: &[String],
     mut db: Option<&mut crate::storage::Database>,
+    outer_row: Option<&[(String, Value)]>,
 ) -> Result<Vector> {
     // 简化实现：对于不需要子查询的表达式，忽略 db 参数
     // 对于需要子查询的表达式，使用 eval_vectorized_with_db_internal
@@ -56,44 +439,44 @@ pub fn eval_vectorized_with_db(
             }
         }
         Expression::BinaryOp { left, op, right } => {
-            let left_vec = eval_vectorized_with_db(left, chunk, column_names, db.as_deref_mut())?;
-            let right_vec = eval_vectorized_with_db(right, chunk, column_names, db.as_deref_mut())?;
+            let left_vec = eval_vectorized_with_db(left, chunk, column_names, db.as_deref_mut(), outer_row)?;
+            let right_vec = eval_vectorized_with_db(right, chunk, column_names, db.as_deref_mut(), outer_row)?;
             eval_binary_vectorized(&left_vec, *op, &right_vec)
         }
         Expression::UnaryOp { op, expr } => {
-            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut())?;
+            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
             eval_unary_vectorized(&vec, *op)
         }
         Expression::IsNull(expr) => {
-            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut())?;
+            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
             Ok(eval_is_null(&vec, false))
         }
         Expression::IsNotNull(expr) => {
-            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut())?;
+            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
             Ok(eval_is_null(&vec, true))
         }
         Expression::Cast { expr, data_type } => {
-            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut())?;
+            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
             eval_cast(&vec, data_type)
         }
         Expression::InList { expr, list } => {
-            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut())?;
+            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
             let mut list_vecs = Vec::new();
             for e in list {
-                list_vecs.push(eval_vectorized_with_db(e, chunk, column_names, db.as_deref_mut())?);
+                list_vecs.push(eval_vectorized_with_db(e, chunk, column_names, db.as_deref_mut(), outer_row)?);
             }
             eval_in_list(&vec, &list_vecs)
         }
         Expression::Like { expr, pattern } => {
-            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut())?;
-            let pat_vec = eval_vectorized_with_db(pattern, chunk, column_names, db.as_deref_mut())?;
+            let vec = eval_vectorized_with_db(expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
+            let pat_vec = eval_vectorized_with_db(pattern, chunk, column_names, db.as_deref_mut(), outer_row)?;
             eval_like(&vec, &pat_vec)
         }
         Expression::Case { when_then, else_expr } => {
-            eval_case_vectorized_with_db(when_then, else_expr.as_deref(), chunk, column_names, db)
+            eval_case_vectorized_with_db(when_then, else_expr.as_deref(), chunk, column_names, db, outer_row)
         }
         Expression::Function { name, args, .. } => {
-            eval_function_with_db(name, args, chunk, column_names, db)
+            eval_function_with_db(name, args, chunk, column_names, db, outer_row)
         }
         Expression::Placeholder(_) => {
             Err(EngramDbError::Internal(
@@ -103,7 +486,7 @@ pub fn eval_vectorized_with_db(
         // 标量子查询支持（v0.22.0 新增）
         Expression::Subquery(subquery) => {
             if let Some(mut db) = db {
-                let value = eval_scalar_subquery(subquery, &mut db)?;
+                let value = eval_scalar_subquery(subquery, &mut db, outer_row)?;
                 Ok(Vector::Constant(value, chunk.count))
             } else {
                 Err(EngramDbError::Internal(
@@ -114,7 +497,7 @@ pub fn eval_vectorized_with_db(
         // EXISTS 子查询支持（v0.22.0 新增）
         Expression::Exists { subquery, negated } => {
             if let Some(mut db) = db {
-                let value = eval_exists_subquery(subquery, &mut db, *negated)?;
+                let value = eval_exists_subquery(subquery, &mut db, *negated, outer_row)?;
                 Ok(Vector::Constant(value, chunk.count))
             } else {
                 Err(EngramDbError::Internal(
@@ -125,13 +508,13 @@ pub fn eval_vectorized_with_db(
         // IN 子查询支持（v0.22.0 新增）
         Expression::InSubquery { expr, subquery, negated } => {
             if let Some(mut db) = db {
-                let expr_vec = eval_vectorized_with_db(expr, chunk, column_names, Some(&mut db))?;
+                let expr_vec = eval_vectorized_with_db(expr, chunk, column_names, Some(&mut db), outer_row)?;
                 let expr_value = match &expr_vec {
                     Vector::Constant(v, _) => v.clone(),
                     Vector::Flat(values) => values.first().cloned().unwrap_or(Value::Null),
                     Vector::Typed(typed) => typed.to_values().first().cloned().unwrap_or(Value::Null),
                 };
-                let result = eval_in_subquery(&expr_value, subquery, &mut db, *negated)?;
+                let result = eval_in_subquery(&expr_value, subquery, &mut db, *negated, outer_row)?;
                 Ok(Vector::Constant(result, chunk.count))
             } else {
                 Err(EngramDbError::Internal(
@@ -147,12 +530,21 @@ pub fn eval_vectorized_with_db(
 /// 执行子查询计划，返回单行单列的值。
 /// 如果子查询返回多行，取第一行第一列。
 /// 如果子查询返回空结果，返回 NULL。
+/// outer_row 用于关联子查询的外部行上下文。
 pub fn eval_scalar_subquery(
     subquery: &crate::sql::ast::SelectStmt,
     db: &mut crate::storage::Database,
+    outer_row: Option<&[(String, Value)]>,
 ) -> Result<Value> {
     use crate::sql::planner::plan_select;
     use crate::executor::executor::execute;
+
+    // 如果有外部行，注入到子查询 WHERE 子句中
+    let subquery = if let Some(row) = outer_row {
+        bind_outer_columns(subquery, row)
+    } else {
+        subquery.clone()
+    };
 
     // 验证子查询语句
     if subquery.from.is_none() {
@@ -187,13 +579,22 @@ pub fn eval_scalar_subquery(
 /// 求值 EXISTS 子查询（v0.22.0 新增）
 ///
 /// 执行子查询计划，返回是否存在行。
+/// outer_row 用于关联子查询的外部行上下文。
 pub fn eval_exists_subquery(
     subquery: &crate::sql::ast::SelectStmt,
     db: &mut crate::storage::Database,
     negated: bool,
+    outer_row: Option<&[(String, Value)]>,
 ) -> Result<Value> {
     use crate::sql::planner::plan_select;
     use crate::executor::executor::execute;
+
+    // 如果有外部行，注入到子查询 WHERE 子句中
+    let subquery = if let Some(row) = outer_row {
+        bind_outer_columns(subquery, row)
+    } else {
+        subquery.clone()
+    };
 
     // 验证子查询语句
     if subquery.from.is_none() {
@@ -217,17 +618,34 @@ pub fn eval_exists_subquery(
     }
 }
 
+fn expr_dbg_has_sentinel(e: &Expression) -> bool {
+    match e {
+        Expression::ColumnRef { column, .. } => column.starts_with(OUTER_SENTINEL_PREFIX),
+        Expression::BinaryOp { left, right, .. } => expr_dbg_has_sentinel(left) || expr_dbg_has_sentinel(right),
+        _ => false,
+    }
+}
+
 /// 求值 IN 子查询（v0.22.0 新增）
 ///
 /// 执行子查询计划，检查表达式值是否在结果集中。
+/// outer_row 用于关联子查询的外部行上下文。
 pub fn eval_in_subquery(
     expr_value: &Value,
     subquery: &crate::sql::ast::SelectStmt,
     db: &mut crate::storage::Database,
     negated: bool,
+    outer_row: Option<&[(String, Value)]>,
 ) -> Result<Value> {
     use crate::sql::planner::plan_select;
     use crate::executor::executor::execute;
+
+    // 如果有外部行，注入到子查询 WHERE 子句中
+    let subquery = if let Some(row) = outer_row {
+        bind_outer_columns(subquery, row)
+    } else {
+        subquery.clone()
+    };
 
     // 验证子查询语句
     if subquery.from.is_none() {
@@ -1666,6 +2084,11 @@ fn eval_cast(vec: &Vector, target_type: &DataType) -> Result<Vector> {
     }
 }
 
+/// 公开的单值转换入口（供 INSERT 强转使用；失败语义：返回 NULL）
+pub fn cast_value_public(v: &Value, target: &DataType) -> Value {
+    cast_value(v, target).unwrap_or(Value::Null)
+}
+
 fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
     use crate::common::types::DataType::*;
 
@@ -1702,6 +2125,42 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
                 Value::Int64(f as i64)
             } else if let Value::Varchar(s) = v {
                 s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        }
+        Int16 => {
+            if let Some(i) = v.as_i64() {
+                Value::Int16(i as i16)
+            } else if let Some(f) = v.as_f64() {
+                Value::Int16(f as i16)
+            } else if let Value::Varchar(s) = v {
+                s.parse::<i16>().map(Value::Int16).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        }
+        Decimal { scale, .. } => {
+            // 数值 → 定点 i128（按 scale 缩放；字符串格式化避免浮点误差）
+            if let Some(i) = v.as_i64() {
+                Value::Decimal(i as i128 * 10i128.pow(*scale as u32), *scale)
+            } else if let Value::Float32(f) = v {
+                let s = format!("{:.*}", *scale as usize, *f);
+                match s.replace('.', "").parse::<i128>() {
+                    Ok(n) => Value::Decimal(n, *scale),
+                    Err(_) => Value::Null,
+                }
+            } else if let Value::Float64(f) = v {
+                let s = format!("{:.*}", *scale as usize, *f);
+                match s.replace('.', "").parse::<i128>() {
+                    Ok(n) => Value::Decimal(n, *scale),
+                    Err(_) => Value::Null,
+                }
+            } else if let Value::Varchar(s) = v {
+                match crate::common::value_cmp::parse_decimal_str(s, *scale) {
+                    Some(n) => Value::Decimal(n, *scale),
+                    None => Value::Null,
+                }
             } else {
                 Value::Null
             }
@@ -1906,7 +2365,7 @@ fn eval_case_vectorized(
     chunk: &DataChunk,
     column_names: &[String],
 ) -> Result<Vector> {
-    eval_case_vectorized_with_db(when_then, else_expr, chunk, column_names, None)
+    eval_case_vectorized_with_db(when_then, else_expr, chunk, column_names, None, None)
 }
 
 fn eval_case_vectorized_with_db(
@@ -1915,6 +2374,7 @@ fn eval_case_vectorized_with_db(
     chunk: &DataChunk,
     column_names: &[String],
     mut db: Option<&mut crate::storage::Database>,
+    outer_row: Option<&[(String, Value)]>,
 ) -> Result<Vector> {
     let count = chunk.count;
 
@@ -1923,14 +2383,14 @@ fn eval_case_vectorized_with_db(
     let mut then_vecs = Vec::with_capacity(when_then.len());
 
     for (when_expr, then_expr) in when_then {
-        let when_vec = eval_vectorized_with_db(when_expr, chunk, column_names, db.as_deref_mut())?;
-        let then_vec = eval_vectorized_with_db(then_expr, chunk, column_names, db.as_deref_mut())?;
+        let when_vec = eval_vectorized_with_db(when_expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
+        let then_vec = eval_vectorized_with_db(then_expr, chunk, column_names, db.as_deref_mut(), outer_row)?;
         when_vecs.push(when_vec);
         then_vecs.push(then_vec);
     }
 
     let else_vec = match else_expr {
-        Some(e) => eval_vectorized_with_db(e, chunk, column_names, db.as_deref_mut())?,
+        Some(e) => eval_vectorized_with_db(e, chunk, column_names, db.as_deref_mut(), outer_row)?,
         None => Vector::Constant(Value::Null, count),
     };
 
@@ -1957,10 +2417,10 @@ fn eval_case_vectorized_with_db(
 // 内置函数
 // ============================================================================
 
-/// 辅助宏：简化 eval_vectorized 调用（自动传递 db 参数）
+/// 辅助宏：简化 eval_vectorized 调用（自动传递 db 和 outer_row 参数）
 macro_rules! eval {
-    ($expr:expr, $chunk:expr, $names:expr, $db:expr) => {
-        eval_vectorized_with_db($expr, $chunk, $names, $db.as_deref_mut())
+    ($expr:expr, $chunk:expr, $names:expr, $db:expr, $outer:expr) => {
+        eval_vectorized_with_db($expr, $chunk, $names, $db.as_deref_mut(), $outer)
     };
 }
 
@@ -1970,7 +2430,7 @@ fn eval_function(
     chunk: &DataChunk,
     column_names: &[String],
 ) -> Result<Vector> {
-    eval_function_with_db(name, args, chunk, column_names, None)
+    eval_function_with_db(name, args, chunk, column_names, None, None)
 }
 
 fn eval_function_with_db(
@@ -1979,6 +2439,7 @@ fn eval_function_with_db(
     chunk: &DataChunk,
     column_names: &[String],
     mut db: Option<&mut crate::storage::Database>,
+    outer_row: Option<&[(String, Value)]>,
 ) -> Result<Vector> {
     let func_name = name.to_uppercase();
 
@@ -1987,35 +2448,35 @@ fn eval_function_with_db(
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("ABS requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_abs(&vec)
         }
         "LENGTH" | "LEN" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("LENGTH requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_length(&vec)
         }
         "UPPER" | "UCASE" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("UPPER requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_upper(&vec)
         }
         "LOWER" | "LCASE" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("LOWER requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_lower(&vec)
         }
         "ROUND" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(EngramDbError::Parse("ROUND requires 1-2 arguments".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let decimals = if args.len() == 2 {
                 if let Expression::Literal(Value::Int32(n)) = &args[1] {
                     *n
@@ -2035,7 +2496,7 @@ fn eval_function_with_db(
             }
             let mut arg_vecs = Vec::with_capacity(args.len());
             for a in args {
-                arg_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut())?);
+                arg_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut(), outer_row)?);
             }
             eval_coalesce(&arg_vecs)
         }
@@ -2043,10 +2504,10 @@ fn eval_function_with_db(
             if args.len() < 2 || args.len() > 3 {
                 return Err(EngramDbError::Parse("SUBSTRING requires 2-3 arguments".into()));
             }
-            let str_vec = eval!(&args[0], chunk, column_names, db)?;
-            let start_vec = eval!(&args[1], chunk, column_names, db)?;
+            let str_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let start_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             let len_vec = if args.len() == 3 {
-                Some(eval!(&args[2], chunk, column_names, db)?)
+                Some(eval!(&args[2], chunk, column_names, db, outer_row)?)
             } else {
                 None
             };
@@ -2058,7 +2519,7 @@ fn eval_function_with_db(
             }
             let mut arg_vecs = Vec::with_capacity(args.len());
             for a in args {
-                arg_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut())?);
+                arg_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut(), outer_row)?);
             }
             eval_concat_func(&arg_vecs)
         }
@@ -2068,7 +2529,7 @@ fn eval_function_with_db(
             }
             let mut arg_vecs = Vec::with_capacity(args.len());
             for a in args {
-                arg_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut())?);
+                arg_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut(), outer_row)?);
             }
             eval_coalesce(&arg_vecs)
         }
@@ -2076,8 +2537,8 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("NULLIF requires 2 arguments".into()));
             }
-            let a_vec = eval!(&args[0], chunk, column_names, db)?;
-            let b_vec = eval!(&args[1], chunk, column_names, db)?;
+            let a_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let b_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_nullif(&a_vec, &b_vec)
         }
         "IF" => {
@@ -2085,9 +2546,9 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("IF requires 3 arguments".into()));
             }
-            let cond_vec = eval!(&args[0], chunk, column_names, db)?;
-            let true_vec = eval!(&args[1], chunk, column_names, db)?;
-            let false_vec = eval!(&args[2], chunk, column_names, db)?;
+            let cond_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let true_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let false_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             eval_if(&cond_vec, &true_vec, &false_vec)
         }
         "TRIM" => {
@@ -2095,9 +2556,9 @@ fn eval_function_with_db(
             if args.is_empty() || args.len() > 2 {
                 return Err(EngramDbError::Parse("TRIM requires 1 or 2 arguments".into()));
             }
-            let str_vec = eval!(&args[0], chunk, column_names, db)?;
+            let str_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let chars_vec = if args.len() == 2 {
-                Some(eval!(&args[1], chunk, column_names, db)?)
+                Some(eval!(&args[1], chunk, column_names, db, outer_row)?)
             } else {
                 None
             };
@@ -2107,9 +2568,9 @@ fn eval_function_with_db(
             if args.is_empty() || args.len() > 2 {
                 return Err(EngramDbError::Parse("LTRIM requires 1 or 2 arguments".into()));
             }
-            let str_vec = eval!(&args[0], chunk, column_names, db)?;
+            let str_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let chars_vec = if args.len() == 2 {
-                Some(eval!(&args[1], chunk, column_names, db)?)
+                Some(eval!(&args[1], chunk, column_names, db, outer_row)?)
             } else {
                 None
             };
@@ -2119,9 +2580,9 @@ fn eval_function_with_db(
             if args.is_empty() || args.len() > 2 {
                 return Err(EngramDbError::Parse("RTRIM requires 1 or 2 arguments".into()));
             }
-            let str_vec = eval!(&args[0], chunk, column_names, db)?;
+            let str_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let chars_vec = if args.len() == 2 {
-                Some(eval!(&args[1], chunk, column_names, db)?)
+                Some(eval!(&args[1], chunk, column_names, db, outer_row)?)
             } else {
                 None
             };
@@ -2132,8 +2593,8 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("INSTR requires 2 arguments".into()));
             }
-            let haystack_vec = eval!(&args[0], chunk, column_names, db)?;
-            let needle_vec = eval!(&args[1], chunk, column_names, db)?;
+            let haystack_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let needle_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_instr(&haystack_vec, &needle_vec)
         }
         "SPLIT_PART" => {
@@ -2141,23 +2602,23 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("SPLIT_PART requires 3 arguments".into()));
             }
-            let str_vec = eval!(&args[0], chunk, column_names, db)?;
-            let delim_vec = eval!(&args[1], chunk, column_names, db)?;
-            let part_vec = eval!(&args[2], chunk, column_names, db)?;
+            let str_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let delim_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let part_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             eval_split_part(&str_vec, &delim_vec, &part_vec)
         }
         "CEIL" | "CEILING" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("CEIL requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_unary_numeric(&vec, |x| x.ceil())
         }
         "FLOOR" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("FLOOR requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_unary_numeric(&vec, |x| x.floor())
         }
         "TRUNC" | "TRUNCATE" => {
@@ -2165,43 +2626,43 @@ fn eval_function_with_db(
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("TRUNC requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_unary_numeric(&vec, |x| x.trunc())
         }
         "POWER" | "POW" => {
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("POWER requires 2 arguments".into()));
             }
-            let base_vec = eval!(&args[0], chunk, column_names, db)?;
-            let exp_vec = eval!(&args[1], chunk, column_names, db)?;
+            let base_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let exp_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_binary_numeric(&base_vec, &exp_vec, |a, b| a.powf(b))
         }
         "SQRT" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("SQRT requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_unary_numeric(&vec, |x| x.sqrt())
         }
         "LN" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("LN requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_unary_numeric(&vec, |x| x.ln())
         }
         "LOG" | "LOG10" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("LOG/LOG10 requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_unary_numeric(&vec, |x| x.log10())
         }
         "LOG2" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("LOG2 requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_unary_numeric(&vec, |x| x.log2())
         }
         "RANDOM" | "RAND" => {
@@ -2215,24 +2676,24 @@ fn eval_function_with_db(
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("TYPEOF requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_typeof(&vec)
         }
         "REPLACE" => {
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("REPLACE requires 3 arguments".into()));
             }
-            let str_vec = eval!(&args[0], chunk, column_names, db)?;
-            let from_vec = eval!(&args[1], chunk, column_names, db)?;
-            let to_vec = eval!(&args[2], chunk, column_names, db)?;
+            let str_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let from_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let to_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             eval_replace(&str_vec, &from_vec, &to_vec)
         }
         "MOD" => {
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("MOD requires 2 arguments".into()));
             }
-            let a_vec = eval!(&args[0], chunk, column_names, db)?;
-            let b_vec = eval!(&args[1], chunk, column_names, db)?;
+            let a_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let b_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_mod(&a_vec, &b_vec)
         }
         // JSON 函数（v0.12.0 新增，Agent 元数据场景）
@@ -2240,18 +2701,18 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("JSON_EXTRACT requires 2 arguments".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
-            let path_vec = eval!(&args[1], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let path_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_json_extract(&json_vec, &path_vec)
         }
         "JSON_CONTAINS" => {
             if args.len() < 2 || args.len() > 3 {
                 return Err(EngramDbError::Parse("JSON_CONTAINS requires 2-3 arguments".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
-            let target_vec = eval!(&args[1], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let target_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             let path_vec = if args.len() == 3 {
-                Some(eval!(&args[2], chunk, column_names, db)?)
+                Some(eval!(&args[2], chunk, column_names, db, outer_row)?)
             } else {
                 None
             };
@@ -2261,9 +2722,9 @@ fn eval_function_with_db(
             if args.len() < 1 || args.len() > 2 {
                 return Err(EngramDbError::Parse("JSON_ARRAY_LENGTH requires 1-2 arguments".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let path_vec = if args.len() == 2 {
-                Some(eval!(&args[1], chunk, column_names, db)?)
+                Some(eval!(&args[1], chunk, column_names, db, outer_row)?)
             } else {
                 None
             };
@@ -2278,11 +2739,11 @@ fn eval_function_with_db(
             // 简化为对所有行应用同一个 JSON
             let mut key_vecs = Vec::new();
             for a in args.iter().step_by(2) {
-                key_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut())?);
+                key_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut(), outer_row)?);
             }
             let mut val_vecs = Vec::new();
             for a in args.iter().skip(1).step_by(2) {
-                val_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut())?);
+                val_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut(), outer_row)?);
             }
             eval_json_object(&key_vecs, &val_vecs)
         }
@@ -2290,7 +2751,7 @@ fn eval_function_with_db(
         "JSON_ARRAY" => {
             let mut val_vecs = Vec::new();
             for a in args {
-                val_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut())?);
+                val_vecs.push(eval_vectorized_with_db(a, chunk, column_names, db.as_deref_mut(), outer_row)?);
             }
             eval_json_array(&val_vecs)
         }
@@ -2299,9 +2760,9 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("JSON_SET requires 3 arguments".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
-            let path_vec = eval!(&args[1], chunk, column_names, db)?;
-            let val_vec = eval!(&args[2], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let path_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let val_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             eval_json_set(&json_vec, &path_vec, &val_vec, false)
         }
         // JSON_INSERT(json, path, value) — 仅当路径不存在时设置（v0.15.0 新增）
@@ -2309,9 +2770,9 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("JSON_INSERT requires 3 arguments".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
-            let path_vec = eval!(&args[1], chunk, column_names, db)?;
-            let val_vec = eval!(&args[2], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let path_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let val_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             eval_json_set(&json_vec, &path_vec, &val_vec, true)
         }
         // JSON_REPLACE(json, path, value) — 仅当路径存在时替换（v0.15.0 新增）
@@ -2319,9 +2780,9 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("JSON_REPLACE requires 3 arguments".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
-            let path_vec = eval!(&args[1], chunk, column_names, db)?;
-            let val_vec = eval!(&args[2], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let path_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let val_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             // JSON_REPLACE = JSON_SET 但只在路径存在时生效
             eval_json_replace(&json_vec, &path_vec, &val_vec)
         }
@@ -2330,8 +2791,8 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("JSON_REMOVE requires 2 arguments".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
-            let path_vec = eval!(&args[1], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let path_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_json_remove(&json_vec, &path_vec)
         }
         // 向量函数（v0.12.0 新增，Agent 语义记忆 / RAG 场景）
@@ -2339,31 +2800,31 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("VECTOR_DISTANCE requires 2 arguments".into()));
             }
-            let v1 = eval!(&args[0], chunk, column_names, db)?;
-            let v2 = eval!(&args[1], chunk, column_names, db)?;
+            let v1 = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let v2 = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_vector_distance(&v1, &v2)
         }
         "VECTOR_L2_DISTANCE" => {
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("VECTOR_L2_DISTANCE requires 2 arguments".into()));
             }
-            let v1 = eval!(&args[0], chunk, column_names, db)?;
-            let v2 = eval!(&args[1], chunk, column_names, db)?;
+            let v1 = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let v2 = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_vector_distance(&v1, &v2)
         }
         "VECTOR_COSINE_SIMILARITY" => {
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("VECTOR_COSINE_SIMILARITY requires 2 arguments".into()));
             }
-            let v1 = eval!(&args[0], chunk, column_names, db)?;
-            let v2 = eval!(&args[1], chunk, column_names, db)?;
+            let v1 = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let v2 = eval!(&args[1], chunk, column_names, db, outer_row)?;
             eval_vector_cosine_similarity(&v1, &v2)
         }
         "VECTOR_NORM" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("VECTOR_NORM requires 1 argument".into()));
             }
-            let v = eval!(&args[0], chunk, column_names, db)?;
+            let v = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_vector_norm(&v)
         }
         "NOW" | "CURRENT_TIMESTAMP" => {
@@ -2377,7 +2838,7 @@ fn eval_function_with_db(
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("DATE requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
         let vec_norm = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
             match &vec_norm {
                 Vector::Typed(_) => unreachable!("typed column normalized to flat"),
@@ -2395,8 +2856,8 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("STRFTIME requires 2 arguments (format, timestamp)".into()));
             }
-            let fmt_vec = eval!(&args[0], chunk, column_names, db)?;
-            let ts_vec = eval!(&args[1], chunk, column_names, db)?;
+            let fmt_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let ts_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             let fmt = match &fmt_vec {
                 Vector::Constant(Value::Varchar(s), _) => s.clone(),
                 _ => return Err(EngramDbError::Parse("STRFTIME format must be a constant string".into())),
@@ -2418,7 +2879,7 @@ fn eval_function_with_db(
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("TIME requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
         let vec_norm = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
             match &vec_norm {
                 Vector::Typed(_) => unreachable!("typed column normalized to flat"),
@@ -2436,7 +2897,7 @@ fn eval_function_with_db(
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("DATETIME requires 1 argument".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
         let vec_norm = match vec { Vector::Typed(d) => Vector::Flat(d.to_values()), other => other.clone() };
             match &vec_norm {
                 Vector::Typed(_) => unreachable!("typed column normalized to flat"),
@@ -2454,9 +2915,9 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("DATE_ADD requires 3 arguments (timestamp, number, unit)".into()));
             }
-            let ts_vec = eval!(&args[0], chunk, column_names, db)?;
-            let n_vec = eval!(&args[1], chunk, column_names, db)?;
-            let unit_vec = eval!(&args[2], chunk, column_names, db)?;
+            let ts_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let n_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let unit_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             let unit = match &unit_vec {
                 Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
                 _ => return Err(EngramDbError::Parse("DATE_ADD unit must be a constant string".into())),
@@ -2477,9 +2938,9 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("DATE_SUB requires 3 arguments (timestamp, number, unit)".into()));
             }
-            let ts_vec = eval!(&args[0], chunk, column_names, db)?;
-            let n_vec = eval!(&args[1], chunk, column_names, db)?;
-            let unit_vec = eval!(&args[2], chunk, column_names, db)?;
+            let ts_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let n_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let unit_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             let unit = match &unit_vec {
                 Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
                 _ => return Err(EngramDbError::Parse("DATE_SUB unit must be a constant string".into())),
@@ -2500,9 +2961,9 @@ fn eval_function_with_db(
             if args.len() != 3 {
                 return Err(EngramDbError::Parse("DATE_DIFF requires 3 arguments (timestamp1, timestamp2, unit)".into()));
             }
-            let ts1_vec = eval!(&args[0], chunk, column_names, db)?;
-            let ts2_vec = eval!(&args[1], chunk, column_names, db)?;
-            let unit_vec = eval!(&args[2], chunk, column_names, db)?;
+            let ts1_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let ts2_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
+            let unit_vec = eval!(&args[2], chunk, column_names, db, outer_row)?;
             let unit = match &unit_vec {
                 Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
                 _ => return Err(EngramDbError::Parse("DATE_DIFF unit must be a constant string".into())),
@@ -2523,8 +2984,8 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("DATE_TRUNC requires 2 arguments (unit, timestamp)".into()));
             }
-            let unit_vec = eval!(&args[0], chunk, column_names, db)?;
-            let ts_vec = eval!(&args[1], chunk, column_names, db)?;
+            let unit_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let ts_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             let unit = match &unit_vec {
                 Vector::Constant(Value::Varchar(s), _) => s.to_lowercase(),
                 _ => return Err(EngramDbError::Parse("DATE_TRUNC unit must be a constant string".into())),
@@ -2546,8 +3007,8 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("STRPTIME requires 2 arguments (format, string)".into()));
             }
-            let fmt_vec = eval!(&args[0], chunk, column_names, db)?;
-            let s_vec = eval!(&args[1], chunk, column_names, db)?;
+            let fmt_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let s_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             let fmt = match &fmt_vec {
                 Vector::Constant(Value::Varchar(s), _) => s.clone(),
                 _ => return Err(EngramDbError::Parse("STRPTIME format must be a constant string".into())),
@@ -2569,8 +3030,8 @@ fn eval_function_with_db(
             if args.len() != 2 {
                 return Err(EngramDbError::Parse("MATCH requires 2 arguments (column, query)".into()));
             }
-            let vec = eval!(&args[0], chunk, column_names, db)?;
-            let query_vec = eval!(&args[1], chunk, column_names, db)?;
+            let vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
+            let query_vec = eval!(&args[1], chunk, column_names, db, outer_row)?;
             let query = match &query_vec {
                 Vector::Constant(Value::Varchar(s), _) => s.clone(),
                 _ => return Err(EngramDbError::Parse("MATCH query must be a string literal".into())),
@@ -2582,9 +3043,9 @@ fn eval_function_with_db(
             if args.len() < 1 || args.len() > 2 {
                 return Err(EngramDbError::Parse("DATE_TO_STRING requires 1-2 arguments".into()));
             }
-            let date_vec = eval!(&args[0], chunk, column_names, db)?;
+            let date_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let fmt = if args.len() == 2 {
-                match eval!(&args[1], chunk, column_names, db)? {
+                match eval!(&args[1], chunk, column_names, db, outer_row)? {
                     Vector::Constant(Value::Varchar(s), _) => Some(s),
                     _ => None,
                 }
@@ -2597,9 +3058,9 @@ fn eval_function_with_db(
             if args.len() < 1 || args.len() > 2 {
                 return Err(EngramDbError::Parse("TIME_TO_STRING requires 1-2 arguments".into()));
             }
-            let time_vec = eval!(&args[0], chunk, column_names, db)?;
+            let time_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let fmt = if args.len() == 2 {
-                match eval!(&args[1], chunk, column_names, db)? {
+                match eval!(&args[1], chunk, column_names, db, outer_row)? {
                     Vector::Constant(Value::Varchar(s), _) => Some(s),
                     _ => None,
                 }
@@ -2612,9 +3073,9 @@ fn eval_function_with_db(
             if args.len() < 1 || args.len() > 2 {
                 return Err(EngramDbError::Parse("TIMESTAMP_TO_STRING requires 1-2 arguments".into()));
             }
-            let ts_vec = eval!(&args[0], chunk, column_names, db)?;
+            let ts_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             let fmt = if args.len() == 2 {
-                match eval!(&args[1], chunk, column_names, db)? {
+                match eval!(&args[1], chunk, column_names, db, outer_row)? {
                     Vector::Constant(Value::Varchar(s), _) => Some(s),
                     _ => None,
                 }
@@ -2627,14 +3088,14 @@ fn eval_function_with_db(
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("UUID_TO_STRING requires 1 argument".into()));
             }
-            let uuid_vec = eval!(&args[0], chunk, column_names, db)?;
+            let uuid_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_uuid_to_string(&uuid_vec)
         }
         "JSON_TO_JSONB" | "JSONB_TO_JSON" => {
             if args.len() != 1 {
                 return Err(EngramDbError::Parse("JSON_TO_JSONB requires 1 argument".into()));
             }
-            let json_vec = eval!(&args[0], chunk, column_names, db)?;
+            let json_vec = eval!(&args[0], chunk, column_names, db, outer_row)?;
             eval_json_to_jsonb(&json_vec)
         }
         _ => {

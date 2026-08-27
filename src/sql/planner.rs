@@ -2375,7 +2375,45 @@ fn collect_expr_columns_ordered(
         Expression::IsNull(e) | Expression::IsNotNull(e) => {
             collect_expr_columns_ordered(e, cols, seen);
         }
-        _ => {} // Literal, Placeholder, Subquery, Wildcard: 无列引用
+        // v0.22.1 关联子查询：收集子查询内部列引用进外层扫描集。
+        // 多收的列若外层不存在会被 position() 丢弃；关联列运行时
+        // 由哨兵机制绑定成字面量，实际不被 chunk 求值。
+        Expression::Subquery(sq) => {
+            collect_select_stmt_columns_ordered(sq, cols, seen);
+        }
+        Expression::Exists { subquery, .. } => {
+            collect_select_stmt_columns_ordered(subquery, cols, seen);
+        }
+        Expression::InSubquery { expr, subquery, .. } => {
+            collect_expr_columns_ordered(expr, cols, seen);
+            collect_select_stmt_columns_ordered(subquery, cols, seen);
+        }
+        _ => {} // Literal, Placeholder, Wildcard: 无列引用
+    }
+}
+
+/// 收集 SELECT 语句（子查询体）中所有表达式级列引用（保序去重）
+fn collect_select_stmt_columns_ordered(
+    stmt: &SelectStmt,
+    cols: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for item in &stmt.select_list {
+        if let SelectItem::Expression(e, _) = item {
+            collect_expr_columns_ordered(e, cols, seen);
+        }
+    }
+    if let Some(w) = &stmt.where_clause {
+        collect_expr_columns_ordered(w, cols, seen);
+    }
+    for g in &stmt.group_by {
+        collect_expr_columns_ordered(g, cols, seen);
+    }
+    if let Some(h) = &stmt.having {
+        collect_expr_columns_ordered(h, cols, seen);
+    }
+    for ob in &stmt.order_by {
+        collect_expr_columns_ordered(&ob.expr, cols, seen);
     }
 }
 
@@ -2422,14 +2460,37 @@ fn collect_expr_columns(expr: &Expression, cols: &mut std::collections::HashSet<
                 collect_expr_columns(e, cols);
             }
         }
-        Expression::Literal(_) | Expression::Placeholder(_) | Expression::Subquery(_) => {}
-        Expression::Exists { subquery, .. } | Expression::InSubquery { subquery, .. } => {
-            if let Some(ref from) = subquery.from {
-                if let TableRef::Table { table_name, .. } = from {
-                    // 子查询列引用，暂时忽略
-                }
-            }
+        Expression::Literal(_) | Expression::Placeholder(_) => {}
+        Expression::Subquery(sq) => collect_select_stmt_columns(sq, cols),
+        Expression::Exists { subquery, .. } => collect_select_stmt_columns(subquery, cols),
+        Expression::InSubquery { expr, subquery, .. } => {
+            collect_expr_columns(expr, cols);
+            collect_select_stmt_columns(subquery, cols);
         }
+    }
+}
+
+/// 收集 SELECT 语句（子查询体）中所有表达式级列引用（HashSet 版）
+fn collect_select_stmt_columns(
+    stmt: &SelectStmt,
+    cols: &mut std::collections::HashSet<String>,
+) {
+    for item in &stmt.select_list {
+        if let SelectItem::Expression(e, _) = item {
+            collect_expr_columns(e, cols);
+        }
+    }
+    if let Some(w) = &stmt.where_clause {
+        collect_expr_columns(w, cols);
+    }
+    for g in &stmt.group_by {
+        collect_expr_columns(g, cols);
+    }
+    if let Some(h) = &stmt.having {
+        collect_expr_columns(h, cols);
+    }
+    for ob in &stmt.order_by {
+        collect_expr_columns(&ob.expr, cols);
     }
 }
 

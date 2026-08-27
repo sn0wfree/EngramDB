@@ -113,7 +113,11 @@ fn try_execute_chunks(
                         return Ok(Some((names, chunks)));
                     }
                     // 谓词列不在输出列：扫描只做 row group 级粗裁，需精确过滤
-                    let filtered_chunks = operators::filter::execute(&chunks, condition, &names)?;
+                    let filtered_chunks = if super::expression::contains_subquery(condition) {
+                        operators::filter::execute_with_db(&chunks, condition, &names, db)?
+                    } else {
+                        operators::filter::execute(&chunks, condition, &names)?
+                    };
                     return Ok(Some((names, filtered_chunks)));
                 }
             }
@@ -122,7 +126,11 @@ fn try_execute_chunks(
                 Some(x) => x,
                 None => return Ok(None),
             };
-            let filtered = operators::filter::execute(&chunks, condition, &cols)?;
+            let filtered = if super::expression::contains_subquery(condition) {
+                operators::filter::execute_with_db(&chunks, condition, &cols, db)?
+            } else {
+                operators::filter::execute(&chunks, condition, &cols)?
+            };
             Ok(Some((cols, filtered)))
         }
         PhysicalPlan::Sort {
@@ -781,7 +789,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_chunks = rows_to_chunks(&input_result.rows);
             let column_names = input_result.columns.clone();
 
-            let filtered = operators::filter::execute(&input_chunks, &condition, &column_names)?;
+            let filtered = if super::expression::contains_subquery(&condition) {
+                operators::filter::execute_with_db(&input_chunks, &condition, &column_names, db)?
+            } else {
+                operators::filter::execute(&input_chunks, &condition, &column_names)?
+            };
             let rows = chunks_to_rows(&filtered);
 
             Ok(QueryResult {
@@ -824,9 +836,15 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_chunks = rows_to_chunks(&input_result.rows);
             let input_columns = input_result.columns.clone();
 
-            let projected = operators::projection::execute(
-                &input_chunks, &expressions, &input_columns, &column_names
-            )?;
+            let projected = if expressions.iter().any(super::expression::contains_subquery) {
+                operators::projection::execute_with_db(
+                    &input_chunks, &expressions, &input_columns, &column_names, db
+                )?
+            } else {
+                operators::projection::execute(
+                    &input_chunks, &expressions, &input_columns, &column_names
+                )?
+            };
             let rows = chunks_to_rows(&projected);
 
             Ok(QueryResult {
@@ -1943,11 +1961,15 @@ fn find_conflicting_row(
 // ============================================================================
 
 /// 在计划树中递归解析所有子查询表达式
+///
+/// Filter/Projection 节点处理其表达式时，先收集输入计划的外层作用域
+/// （输出列名 + FROM 表名），用于关联子query的检测与哨兵改写。
 fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<PhysicalPlan> {
     match plan {
         PhysicalPlan::Filter { input, condition } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
-            let condition = resolve_subqueries_in_expr(condition, db)?;
+            let scope = collect_outer_scope(&input, db);
+            let condition = resolve_subqueries_in_expr(condition, db, &scope)?;
             Ok(PhysicalPlan::Filter {
                 input: Box::new(input),
                 condition,
@@ -1955,9 +1977,10 @@ fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<P
         }
         PhysicalPlan::Projection { input, expressions, column_names } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
+            let scope = collect_outer_scope(&input, db);
             let mut resolved = Vec::with_capacity(expressions.len());
             for expr in expressions {
-                resolved.push(resolve_subqueries_in_expr(expr, db)?);
+                resolved.push(resolve_subqueries_in_expr(expr, db, &scope)?);
             }
             Ok(PhysicalPlan::Projection {
                 input: Box::new(input),
@@ -2004,96 +2027,201 @@ fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<P
     }
 }
 
+/// 从物理计划收集外层作用域（v0.22.1 关联子query支持）
+///
+/// 递归遍历，汇总 TableScan 的表名+schema 列名、Projection/Window 的
+/// 输出列名。Aggregate 的分组列名同样属于下游可见列。
+fn collect_outer_scope(plan: &PhysicalPlan, db: &Database) -> super::expression::OuterScope {
+    use super::expression::{OuterScope, OUTER_SENTINEL_PREFIX};
+    let _ = OUTER_SENTINEL_PREFIX;
+
+    fn walk(plan: &PhysicalPlan, db: &Database, s: &mut OuterScope) {
+        match plan {
+            PhysicalPlan::TableScan { table_name, column_indices } => {
+                if !s.tables.iter().any(|t| t == table_name) {
+                    s.tables.push(table_name.clone());
+                }
+                if let Some(t) = db.get_engine_table(table_name) {
+                    for &i in column_indices {
+                        if let Some(c) = t.def().columns.get(i) {
+                            let n = c.name.clone();
+                            if !s.cols.contains(&n) {
+                                s.cols.push(n);
+                            }
+                        }
+                    }
+                }
+            }
+            PhysicalPlan::Projection { input, column_names, .. } => {
+                walk(input, db, s);
+                for n in column_names {
+                    if !s.cols.contains(n) {
+                        s.cols.push(n.clone());
+                    }
+                }
+            }
+            PhysicalPlan::Window { input, column_names, .. } => {
+                walk(input, db, s);
+                for n in column_names {
+                    if !s.cols.contains(n) {
+                        s.cols.push(n.clone());
+                    }
+                }
+            }
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::SubqueryScan { plan: input } => walk(input, db, s),
+            PhysicalPlan::Aggregate { input, .. } => {
+                // group_by 为列索引（Vec<usize>），索引不属于名字空间，仅递归输入
+                walk(input, db, s);
+            }
+            PhysicalPlan::HashJoin { left, right, .. } | PhysicalPlan::CrossJoin { left, right } => {
+                walk(left, db, s);
+                walk(right, db, s);
+            }
+            PhysicalPlan::SetUnion { left, .. } => walk(left, db, s),
+            _ => {}
+        }
+    }
+
+    let mut s = OuterScope::default();
+    walk(plan, db, &mut s);
+    s
+}
+
 /// 在表达式中递归解析子查询节点
-fn resolve_subqueries_in_expr(expr: Expression, db: &mut Database) -> Result<Expression> {
+///
+/// 用外层作用域探测每个子查询：改写成功（出现外层引用）→ 关联子查询，
+/// 保留改写后的表达式在运行时逐行求值；否则立即静态求值为字面量。
+fn resolve_subqueries_in_expr(
+    expr: Expression,
+    db: &mut Database,
+    outer: &super::expression::OuterScope,
+) -> Result<Expression> {
+    use super::expression::normalize_outer_refs;
     match expr {
         Expression::Subquery(subquery) => {
-            let plan = crate::sql::planner::plan(
-                crate::sql::ast::Statement::Select(*subquery), db
-            )?;
-            let result = crate::executor::execute(plan, db)?;
-            let val = result.rows.first()
-                .and_then(|r| r.first().cloned())
-                .unwrap_or(Value::Null);
-            Ok(Expression::Literal(val))
+            let mut probe = subquery.clone();
+            if normalize_outer_refs(&mut probe, outer, db) {
+                // 关联子查询：保留（已含哨兵改写），运行时逐行求值
+                Ok(Expression::Subquery(probe))
+            } else {
+                // 非关联：静态解析为字面量
+                let plan = crate::sql::planner::plan(
+                    crate::sql::ast::Statement::Select(*subquery), db
+                )?;
+                let result = crate::executor::execute(plan, db)?;
+                let val = result.rows.first()
+                    .and_then(|r| r.first().cloned())
+                    .unwrap_or(Value::Null);
+                Ok(Expression::Literal(val))
+            }
         }
         Expression::Exists { subquery, negated } => {
-            let plan = crate::sql::planner::plan(
-                crate::sql::ast::Statement::Select(*subquery), db
-            )?;
-            let result = crate::executor::execute(plan, db)?;
-            let exists = !result.rows.is_empty();
-            let val = if negated { !exists } else { exists };
-            Ok(Expression::Literal(Value::Boolean(val)))
+            let mut probe = subquery.clone();
+            let normalized = normalize_outer_refs(&mut probe, outer, db);
+            if normalized {
+                Ok(Expression::Exists { subquery: probe, negated })
+            } else {
+                let plan = crate::sql::planner::plan(
+                    crate::sql::ast::Statement::Select(*subquery), db
+                )?;
+                let result = crate::executor::execute(plan, db)?;
+                let exists = !result.rows.is_empty();
+                let val = if negated { !exists } else { exists };
+                Ok(Expression::Literal(Value::Boolean(val)))
+            }
         }
         Expression::InSubquery { expr, subquery, negated } => {
-            let plan = crate::sql::planner::plan(
-                crate::sql::ast::Statement::Select(*subquery), db
-            )?;
-            let result = crate::executor::execute(plan, db)?;
-            let values: Vec<Expression> = result.rows.iter()
-                .filter_map(|r| r.first().cloned())
-                .map(Expression::Literal)
-                .collect();
-            let list = Expression::InList {
-                expr,
-                list: values,
-            };
-            if negated {
-                Ok(Expression::UnaryOp {
-                    op: crate::sql::ast::UnaryOperator::Not,
-                    expr: Box::new(list),
+            let mut probe = subquery.clone();
+            if normalize_outer_refs(&mut probe, outer, db) {
+                Ok(Expression::InSubquery {
+                    expr: Box::new(resolve_subqueries_in_expr_only_inner_refs(*expr, db, outer)?),
+                    subquery: probe,
+                    negated,
                 })
             } else {
-                Ok(list)
+                let plan = crate::sql::planner::plan(
+                    crate::sql::ast::Statement::Select(*subquery), db
+                )?;
+                let result = crate::executor::execute(plan, db)?;
+                let values: Vec<Expression> = result.rows.iter()
+                    .filter_map(|r| r.first().cloned())
+                    .map(Expression::Literal)
+                    .collect();
+                let list = Expression::InList {
+                    expr,
+                    list: values,
+                };
+                if negated {
+                    Ok(Expression::UnaryOp {
+                        op: crate::sql::ast::UnaryOperator::Not,
+                        expr: Box::new(list),
+                    })
+                } else {
+                    Ok(list)
+                }
             }
         }
         Expression::BinaryOp { left, op, right } => Ok(Expression::BinaryOp {
-            left: Box::new(resolve_subqueries_in_expr(*left, db)?),
+            left: Box::new(resolve_subqueries_in_expr(*left, db, outer)?),
             op,
-            right: Box::new(resolve_subqueries_in_expr(*right, db)?),
+            right: Box::new(resolve_subqueries_in_expr(*right, db, outer)?),
         }),
         Expression::UnaryOp { op, expr: inner } => Ok(Expression::UnaryOp {
             op,
-            expr: Box::new(resolve_subqueries_in_expr(*inner, db)?),
+            expr: Box::new(resolve_subqueries_in_expr(*inner, db, outer)?),
         }),
         Expression::Function { name, args, distinct, count_star, over } => {
             let mut resolved = Vec::with_capacity(args.len());
             for arg in args {
-                resolved.push(resolve_subqueries_in_expr(arg, db)?);
+                resolved.push(resolve_subqueries_in_expr(arg, db, outer)?);
             }
             Ok(Expression::Function { name, args: resolved, distinct, count_star, over })
         }
         Expression::Like { expr, pattern } => Ok(Expression::Like {
-            expr: Box::new(resolve_subqueries_in_expr(*expr, db)?),
-            pattern: Box::new(resolve_subqueries_in_expr(*pattern, db)?),
+            expr: Box::new(resolve_subqueries_in_expr(*expr, db, outer)?),
+            pattern: Box::new(resolve_subqueries_in_expr(*pattern, db, outer)?),
         }),
         Expression::Case { when_then, else_expr } => {
             let mut resolved = Vec::with_capacity(when_then.len());
             for (w, t) in when_then {
-                resolved.push((resolve_subqueries_in_expr(w, db)?, resolve_subqueries_in_expr(t, db)?));
+                resolved.push((resolve_subqueries_in_expr(w, db, outer)?, resolve_subqueries_in_expr(t, db, outer)?));
             }
             let resolved_else = match else_expr {
-                Some(e) => Some(Box::new(resolve_subqueries_in_expr(*e, db)?)),
+                Some(e) => Some(Box::new(resolve_subqueries_in_expr(*e, db, outer)?)),
                 None => None,
             };
             Ok(Expression::Case { when_then: resolved, else_expr: resolved_else })
         }
         Expression::Cast { expr, data_type } => Ok(Expression::Cast {
-            expr: Box::new(resolve_subqueries_in_expr(*expr, db)?),
+            expr: Box::new(resolve_subqueries_in_expr(*expr, db, outer)?),
             data_type,
         }),
-        Expression::IsNull(inner) => Ok(Expression::IsNull(Box::new(resolve_subqueries_in_expr(*inner, db)?))),
-        Expression::IsNotNull(inner) => Ok(Expression::IsNotNull(Box::new(resolve_subqueries_in_expr(*inner, db)?))),
+        Expression::IsNull(inner) => Ok(Expression::IsNull(Box::new(resolve_subqueries_in_expr(*inner, db, outer)?))),
+        Expression::IsNotNull(inner) => Ok(Expression::IsNotNull(Box::new(resolve_subqueries_in_expr(*inner, db, outer)?))),
         Expression::InList { expr, list } => {
             let mut resolved = Vec::with_capacity(list.len());
             for item in list {
-                resolved.push(resolve_subqueries_in_expr(item, db)?);
+                resolved.push(resolve_subqueries_in_expr(item, db, outer)?);
             }
-            Ok(Expression::InList { expr: Box::new(resolve_subqueries_in_expr(*expr, db)?), list: resolved })
+            Ok(Expression::InList { expr: Box::new(resolve_subqueries_in_expr(*expr, db, outer)?), list: resolved })
         }
         other => Ok(other),
     }
+}
+
+/// InSubquery 左侧表达式的解析：同样递归但其本身可含外层 ColumnRef
+/// （这些是 IN 的输入列，不属于被改写对象——由运行时 chunk 求值解析）。
+fn resolve_subqueries_in_expr_only_inner_refs(
+    expr: Expression,
+    db: &mut Database,
+    outer: &super::expression::OuterScope,
+) -> Result<Expression> {
+    // 与通用路径一致：其中的嵌套子查询才会被静态/推迟处理，
+    // 顶层 ColumnRef 原样保留（普通外层输入列）。
+    resolve_subqueries_in_expr(expr, db, outer)
 }
 
 #[cfg(test)]
