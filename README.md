@@ -14,7 +14,7 @@
 - 🔍 **多维度索引**：稀疏主索引 + 跳表二级索引 + 位图索引 + 布隆过滤器 + HNSW 向量索引 + 倒排索引（FTS）
 - 🚀 **向量化执行**：基于 DataChunk 的向量化查询引擎（1024 行/chunk），查询计划缓存
 - 🧠 **AI Agent 友好**：JSON 类型 + Vector 类型 + HNSW 语义检索 + 全文检索（BM25）+ 混合检索
-- 📊 **丰富类型**：BOOLEAN/INT32/INT64/FLOAT32/FLOAT64/VARCHAR/JSON/JSONB/VECTOR/VECTOR_INT8/BLOB/TIMESTAMP/**DATE**/**TIME**/**ARRAY**/**UUID**/**ENUM**
+- 📊 **丰富类型**：BOOLEAN/SMALLINT/INT32/INT64/FLOAT32/FLOAT64/DECIMAL/VARCHAR/JSON/JSONB/VECTOR/VECTOR_INT8/BLOB/TIMESTAMP/**DATE**/**TIME**/**ARRAY**/**UUID**/**ENUM**
 - 📋 **完整 SQL**：VIEW/CHECK约束/标量子查询/递归CTE/ALTER TABLE
 - 🔧 **类型转换**：DATE_TO_STRING/TIME_TO_STRING/UUID_TO_STRING 等内置函数
 - 🦀 **Rust 实现**：内存安全、零成本抽象、jemalloc 全局分配器
@@ -164,12 +164,41 @@ COMMIT;
 ### DDL
 ```sql
 CREATE TABLE table_name (
-    column_name TYPE [PRIMARY KEY] [NOT NULL],
+    column_name TYPE [PRIMARY KEY] [NOT NULL] [CHECK (expr)],
     ...
 );
 ```
 
-**支持类型**：`INT`, `BIGINT`, `DOUBLE`, `FLOAT32`, `VARCHAR`, `BOOLEAN`, `JSON`, `JSONB`, `VECTOR`, `VECTOR_INT8`, `BLOB`, `TIMESTAMP`, `DATE`, `TIME`, `ARRAY`, `UUID`, `ENUM`
+**支持类型**：`INT`, `BIGINT`, `SMALLINT`, `DOUBLE`, `FLOAT32`, `DECIMAL`/`NUMERIC`, `VARCHAR`, `BOOLEAN`, `JSON`, `JSONB`, `VECTOR`, `VECTOR_INT8`, `BLOB`, `TIMESTAMP`, `DATE`, `TIME`, `ARRAY`, `UUID`, `ENUM`
+
+### 视图 / ALTER TABLE（v0.22）
+```sql
+-- 视图（定义随数据库持久化）
+CREATE VIEW [OR REPLACE] view_name AS SELECT ...;
+DROP VIEW [IF EXISTS] view_name;
+
+-- ALTER TABLE
+ALTER TABLE t ADD COLUMN c TYPE;
+ALTER TABLE t DROP COLUMN c;
+ALTER TABLE t RENAME COLUMN old TO new;
+ALTER TABLE t RENAME TO new_name;
+```
+
+### CTE / 子查询（v0.22）
+```sql
+-- 递归 CTE（最大迭代 1000 次，防无限递归）
+WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x + 1 FROM cnt WHERE x < 10
+)
+SELECT * FROM cnt;
+
+-- 标量子查询 / IN / EXISTS 子查询
+SELECT name, (SELECT MAX(amount) FROM orders o WHERE o.uid = users.id) FROM users;
+SELECT * FROM users WHERE id IN (SELECT uid FROM orders);
+SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders o WHERE o.uid = users.id);
+```
 
 ### DML
 ```sql
@@ -247,6 +276,7 @@ engramdb/
 │   │   └── value_cmp.rs     # Value 跨类型比较
 │   ├── storage/             # 存储引擎
 │   │   ├── engine.rs        # 多引擎抽象层（StorageEngine trait + EngineTable 枚举）
+│   │   ├── capabilities.rs  # 引擎能力矩阵（planner 前置校验：索引/FTS/ALTER 等）
 │   │   ├── file_format.rs   # 单文件格式（文件头、页布局）
 │   │   ├── buffer_pool.rs   # LRU 缓冲池
 │   │   ├── column_store.rs  # 列存主存储（Row Group + Zone Map + Bloom）
@@ -336,7 +366,7 @@ engramdb/
 │   └── datafusion_ext/      # DataFusion TableProvider 集成（feature = "datafusion"）
 ├── tests/                   # 集成测试（19 个）
 ├── benches/                 # 基准测试（28 个 + native_bench 子项目）
-├── examples/                # 示例（27 个）
+├── examples/                # 示例（28 个）
 ├── docs/                    # 文档
 ├── scripts/                 # 构建脚本、Python 基准工具
 │   └── benchmarks/          # Python 性能对比脚本
