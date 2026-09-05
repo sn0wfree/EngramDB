@@ -16,11 +16,7 @@ use engramdb::common::tokenizer::{Tokenizer, UNKNOWN_ID};
 /// 缺失时跳过（原 `include_bytes!` 是编译期嵌入，缺文件直接编译失败，
 /// 曾导致 CI 全部测试无法运行）。
 fn load_vocab() -> Option<Vec<u8>> {
-    std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/data/vocab/engram_vocab_v1.bin"
-    ))
-    .ok()
+    std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/data/vocab/engram_vocab_v1.bin")).ok()
 }
 
 const GOLDEN: &str = include_str!("../data/vocab/engram_vocab_v1.golden.txt");
