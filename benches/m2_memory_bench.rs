@@ -142,7 +142,7 @@ fn main() {
         let start = Instant::now();
         for i in 0..50_000 {
             let db = conn.database_mut();
-            let rid = db.get_engine_table("m").unwrap().lookup_primary_key(&Value::Int64(i));
+            let rid = db.get_engine_table_mut("m").unwrap().lookup_primary_key(&Value::Int64(i));
             let _ = db.get_engine_table_mut("m").unwrap().get_row_by_id(rid.unwrap()).unwrap();
         }
         mem_samples.push(start.elapsed() / 50_000);
@@ -150,7 +150,7 @@ fn main() {
         let start = Instant::now();
         for i in 0..50_000 {
             let db = conn.database_mut();
-            let rid = db.get_engine_table("c").unwrap().lookup_primary_key(&Value::Int64(i));
+            let rid = db.get_engine_table_mut("c").unwrap().lookup_primary_key(&Value::Int64(i));
             let _ = db.get_engine_table_mut("c").unwrap().get_row_by_id(rid.unwrap()).unwrap();
         }
         col_samples.push(start.elapsed() / 50_000);
