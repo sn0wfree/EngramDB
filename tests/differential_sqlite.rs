@@ -418,7 +418,7 @@ fn diff_expression_arith() {
         "predicate expr",
         &mut eng,
         &lite,
-        "SELECT id FROM orders WHERE amount * 2 >= 900 ORDER BY oid",
+        "SELECT oid FROM orders WHERE amount * 2 >= 900 ORDER BY oid",
     );
     // v0.22.4：浮点除零 → NULL（对齐 SQLite；oid=1000 的 amount=0）
     assert_same(
