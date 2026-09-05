@@ -319,7 +319,12 @@ impl Default for Config {
             wal_group_commit_size: 16, // Perf04：默认组提交，吞吐提升 5~10×（可通过 0 关闭）
             wal_group_commit_max_bytes: 65536, // 64KB，按大小兜底
             wal_group_commit_timeout_ms: 10, // P0-3：距上次 fsync 超 10ms 则下次 commit 强制 sync（低流量延迟有界）
-            wal_batch_insert: true, // P0-2：autocommit INSERT 攒批合并（可通过 0 关闭）
+            // v0.22.2：默认关闭（durable-by-default）。autocommit 攒批的缓冲行
+            // 仅存于进程内存（未写 WAL），语句返回成功后进程崩溃会丢失这些
+            // "已确认"的行——违背 ACID。组提交（wal_group_commit_size，默认 16）
+            // 已摊销 fsync，攒批的增量收益有限。需要极限 autocommit 吞吐、
+            // 且接受崩溃丢批内行的场景可显式开启。
+            wal_batch_insert: false,
             insert_batch_rows: 1024, // P0-2：满 1024 行 flush
             insert_batch_bytes: 65536, // P0-2：满 64KB 估算字节 flush
             insert_batch_timeout_ms: 10, // P0-2：首行入批 10ms 后 flush（低流量延迟有界）
@@ -359,7 +364,8 @@ mod tests {
         assert_eq!(cfg.wal_group_commit_size, 16);
         assert_eq!(cfg.wal_group_commit_max_bytes, 65536);
         assert_eq!(cfg.wal_group_commit_timeout_ms, 10);
-        assert!(cfg.wal_batch_insert);
+        // v0.22.2：durable-by-default，autocommit 攒批默认关闭
+        assert!(!cfg.wal_batch_insert);
         assert_eq!(cfg.insert_batch_rows, 1024);
         assert_eq!(cfg.insert_batch_timeout_ms, 10);
         assert!(cfg.txn_batch_enabled);

@@ -199,12 +199,21 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
             }
             WalRecordType::Update => {
                 let Some((rowid, _, new_row)) = parse_update_payload(&rec.payload) else { continue };
-                table.update_row(rowid as u32, &new_row)?;
+                // v0.22.2：行不存在时跳过而非报错——redo 语义下 update 目标行
+                // 由同事务更早的 insert redo 保证；行缺失说明该 insert 从未
+                // 持久化（部分 flush），后续操作应为无操作。良性不一致不再
+                // 中断恢复把库变砖。
+                if table.get_row_by_id(rowid as u32)?.is_some() {
+                    table.update_row(rowid as u32, &new_row)?;
+                }
                 result.records_redone += 1;
             }
             WalRecordType::Delete => {
                 let Some((rowid, _)) = parse_delete_payload(&rec.payload) else { continue };
-                table.delete_row(rowid as u32)?;
+                // v0.22.2：同 Update——行缺失时删除为无操作
+                if table.get_row_by_id(rowid as u32)?.is_some() {
+                    table.delete_row(rowid as u32)?;
+                }
                 result.records_redone += 1;
             }
             _ => {}
@@ -212,6 +221,10 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
     }
 
     // 恢复完成：立即 checkpoint（数据落盘 + 写 Checkpoint 记录 → 幂等）
+    //
+    // v0.22.2 契约说明：只有重放完整成功才走到这里——上面任何 insert_row
+    // 失败都经 `?` 中止恢复（Database::open 随之失败，半恢复的内存态随
+    // 之丢弃），半恢复状态不可能被 checkpoint 固化。
     db.checkpoint()?;
     result.transactions_committed = redo.iter().filter(|r| r.record_type == WalRecordType::Commit).count() as u64;
     result.success = true;

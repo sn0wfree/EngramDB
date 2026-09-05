@@ -140,6 +140,7 @@ fn compute_single_window_function(rows: &[Vec<Value>], current_idx: usize, wf: &
             Value::Int64(dr)
         }
         WindowFuncType::Lag(offset) => {
+            // saturating：offset 为极大字面量时防 usize 溢出 panic
             if current_idx >= offset {
                 if let Some(col) = wf.input_column {
                     if col < rows[current_idx - offset].len() {
@@ -150,7 +151,8 @@ fn compute_single_window_function(rows: &[Vec<Value>], current_idx: usize, wf: &
             Value::Null
         }
         WindowFuncType::Lead(offset) => {
-            if current_idx + offset < rows.len() {
+            // saturating：offset 为极大字面量时防 current_idx + offset 溢出
+            if current_idx.saturating_add(offset) < rows.len() {
                 if let Some(col) = wf.input_column {
                     if col < rows[current_idx + offset].len() {
                         return rows[current_idx + offset][col].clone();
@@ -256,21 +258,31 @@ fn compute_frame_bounds(total_rows: usize, current_idx: usize, spec: &WindowSpec
         Some(f) => f,
         None => return (0, current_idx + 1),
     };
+    // v0.22.2：帧边界算术全部 saturating——极大 N（如 ROWS BETWEEN 1e19 FOLLOWING
+    // AND UNBOUNDED FOLLOWING）此前会 usize 溢出 panic
     let start = match &frame.start {
         WindowFrameBound::UnboundedPreceding => 0,
         WindowFrameBound::NPreceding(n) => current_idx.saturating_sub(*n),
         WindowFrameBound::CurrentRow => current_idx,
-        WindowFrameBound::NFollowing(n) => (current_idx + n).min(total_rows - 1),
-        WindowFrameBound::UnboundedFollowing => total_rows - 1,
+        WindowFrameBound::NFollowing(n) => current_idx.saturating_add(*n).min(total_rows.saturating_sub(1)),
+        WindowFrameBound::UnboundedFollowing => total_rows.saturating_sub(1),
     };
     let end = match &frame.end {
         Some(WindowFrameBound::UnboundedFollowing) => total_rows,
-        Some(WindowFrameBound::NFollowing(n)) => (current_idx + n + 1).min(total_rows),
+        Some(WindowFrameBound::NFollowing(n)) => current_idx.saturating_add(*n).saturating_add(1).min(total_rows),
         Some(WindowFrameBound::CurrentRow) => current_idx + 1,
         Some(WindowFrameBound::NPreceding(n)) => current_idx.saturating_sub(*n) + 1,
         None | Some(WindowFrameBound::UnboundedPreceding) => current_idx + 1,
     };
-    (start.min(total_rows), end.min(total_rows))
+    let (start, end) = (start.min(total_rows), end.min(total_rows));
+    // SQL 语义：frame start > frame end 时帧为空（聚合得 NULL/0）。
+    // 归一化为空区间，保证 start <= end 不变量（调用方现为 range 迭代
+    // 天然安全，此处防御未来改为切片的用法）。
+    if start > end {
+        (end, end)
+    } else {
+        (start, end)
+    }
 }
 
 fn rows_equal_on_order(a: &[Value], b: &[Value], _spec: &WindowSpec) -> bool {

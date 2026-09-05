@@ -2027,7 +2027,9 @@ fn eval_unary_value(v: &Value, op: UnaryOperator) -> Value {
                 return Value::Null;
             }
             if let Some(i) = v.as_i64() {
-                Value::Int64(-i)
+                // v0.22.2：-i64::MIN 溢出按算术溢出约定返回 NULL（与 eval_arith 一致），
+                // 不再直接取负（debug panic / release 静默环绕）
+                i.checked_neg().map(Value::Int64).unwrap_or(Value::Null)
             } else if let Some(f) = v.as_f64() {
                 Value::Float64(-f)
             } else {

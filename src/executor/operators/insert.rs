@@ -120,7 +120,9 @@ pub fn execute(
                 let all = db.insert_batcher().drain(table_name);
                 return execute_with_txn(db, table_name, all);
             }
-            // 已入批：事务语义等价于"已接受未提交"（WAL 组提交同款异步窗口）
+            // v0.22.2：已入批的行仅在内存（未写 WAL）——进程崩溃即丢。
+            // wal_batch_insert 默认 false（durable-by-default），开启即接受
+            // 该崩溃窗口（见 insert_batcher.rs 模块文档）。
             return Ok(n as u64);
         }
         // P0-2 事务级 Batcher：显式事务内 INSERT 攒入事务私有 buffer，

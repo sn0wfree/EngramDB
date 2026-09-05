@@ -93,17 +93,26 @@ impl<T: Clone> MvccStore<T> {
 
     /// 写入新版本（事务内写入，committed = false 表示未提交）
     /// 返回 true 表示写入成功，false 表示写-写冲突
+    ///
+    /// 冲突检测两阶段（v0.22.2 补全 first-committer-wins）：
+    /// 1. 链上有其他事务的**未提交**版本 → 冲突（先写者锁定）
+    /// 2. 最新已提交版本的 begin_ts（commit_txn 已改写为 commit_ts）晚于
+    ///    本事务的 start_ts → 本事务快照未见过该版本，SI 下拒绝写入
+    ///    （防止丢失更新）。调用方传入的 write_ts 语义即本事务 start_ts
+    ///    （见 TransactionManager 各写入路径）。
     pub fn write(&mut self, key: u64, value: T, txn_id: TxnId, write_ts: Timestamp) -> bool {
         let chain = self.versions.entry(key).or_insert_with(Vec::new);
 
-        // 写-写冲突检测：检查链头是否有其他事务的未提交版本
         for node in chain.iter().rev() {
             if !node.committed && node.txn_id != txn_id {
                 // 有其他未提交事务的版本，冲突
                 return false;
             }
-            // 找到第一个已提交版本就可以停了（无冲突）
             if node.committed {
+                // first-committer-wins：已提交版本在本事务开始后才提交
+                if node.begin_ts > write_ts && node.txn_id != txn_id {
+                    return false;
+                }
                 break;
             }
         }
@@ -145,6 +154,10 @@ impl<T: Clone> MvccStore<T> {
                         return false;
                     }
                     if node.committed {
+                        // v0.22.2 first-committer-wins（与 write 一致）
+                        if node.begin_ts > write_ts && node.txn_id != txn_id {
+                            return false;
+                        }
                         break;
                     }
                 }
@@ -824,6 +837,77 @@ mod tests {
         // txn1 提交后，新事务可以写（不会冲突，因为已提交版本不算"未提交其他事务"）
         let (txn2, ts2) = txn_table.begin_txn();
         assert!(store.write(1, 200, txn2, ts2));
+    }
+
+    // --- v0.22.2 first-committer-wins ---
+
+    #[test]
+    fn test_first_committer_wins_blocks_stale_writer() {
+        // T2 快照早于 T1 的提交 → T2 写同 key 必须被拒绝（防丢失更新）
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let mut txn_table = ActiveTxnTable::new();
+
+        let (txn1, ts1) = txn_table.begin_txn();
+        let (txn2, _ts2) = txn_table.begin_txn(); // T2 快照在 T1 提交之前
+
+        // T1 提交
+        assert!(store.write(1, 100, txn1, ts1));
+        let c1 = txn_table.commit_txn(txn1);
+        store.commit_txn(txn1, c1);
+
+        // T2 现在写同 key：其快照没见过 T1 的提交 → 冲突
+        assert!(!store.write(1, 200, txn2, _ts2));
+    }
+
+    #[test]
+    fn test_first_committer_wins_batch_stale_writer() {
+        // batch_write 与 write 语义一致：批量中任一 key 命中过期快照 → 整批拒绝
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let mut txn_table = ActiveTxnTable::new();
+
+        let (txn1, ts1) = txn_table.begin_txn();
+        let (txn2, ts2) = txn_table.begin_txn();
+
+        assert!(store.write(12, 100, txn1, ts1));
+        let c1 = txn_table.commit_txn(txn1);
+        store.commit_txn(txn1, c1);
+
+        // T2 批量写 10..15，key 12 在 T2 快照之后被 T1 提交 → 整批失败且零副作用
+        assert!(!store.batch_write(10, vec![1, 2, 3, 4, 5], txn2, ts2));
+        assert_eq!(store.version_count(10), 0);
+        assert_eq!(store.version_count(11), 0);
+        assert_eq!(store.version_count(12), 1);
+        assert_eq!(store.version_count(13), 0);
+    }
+
+    #[test]
+    fn test_first_committer_wins_allows_fresh_snapshot() {
+        // 新事务（begin 晚于提交）写同 key 不受影响
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let mut txn_table = ActiveTxnTable::new();
+
+        let (txn1, ts1) = txn_table.begin_txn();
+        store.write(1, 100, txn1, ts1);
+        let c1 = txn_table.commit_txn(txn1);
+        store.commit_txn(txn1, c1);
+
+        let (txn2, ts2) = txn_table.begin_txn();
+        assert!(ts2 > c1);
+        assert!(store.write(1, 200, txn2, ts2));
+    }
+
+    #[test]
+    fn test_first_committer_wins_own_versions_ok() {
+        // 同一事务多次写同 key 不应被自己的已提交版本挡住（防御性：不发生但不应误判）
+        let mut store: MvccStore<i32> = MvccStore::new();
+        let mut txn_table = ActiveTxnTable::new();
+
+        let (txn1, ts1) = txn_table.begin_txn();
+        assert!(store.write(1, 100, txn1, ts1));
+        assert!(store.write(1, 150, txn1, ts1)); // 自己的未提交版本，不冲突
+        let c1 = txn_table.commit_txn(txn1);
+        store.commit_txn(txn1, c1);
+        assert_eq!(store.get(1, c1), Some(&150));
     }
 
     // --- 回滚 ---

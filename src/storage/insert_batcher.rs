@@ -10,7 +10,12 @@
 //!   持 `&mut Database`，与 executor 互斥，天然隔离
 //! - 缓冲行在落盘前对其他语句不可见 → 所有非裸 INSERT 语句执行前必须
 //!   `flush_all_batched`（读己之写 + 语句间顺序）
-//! - 崩溃时丢失缓冲行 = 与 WAL 组提交窗口一致的异步窗口（`close` 时兜底 flush）
+//! - **持久性（v0.22.2 修正）**：缓冲行仅存于进程内存、未写 WAL——语句
+//!   返回成功后进程崩溃（SIGKILL/panic）会丢失这批行。这与 WAL 组提交
+//!   窗口不同（组提交的行已在 WAL 文件中，进程崩溃不丢，仅掉电有风险）。
+//!   因此 v0.22.2 起 `wal_batch_insert` 默认 **false**（durable-by-default），
+//!   需要极限 autocommit 吞吐且接受上述崩溃窗口的场景显式开启。
+//!   `close` / `Drop` / checkpoint 兜底 flush 覆盖正常退出路径。
 //! - INSERT ... RETURNING 绕过 batcher（需立即读回插入行）
 
 use std::collections::{HashMap, HashSet};

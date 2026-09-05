@@ -3,6 +3,49 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [0.22.2] - 2026-08-30
+
+### P0 剩余修复（恢复/MVCC/panic 面/持久性默认值）
+
+#### 恢复健壮性
+- **Update/Delete 重放幂等化**：WAL 重放时目标行不存在则跳过（redo 语义下
+  行缺失 = 其 insert 从未持久化，后续操作应为无操作）。良性不一致不再中断
+  恢复把库变砖
+- **fail-closed 契约文档化**：重放任何其他失败经 `?` 中止 → `Database::open`
+  失败 → 半恢复内存态丢弃，不可能被 checkpoint 固化
+
+#### MVCC first-committer-wins
+- **写-写冲突检测补全**：事务快照早于某 key 最新已提交版本（begin_ts > 本事务
+  start_ts）时拒绝写入，防快照隔离下的丢失更新。`write` / `batch_write` 两处
+  均覆盖，新增 4 个回归测试
+
+#### 用户可触发的 panic 修复（DoS 面）
+- **DECIMAL scale 解析期校验**：`DECIMAL(p, s)` 的 s > 38 报 Parse error
+  （此前 `as u8` 静默截断，求值时 10^scale 溢出 i128）
+- **窗口帧边界算术 saturating**：`ROWS BETWEEN 1e19 FOLLOWING ...` 不再
+  usize 溢出 panic；帧 start > end 归一化为空帧（SQL 语义：聚合得 NULL/0）；
+  LAG/LEAD 极大 offset 同样 saturating
+- **一元取负溢出**：`-(-9223372036854775808)` 按算术溢出约定返回 NULL，
+  与 eval_arith 的 checked 算术约定一致
+
+#### 持久性默认值（**行为变更**）
+- **`wal_batch_insert` 默认 false（durable-by-default）**：autocommit 攒批的
+  缓冲行仅存于进程内存、未写 WAL，语句返回成功后进程崩溃会丢失这批
+  "已确认"的行——违背 ACID。旧注释声称与 WAL 组提交窗口一致是错误的
+  （组提交的行已在 WAL 文件中，进程崩溃不丢）。组提交（默认 16）仍然
+  摊销 fsync；需要极限 autocommit 吞吐且接受崩溃丢批内行的场景显式
+  开启 `wal_batch_insert = true`。事务级攒批（`txn_batch_enabled`）语义
+  正确（崩溃时事务本应回滚），保持默认开启
+
+### 修改文件
+- `src/wal/recovery.rs`：Update/Delete 重放幂等化 + 契约注释
+- `src/txn/mvcc.rs`：first-committer-wins（write/batch_write）+ 4 测试
+- `src/sql/parser.rs`：DECIMAL scale 校验
+- `src/executor/operators/window.rs`：帧边界 saturating + 空帧归一化
+- `src/executor/expression.rs`：checked_neg
+- `src/common/config.rs`：`wal_batch_insert` 默认 false + 默认值测试
+- `src/storage/insert_batcher.rs` / `src/executor/operators/insert.rs`：语义文档修正
+
 ## [0.22.1] - 2026-08-30
 
 ### 崩溃安全加固（P0 修复）

@@ -1693,6 +1693,14 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
                 sqlast::ExactNumberInfo::None => Ok(DataType::Decimal { scale: 0 }),
                 sqlast::ExactNumberInfo::Precision(_) => Ok(DataType::Decimal { scale: 0 }),
                 sqlast::ExactNumberInfo::PrecisionAndScale(_, s) => {
+                    // v0.22.2：scale 上限 38（i128 十进制有效位）。此前 `as u8`
+                    // 静默截断（如 DECIMAL(1,300) → scale 44），求值时 10^scale
+                    // 溢出 i128 panic。
+                    if *s > 38 {
+                        return Err(EngramDbError::Parse(format!(
+                            "DECIMAL scale {} out of range (max 38)", s
+                        )));
+                    }
                     Ok(DataType::Decimal { scale: *s as u8 })
                 }
             }

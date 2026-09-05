@@ -21,7 +21,8 @@
 
 ## 二、必须先修的问题（P0）
 
-> **状态更新（v0.22.1）**：以下 P0-1（文件头原子性）、P0-2（打开路径 panic）、P0-5（OFFSET/缓存失效）已修复并通过代码审查级自查；修复内容见 CHANGELOG 0.22.1 与 `test_header_torn_write_recovers_from_replica` 等回归测试。**尚未修复**：P0-3（裸 INSERT 攒批崩溃丢行）、P0-4（恢复半途失败固化）、P0-6（MVCC first-committer-wins）、P0-7~10（用户可触发 panic 面）。修复未经编译验证（本机 SAC 限制），需在可编译环境跑 `cargo test` 确认。
+> **状态更新（v0.22.1）**：以下 P0-1（文件头原子性）、P0-2（打开路径 panic）、P0-5（OFFSET/缓存失效）已修复并通过代码审查级自查；修复内容见 CHANGELOG 0.22.1 与 `test_header_torn_write_recovers_from_replica` 等回归测试。
+> **状态更新（v0.22.2）**：P0-3（攒批持久性——`wal_batch_insert` 默认改为 false，durable-by-default）、P0-4（恢复 Update/Delete 重放幂等化）、P0-6（MVCC first-committer-wins）、P0-7~10（DECIMAL 校验/窗口帧 saturating/checked_neg）已全部修复，见 CHANGELOG 0.22.2。**P0 清单清零。** 修复未经编译验证（本机 SAC 限制），需在可编译环境跑 `cargo test` 确认。
 
 ### 持久化与崩溃安全
 1. **主文件头非原子更新**：`storage/mod.rs:1470-1479` 数据 append 后原地重写 offset 0 的文件头，仅 flush 无 fsync，且 FileHeader **无 checksum、无双头、无 rename 原子替换**（mmap 路径有，主路径没有）。崩溃在 header 写一半 → 库打不开且无法检测。**修法：双 header 交替写 + CRC + fsync 序。**
