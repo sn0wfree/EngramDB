@@ -9,12 +9,12 @@
 
 use std::sync::Arc;
 
-use datafusion::prelude::*;
 use datafusion::arrow::util::pretty::print_batches;
+use datafusion::prelude::*;
 
+use engramdb::common::types::DataType;
 use engramdb::datafusion_ext::catalog::EngramDBSchema;
 use engramdb::datafusion_ext::table_provider::EngramDBTable;
-use engramdb::common::types::DataType;
 use engramdb::Value;
 
 /// 创建测试表
@@ -89,7 +89,10 @@ async fn test_count() {
 async fn test_where_filter() {
     let ctx = create_context();
 
-    let result = ctx.sql("SELECT name, age FROM users WHERE age > 30 ORDER BY age").await.unwrap();
+    let result = ctx
+        .sql("SELECT name, age FROM users WHERE age > 30 ORDER BY age")
+        .await
+        .unwrap();
     let batches = result.collect().await.unwrap();
 
     // age > 30: charlie(26)? 不对, 20+0*3=20, 20+1*3=23, 20+2*3=26, 20+3*3=29, 20+4*3=32...
@@ -121,7 +124,10 @@ async fn test_sum_avg() {
 async fn test_group_by() {
     let ctx = create_context();
 
-    let result = ctx.sql("SELECT active, COUNT(*) as cnt FROM users GROUP BY active ORDER BY active").await.unwrap();
+    let result = ctx
+        .sql("SELECT active, COUNT(*) as cnt FROM users GROUP BY active ORDER BY active")
+        .await
+        .unwrap();
     let batches = result.collect().await.unwrap();
 
     // 2 组: active=true(4人), active=false(4人)
@@ -132,7 +138,10 @@ async fn test_group_by() {
 async fn test_order_by_limit() {
     let ctx = create_context();
 
-    let result = ctx.sql("SELECT name, score FROM users ORDER BY score DESC LIMIT 3").await.unwrap();
+    let result = ctx
+        .sql("SELECT name, score FROM users ORDER BY score DESC LIMIT 3")
+        .await
+        .unwrap();
     let batches = result.collect().await.unwrap();
 
     assert_eq!(batches[0].num_rows(), 3);
@@ -153,7 +162,10 @@ async fn test_order_by_limit() {
 async fn test_where_with_and() {
     let ctx = create_context();
 
-    let result = ctx.sql("SELECT name FROM users WHERE active = true AND age > 25 ORDER BY name").await.unwrap();
+    let result = ctx
+        .sql("SELECT name FROM users WHERE active = true AND age > 25 ORDER BY name")
+        .await
+        .unwrap();
     let batches = result.collect().await.unwrap();
 
     // active=true: id 1,3,5,7 → alice(20), charlie(26), eve(32), grace(38)

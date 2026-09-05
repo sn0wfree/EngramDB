@@ -92,8 +92,18 @@ fn test_on_commit_tick_interval() {
     }
 
     // 默认 TICK_INTERVAL = 1000 → 1500 commits 应触发 1 次
-    assert!(triggered >= 1, "expected at least 1 tick trigger, got {} out of {}", triggered, total);
-    assert!(triggered <= 2, "expected at most 2 tick triggers, got {} out of {}", triggered, total);
+    assert!(
+        triggered >= 1,
+        "expected at least 1 tick trigger, got {} out of {}",
+        triggered,
+        total
+    );
+    assert!(
+        triggered <= 2,
+        "expected at most 2 tick triggers, got {} out of {}",
+        triggered,
+        total
+    );
 }
 
 #[test]
@@ -141,5 +151,10 @@ fn test_scan_via_sql_records_heat() {
     }
 
     let after = conn.database_mut().heat_tracker().access_count(id);
-    assert!(after > before, "SQL scan should increment access count: {} -> {}", before, after);
+    assert!(
+        after > before,
+        "SQL scan should increment access count: {} -> {}",
+        before,
+        after
+    );
 }

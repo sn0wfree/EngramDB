@@ -13,8 +13,8 @@
 //! 4. Compact 次数
 //! 5. 查询性能（合并后 vs 合并前）
 
-use engramdb::{Connection, CompactStrategy, Value};
-use std::time::{Instant, Duration};
+use engramdb::{CompactStrategy, Connection, Value};
+use std::time::{Duration, Instant};
 
 const TABLE_SQL: &str = "CREATE TABLE bench (id INT, name VARCHAR, age INT, score DOUBLE, active BOOLEAN)";
 const TOTAL_ROWS: usize = 200_000;
@@ -22,25 +22,41 @@ const BATCH_SIZE: usize = 500; // 小批量写入，确保走 Delta 路径
 
 fn main() {
     println!("=== EngramDB v0.11.3 Compact 策略性能对比测试 ===\n");
-    println!("测试配置: {} 行，{} 行/批，5 列（Int/Varchar/Int/Double/Bool）\n", TOTAL_ROWS, BATCH_SIZE);
+    println!(
+        "测试配置: {} 行，{} 行/批，5 列（Int/Varchar/Int/Double/Bool）\n",
+        TOTAL_ROWS, BATCH_SIZE
+    );
 
     // 测试各策略
     let results = vec![
         run_strategy_bench("Manual (手动)", CompactStrategy::manual()),
         run_strategy_bench("Full (全量, 阈值=10K)", CompactStrategy::full(10_000)),
         run_strategy_bench("Full (全量, 阈值=50K)", CompactStrategy::full(50_000)),
-        run_strategy_bench("Incremental (阈值=10K, 批次=1K)", CompactStrategy::incremental(10_000, 1_000)),
-        run_strategy_bench("Incremental (阈值=50K, 批次=10K)", CompactStrategy::incremental(50_000, 10_000)),
-        run_strategy_bench("Incremental (阈值=50K, 批次=50K)", CompactStrategy::incremental(50_000, 50_000)),
-        run_strategy_bench("Adaptive (默认, min=10K/max=120K/10%)",
-            CompactStrategy::default_adaptive(122_880)),
-        run_strategy_bench("Adaptive (激进, min=5K/max=60K/5%)",
+        run_strategy_bench(
+            "Incremental (阈值=10K, 批次=1K)",
+            CompactStrategy::incremental(10_000, 1_000),
+        ),
+        run_strategy_bench(
+            "Incremental (阈值=50K, 批次=10K)",
+            CompactStrategy::incremental(50_000, 10_000),
+        ),
+        run_strategy_bench(
+            "Incremental (阈值=50K, 批次=50K)",
+            CompactStrategy::incremental(50_000, 50_000),
+        ),
+        run_strategy_bench(
+            "Adaptive (默认, min=10K/max=120K/10%)",
+            CompactStrategy::default_adaptive(122_880),
+        ),
+        run_strategy_bench(
+            "Adaptive (激进, min=5K/max=60K/5%)",
             CompactStrategy::Adaptive {
                 min_threshold: 5_000,
                 max_threshold: 60_000,
                 pct_of_table: 0.05,
                 batch_size: 60_000,
-            }),
+            },
+        ),
     ];
 
     // 输出汇总表
@@ -67,7 +83,10 @@ fn run_strategy_bench(name: &str, strategy: CompactStrategy) -> BenchResult {
     println!("────────────────────────────────────────");
     println!("策略: {}", name);
 
-    let path = format!("/tmp/bench_strategy_{}.db", name.replace(|c: char| !c.is_alphanumeric(), "_"));
+    let path = format!(
+        "/tmp/bench_strategy_{}.db",
+        name.replace(|c: char| !c.is_alphanumeric(), "_")
+    );
     let _ = std::fs::remove_file(&path);
 
     let mut conn = Connection::open(&path).unwrap();
@@ -126,7 +145,11 @@ fn run_strategy_bench(name: &str, strategy: CompactStrategy) -> BenchResult {
     let _ = result;
 
     println!("  总耗时: {:.2} ms", total_time_ms);
-    println!("  吞吐: {:.1} 行/秒 ({:.1} 万行/秒)", rows_per_sec, rows_per_sec / 10000.0);
+    println!(
+        "  吞吐: {:.1} 行/秒 ({:.1} 万行/秒)",
+        rows_per_sec,
+        rows_per_sec / 10000.0
+    );
     println!("  延迟 P50: {:.1} µs", p50);
     println!("  延迟 P99: {:.1} µs", p99);
     println!("  延迟 Max: {:.1} µs ({:.2} ms)", max_lat, max_lat / 1000.0);
@@ -160,8 +183,10 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 fn print_summary_table(results: &[BenchResult]) {
     println!("\n=== 汇总对比表 ===\n");
-    println!("{:<42} {:>12} {:>14} {:>12} {:>12} {:>10}",
-        "策略", "总耗时(ms)", "吞吐(万行/s)", "P50(µs)", "P99(µs)", "Max(ms)");
+    println!(
+        "{:<42} {:>12} {:>14} {:>12} {:>12} {:>10}",
+        "策略", "总耗时(ms)", "吞吐(万行/s)", "P50(µs)", "P99(µs)", "Max(ms)"
+    );
     println!("{}", "-".repeat(105));
 
     // 找基准（Manual）
@@ -178,7 +203,8 @@ fn print_summary_table(results: &[BenchResult]) {
             String::from(" (基准)")
         };
 
-        println!("{:<42} {:>12.2} {:>10.2}{:<10} {:>12.1} {:>12.1} {:>10.2}",
+        println!(
+            "{:<42} {:>12.2} {:>10.2}{:<10} {:>12.1} {:>12.1} {:>10.2}",
             r.name,
             r.total_time_ms,
             r.rows_per_sec / 10000.0,
@@ -192,8 +218,10 @@ fn print_summary_table(results: &[BenchResult]) {
 
 fn print_latency_comparison(results: &[BenchResult]) {
     println!("\n=== 延迟稳定性对比 ===\n");
-    println!("{:<42} {:>10} {:>10} {:>10} {:>12}",
-        "策略", "P50(µs)", "P99(µs)", "Max(ms)", "P99/P50 倍数");
+    println!(
+        "{:<42} {:>10} {:>10} {:>10} {:>12}",
+        "策略", "P50(µs)", "P99(µs)", "Max(ms)", "P99/P50 倍数"
+    );
     println!("{}", "-".repeat(80));
 
     for r in results {
@@ -202,7 +230,8 @@ fn print_latency_comparison(results: &[BenchResult]) {
         } else {
             0.0
         };
-        println!("{:<42} {:>10.1} {:>10.1} {:>10.2} {:>12.1}x",
+        println!(
+            "{:<42} {:>10.1} {:>10.1} {:>10.2} {:>12.1}x",
             r.name,
             r.p50_latency_us,
             r.p99_latency_us,

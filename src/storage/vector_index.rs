@@ -8,8 +8,8 @@
 //! 参考论文：https://arxiv.org/abs/1603.09320
 
 use crate::common::error::Result;
-use std::collections::BinaryHeap;
 use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 // ============================================================================
 // 距离度量
@@ -26,10 +26,13 @@ pub enum DistanceMetric {
 /// 计算 L2 距离平方（不开根号，不影响排序）
 #[inline]
 pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| {
-        let d = x - y;
-        d * d
-    }).sum()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
 }
 
 /// 计算内积
@@ -84,8 +87,12 @@ pub fn quantize_to_int8(v: &[f32]) -> (Vec<i8>, f32, f32) {
     let mut min = v[0];
     let mut max = v[0];
     for &x in v {
-        if x < min { min = x; }
-        if x > max { max = x; }
+        if x < min {
+            min = x;
+        }
+        if x > max {
+            max = x;
+        }
     }
     let range = max - min;
     if range == 0.0 {
@@ -117,11 +124,11 @@ pub fn dequantize_to_f32(q: &[i8], scale: f32, offset: f32) -> Vec<f32> {
 /// HNSW 索引配置
 #[derive(Debug, Clone)]
 pub struct HnswConfig {
-    pub dim: usize,           // 向量维度
-    pub m: usize,             // 每层每个节点的最大连接数 (M)
-    pub m_max0: usize,        // 第 0 层最大连接数 (M_max0)，通常 = 2*M
+    pub dim: usize,             // 向量维度
+    pub m: usize,               // 每层每个节点的最大连接数 (M)
+    pub m_max0: usize,          // 第 0 层最大连接数 (M_max0)，通常 = 2*M
     pub ef_construction: usize, // 构建时的搜索宽度 (efConstruction)
-    pub ef_search: usize,     // 查询时的搜索宽度 (efSearch)
+    pub ef_search: usize,       // 查询时的搜索宽度 (efSearch)
     pub metric: DistanceMetric,
     /// 是否启用 INT8 量化存储（v0.15.0 新增）
     ///
@@ -360,25 +367,31 @@ impl HnswIndex {
                 let dist = self.distance(query, &neighbor.vector);
 
                 // 加入候选
-                candidates.push(Reverse(SearchCandidate { distance: dist, id: neighbor_id }));
+                candidates.push(Reverse(SearchCandidate {
+                    distance: dist,
+                    id: neighbor_id,
+                }));
 
                 // 加入结果（维护 top-ef）
                 if results.len() < ef {
-                    results.push(SearchCandidate { distance: dist, id: neighbor_id });
+                    results.push(SearchCandidate {
+                        distance: dist,
+                        id: neighbor_id,
+                    });
                 } else if let Some(farthest) = results.peek() {
                     if dist < farthest.distance {
                         results.pop();
-                        results.push(SearchCandidate { distance: dist, id: neighbor_id });
+                        results.push(SearchCandidate {
+                            distance: dist,
+                            id: neighbor_id,
+                        });
                     }
                 }
             }
         }
 
         // 转换为升序结果
-        let mut result_vec: Vec<(f32, u32)> = results.into_vec()
-            .into_iter()
-            .map(|s| (s.distance, s.id))
-            .collect();
+        let mut result_vec: Vec<(f32, u32)> = results.into_vec().into_iter().map(|s| (s.distance, s.id)).collect();
         result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
         result_vec
     }
@@ -488,9 +501,7 @@ impl HnswIndex {
                     self.nodes[neighbor_id as usize].layers[level as usize].push(id);
                 } else {
                     // 邻居已满：先计算所有邻居的距离（不可变借用阶段）
-                    let neighbor_ids: Vec<u32> = self.nodes[neighbor_id as usize]
-                        .layers[level as usize]
-                        .clone();
+                    let neighbor_ids: Vec<u32> = self.nodes[neighbor_id as usize].layers[level as usize].clone();
                     let mut farthest_idx = 0;
                     let mut farthest_dist = dist;
                     for (j, &nid) in neighbor_ids.iter().enumerate() {
@@ -530,7 +541,11 @@ impl HnswIndex {
     /// 返回 (top-k 邻居, 搜索 trace)。自动过滤已逻辑删除（tombstone）的节点。
     pub fn search_with_trace(&self, query: &[f32], k: usize) -> (Vec<Neighbor>, SearchTrace) {
         let mut trace = SearchTrace::new();
-        trace.index_type = if self.config.quantize { "HNSW-INT8".to_string() } else { "HNSW".to_string() };
+        trace.index_type = if self.config.quantize {
+            "HNSW-INT8".to_string()
+        } else {
+            "HNSW".to_string()
+        };
         trace.metric = match self.config.metric {
             DistanceMetric::L2 => "L2".to_string(),
             DistanceMetric::InnerProduct => "InnerProduct".to_string(),
@@ -593,7 +608,8 @@ impl HnswIndex {
         trace.candidates_visited = seen.len();
 
         // 过滤 tombstone 节点，取前 k 个有效结果
-        let neighbors: Vec<Neighbor> = results.into_iter()
+        let neighbors: Vec<Neighbor> = results
+            .into_iter()
             .filter(|(_, id)| !self.deleted.contains(id))
             .take(k)
             .map(|(dist, id)| Neighbor { id, distance: dist })
@@ -662,23 +678,29 @@ impl HnswIndex {
                 let neighbor = &self.nodes[neighbor_id as usize];
                 let dist = self.distance(query, &neighbor.vector);
 
-                candidates.push(Reverse(SearchCandidate { distance: dist, id: neighbor_id }));
+                candidates.push(Reverse(SearchCandidate {
+                    distance: dist,
+                    id: neighbor_id,
+                }));
 
                 if results.len() < ef {
-                    results.push(SearchCandidate { distance: dist, id: neighbor_id });
+                    results.push(SearchCandidate {
+                        distance: dist,
+                        id: neighbor_id,
+                    });
                 } else if let Some(farthest) = results.peek() {
                     if dist < farthest.distance {
                         results.pop();
-                        results.push(SearchCandidate { distance: dist, id: neighbor_id });
+                        results.push(SearchCandidate {
+                            distance: dist,
+                            id: neighbor_id,
+                        });
                     }
                 }
             }
         }
 
-        let mut result_vec: Vec<(f32, u32)> = results.into_vec()
-            .into_iter()
-            .map(|s| (s.distance, s.id))
-            .collect();
+        let mut result_vec: Vec<(f32, u32)> = results.into_vec().into_iter().map(|s| (s.distance, s.id)).collect();
         result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
         (result_vec, visited_ids)
     }
@@ -727,7 +749,11 @@ impl HnswIndex {
             num_nodes: self.nodes.len(),
             max_level: self.max_level,
             total_connections,
-            avg_connections_per_node: if self.nodes.is_empty() { 0.0 } else { total_connections as f64 / self.nodes.len() as f64 },
+            avg_connections_per_node: if self.nodes.is_empty() {
+                0.0
+            } else {
+                total_connections as f64 / self.nodes.len() as f64
+            },
         }
     }
 
@@ -843,7 +869,7 @@ impl HnswIndex {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 9 {
             return Err(crate::common::error::EngramDbError::InvalidFormat(
-                "HNSW index data too short".into()
+                "HNSW index data too short".into(),
             ));
         }
 
@@ -851,7 +877,7 @@ impl HnswIndex {
         let is_v2 = &data[..9] == b"HNSW_IDX2";
         if !is_v2 && &data[..9] != b"HNSW_IDX1" {
             return Err(crate::common::error::EngramDbError::InvalidFormat(
-                "invalid HNSW index magic".into()
+                "invalid HNSW index magic".into(),
             ));
         }
 
@@ -861,10 +887,10 @@ impl HnswIndex {
         let read_u32 = |data: &[u8], off: &mut usize| -> Result<u32> {
             if *off + 4 > data.len() {
                 return Err(crate::common::error::EngramDbError::InvalidFormat(
-                    "truncated HNSW index data".into()
+                    "truncated HNSW index data".into(),
                 ));
             }
-            let val = u32::from_le_bytes(data[*off..*off+4].try_into().unwrap());
+            let val = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
             *off += 4;
             Ok(val)
         };
@@ -872,10 +898,10 @@ impl HnswIndex {
         let read_i32 = |data: &[u8], off: &mut usize| -> Result<i32> {
             if *off + 4 > data.len() {
                 return Err(crate::common::error::EngramDbError::InvalidFormat(
-                    "truncated HNSW index data".into()
+                    "truncated HNSW index data".into(),
                 ));
             }
-            let val = i32::from_le_bytes(data[*off..*off+4].try_into().unwrap());
+            let val = i32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
             *off += 4;
             Ok(val)
         };
@@ -883,10 +909,10 @@ impl HnswIndex {
         let read_f32 = |data: &[u8], off: &mut usize| -> Result<f32> {
             if *off + 4 > data.len() {
                 return Err(crate::common::error::EngramDbError::InvalidFormat(
-                    "truncated HNSW index data".into()
+                    "truncated HNSW index data".into(),
                 ));
             }
-            let val = f32::from_le_bytes(data[*off..*off+4].try_into().unwrap());
+            let val = f32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
             *off += 4;
             Ok(val)
         };
@@ -901,16 +927,19 @@ impl HnswIndex {
         // metric
         if offset + 1 > data.len() {
             return Err(crate::common::error::EngramDbError::InvalidFormat(
-                "truncated HNSW metric byte".into()
+                "truncated HNSW metric byte".into(),
             ));
         }
         let metric = match data[offset] {
             0 => DistanceMetric::L2,
             1 => DistanceMetric::InnerProduct,
             2 => DistanceMetric::Cosine,
-            other => return Err(crate::common::error::EngramDbError::InvalidFormat(
-                format!("unknown HNSW metric: {}", other)
-            )),
+            other => {
+                return Err(crate::common::error::EngramDbError::InvalidFormat(format!(
+                    "unknown HNSW metric: {}",
+                    other
+                )))
+            }
         };
         offset += 1;
 
@@ -918,7 +947,7 @@ impl HnswIndex {
         let quantize = if is_v2 {
             if offset + 1 > data.len() {
                 return Err(crate::common::error::EngramDbError::InvalidFormat(
-                    "truncated HNSW quantize byte".into()
+                    "truncated HNSW quantize byte".into(),
                 ));
             }
             let q = data[offset] != 0;
@@ -928,7 +957,15 @@ impl HnswIndex {
             false
         };
 
-        let config = HnswConfig { dim, m, m_max0, ef_construction, ef_search, metric, quantize };
+        let config = HnswConfig {
+            dim,
+            m,
+            m_max0,
+            ef_construction,
+            ef_search,
+            metric,
+            quantize,
+        };
 
         // max_level
         let max_level = read_i32(data, &mut offset)?;
@@ -953,7 +990,7 @@ impl HnswIndex {
             let has_quantized = if is_v2 {
                 if offset + 1 > data.len() {
                     return Err(crate::common::error::EngramDbError::InvalidFormat(
-                        "truncated HNSW quantized_flag".into()
+                        "truncated HNSW quantized_flag".into(),
                     ));
                 }
                 let flag = data[offset] != 0;
@@ -970,7 +1007,7 @@ impl HnswIndex {
                 for _ in 0..dim {
                     if offset >= data.len() {
                         return Err(crate::common::error::EngramDbError::InvalidFormat(
-                            "truncated HNSW quantized data".into()
+                            "truncated HNSW quantized data".into(),
                         ));
                     }
                     q.push(data[offset] as i8);
@@ -999,7 +1036,14 @@ impl HnswIndex {
                 layers.push(neighbors);
             }
 
-            nodes.push(HnswNode { id, vector, quantized, scale, offset: offset_f, layers });
+            nodes.push(HnswNode {
+                id,
+                vector,
+                quantized,
+                scale,
+                offset: offset_f,
+                layers,
+            });
         }
 
         // tombstone 集合（v0.12.0 DELETE 支持，可选段）
@@ -1012,7 +1056,13 @@ impl HnswIndex {
             }
         }
 
-        Ok(HnswIndex { config, nodes, enter_point, max_level, deleted })
+        Ok(HnswIndex {
+            config,
+            nodes,
+            enter_point,
+            max_level,
+            deleted,
+        })
     }
 }
 
@@ -1037,7 +1087,11 @@ pub struct BruteForceIndex {
 
 impl BruteForceIndex {
     pub fn new(dim: usize, metric: DistanceMetric) -> Self {
-        BruteForceIndex { dim, vectors: Vec::new(), metric }
+        BruteForceIndex {
+            dim,
+            vectors: Vec::new(),
+            metric,
+        }
     }
 
     pub fn insert(&mut self, v: Vec<f32>) -> u32 {
@@ -1048,14 +1102,22 @@ impl BruteForceIndex {
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
-        let mut results: Vec<Neighbor> = self.vectors.iter().enumerate().map(|(i, v)| {
-            let dist = match self.metric {
-                DistanceMetric::L2 => l2_distance_sq(query, v),
-                DistanceMetric::InnerProduct => -inner_product(query, v),
-                DistanceMetric::Cosine => -cosine_similarity(query, v),
-            };
-            Neighbor { id: i as u32, distance: dist }
-        }).collect();
+        let mut results: Vec<Neighbor> = self
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let dist = match self.metric {
+                    DistanceMetric::L2 => l2_distance_sq(query, v),
+                    DistanceMetric::InnerProduct => -inner_product(query, v),
+                    DistanceMetric::Cosine => -cosine_similarity(query, v),
+                };
+                Neighbor {
+                    id: i as u32,
+                    distance: dist,
+                }
+            })
+            .collect();
 
         results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
         results.truncate(k);
@@ -1124,7 +1186,12 @@ mod tests {
         let metric = DistanceMetric::L2;
 
         let mut hnsw = HnswIndex::new(HnswConfig {
-            dim, m: 16, m_max0: 32, ef_construction: 200, ef_search: 100, metric,
+            dim,
+            m: 16,
+            m_max0: 32,
+            ef_construction: 200,
+            ef_search: 100,
+            metric,
             quantize: false,
         });
         let mut bf = BruteForceIndex::new(dim, metric);
@@ -1192,7 +1259,11 @@ mod tests {
     #[test]
     fn test_hnsw_single_vector() {
         let mut index = HnswIndex::new(HnswConfig {
-            dim: 4, m: 4, m_max0: 8, ef_construction: 10, ef_search: 10,
+            dim: 4,
+            m: 4,
+            m_max0: 8,
+            ef_construction: 10,
+            ef_search: 10,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1211,7 +1282,11 @@ mod tests {
     fn test_inner_product_metric() {
         let dim = 8;
         let mut index = HnswIndex::new(HnswConfig {
-            dim, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
+            dim,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 30,
             metric: DistanceMetric::InnerProduct,
             quantize: false,
         });
@@ -1237,7 +1312,11 @@ mod tests {
     fn test_cosine_metric() {
         let dim = 8;
         let mut index = HnswIndex::new(HnswConfig {
-            dim, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
+            dim,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 30,
             metric: DistanceMetric::Cosine,
             quantize: false,
         });
@@ -1298,7 +1377,11 @@ mod tests {
     #[test]
     fn test_get_vector() {
         let mut index = HnswIndex::new(HnswConfig {
-            dim: 4, m: 4, m_max0: 8, ef_construction: 10, ef_search: 10,
+            dim: 4,
+            m: 4,
+            m_max0: 8,
+            ef_construction: 10,
+            ef_search: 10,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1313,7 +1396,11 @@ mod tests {
     #[test]
     fn test_hnsw_stats() {
         let mut index = HnswIndex::new(HnswConfig {
-            dim: 8, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
+            dim: 8,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 30,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1388,7 +1475,11 @@ mod tests {
     #[test]
     fn test_tombstone_mark_deleted() {
         let mut index = HnswIndex::new(HnswConfig {
-            dim: 4, m: 4, m_max0: 8, ef_construction: 20, ef_search: 20,
+            dim: 4,
+            m: 4,
+            m_max0: 8,
+            ef_construction: 20,
+            ef_search: 20,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1426,7 +1517,11 @@ mod tests {
         let dim = 8;
         let n = 50;
         let mut index = HnswIndex::new(HnswConfig {
-            dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
+            dim,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1460,7 +1555,11 @@ mod tests {
     #[test]
     fn test_tombstone_undelete() {
         let mut index = HnswIndex::new(HnswConfig {
-            dim: 4, m: 4, m_max0: 8, ef_construction: 20, ef_search: 20,
+            dim: 4,
+            m: 4,
+            m_max0: 8,
+            ef_construction: 20,
+            ef_search: 20,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1491,7 +1590,11 @@ mod tests {
     #[test]
     fn test_tombstone_serialization_roundtrip() {
         let mut index = HnswIndex::new(HnswConfig {
-            dim: 8, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
+            dim: 8,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 30,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1534,7 +1637,11 @@ mod tests {
     fn test_tombstone_backward_compatibility() {
         // 模拟旧版本格式（没有 tombstone 段）：手动构造不含 tombstone 的字节
         let mut index = HnswIndex::new(HnswConfig {
-            dim: 4, m: 4, m_max0: 8, ef_construction: 20, ef_search: 20,
+            dim: 4,
+            m: 4,
+            m_max0: 8,
+            ef_construction: 20,
+            ef_search: 20,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1565,7 +1672,11 @@ mod tests {
         let dim = 8;
         let n = 100;
         let mut index = HnswIndex::new(HnswConfig {
-            dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
+            dim,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1637,7 +1748,11 @@ mod tests {
         let dim = 8;
         let n = 100;
         let mut index = HnswIndex::new(HnswConfig {
-            dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
+            dim,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
             metric: DistanceMetric::L2,
             quantize: true,
         });
@@ -1669,12 +1784,20 @@ mod tests {
         let dim = 8;
         let n = 200;
         let mut f32_index = HnswIndex::new(HnswConfig {
-            dim, m: 16, m_max0: 32, ef_construction: 200, ef_search: 100,
+            dim,
+            m: 16,
+            m_max0: 32,
+            ef_construction: 200,
+            ef_search: 100,
             metric: DistanceMetric::L2,
             quantize: false,
         });
         let mut q_index = HnswIndex::new(HnswConfig {
-            dim, m: 16, m_max0: 32, ef_construction: 200, ef_search: 100,
+            dim,
+            m: 16,
+            m_max0: 32,
+            ef_construction: 200,
+            ef_search: 100,
             metric: DistanceMetric::L2,
             quantize: true,
         });
@@ -1711,7 +1834,11 @@ mod tests {
         let dim = 8;
         let n = 50;
         let mut index = HnswIndex::new(HnswConfig {
-            dim, m: 8, m_max0: 16, ef_construction: 100, ef_search: 50,
+            dim,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
             metric: DistanceMetric::L2,
             quantize: true,
         });
@@ -1733,7 +1860,11 @@ mod tests {
 
         // 验证量化数据已恢复
         for i in 0..n {
-            assert!(!restored.nodes[i as usize].quantized.is_empty(), "反序列化后节点 {} 应有量化数据", i);
+            assert!(
+                !restored.nodes[i as usize].quantized.is_empty(),
+                "反序列化后节点 {} 应有量化数据",
+                i
+            );
             assert_eq!(restored.nodes[i as usize].quantized.len(), dim);
         }
 
@@ -1749,7 +1880,11 @@ mod tests {
         // 构造一个 f32 索引，序列化为旧格式，然后反序列化
         let dim = 4;
         let mut index = HnswIndex::new(HnswConfig {
-            dim, m: 8, m_max0: 16, ef_construction: 50, ef_search: 30,
+            dim,
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 30,
             metric: DistanceMetric::L2,
             quantize: false,
         });
@@ -1768,7 +1903,7 @@ mod tests {
         buf.extend_from_slice(&0i32.to_le_bytes()); // max_level
         buf.extend_from_slice(&0u32.to_le_bytes()); // enter_point = 0
         buf.extend_from_slice(&1u32.to_le_bytes()); // num_nodes = 1
-        // node 0
+                                                    // node 0
         buf.extend_from_slice(&0u32.to_le_bytes()); // id = 0
         for f in [0.1f32, 0.2f32, 0.3f32, 0.4f32] {
             buf.extend_from_slice(&f.to_le_bytes());

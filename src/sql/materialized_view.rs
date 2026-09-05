@@ -99,10 +99,9 @@ impl MaterializedViewRegistry {
 
     /// 更新刷新时间
     pub fn mark_refreshed(&mut self, name: &str) -> Result<()> {
-        let mv = self.views.get_mut(name)
-            .ok_or_else(|| crate::common::error::EngramDbError::Internal(
-                format!("materialized view '{}' not found", name)
-            ))?;
+        let mv = self.views.get_mut(name).ok_or_else(|| {
+            crate::common::error::EngramDbError::Internal(format!("materialized view '{}' not found", name))
+        })?;
         mv.mark_refreshed();
         Ok(())
     }
@@ -147,10 +146,11 @@ impl<'a> QueryRewriter<'a> {
 
     /// 检查语句是否是物化视图相关操作
     pub fn is_mv_statement(stmt: &Statement) -> bool {
-        matches!(stmt,
+        matches!(
+            stmt,
             Statement::CreateMaterializedView { .. }
-            | Statement::RefreshMaterializedView { .. }
-            | Statement::DropMaterializedView { .. }
+                | Statement::RefreshMaterializedView { .. }
+                | Statement::DropMaterializedView { .. }
         )
     }
 }
@@ -232,11 +232,7 @@ mod tests {
 
     #[test]
     fn test_refresh_mode_default() {
-        let mv = MaterializedView::new(
-            "mv_mode".to_string(),
-            "SELECT 1".to_string(),
-            vec!["c".to_string()],
-        );
+        let mv = MaterializedView::new("mv_mode".to_string(), "SELECT 1".to_string(), vec!["c".to_string()]);
         assert_eq!(mv.refresh_mode, RefreshMode::Full);
     }
 

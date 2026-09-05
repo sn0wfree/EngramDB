@@ -45,7 +45,8 @@ fn test_engine_type_auto_serde() {
 
     let mut conn = Connection::open(path).unwrap();
     conn.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY) ENGINE = Auto").unwrap();
-    conn.execute("CREATE TABLE t2 (id INT64 PRIMARY KEY) ENGINE = Columnar").unwrap();
+    conn.execute("CREATE TABLE t2 (id INT64 PRIMARY KEY) ENGINE = Columnar")
+        .unwrap();
     conn.execute("CREATE TABLE t3 (id INT64 PRIMARY KEY) ENGINE = Memory").unwrap();
     conn.execute("CREATE TABLE t4 (id INT64 PRIMARY KEY) ENGINE = Log").unwrap();
     drop(conn);

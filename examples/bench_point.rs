@@ -1,11 +1,12 @@
-use std::time::Instant;
 use engramdb::{Connection, Value};
+use std::time::Instant;
 
 fn main() {
     // Setup with 10K rows
     {
         let mut conn = Connection::open("/tmp/test_point2.hdb").unwrap();
-        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)")
+            .unwrap();
         let stmt = conn.prepare("INSERT INTO t VALUES (?, ?, ?)").unwrap();
         let mut batch: Vec<Vec<Value>> = Vec::with_capacity(10000);
         for i in 0..10000 {

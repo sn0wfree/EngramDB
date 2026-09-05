@@ -34,7 +34,11 @@ fn fmt_us(ns: u128) -> String {
 
 fn main() {
     println!("=== Phase 2 P0-A: mmap Read Path Bench ===");
-    println!("File size: {} MB, {} iters per scenario", FILE_SIZE / 1024 / 1024, N_ITERS);
+    println!(
+        "File size: {} MB, {} iters per scenario",
+        FILE_SIZE / 1024 / 1024,
+        N_ITERS
+    );
     println!();
 
     // 准备测试文件
@@ -59,7 +63,10 @@ fn main() {
         let _ = total;
         samples.push(t0.elapsed().as_nanos());
     }
-    println!("  mmap 顺序读 16MB: median={} (total bytes consumed)", fmt_us(median(samples.clone())));
+    println!(
+        "  mmap 顺序读 16MB: median={} (total bytes consumed)",
+        fmt_us(median(samples.clone()))
+    );
     println!();
 
     // -------- 场景 B：mmap 随机读 4KB × 1000 --------
@@ -79,8 +86,12 @@ fn main() {
         samples.push(t0.elapsed().as_nanos());
     }
     let mmap_rand = median(samples.clone());
-    println!("  mmap 随机读 1000 次: median={} ({:.2} ns/op), last_byte={}",
-             fmt_us(mmap_rand), mmap_rand as f64 / 1000.0, last_byte);
+    println!(
+        "  mmap 随机读 1000 次: median={} ({:.2} ns/op), last_byte={}",
+        fmt_us(mmap_rand),
+        mmap_rand as f64 / 1000.0,
+        last_byte
+    );
     println!();
 
     // -------- 场景 C：与 EngramDB Connection 对比（基线）--------
@@ -91,12 +102,21 @@ fn main() {
 
     println!("=== 总结 ===");
     println!("  mmap 顺序读 16MB:  median = {}", fmt_us(median(samples)));
-    println!("  mmap 随机读 1000×4KB: median = {} ({:.2} ns/op)",
-             fmt_us(mmap_rand), mmap_rand as f64 / 1000.0);
+    println!(
+        "  mmap 随机读 1000×4KB: median = {} ({:.2} ns/op)",
+        fmt_us(mmap_rand),
+        mmap_rand as f64 / 1000.0
+    );
     println!();
     println!("Phase 2 P0-A KPI:");
-    println!("  热数据点查 ≤ 1µs (mmap 页缓存命中): {}",
-             if mmap_rand as f64 / 1000.0 < 1000.0 { "✅ 达成" } else { "⚠️  待优化" });
+    println!(
+        "  热数据点查 ≤ 1µs (mmap 页缓存命中): {}",
+        if mmap_rand as f64 / 1000.0 < 1000.0 {
+            "✅ 达成"
+        } else {
+            "⚠️  待优化"
+        }
+    );
     println!("  零拷贝（指针直接借用 mmap 内存）: ✅ 已实现");
 
     // 清理

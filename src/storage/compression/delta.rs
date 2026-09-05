@@ -230,13 +230,37 @@ mod tests {
 
     #[test]
     fn test_varint_roundtrip() {
-        let values: Vec<i64> = vec![0, 1, -1, 63, -63, 64, -64, 127, -127, 128, -128,
-                                   1000, -1000, 100000, -100000, i64::MAX, i64::MIN];
+        let values: Vec<i64> = vec![
+            0,
+            1,
+            -1,
+            63,
+            -63,
+            64,
+            -64,
+            127,
+            -127,
+            128,
+            -128,
+            1000,
+            -1000,
+            100000,
+            -100000,
+            i64::MAX,
+            i64::MIN,
+        ];
         for &v in &values {
             let mut buf = Vec::new();
             write_varint(&mut buf, v);
             let (decoded, consumed) = read_varint(&buf).unwrap();
-            assert_eq!(decoded, v, "failed for {} (buf len={}, consumed={})", v, buf.len(), consumed);
+            assert_eq!(
+                decoded,
+                v,
+                "failed for {} (buf len={}, consumed={})",
+                v,
+                buf.len(),
+                consumed
+            );
             assert_eq!(consumed, buf.len());
         }
     }
@@ -268,8 +292,13 @@ mod tests {
         let values: Vec<i64> = (0..1000).map(|i| 1_700_000_000 + i).collect();
         let encoded = encode_i64(&values);
         let original_size = values.len() * 8; // 8000 bytes
-        // delta=1 的 varint 只占 1 字节，加上第一个 8 字节 ≈ 1007 bytes
-        assert!(encoded.len() < original_size / 4, "compression not good enough: {} vs {}", encoded.len(), original_size);
+                                              // delta=1 的 varint 只占 1 字节，加上第一个 8 字节 ≈ 1007 bytes
+        assert!(
+            encoded.len() < original_size / 4,
+            "compression not good enough: {} vs {}",
+            encoded.len(),
+            original_size
+        );
         let decoded = decode_i64(&encoded).unwrap();
         assert_eq!(decoded, values);
     }

@@ -47,14 +47,16 @@
 
 use std::cmp::Ordering;
 
-use crate::Value as Value;
+use crate::Value;
 
 /// 类型 rank（用于"不相关类型兜底"，保证全序不 panic）
 fn type_rank(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
         Value::Boolean(_) => 1,
-        Value::Int16(_) | Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_) | Value::Date(_) | Value::Time(_) => 2,
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_) | Value::Date(_) | Value::Time(_) => {
+            2
+        }
         Value::Float32(_) | Value::Float64(_) => 3,
         Value::Decimal(_, _) => 4,
         Value::Varchar(_) | Value::Enum(_) => 5,
@@ -121,7 +123,7 @@ fn same_type_cmp(a: &Value, b: &Value) -> Ordering {
                     x.cmp(&ya)
                 }
             }
-        },
+        }
         // Vector/VectorInt8/Blob：序列长度优先，再按位比
         (Vector(x), Vector(y)) => {
             let len_ord = x.len().cmp(&y.len());
@@ -310,7 +312,10 @@ mod tests {
     #[test]
     fn test_varchar_lexicographic() {
         assert_eq!(total_cmp(&Varchar("a".into()), &Varchar("b".into())), Ordering::Less);
-        assert_eq!(total_cmp(&Varchar("abc".into()), &Varchar("ab".into())), Ordering::Greater);
+        assert_eq!(
+            total_cmp(&Varchar("abc".into()), &Varchar("ab".into())),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -318,7 +323,7 @@ mod tests {
         // 不相关类型（Int64 vs Varchar）：按 type_rank 兜底，全序不 panic
         assert_eq!(total_cmp(&Int64(100), &Varchar("a".into())), Ordering::Less); // rank 2 < 4
         assert_eq!(total_cmp(&Varchar("a".into()), &Float64(1.0)), Ordering::Greater); // rank 4 > 3
-        // Vector vs Blob：rank 6 < 8
+                                                                                       // Vector vs Blob：rank 6 < 8
         assert_eq!(total_cmp(&Vector(vec![1.0]), &Blob(vec![1])), Ordering::Less);
     }
 

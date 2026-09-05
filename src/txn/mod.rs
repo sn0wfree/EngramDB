@@ -6,14 +6,14 @@
 //! - I (Isolation): MVCC 快照隔离
 //! - D (Durability): WAL fsync 保证持久化
 
-pub mod transaction;
-pub mod mvcc;
 pub mod manager;
+pub mod mvcc;
+pub mod transaction;
 
 use crate::common::error::Result;
 
-pub use mvcc::{Timestamp, TxnId, MvccStore, ActiveTxnTable, Snapshot};
 pub use manager::TransactionManager;
+pub use mvcc::{ActiveTxnTable, MvccStore, Snapshot, Timestamp, TxnId};
 pub use transaction::Transaction;
 
 /// 事务状态

@@ -94,7 +94,8 @@ fn test_multi_table_persistence() {
     {
         let mut conn = Connection::open(db_path.to_str().unwrap()).unwrap();
         conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR)").unwrap();
-        conn.execute("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount DOUBLE)").unwrap();
+        conn.execute("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount DOUBLE)")
+            .unwrap();
         conn.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
         conn.execute("INSERT INTO orders VALUES (1, 1, 99.5)").unwrap();
         conn.close().unwrap();

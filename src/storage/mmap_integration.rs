@@ -39,11 +39,7 @@ use super::column_store::ColumnStore;
 ///
 /// 与 `data_to_bytes()` 格式完全一致（向后兼容）。
 /// 写入后文件可立即 mmap 读。
-pub fn data_to_mmap_file(
-    column_store: &mut ColumnStore,
-    path: &Path,
-    compress: bool,
-) -> Result<()> {
+pub fn data_to_mmap_file(column_store: &mut ColumnStore, path: &Path, compress: bool) -> Result<()> {
     let bytes = column_store.data_to_bytes(compress)?;
     let mut file = File::create(path)?;
     file.write_all(&bytes)?;
@@ -54,10 +50,7 @@ pub fn data_to_mmap_file(
 /// Phase 3 P1-B：从 mmap 文件读取列存数据
 ///
 /// 文件必须由 `data_to_mmap_file` 或 `data_to_bytes` 生成。
-pub fn data_from_mmap_file(
-    column_store: &mut ColumnStore,
-    path: &Path,
-) -> Result<()> {
+pub fn data_from_mmap_file(column_store: &mut ColumnStore, path: &Path) -> Result<()> {
     let file = File::open(path)?;
     // SAFETY: mmap 只读访问，文件由 data_to_mmap_file 生成
     let mmap = unsafe { MmapOptions::new().map(&file)? };
@@ -74,10 +67,12 @@ pub fn data_from_mmap_file(
 ///
 /// 当前实现：使用 std::fs::rename 原子替换。
 pub fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::rename(src, dst).map_err(|e| EngramDbError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!("atomic rename failed: {}", e),
-    )))?;
+    std::fs::rename(src, dst).map_err(|e| {
+        EngramDbError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("atomic rename failed: {}", e),
+        ))
+    })?;
     Ok(())
 }
 

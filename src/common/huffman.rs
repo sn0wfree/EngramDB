@@ -21,8 +21,7 @@ pub struct Code {
 
 /// 由码长表重建规范码字：(symbol, len) 按 (len, symbol) 排序，同长组内符号序递增
 pub fn canonical_codes(lengths: &[(u32, u8)]) -> FxHashMap<u32, Code> {
-    let mut sorted: Vec<(u8, u32)> =
-        lengths.iter().filter(|(_, l)| *l > 0).map(|(s, l)| (*l, *s)).collect();
+    let mut sorted: Vec<(u8, u32)> = lengths.iter().filter(|(_, l)| *l > 0).map(|(s, l)| (*l, *s)).collect();
     sorted.sort_unstable();
     let mut codes: FxHashMap<u32, Code> = FxHashMap::default();
     let mut code: u32 = 0;
@@ -55,15 +54,19 @@ pub fn build_lengths(freqs: &FxHashMap<u32, u64>) -> Vec<(u32, u8)> {
     let mut syms: Vec<u32> = freqs.keys().copied().collect();
     syms.sort_unstable();
     // 堆项：(Reverse<freq>, Reverse<node_id>)——node_id 保证同频确定性
-    let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, std::cmp::Reverse<usize>)> =
-        BinaryHeap::new();
+    let mut heap: BinaryHeap<(std::cmp::Reverse<u64>, std::cmp::Reverse<usize>)> = BinaryHeap::new();
     for s in syms {
         let f = freqs[&s];
         if f == 0 {
             continue;
         }
         let id = nodes.len();
-        nodes.push(HNode { freq: f, symbol: Some(s), left: None, right: None });
+        nodes.push(HNode {
+            freq: f,
+            symbol: Some(s),
+            left: None,
+            right: None,
+        });
         heap.push((std::cmp::Reverse(f), std::cmp::Reverse(id)));
     }
     if nodes.is_empty() {
@@ -124,7 +127,11 @@ impl HuffmanEncoder {
         symbols.sort_unstable();
         let len_map: FxHashMap<u32, u8> = lengths.iter().copied().collect();
         let lens: Vec<u8> = symbols.iter().map(|s| len_map[s]).collect();
-        Self { codes, symbols, lengths: lens }
+        Self {
+            codes,
+            symbols,
+            lengths: lens,
+        }
     }
 
     /// 表头字节（解码端重建）
@@ -204,11 +211,7 @@ impl HuffmanTable {
 
     /// 从码长对直接建表（免 header 序列化往返，静态表缓存路径）
     pub fn from_lengths(lengths: &[(u32, u8)]) -> Self {
-        let mut pairs: Vec<(u8, u32)> = lengths
-            .iter()
-            .filter(|(_, l)| *l > 0)
-            .map(|(s, l)| (*l, *s))
-            .collect();
+        let mut pairs: Vec<(u8, u32)> = lengths.iter().filter(|(_, l)| *l > 0).map(|(s, l)| (*l, *s)).collect();
         pairs.sort_unstable();
         Self::from_pairs(pairs)
     }
@@ -227,7 +230,11 @@ impl HuffmanTable {
             code = (code + count[len - 1]) << 1;
             first_code[len] = code;
         }
-        Self { first_code, count, symbols_by_len }
+        Self {
+            first_code,
+            count,
+            symbols_by_len,
+        }
     }
 }
 
@@ -243,7 +250,13 @@ pub struct HuffmanDecoder<'t> {
 impl<'t> HuffmanDecoder<'t> {
     /// 轻量构造：表借用共享（零克隆），仅流状态新建
     pub fn from_table(table: &'t HuffmanTable, stream: Vec<u8>) -> Self {
-        Self { table, data: stream, pos: 0, buf: 0, nbits: 0 }
+        Self {
+            table,
+            data: stream,
+            pos: 0,
+            buf: 0,
+            nbits: 0,
+        }
     }
 
     fn read_bit(&mut self) -> bool {

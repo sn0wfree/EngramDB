@@ -15,9 +15,8 @@ fn main() {
 
     // 1. 建表
     println!("1. 创建表 users...");
-    conn.execute(
-        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT, balance DOUBLE)"
-    ).unwrap();
+    conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT, balance DOUBLE)")
+        .unwrap();
     println!("   表创建成功\n");
 
     // 2. 批量插入
@@ -28,16 +27,16 @@ fn main() {
          (2, 'Bob', 25, 500.0), \
          (3, 'Charlie', 35, 2500.75), \
          (4, 'Diana', 28, 800.25), \
-         (5, 'Eve', 32, 3000.0)"
-    ).unwrap();
+         (5, 'Eve', 32, 3000.0)",
+    )
+    .unwrap();
     println!("   5 行数据已插入\n");
 
     // 3. 全表扫描
     println!("3. 查询所有用户:");
     let result = conn.execute("SELECT * FROM users").unwrap();
     for row in &result.rows {
-        println!("   id={}, name={}, age={}, balance={}",
-            row[0], row[1], row[2], row[3]);
+        println!("   id={}, name={}, age={}, balance={}", row[0], row[1], row[2], row[3]);
     }
     println!();
 
@@ -85,8 +84,18 @@ fn main() {
     println!("9. Prepared Statement 批量写入:");
     let stmt = conn.prepare("INSERT INTO users VALUES (?, ?, ?, ?)").unwrap();
     let batch = vec![
-        vec![Value::Int64(7), Value::Varchar("Grace".into()), Value::Int64(27), Value::Float64(1500.0)],
-        vec![Value::Int64(8), Value::Varchar("Henry".into()), Value::Int64(45), Value::Float64(4200.0)],
+        vec![
+            Value::Int64(7),
+            Value::Varchar("Grace".into()),
+            Value::Int64(27),
+            Value::Float64(1500.0),
+        ],
+        vec![
+            Value::Int64(8),
+            Value::Varchar("Henry".into()),
+            Value::Int64(45),
+            Value::Float64(4200.0),
+        ],
     ];
     let n = conn.execute_prepared_batch(&stmt, &batch).unwrap();
     println!("   批量插入 {} 行\n", n);

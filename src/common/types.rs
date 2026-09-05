@@ -31,14 +31,18 @@ pub enum DataType {
     ///
     /// 存储固定维度的 f32 向量，支持 HNSW 近似最近邻搜索。
     /// 维度在建表时指定（如 `VECTOR(1536)`），默认 0 表示动态维度。
-    Vector { dim: usize },
+    Vector {
+        dim: usize,
+    },
     /// INT8 量化向量类型（v0.15.0 新增）
     ///
     /// 存储 INT8 量化后的向量，存储量减少 75%（4x 压缩）。
     /// 基于 MinMax 量化，每个向量独立存储 scale/offset 参数。
     /// 搜索时自动反量化回 f32 计算距离，精度损失约 1-5% 召回率。
     /// 适合 AI embedding 等对精度要求不苛刻的场景。
-    VectorInt8 { dim: usize },
+    VectorInt8 {
+        dim: usize,
+    },
     /// BLOB 二进制数据（v0.13.0 新增）
     Blob,
     /// 精确十进制（v0.22.0 新增）
@@ -46,7 +50,9 @@ pub enum DataType {
     /// 存储为 (i128, u8)，表示 value 和 scale。
     /// scale 表示小数位数（0-38）。
     /// 适合金融计算、货币、精确度量等场景。
-    Decimal { scale: u8 },
+    Decimal {
+        scale: u8,
+    },
     /// 时间戳（v0.14.0 新增）
     ///
     /// 内部存储为 Unix 毫秒（i64 UTC），适合 Agent 日志/记忆等时间序列场景。
@@ -65,7 +71,9 @@ pub enum DataType {
     ///
     /// 存储同质元素数组，元素类型在建表时指定（如 `ARRAY(INT)`）。
     /// 适合标签、向量嵌入、JSON 路径结果等场景。
-    Array { element_type: Box<DataType> },
+    Array {
+        element_type: Box<DataType>,
+    },
     /// UUID 类型（v0.22.0 新增）
     ///
     /// 存储 128 位通用唯一标识符，内部表示为 u128。
@@ -75,7 +83,9 @@ pub enum DataType {
     ///
     /// 字符串枚举，存储为 Varchar 但只在预设值范围内。
     /// 适合性别、状态、等级等低基数分类字段。
-    Enum { values: Vec<String> },
+    Enum {
+        values: Vec<String>,
+    },
 }
 
 impl DataType {
@@ -158,7 +168,7 @@ impl ColumnDef {
             nullable: true,
             is_primary_key: false,
             default_value: None,
-                    check_expr: None,
+            check_expr: None,
             auto_increment: false,
         }
     }
@@ -557,7 +567,11 @@ mod tests {
     #[test]
     fn test_engine_type_from_str() {
         assert_eq!(EngineType::from_str("columnar"), Some(EngineType::Columnar));
-        assert_eq!(EngineType::from_str("COLUMNAR"), Some(EngineType::Columnar), "大小写不敏感");
+        assert_eq!(
+            EngineType::from_str("COLUMNAR"),
+            Some(EngineType::Columnar),
+            "大小写不敏感"
+        );
         assert_eq!(EngineType::from_str("memory"), Some(EngineType::Memory));
         assert_eq!(EngineType::from_str("log"), Some(EngineType::Log));
         assert_eq!(EngineType::from_str("unknown"), None);
@@ -585,7 +599,12 @@ mod tests {
 
     #[test]
     fn test_engine_type_to_u8_roundtrip() {
-        for e in [EngineType::Columnar, EngineType::Memory, EngineType::Log, EngineType::Auto] {
+        for e in [
+            EngineType::Columnar,
+            EngineType::Memory,
+            EngineType::Log,
+            EngineType::Auto,
+        ] {
             assert_eq!(EngineType::from_u8(e.to_u8()), Some(e));
         }
     }

@@ -177,11 +177,11 @@ mod tests {
     #[test]
     fn test_min_bit_width_power_of_two() {
         // 2^n 需要 n+1 位（因为从 0 开始算）
-        assert_eq!(min_bit_width(1), 1);    // 2^0
-        assert_eq!(min_bit_width(2), 2);    // 2^1
-        assert_eq!(min_bit_width(4), 3);    // 2^2
-        assert_eq!(min_bit_width(8), 4);    // 2^3
-        assert_eq!(min_bit_width(128), 8);  // 2^7
-        assert_eq!(min_bit_width(256), 9);  // 2^8
+        assert_eq!(min_bit_width(1), 1); // 2^0
+        assert_eq!(min_bit_width(2), 2); // 2^1
+        assert_eq!(min_bit_width(4), 3); // 2^2
+        assert_eq!(min_bit_width(8), 4); // 2^3
+        assert_eq!(min_bit_width(128), 8); // 2^7
+        assert_eq!(min_bit_width(256), 9); // 2^8
     }
 }

@@ -2,14 +2,14 @@
 //!
 //! 基于 Row Group 的列式存储，支持轻量级压缩
 
-use crate::common::error::Result;
-use crate::common::types::{DataType, TableDef};
-use crate::common::config::CompressionType;
-use crate::common::column_data::{ColumnData, ColumnValue};
-use crate::common::value_cmp::{total_cmp, total_eq};
-use crate::storage::bloom_filter::{bloomable_key, is_bloomable};
 use super::bloom::BloomFilter;
 use super::sparse_index::SparseIndex;
+use crate::common::column_data::{ColumnData, ColumnValue};
+use crate::common::config::CompressionType;
+use crate::common::error::Result;
+use crate::common::types::{DataType, TableDef};
+use crate::common::value_cmp::{total_cmp, total_eq};
+use crate::storage::bloom_filter::{bloomable_key, is_bloomable};
 use crate::Value;
 use std::sync::Arc;
 
@@ -47,13 +47,7 @@ fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 ///
 /// `start` 为全局行序偏移，`count` 为段行数，`cache` 为主键列连续副本。
 /// 返回命中行的全局行序（= row_id）。
-fn confirm_cached(
-    key: &Value,
-    start: u32,
-    count: u32,
-    cache: &ColumnData,
-    sorted: bool,
-) -> Result<Option<u32>> {
+fn confirm_cached(key: &Value, start: u32, count: u32, cache: &ColumnData, sorted: bool) -> Result<Option<u32>> {
     let (lo0, hi0) = (start as usize, (start + count) as usize);
     if sorted {
         let (mut lo, mut hi) = (lo0, hi0);
@@ -152,7 +146,9 @@ impl ColumnStore {
         let mut skipped = 0;
         for rg in &self.row_groups {
             let Some(chunk) = rg.columns.get(col_idx) else { continue };
-            let (Some(min), Some(max)) = (&chunk.min_value, &chunk.max_value) else { continue };
+            let (Some(min), Some(max)) = (&chunk.min_value, &chunk.max_value) else {
+                continue;
+            };
             let Some(lo) = cmp_values(min, val) else { continue };
             let Some(hi) = cmp_values(max, val) else { continue };
             use std::cmp::Ordering::*;
@@ -236,15 +232,15 @@ impl ColumnStore {
         if self.total_rows() != 0 {
             return;
         }
-        let Some(sparse) = self.sparse_primary.as_mut() else { return };
+        let Some(sparse) = self.sparse_primary.as_mut() else {
+            return;
+        };
         *sparse = SparseIndex::new(granule_rows.max(1));
     }
 
     /// 稀疏索引序列化状态（持久化用）：(bincode 字节, 全局有序标志)
     pub fn sparse_state(&self) -> Option<(Vec<u8>, bool)> {
-        self.sparse_primary
-            .as_ref()
-            .map(|s| (s.to_bytes(), self.sparse_sorted))
+        self.sparse_primary.as_ref().map(|s| (s.to_bytes(), self.sparse_sorted))
     }
 
     /// 恢复稀疏索引（load 用）；失败返回 false
@@ -268,7 +264,12 @@ impl ColumnStore {
 
         while !remaining.is_empty() {
             // 找到或创建当前 row group
-            let current_rg = if self.row_groups.last().map(|rg| rg.row_count < self.row_group_size).unwrap_or(false) {
+            let current_rg = if self
+                .row_groups
+                .last()
+                .map(|rg| rg.row_count < self.row_group_size)
+                .unwrap_or(false)
+            {
                 self.row_groups.len() - 1
             } else {
                 // 创建新的 row group
@@ -300,10 +301,7 @@ impl ColumnStore {
 
             // 按列追加，同时维护 MinMax 索引（S2-M1：直接构造类型化 ColumnData）
             for (col_idx, col_chunk) in rg.columns.iter_mut().enumerate() {
-                let vals: Vec<Value> = remaining[..take]
-                    .iter()
-                    .map(|row| row[col_idx].clone())
-                    .collect();
+                let vals: Vec<Value> = remaining[..take].iter().map(|row| row[col_idx].clone()).collect();
                 let new_data = ColumnData::from_values_typed(&vals, &col_chunk.data_type);
                 for (i, val) in vals.iter().enumerate() {
                     if val.is_null() {
@@ -371,7 +369,12 @@ impl ColumnStore {
 
         while remaining_rows > 0 {
             // 找到或创建当前 row group
-            let current_rg = if self.row_groups.last().map(|rg| rg.row_count < self.row_group_size).unwrap_or(false) {
+            let current_rg = if self
+                .row_groups
+                .last()
+                .map(|rg| rg.row_count < self.row_group_size)
+                .unwrap_or(false)
+            {
                 self.row_groups.len() - 1
             } else {
                 self.row_groups.push(RowGroup {
@@ -436,10 +439,7 @@ impl ColumnStore {
                         col_chunk.null_count += 1;
                     }
                     if let Some(d) = &mut col_chunk.data {
-                        let nulls = ColumnData::from_values_typed(
-                            &vec![Value::Null; take],
-                            &col_chunk.data_type,
-                        );
+                        let nulls = ColumnData::from_values_typed(&vec![Value::Null; take], &col_chunk.data_type);
                         d.append(&nulls);
                     } else {
                         col_chunk.data = Some(ColumnData::from_values_typed(
@@ -465,10 +465,9 @@ impl ColumnStore {
                         continue; // 已构建
                     }
                     if let Some(data) = &col_chunk.data {
-                        if let Some(bloom) = crate::storage::bloom_filter::build_bloom_from_column(
-                            data,
-                            &col_chunk.data_type,
-                        ) {
+                        if let Some(bloom) =
+                            crate::storage::bloom_filter::build_bloom_from_column(data, &col_chunk.data_type)
+                        {
                             col_chunk.bloom = Some(Arc::new(bloom));
                         }
                     }
@@ -490,7 +489,9 @@ impl ColumnStore {
     /// - 新段首键 < 末 granule 首键 → 全局有序性破坏 → 降级线性扫模式
     fn sparse_append(&mut self, columns: &[Vec<Value>], start_total: u64, sorted: bool) {
         let Some(pk_col) = self.sparse_pk_col else { return };
-        let Some(sparse) = self.sparse_primary.as_mut() else { return };
+        let Some(sparse) = self.sparse_primary.as_mut() else {
+            return;
+        };
         let Some(pk_values) = columns.get(pk_col) else { return };
         if pk_values.is_empty() || start_total > u32::MAX as u64 {
             return;
@@ -526,7 +527,11 @@ impl ColumnStore {
         for col in &mut rg.columns {
             if col.data.is_none() && !col.compressed_data.is_empty() {
                 let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
-                col.data = Some(ColumnData::deserialize_typed(&bytes, &col.data_type, col.uncompressed_count as usize));
+                col.data = Some(ColumnData::deserialize_typed(
+                    &bytes,
+                    &col.data_type,
+                    col.uncompressed_count as usize,
+                ));
                 col.compressed_data.clear();
                 col.compressed_data.shrink_to_fit();
                 col.compression = CompressionType::Uncompressed;
@@ -545,7 +550,11 @@ impl ColumnStore {
         // 惰性解压：如果数据是压缩状态，先解压
         if col.data.is_none() && !col.compressed_data.is_empty() {
             let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
-            col.data = Some(ColumnData::deserialize_typed(&bytes, &col.data_type, col.uncompressed_count as usize));
+            col.data = Some(ColumnData::deserialize_typed(
+                &bytes,
+                &col.data_type,
+                col.uncompressed_count as usize,
+            ));
             // 清空压缩态，避免后续 append / data_to_bytes 误用陈旧的 compressed_data
             col.compressed_data.clear();
             col.compressed_data.shrink_to_fit();
@@ -575,7 +584,8 @@ impl ColumnStore {
     ///
     /// 与 `read_column` 的区别：不需要可变借用，可同时持有多个列引用。
     pub fn get_column(&self, row_group_idx: usize, col_idx: usize) -> Option<&ColumnData> {
-        self.row_groups.get(row_group_idx)
+        self.row_groups
+            .get(row_group_idx)
             .and_then(|rg| rg.columns.get(col_idx))
             .and_then(|col| col.data.as_ref())
     }
@@ -625,7 +635,9 @@ impl ColumnStore {
     /// 零堆分配：granule 元组逐次块内读取（Copy），不收集 Vec。
     /// 快路径：数值主键首次点查惰性构建连续缓存，段内确认零除法/零压缩检查。
     pub fn locate_pk(&mut self, key: &Value) -> Result<Option<u32>> {
-        let Some(pk_col) = self.sparse_pk_col else { return Ok(None) };
+        let Some(pk_col) = self.sparse_pk_col else {
+            return Ok(None);
+        };
 
         // 惰性构建主键列连续缓存（数值主键 + 稀疏有数据时）
         if self.pk_value_cache.is_none()
@@ -657,7 +669,9 @@ impl ColumnStore {
             }
             let total = self.granule_count();
             for i in 0..total {
-                let Some((off, cnt)) = self.granule_range_opt(i) else { continue };
+                let Some((off, cnt)) = self.granule_range_opt(i) else {
+                    continue;
+                };
                 if let Some(v) = confirm_cached(key, off, cnt, cache, sorted)? {
                     return Ok(Some(v));
                 }
@@ -683,7 +697,9 @@ impl ColumnStore {
 
         let total = self.granule_count();
         for i in 0..total {
-            let Some((off, cnt)) = self.granule_range_opt(i) else { continue };
+            let Some((off, cnt)) = self.granule_range_opt(i) else {
+                continue;
+            };
             if let Some(v) = self.granule_confirm_range(key, pk_col, off, cnt)? {
                 return Ok(Some(v));
             }
@@ -703,7 +719,8 @@ impl ColumnStore {
 
     /// 读取第 idx 个 granule 的 (row_offset, row_count)
     fn granule_range_opt(&self, idx: usize) -> Option<(u32, u32)> {
-        self.sparse_primary.as_ref()?
+        self.sparse_primary
+            .as_ref()?
             .get_granule(idx)
             .map(|g| (g.row_offset, g.row_count))
     }
@@ -724,7 +741,11 @@ impl ColumnStore {
             }
         }
         let idx = lo.saturating_sub(1);
-        if idx < sparse.granule_count() { Some(idx) } else { None }
+        if idx < sparse.granule_count() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     /// 主键列是否适合连续缓存（数值类型：Copy 值，无堆分配）
@@ -742,7 +763,9 @@ impl ColumnStore {
 
     /// 惰性构建主键列连续缓存（跨 row group 拼装为单个 ColumnData）
     fn build_pk_cache(&mut self) -> Result<()> {
-        let Some(pk_col) = self.sparse_pk_col else { return Ok(()) };
+        let Some(pk_col) = self.sparse_pk_col else {
+            return Ok(());
+        };
         if !self.pk_cacheable(pk_col) {
             return Ok(());
         }
@@ -764,13 +787,7 @@ impl ColumnStore {
     }
 
     /// 单个 granule 段内确认：二分（段内有序）或线性（段内无序）
-    fn granule_confirm_range(
-        &mut self,
-        key: &Value,
-        pk_col: usize,
-        start: u32,
-        count: u32,
-    ) -> Result<Option<u32>> {
+    fn granule_confirm_range(&mut self, key: &Value, pk_col: usize, start: u32, count: u32) -> Result<Option<u32>> {
         let end = start + count;
         if self.sparse_sorted {
             // 段内必有序（compact 排序保证）→ 二分
@@ -831,10 +848,7 @@ impl ColumnStore {
                     continue;
                 }
                 if let Some(data) = &col.data {
-                    if let Some(bloom) = crate::storage::bloom_filter::build_bloom_from_column(
-                        data,
-                        &col.data_type,
-                    ) {
+                    if let Some(bloom) = crate::storage::bloom_filter::build_bloom_from_column(data, &col.data_type) {
                         col.bloom = Some(Arc::new(bloom));
                     }
                 }
@@ -856,7 +870,9 @@ impl ColumnStore {
     ///
     /// 顺带验证全局有序性（有序 → 后续可二分定位）。
     pub fn rebuild_sparse(&mut self) -> Result<()> {
-        let Some(pk_col) = self.sparse_pk_col else { return Ok(()) };
+        let Some(pk_col) = self.sparse_pk_col else {
+            return Ok(());
+        };
 
         // 先收集主键列值（读列需要 &mut self；随后再重建索引）
         let total = self.total_rows() as usize;
@@ -963,7 +979,11 @@ impl ColumnStore {
                 }
 
                 let bytes = compression::decompress(&col.compressed_data, col.compression.clone(), &col.data_type)?;
-                col.data = Some(ColumnData::deserialize_typed(&bytes, &col.data_type, col.uncompressed_count as usize));
+                col.data = Some(ColumnData::deserialize_typed(
+                    &bytes,
+                    &col.data_type,
+                    col.uncompressed_count as usize,
+                ));
                 col.compressed_data.clear();
                 col.compressed_data.shrink_to_fit();
                 col.compression = CompressionType::Uncompressed;
@@ -989,10 +1009,10 @@ impl ColumnStore {
                         DataType::Float64 => col.uncompressed_count as usize * 8,
                         DataType::Boolean => col.uncompressed_count as usize,
                         DataType::Varchar => col.uncompressed_count as usize * 12, // 估算
-                        DataType::Json => col.uncompressed_count as usize * 32, // 估算
-                        DataType::Jsonb => col.uncompressed_count as usize * 32, // 估算
+                        DataType::Json => col.uncompressed_count as usize * 32,    // 估算
+                        DataType::Jsonb => col.uncompressed_count as usize * 32,   // 估算
                         DataType::Vector { .. } => col.uncompressed_count as usize * 64, // 估算
-                        DataType::Blob => col.uncompressed_count as usize * 64, // 估算
+                        DataType::Blob => col.uncompressed_count as usize * 64,    // 估算
                         DataType::Timestamp => col.uncompressed_count as usize * 8,
                         DataType::Date => col.uncompressed_count as usize * 4,
                         DataType::Time => col.uncompressed_count as usize * 4,
@@ -1081,31 +1101,31 @@ impl ColumnStore {
                 // 计算落盘的 (compression, payload, uncompressed_count)——不修改内存状态
                 // - 内存中已压缩（compress_all 产物）：直接写压缩字节
                 // - 未压缩：序列化后按 `compress` 开关决定是否压缩
-                let (ctype, payload, ucount): (CompressionType, Vec<u8>, u32) =
-                    if !col.compressed_data.is_empty() {
-                        (col.compression, col.compressed_data.clone(), col.uncompressed_count)
-                    } else {
-                        let serialized = match &col.data {
-                            Some(d) => d.serialize_typed(&col.data_type),
-                            None => Vec::new(),
-                        };
-                        let count = match &col.data {
-                            Some(d) => d.len() as u32,
-                            None => 0,
-                        };
-                        if compress && !serialized.is_empty() {
-                            // Step 1.3：序列化压缩前确保 Bloom 存在
-                            if col.bloom.is_none() {
-                                if let Some(data) = &col.data {
-                                    col.bloom = crate::storage::bloom_filter::build_bloom_from_column(data, &col.data_type).map(std::sync::Arc::new);
-                                }
-                            }
-                            let (c, comp) = compression::compress(&serialized, &col.data_type)?;
-                            (c, comp, count)
-                        } else {
-                            (CompressionType::Uncompressed, serialized, count)
-                        }
+                let (ctype, payload, ucount): (CompressionType, Vec<u8>, u32) = if !col.compressed_data.is_empty() {
+                    (col.compression, col.compressed_data.clone(), col.uncompressed_count)
+                } else {
+                    let serialized = match &col.data {
+                        Some(d) => d.serialize_typed(&col.data_type),
+                        None => Vec::new(),
                     };
+                    let count = match &col.data {
+                        Some(d) => d.len() as u32,
+                        None => 0,
+                    };
+                    if compress && !serialized.is_empty() {
+                        // Step 1.3：序列化压缩前确保 Bloom 存在
+                        if col.bloom.is_none() {
+                            if let Some(data) = &col.data {
+                                col.bloom = crate::storage::bloom_filter::build_bloom_from_column(data, &col.data_type)
+                                    .map(std::sync::Arc::new);
+                            }
+                        }
+                        let (c, comp) = compression::compress(&serialized, &col.data_type)?;
+                        (c, comp, count)
+                    } else {
+                        (CompressionType::Uncompressed, serialized, count)
+                    }
+                };
 
                 // data_type
                 buf.push(data_type_to_u8(&col.data_type));
@@ -1156,7 +1176,11 @@ impl ColumnStore {
     /// 与 `data_to_bytes` 格式完全一致，但使用 MmapWriter 直接写文件，
     /// 不在内存中缓冲整个数据段。
     #[cfg(feature = "mmap-read")]
-    pub fn data_to_mmap_writer(&mut self, writer: &mut crate::storage::mmap_writer::MmapWriter, compress: bool) -> Result<()> {
+    pub fn data_to_mmap_writer(
+        &mut self,
+        writer: &mut crate::storage::mmap_writer::MmapWriter,
+        compress: bool,
+    ) -> Result<()> {
         let rg_count = self.row_groups.len() as u32;
         writer.write_u32(rg_count)?;
 
@@ -1165,25 +1189,24 @@ impl ColumnStore {
             writer.write_u32(rg.columns.len() as u32)?;
 
             for col in &mut rg.columns {
-                let (ctype, payload, ucount): (CompressionType, Vec<u8>, u32) =
-                    if !col.compressed_data.is_empty() {
-                        (col.compression, col.compressed_data.clone(), col.uncompressed_count)
-                    } else {
-                        let serialized = match &col.data {
-                            Some(d) => d.serialize_typed(&col.data_type),
-                            None => Vec::new(),
-                        };
-                        let count = match &col.data {
-                            Some(d) => d.len() as u32,
-                            None => 0,
-                        };
-                        if compress && !serialized.is_empty() {
-                            let (c, comp) = compression::compress(&serialized, &col.data_type)?;
-                            (c, comp, count)
-                        } else {
-                            (CompressionType::Uncompressed, serialized, count)
-                        }
+                let (ctype, payload, ucount): (CompressionType, Vec<u8>, u32) = if !col.compressed_data.is_empty() {
+                    (col.compression, col.compressed_data.clone(), col.uncompressed_count)
+                } else {
+                    let serialized = match &col.data {
+                        Some(d) => d.serialize_typed(&col.data_type),
+                        None => Vec::new(),
                     };
+                    let count = match &col.data {
+                        Some(d) => d.len() as u32,
+                        None => 0,
+                    };
+                    if compress && !serialized.is_empty() {
+                        let (c, comp) = compression::compress(&serialized, &col.data_type)?;
+                        (c, comp, count)
+                    } else {
+                        (CompressionType::Uncompressed, serialized, count)
+                    }
+                };
 
                 writer.push(data_type_to_u8(&col.data_type));
                 writer.push(ctype as u8);
@@ -1285,7 +1308,14 @@ impl ColumnStore {
                 // - 其它 → 压缩字节，惰性存入 compressed_data，由 read_column 首次访问时解压
                 let (col_data, compressed_data): (Option<ColumnData>, Vec<u8>) =
                     if compression == CompressionType::Uncompressed {
-                        (Some(ColumnData::deserialize_typed(payload, &data_type, uncompressed_count as usize)), Vec::new())
+                        (
+                            Some(ColumnData::deserialize_typed(
+                                payload,
+                                &data_type,
+                                uncompressed_count as usize,
+                            )),
+                            Vec::new(),
+                        )
                     } else {
                         (None, payload.to_vec())
                     };
@@ -1349,9 +1379,9 @@ impl ColumnStore {
                     let bloom_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     if bloom_len > 0 && offset + bloom_len <= data.len() {
-                        if let Some(b) = crate::storage::bloom_filter::ColumnBloom::from_bytes(
-                            &data[offset..offset + bloom_len],
-                        ) {
+                        if let Some(b) =
+                            crate::storage::bloom_filter::ColumnBloom::from_bytes(&data[offset..offset + bloom_len])
+                        {
                             bloom = Some(std::sync::Arc::new(b));
                         }
                         offset += bloom_len;
@@ -1403,13 +1433,7 @@ impl ColumnStore {
     /// 则整个 chunk 都可以跳过，无需解压和扫描。
     ///
     /// 返回 true 表示可以跳过（该 chunk 不可能包含满足条件的值）
-    pub fn can_skip_range(
-        &self,
-        row_group_idx: usize,
-        col_idx: usize,
-        low: &Value,
-        high: &Value,
-    ) -> bool {
+    pub fn can_skip_range(&self, row_group_idx: usize, col_idx: usize, low: &Value, high: &Value) -> bool {
         let rg = match self.row_groups.get(row_group_idx) {
             Some(rg) => rg,
             None => return true,
@@ -1442,9 +1466,7 @@ impl ColumnStore {
         };
 
         match (&col.min_value, &col.max_value) {
-            (Some(min), Some(max)) => {
-                value_less(val, min) || value_greater(val, max)
-            }
+            (Some(min), Some(max)) => value_less(val, min) || value_greater(val, max),
             _ => false,
         }
     }
@@ -1462,13 +1484,7 @@ impl ColumnStore {
     /// [min, max] 区间内但实际不存在时（如 id ∈ [1,100] 查 50 但表中
     /// 无 50），Bloom 判定"肯定不存在"整块跳过。压缩态列跳过 Bloom
     /// 检查（保持解压惰性，回退 MinMax-only）。
-    pub fn can_skip_predicate(
-        &mut self,
-        row_group_idx: usize,
-        col_idx: usize,
-        op: PredicateOp,
-        val: &Value,
-    ) -> bool {
+    pub fn can_skip_predicate(&mut self, row_group_idx: usize, col_idx: usize, op: PredicateOp, val: &Value) -> bool {
         let rg = match self.row_groups.get(row_group_idx) {
             Some(rg) => rg,
             None => return true,
@@ -1559,12 +1575,7 @@ impl ColumnStore {
     pub fn debug_minmax(&self) -> Vec<Vec<(Option<Value>, Option<Value>)>> {
         self.row_groups
             .iter()
-            .map(|rg| {
-                rg.columns
-                    .iter()
-                    .map(|c| (c.min_value.clone(), c.max_value.clone()))
-                    .collect()
-            })
+            .map(|rg| rg.columns.iter().map(|c| (c.min_value.clone(), c.max_value.clone())).collect())
             .collect()
     }
 }
@@ -1943,7 +1954,7 @@ pub fn deserialize_values(data: &[u8], data_type: &DataType, count: usize) -> Ve
         DataType::VectorInt8 { .. } => {
             for _ in 0..count {
                 if offset + 4 <= data.len() {
-                    let dim = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                    let dim = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     let byte_len = dim;
                     if offset + byte_len <= data.len() {
@@ -2234,8 +2245,24 @@ mod tests {
             engine: crate::common::types::EngineType::Columnar,
             name: "t".to_string(),
             columns: vec![
-                crate::common::types::ColumnDef { name: "id".to_string(), data_type: DataType::Int64, nullable: true, is_primary_key: false, default_value: None, auto_increment: false, check_expr: None },
-                crate::common::types::ColumnDef { name: "name".to_string(), data_type: DataType::Varchar, nullable: true, is_primary_key: false, default_value: None, auto_increment: false, check_expr: None },
+                crate::common::types::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_primary_key: false,
+                    default_value: None,
+                    auto_increment: false,
+                    check_expr: None,
+                },
+                crate::common::types::ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Varchar,
+                    nullable: true,
+                    is_primary_key: false,
+                    default_value: None,
+                    auto_increment: false,
+                    check_expr: None,
+                },
             ],
             row_count: 0,
             indexes: Vec::new(),
@@ -2318,20 +2345,21 @@ mod tests {
     fn test_bloom_rebuild_after_append() {
         // RG0 未满（2 行 < size 4）→ 追加落在同一 RG，验证 Bloom 失效重建
         let mut store = ColumnStore::new(make_table_def(), 4);
-        store.append_rows(&[
-            vec![Value::Int64(1), Value::Varchar("a".to_string())],
-            vec![Value::Int64(2), Value::Varchar("b".to_string())],
-        ]).unwrap();
+        store
+            .append_rows(&[
+                vec![Value::Int64(1), Value::Varchar("a".to_string())],
+                vec![Value::Int64(2), Value::Varchar("b".to_string())],
+            ])
+            .unwrap();
         // 第一次等值查询（构建 Bloom）
         assert!(!store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(1)));
         // 范围内不存在的值 → Bloom 跳过（MinMax 无法跳过）
         assert!(store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(3)));
 
         // 追加新行（同 RG）→ Bloom 失效并重建
-        store.append_rows(&[vec![
-            Value::Int64(3),
-            Value::Varchar("c".to_string()),
-        ]]).unwrap();
+        store
+            .append_rows(&[vec![Value::Int64(3), Value::Varchar("c".to_string())]])
+            .unwrap();
         // 新值必须可查（不假阴性）
         assert!(
             !store.can_skip_predicate(0, 0, PredicateOp::Eq, &Value::Int64(3)),
@@ -2376,22 +2404,58 @@ mod tests {
         assert!(matches_predicate(&Value::Int64(5), PredicateOp::Eq, &Value::Int32(5)));
         assert!(matches_predicate(&Value::Int32(4), PredicateOp::Lt, &Value::Int64(5)));
         // Int / Float64
-        assert!(matches_predicate(&Value::Int64(5), PredicateOp::Eq, &Value::Float64(5.0)));
-        assert!(matches_predicate(&Value::Int32(5), PredicateOp::Gt, &Value::Float64(4.9)));
+        assert!(matches_predicate(
+            &Value::Int64(5),
+            PredicateOp::Eq,
+            &Value::Float64(5.0)
+        ));
+        assert!(matches_predicate(
+            &Value::Int32(5),
+            PredicateOp::Gt,
+            &Value::Float64(4.9)
+        ));
         // 类型不匹配：返回 false（保守）
-        assert!(!matches_predicate(&Value::Varchar("x".into()), PredicateOp::Eq, &Value::Int64(0)));
+        assert!(!matches_predicate(
+            &Value::Varchar("x".into()),
+            PredicateOp::Eq,
+            &Value::Int64(0)
+        ));
     }
 
     #[test]
     fn test_matches_predicate_string_bool() {
         // Varchar
-        assert!(matches_predicate(&Value::Varchar("b".into()), PredicateOp::Gt, &Value::Varchar("a".into())));
-        assert!(!matches_predicate(&Value::Varchar("a".into()), PredicateOp::Gt, &Value::Varchar("a".into())));
-        assert!(matches_predicate(&Value::Varchar("a".into()), PredicateOp::LtEq, &Value::Varchar("a".into())));
+        assert!(matches_predicate(
+            &Value::Varchar("b".into()),
+            PredicateOp::Gt,
+            &Value::Varchar("a".into())
+        ));
+        assert!(!matches_predicate(
+            &Value::Varchar("a".into()),
+            PredicateOp::Gt,
+            &Value::Varchar("a".into())
+        ));
+        assert!(matches_predicate(
+            &Value::Varchar("a".into()),
+            PredicateOp::LtEq,
+            &Value::Varchar("a".into())
+        ));
         // Boolean
-        assert!(matches_predicate(&Value::Boolean(true), PredicateOp::Eq, &Value::Boolean(true)));
-        assert!(!matches_predicate(&Value::Boolean(true), PredicateOp::Eq, &Value::Boolean(false)));
-        assert!(matches_predicate(&Value::Boolean(false), PredicateOp::Lt, &Value::Boolean(true)));
+        assert!(matches_predicate(
+            &Value::Boolean(true),
+            PredicateOp::Eq,
+            &Value::Boolean(true)
+        ));
+        assert!(!matches_predicate(
+            &Value::Boolean(true),
+            PredicateOp::Eq,
+            &Value::Boolean(false)
+        ));
+        assert!(matches_predicate(
+            &Value::Boolean(false),
+            PredicateOp::Lt,
+            &Value::Boolean(true)
+        ));
     }
 
     #[test]
@@ -2410,7 +2474,13 @@ mod tests {
         use crate::common::column_data::ColumnData;
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        let ops = [PredicateOp::Eq, PredicateOp::Lt, PredicateOp::LtEq, PredicateOp::Gt, PredicateOp::GtEq];
+        let ops = [
+            PredicateOp::Eq,
+            PredicateOp::Lt,
+            PredicateOp::LtEq,
+            PredicateOp::Gt,
+            PredicateOp::GtEq,
+        ];
         for trial in 0..200 {
             let n = 1 + rng.gen_range(0..30);
             let kind = rng.gen_range(0..3); // Int64 / Float64 / Varchar
@@ -2426,7 +2496,9 @@ mod tests {
                     }
                 })
                 .collect();
-            let Some(data) = ColumnData::try_from_values(&values) else { continue };
+            let Some(data) = ColumnData::try_from_values(&values) else {
+                continue;
+            };
             let target = match kind {
                 0 => {
                     let t = rng.gen_range(0..3);
@@ -2449,8 +2521,16 @@ mod tests {
             for i in 0..n {
                 let typed = matches_predicate_typed(&data, i, op, &target);
                 let value = matches_predicate(&data.get(i), op, &target);
-                assert_eq!(typed, value, "trial {} i {} op {:?} col={:?} target={:?}",
-                    trial, i, op, data.get(i), target);
+                assert_eq!(
+                    typed,
+                    value,
+                    "trial {} i {} op {:?} col={:?} target={:?}",
+                    trial,
+                    i,
+                    op,
+                    data.get(i),
+                    target
+                );
             }
         }
     }

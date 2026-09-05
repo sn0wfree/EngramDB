@@ -2,21 +2,21 @@
 //!
 //! 整合列存主存储 + Delta 层
 
+use crate::common::column_data::{ColumnData, ColumnValue};
 use crate::common::config::CompactStrategy;
 use crate::common::error::Result;
-use crate::common::types::{TableDef, IndexDef, ColumnDef};
-use crate::common::column_data::{ColumnData, ColumnValue};
+use crate::common::types::{ColumnDef, IndexDef, TableDef};
 use crate::common::value_cmp::total_cmp;
-use crate::Value;
 use crate::executor::vector::{DataChunk, Vector};
+use crate::Value;
 
 use super::column_store::{matches_predicate, matches_predicate_typed, ColumnStore, PredicateOp};
 use super::delta_store::DeltaStore;
-use super::segment;
-use crate::search::TokenInvertedIndex;
 use super::index::skiplist::SkipListIndex;
-use super::vector_index::{HnswIndex, HnswConfig, DistanceMetric, Neighbor, SearchTrace};
+use super::segment;
+use super::vector_index::{DistanceMetric, HnswConfig, HnswIndex, Neighbor, SearchTrace};
 use crate::common::error::EngramDbError;
+use crate::search::TokenInvertedIndex;
 
 /// 按指定列对列式数据做聚簇重排
 ///
@@ -176,12 +176,7 @@ impl Table {
     /// 估算比较谓词可跳过的 row group 数（Zone Map，M1-6）
     ///
     /// 列存 row group 用 chunk min/max 判断可跳过；Delta 层全读（不可跳过，计 1 组）。
-    pub fn estimate_skip_for(
-        &self,
-        col_idx: usize,
-        op: PredicateOp,
-        val: &Value,
-    ) -> (usize, usize) {
+    pub fn estimate_skip_for(&self, col_idx: usize, op: PredicateOp, val: &Value) -> (usize, usize) {
         let (total, skipped) = self.column_store.estimate_skip(col_idx, op, val);
         let delta_total = if self.delta_store.len() > 0 { 1 } else { 0 };
         (total + delta_total, skipped)
@@ -432,13 +427,19 @@ impl Table {
                 // 数值归一化
                 use crate::Value::*;
                 match key {
-                    Int32(v) => idx.get(&Int64(*v as i64)).copied()
+                    Int32(v) => idx
+                        .get(&Int64(*v as i64))
+                        .copied()
                         .or_else(|| idx.get(&Timestamp(*v as i64)).copied())
                         .or_else(|| self.lookup_primary_key_layered(key, pk_idx)),
-                    Int64(v) => idx.get(&Int32(*v as i32)).copied()
+                    Int64(v) => idx
+                        .get(&Int32(*v as i32))
+                        .copied()
                         .or_else(|| idx.get(&Timestamp(*v)).copied())
                         .or_else(|| self.lookup_primary_key_layered(key, pk_idx)),
-                    Timestamp(v) => idx.get(&Int64(*v)).copied()
+                    Timestamp(v) => idx
+                        .get(&Int64(*v))
+                        .copied()
                         .or_else(|| idx.get(&Int32(*v as i32)).copied())
                         .or_else(|| self.lookup_primary_key_layered(key, pk_idx)),
                     _ => self.lookup_primary_key_layered(key, pk_idx),
@@ -465,11 +466,14 @@ impl Table {
         use crate::Value::*;
         match key {
             Int32(v) => [Int64(*v as i64), Timestamp(*v as i64)]
-                .iter().find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
+                .iter()
+                .find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
             Int64(v) => [Int32(*v as i32), Timestamp(*v)]
-                .iter().find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
+                .iter()
+                .find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
             Timestamp(v) => [Int64(*v), Int32(*v as i32)]
-                .iter().find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
+                .iter()
+                .find_map(|k| self.column_store.locate_pk(k).ok().flatten()),
             _ => {
                 let _ = pk_idx;
                 None
@@ -566,17 +570,25 @@ impl Table {
     ///
     /// 遍历现有数据构建索引。键列只支持单列（首列），
     /// 覆盖列冗余存储在索引条目中，查询时免回表。
-    pub fn create_index(&mut self, index_name: &str, key_cols: &[usize], included_cols: &[usize], unique: bool) -> Result<()> {
+    pub fn create_index(
+        &mut self,
+        index_name: &str,
+        key_cols: &[usize],
+        included_cols: &[usize],
+        unique: bool,
+    ) -> Result<()> {
         if self.indexes.contains_key(index_name) {
-            return Err(EngramDbError::ConstraintViolation(
-                format!("Index '{}' already exists", index_name)
-            ));
+            return Err(EngramDbError::ConstraintViolation(format!(
+                "Index '{}' already exists",
+                index_name
+            )));
         }
         for &k in key_cols {
             if k >= self.def.columns.len() {
-                return Err(EngramDbError::ColumnNotFound(
-                    format!("index key column index {} out of bounds", k)
-                ));
+                return Err(EngramDbError::ColumnNotFound(format!(
+                    "index key column index {} out of bounds",
+                    k
+                )));
             }
         }
 
@@ -605,8 +617,16 @@ impl Table {
             let row_count = key_data[0].len();
             for row_idx in 0..row_count {
                 let row_vals: Vec<Value> = key_data.iter().map(|col| col[row_idx].clone()).collect();
-                let key = if key_cols.len() == 1 { row_vals[0].clone() } else {
-                    Value::Varchar(key_cols.iter().map(|&k| format!("{:?}", row_vals[key_cols.iter().position(|&x| x == k).unwrap_or(0)])).collect::<Vec<_>>().join("|"))
+                let key = if key_cols.len() == 1 {
+                    row_vals[0].clone()
+                } else {
+                    Value::Varchar(
+                        key_cols
+                            .iter()
+                            .map(|&k| format!("{:?}", row_vals[key_cols.iter().position(|&x| x == k).unwrap_or(0)]))
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    )
                 };
                 let mut inc_vals = Vec::with_capacity(included_cols.len());
                 for col in &included_data {
@@ -614,9 +634,10 @@ impl Table {
                 }
                 let inserted = skiplist.insert_with_included(key, next_row_id, &inc_vals);
                 if unique && !inserted {
-                    return Err(EngramDbError::ConstraintViolation(
-                        format!("Duplicate key in unique index '{}'", index_name)
-                    ));
+                    return Err(EngramDbError::ConstraintViolation(format!(
+                        "Duplicate key in unique index '{}'",
+                        index_name
+                    )));
                 }
                 next_row_id += 1;
             }
@@ -631,9 +652,10 @@ impl Table {
             }
             let inserted = skiplist.insert_with_included(key, next_row_id, &inc_vals);
             if unique && !inserted {
-                return Err(EngramDbError::ConstraintViolation(
-                    format!("Duplicate key in unique index '{}'", index_name)
-                ));
+                return Err(EngramDbError::ConstraintViolation(format!(
+                    "Duplicate key in unique index '{}'",
+                    index_name
+                )));
             }
             next_row_id += 1;
         }
@@ -673,18 +695,27 @@ impl Table {
     /// - `metric`: 距离度量（L2 / InnerProduct / Cosine）
     /// - `m`: 每层最大连接数（默认 16）
     /// - `ef_construction`: 构建时搜索宽度（默认 100）
-    pub fn create_vector_index(&mut self, index_name: &str, col_idx: usize, metric: DistanceMetric, m: usize, ef_construction: usize) -> Result<()> {
+    pub fn create_vector_index(
+        &mut self,
+        index_name: &str,
+        col_idx: usize,
+        metric: DistanceMetric,
+        m: usize,
+        ef_construction: usize,
+    ) -> Result<()> {
         use crate::common::types::DataType;
 
         if self.vector_indexes.contains_key(index_name) {
-            return Err(EngramDbError::ConstraintViolation(
-                format!("Vector index '{}' already exists", index_name)
-            ));
+            return Err(EngramDbError::ConstraintViolation(format!(
+                "Vector index '{}' already exists",
+                index_name
+            )));
         }
         if col_idx >= self.def.columns.len() {
-            return Err(EngramDbError::ColumnNotFound(
-                format!("column index {} out of bounds", col_idx)
-            ));
+            return Err(EngramDbError::ColumnNotFound(format!(
+                "column index {} out of bounds",
+                col_idx
+            )));
         }
 
         // 验证列类型
@@ -692,15 +723,16 @@ impl Table {
         let dim = match &col_def.data_type {
             DataType::Vector { dim } => *dim,
             DataType::VectorInt8 { dim } => *dim,
-            _ => return Err(EngramDbError::InvalidFormat(
-                format!("column '{}' is not a vector type", col_def.name)
-            )),
+            _ => {
+                return Err(EngramDbError::InvalidFormat(format!(
+                    "column '{}' is not a vector type",
+                    col_def.name
+                )))
+            }
         };
 
         if dim == 0 {
-            return Err(EngramDbError::InvalidFormat(
-                "vector column dimension is 0".into()
-            ));
+            return Err(EngramDbError::InvalidFormat("vector column dimension is 0".into()));
         }
 
         // VectorInt8 列自动启用量化存储
@@ -796,12 +828,15 @@ impl Table {
         query: &[f32],
         k: usize,
     ) -> Result<(Vec<Neighbor>, SearchTrace)> {
-        let (index, id_mapping) = self.vector_indexes.get(index_name)
+        let (index, id_mapping) = self
+            .vector_indexes
+            .get(index_name)
             .ok_or_else(|| EngramDbError::IndexNotFound(index_name.into()))?;
 
         let (hnsw_results, mut trace) = index.search_with_trace(query, k);
         // 将 HNSW 内部 ID 转换为表行 ID
-        let neighbors: Vec<Neighbor> = hnsw_results.into_iter()
+        let neighbors: Vec<Neighbor> = hnsw_results
+            .into_iter()
             .map(|n| Neighbor {
                 id: id_mapping.get(n.id as usize).copied().unwrap_or(n.id),
                 distance: n.distance,
@@ -878,8 +913,7 @@ impl Table {
         // 格式：[mark_len:u32][bincode(BTreeMap<Value, u32>)]
         match &self.primary_index {
             Some(idx) => {
-                let bytes = bincode::serialize(idx)
-                    .expect("BTreeMap<Value, u32> serialization cannot fail");
+                let bytes = bincode::serialize(idx).expect("BTreeMap<Value, u32> serialization cannot fail");
                 buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&bytes);
             }
@@ -890,8 +924,7 @@ impl Table {
         // 格式：[sparse_len:u32][bincode((Vec<IndexGranule>, sorted))]
         match self.column_store.sparse_state() {
             Some((bytes, sorted)) => {
-                let payload = bincode::serialize(&(bytes, sorted))
-                    .expect("sparse index serialization cannot fail");
+                let payload = bincode::serialize(&(bytes, sorted)).expect("sparse index serialization cannot fail");
                 buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&payload);
             }
@@ -929,7 +962,7 @@ impl Table {
         let mut offset = 0;
 
         // --- SkipList 索引段 ---
-        let count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         for _ in 0..count {
@@ -937,12 +970,12 @@ impl Table {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated index name length".into()));
             }
-            let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + name_len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated index name".into()));
             }
-            let name = String::from_utf8(data[offset..offset+name_len].to_vec())
+            let name = String::from_utf8(data[offset..offset + name_len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid index name: {}", e)))?;
             offset += name_len;
 
@@ -950,12 +983,12 @@ impl Table {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated index data length".into()));
             }
-            let data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + data_len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated index data".into()));
             }
-            let index = SkipListIndex::from_bytes(&data[offset..offset+data_len])?;
+            let index = SkipListIndex::from_bytes(&data[offset..offset + data_len])?;
             offset += data_len;
 
             self.indexes.insert(name, index);
@@ -966,20 +999,22 @@ impl Table {
             return Ok(()); // 旧格式，没有向量索引段
         }
 
-        let vec_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        let vec_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         for _ in 0..vec_count {
             // name
             if offset + 4 > data.len() {
-                return Err(EngramDbError::InvalidFormat("truncated vector index name length".into()));
+                return Err(EngramDbError::InvalidFormat(
+                    "truncated vector index name length".into(),
+                ));
             }
-            let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + name_len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated vector index name".into()));
             }
-            let name = String::from_utf8(data[offset..offset+name_len].to_vec())
+            let name = String::from_utf8(data[offset..offset + name_len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid vector index name: {}", e)))?;
             offset += name_len;
 
@@ -987,26 +1022,26 @@ impl Table {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated hnsw data length".into()));
             }
-            let hnsw_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let hnsw_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + hnsw_len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated hnsw data".into()));
             }
-            let hnsw = HnswIndex::from_bytes(&data[offset..offset+hnsw_len])?;
+            let hnsw = HnswIndex::from_bytes(&data[offset..offset + hnsw_len])?;
             offset += hnsw_len;
 
             // id mapping
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated id mapping length".into()));
             }
-            let map_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let map_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + map_len * 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated id mapping data".into()));
             }
             let mut id_mapping = Vec::with_capacity(map_len);
             for _ in 0..map_len {
-                id_mapping.push(u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()));
+                id_mapping.push(u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()));
                 offset += 4;
             }
 
@@ -1019,16 +1054,15 @@ impl Table {
         if offset + 4 > data.len() {
             return Ok(()); // 旧格式，无主键段
         }
-        let mark_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        let mark_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if offset + mark_len > data.len() {
             return Err(EngramDbError::InvalidFormat("truncated primary mark index".into()));
         }
         if mark_len > 0 {
             let idx: std::collections::BTreeMap<crate::Value, u32> =
-                bincode::deserialize(&data[offset..offset+mark_len]).map_err(|e| {
-                    crate::common::error::EngramDbError::Serialization(e.to_string())
-                })?;
+                bincode::deserialize(&data[offset..offset + mark_len])
+                    .map_err(|e| crate::common::error::EngramDbError::Serialization(e.to_string()))?;
             self.primary_index = Some(idx);
         }
         // 注意：mark_len == 0 表示表无主键索引（primary_index 保持 None）
@@ -1039,16 +1073,14 @@ impl Table {
         if offset + 4 > data.len() {
             return Ok(()); // 旧格式，无稀疏段
         }
-        let sparse_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        let sparse_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if sparse_len > 0 {
             if offset + sparse_len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated sparse index".into()));
             }
-            let (bytes, sorted): (Vec<u8>, bool) =
-                bincode::deserialize(&data[offset..offset+sparse_len]).map_err(|e| {
-                    crate::common::error::EngramDbError::Serialization(e.to_string())
-                })?;
+            let (bytes, sorted): (Vec<u8>, bool) = bincode::deserialize(&data[offset..offset + sparse_len])
+                .map_err(|e| crate::common::error::EngramDbError::Serialization(e.to_string()))?;
             if !self.column_store.sparse_restore(&bytes, sorted) {
                 return Err(EngramDbError::InvalidFormat("invalid sparse index data".into()));
             }
@@ -1060,7 +1092,7 @@ impl Table {
         if offset + 4 > data.len() {
             return Ok(()); // 旧格式，无 FTS 段
         }
-        let fts_magic = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+        let fts_magic = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         if fts_magic == 0x4654_5321 {
             // v0.21.2+ 格式（zstd 压缩 + raw_len）
             offset += 4;
@@ -1074,24 +1106,24 @@ impl Table {
                 if offset + 4 > data.len() {
                     return Err(EngramDbError::InvalidFormat("truncated fts name length".into()));
                 }
-                let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                let name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
                 if offset + name_len > data.len() {
                     return Err(EngramDbError::InvalidFormat("truncated fts name".into()));
                 }
-                let name = String::from_utf8(data[offset..offset+name_len].to_vec())
+                let name = String::from_utf8(data[offset..offset + name_len].to_vec())
                     .map_err(|e| EngramDbError::InvalidFormat(format!("invalid fts name: {}", e)))?;
                 offset += name_len;
                 // data
                 if offset + 4 > data.len() {
                     return Err(EngramDbError::InvalidFormat("truncated fts data length".into()));
                 }
-                let data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+                let data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
                 if offset + data_len > data.len() {
                     return Err(EngramDbError::InvalidFormat("truncated fts data".into()));
                 }
-                let idx = TokenInvertedIndex::from_bytes(&data[offset..offset+data_len])
+                let idx = TokenInvertedIndex::from_bytes(&data[offset..offset + data_len])
                     .map_err(|e| EngramDbError::InvalidFormat(e))?;
                 offset += data_len;
                 self.fts_indexes.insert(name, idx);
@@ -1107,7 +1139,7 @@ impl Table {
             if *o + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated fts v2".into()));
             }
-            let v = u32::from_le_bytes(data[*o..*o+4].try_into().unwrap());
+            let v = u32::from_le_bytes(data[*o..*o + 4].try_into().unwrap());
             *o += 4;
             Ok(v)
         };
@@ -1117,7 +1149,7 @@ impl Table {
             if *offset + name_len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated fts v2 name".into()));
             }
-            let name = String::from_utf8(data[*offset..*offset+name_len].to_vec())
+            let name = String::from_utf8(data[*offset..*offset + name_len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid fts name: {}", e)))?;
             *offset += name_len;
             let raw_len = rd_u32(data, offset)? as usize;
@@ -1126,15 +1158,13 @@ impl Table {
                 return Err(EngramDbError::InvalidFormat("truncated fts v2 data".into()));
             }
             let raw = if data_len == raw_len {
-                data[*offset..*offset+data_len].to_vec() // 未压缩（压缩失败兜底）
+                data[*offset..*offset + data_len].to_vec() // 未压缩（压缩失败兜底）
             } else {
-                zstd::bulk::decompress(&data[*offset..*offset+data_len], raw_len).map_err(|e| {
-                    EngramDbError::InvalidFormat(format!("fts index decompress: {e}"))
-                })?
+                zstd::bulk::decompress(&data[*offset..*offset + data_len], raw_len)
+                    .map_err(|e| EngramDbError::InvalidFormat(format!("fts index decompress: {e}")))?
             };
             *offset += data_len;
-            let idx = TokenInvertedIndex::from_bytes(&raw)
-                .map_err(|e| EngramDbError::InvalidFormat(e))?;
+            let idx = TokenInvertedIndex::from_bytes(&raw).map_err(|e| EngramDbError::InvalidFormat(e))?;
             self.fts_indexes.insert(name, idx);
         }
         Ok(())
@@ -1199,7 +1229,8 @@ impl Table {
     /// 典型场景：AI Agent 交互存储按 session_id 聚簇，
     /// 查询单个会话的全部消息时只需顺序扫描少量连续数据块。
     pub fn set_cluster_key(&mut self, column_name: &str) -> Result<()> {
-        self.def.set_cluster_key(column_name)
+        self.def
+            .set_cluster_key(column_name)
             .map_err(|e| crate::common::error::EngramDbError::ColumnNotFound(e))?;
         Ok(())
     }
@@ -1262,7 +1293,10 @@ impl Table {
     /// 忽略 insert_with_included 返回值）；此检查在落盘前预检「已存在 + 批内
     /// 自重复」，失败时零副作用。键列取 `key_columns[0]`，与批量 apply 一致。
     fn check_unique_indexes(&mut self, rows: &[Vec<crate::Value>]) -> Result<()> {
-        let unique_defs: Vec<(String, usize)> = self.def.indexes.iter()
+        let unique_defs: Vec<(String, usize)> = self
+            .def
+            .indexes
+            .iter()
             .filter(|i| i.unique)
             .map(|i| (i.name.clone(), i.key_columns[0]))
             .collect();
@@ -1276,12 +1310,14 @@ impl Table {
                 if let Some(cell) = row.get(*key_col) {
                     if !seen[i].insert(cell.clone()) {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: index '{}'", name
+                            "UNIQUE constraint failed: index '{}'",
+                            name
                         )));
                     }
                     if self.indexes.get(name).is_some_and(|idx| idx.get_entries(cell).is_some()) {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: index '{}'", name
+                            "UNIQUE constraint failed: index '{}'",
+                            name
                         )));
                     }
                 }
@@ -1344,16 +1380,15 @@ impl Table {
         if !skip_pk_check {
             return false;
         }
-        !self.def.primary_key_index().map_or(false, |pk| self.def.columns[pk].auto_increment)
+        !self
+            .def
+            .primary_key_index()
+            .map_or(false, |pk| self.def.columns[pk].auto_increment)
     }
 
     /// 插入数据（事务 apply 可选跳过冲突预检已覆盖的 PK 复检）
     #[inline]
-    pub fn insert_with_check(
-        &mut self,
-        mut rows: Vec<Vec<Value>>,
-        skip_pk_check: bool,
-    ) -> Result<u64> {
+    pub fn insert_with_check(&mut self, mut rows: Vec<Vec<Value>>, skip_pk_check: bool) -> Result<u64> {
         let count = rows.len() as u64;
 
         // 类型强转：Varchar → Vector（处理 JSON 字面量）
@@ -1365,9 +1400,8 @@ impl Table {
 
         // AUTO_INCREMENT 自增分配（v0.14.0）
         // 用户未提供 auto_increment 列的值（或提供 0/NULL）时，自动分配并递增
-        let auto_inc_cols: Vec<(usize, &ColumnDef)> = self.def.columns.iter().enumerate()
-            .filter(|(_, c)| c.auto_increment)
-            .collect();
+        let auto_inc_cols: Vec<(usize, &ColumnDef)> =
+            self.def.columns.iter().enumerate().filter(|(_, c)| c.auto_increment).collect();
         if !auto_inc_cols.is_empty() {
             for row in rows.iter_mut() {
                 for (col_idx, col_def) in &auto_inc_cols {
@@ -1428,9 +1462,10 @@ impl Table {
             if !col_def.nullable {
                 for (row_idx, row) in rows.iter().enumerate() {
                     if row_idx < row.len() && row[col_idx].is_null() {
-                        return Err(EngramDbError::ConstraintViolation(
-                            format!("NOT NULL constraint failed: column '{}'", col_def.name)
-                        ));
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "NOT NULL constraint failed: column '{}'",
+                            col_def.name
+                        )));
                     }
                 }
             }
@@ -1502,11 +1537,7 @@ impl Table {
     /// 列式批量插入（事务 apply 可选跳过预检已覆盖的 PK 复检）
     ///
     /// 语义与 `insert_with_check` 一致，仅落盘走列式 `append_columns`。
-    pub fn insert_columns_with_check(
-        &mut self,
-        mut columns: Vec<Vec<Value>>,
-        skip_pk_check: bool,
-    ) -> Result<u64> {
+    pub fn insert_columns_with_check(&mut self, mut columns: Vec<Vec<Value>>, skip_pk_check: bool) -> Result<u64> {
         let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
         if num_rows == 0 {
             return Ok(0);
@@ -1529,7 +1560,11 @@ impl Table {
         }
 
         // AUTO_INCREMENT 自增分配（与 insert() 相同的分配规则）
-        let auto_inc_cols: Vec<usize> = self.def.columns.iter().enumerate()
+        let auto_inc_cols: Vec<usize> = self
+            .def
+            .columns
+            .iter()
+            .enumerate()
             .filter(|(_, c)| c.auto_increment)
             .map(|(i, _)| i)
             .collect();
@@ -1581,9 +1616,10 @@ impl Table {
             if !col_def.nullable {
                 for val in &columns[col_idx] {
                     if val.is_null() {
-                        return Err(EngramDbError::ConstraintViolation(
-                            format!("NOT NULL constraint failed: column '{}'", col_def.name)
-                        ));
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "NOT NULL constraint failed: column '{}'",
+                            col_def.name
+                        )));
                     }
                 }
             }
@@ -1618,7 +1654,11 @@ impl Table {
         self.def.row_count += num_rows as u64;
 
         // 索引维护（与 insert() 一致；仅在需要时才转置为行）
-        if self.def.primary_key_index().is_some() || !self.indexes.is_empty() || !self.vector_indexes.is_empty() || !self.fts_indexes.is_empty() {
+        if self.def.primary_key_index().is_some()
+            || !self.indexes.is_empty()
+            || !self.vector_indexes.is_empty()
+            || !self.fts_indexes.is_empty()
+        {
             let rows = transpose_columns_to_rows(&columns, num_rows);
             if self.primary_index_legacy {
                 self.primary_index_insert_batch(&rows, base_row_id);
@@ -1649,24 +1689,21 @@ impl Table {
         let col_def = &self.def.columns[col_idx];
 
         match col_def.data_type {
-            crate::common::types::DataType::Vector { .. }
-            | crate::common::types::DataType::VectorInt8 { .. } => {
+            crate::common::types::DataType::Vector { .. } | crate::common::types::DataType::VectorInt8 { .. } => {
                 if let Value::Varchar(s) = value {
                     // 去除首尾空白和引号（如果存在）
                     let trimmed = s.trim().trim_matches('\'').trim_matches('"');
                     // 去除数组括号
-                    let inner = trimmed
-                        .trim_start_matches('[')
-                        .trim_end_matches(']');
+                    let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
 
                     // 解析为 f32 数组
                     let floats: Vec<f32> = inner
                         .split(',')
                         .map(|v| v.trim().parse::<f32>())
                         .collect::<std::result::Result<Vec<f32>, _>>()
-                        .map_err(|e| crate::common::error::EngramDbError::Parse(format!(
-                            "Failed to parse vector literal: {}", e
-                        )))?;
+                        .map_err(|e| {
+                            crate::common::error::EngramDbError::Parse(format!("Failed to parse vector literal: {}", e))
+                        })?;
 
                     // 根据列类型转换
                     match col_def.data_type {
@@ -1675,7 +1712,8 @@ impl Table {
                         }
                         crate::common::types::DataType::VectorInt8 { .. } => {
                             // INT8 量化：将 f32 转换为 i8
-                            let int8_vec: Vec<i8> = floats.iter()
+                            let int8_vec: Vec<i8> = floats
+                                .iter()
                                 .map(|f| (*f * 127.0) as i8) // 简单量化
                                 .collect();
                             *value = Value::VectorInt8(int8_vec);
@@ -1703,12 +1741,7 @@ impl Table {
     ///
     /// 与 `insert_row` 相同，`skip_pk_check=true` 且主键非 auto_increment 时
     /// 跳过 `check_pk_uniqueness_one`（冲突已由 execute_with_txn 预检）。
-    pub fn insert_row_with_check(
-        &mut self,
-        row_id: u32,
-        row: &[Value],
-        skip_pk_check: bool,
-    ) -> Result<()> {
+    pub fn insert_row_with_check(&mut self, row_id: u32, row: &[Value], skip_pk_check: bool) -> Result<()> {
         // NOT NULL 约束检查 + AUTO_INCREMENT 自动分配
         let mut owned_row: Vec<Value> = row.to_vec();
 
@@ -1739,15 +1772,16 @@ impl Table {
                             self.def.next_auto_increment_id += 1;
                         } else if (*n as u64) >= self.def.next_auto_increment_id {
                             self.def.next_auto_increment_id = (*n as u64) + 1;
-}
+                        }
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
-        }
-    }
-    if !col_def.nullable && col_idx < owned_row.len() && owned_row[col_idx].is_null() {
-                return Err(EngramDbError::ConstraintViolation(
-                    format!("NOT NULL constraint failed: column '{}'", col_def.name)
-                ));
+            if !col_def.nullable && col_idx < owned_row.len() && owned_row[col_idx].is_null() {
+                return Err(EngramDbError::ConstraintViolation(format!(
+                    "NOT NULL constraint failed: column '{}'",
+                    col_def.name
+                )));
             }
         }
 
@@ -1772,33 +1806,33 @@ impl Table {
 
         // 写入 Delta 层（单行直接插入）
         self.delta_store.insert_row(row_id, owned_row)?;
-        
+
         // 更新总行数
         self.def.row_count += 1;
-        
+
         // Perf03：更新主键索引
         if self.primary_index.is_some() {
             self.primary_index_insert(row, row_id);
         }
-        
+
         // 更新所有二级索引
         if !self.indexes.is_empty() {
             self.update_indexes_for_row(row_id, row)?;
         }
-        
+
         // 更新所有向量索引
         if !self.vector_indexes.is_empty() {
             self.update_vector_indexes_for_row(row_id, row);
         }
-        
+
         // 更新所有全文索引
         if !self.fts_indexes.is_empty() {
             self.update_fts_indexes_for_row(row_id, row);
         }
-        
+
         Ok(())
     }
-    
+
     /// 删除单行数据（事务提交后应用到存储层）
     ///
     /// 参数：row_id - 要删除的行 ID
@@ -1812,39 +1846,39 @@ impl Table {
         // 从 Delta 层获取行数据（用于索引维护）
         let row_id_64 = row_id as u64;
         let old_row = self.delta_store.get(row_id_64);
-        
+
         // 从 Delta 层删除
         self.delta_store.delete_row(row_id)?;
-        
+
         // 更新总行数
         self.def.row_count = self.def.row_count.saturating_sub(1);
-        
+
         // 如果有旧行数据，更新索引
         if let Some(ref row) = old_row {
             // Perf03：删除主键索引条目
             if self.primary_index.is_some() {
                 self.primary_index_remove(row);
             }
-            
+
             // 删除二级索引中的对应条目
             if !self.indexes.is_empty() {
                 self.remove_indexes_for_rows(&[row.clone()], &[row_id]);
             }
-            
+
             // 标记向量索引中的删除
             if !self.vector_indexes.is_empty() {
                 self.remove_vector_indexes_for_rows(&[row_id]);
             }
-            
+
             // 删除全文索引
             if !self.fts_indexes.is_empty() {
                 self.remove_fts_indexes_for_row(row_id, row);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// 更新单行数据（事务提交后应用到存储层）
     ///
     /// 参数：
@@ -1860,62 +1894,61 @@ impl Table {
         // 获取旧行数据
         let row_id_64 = row_id as u64;
         let old_row = self.delta_store.get(row_id_64);
-        
+
         // 更新 Delta 层
         self.delta_store.update_row_by_id(row_id, new_row.to_vec())?;
-        
+
         // 从 Delta 层读取更新后的新行
         let updated_row = self.delta_store.get(row_id_64);
-        
+
         // 如果有旧行数据，更新索引
         if let Some(ref old_r) = old_row {
             // Perf03：删除旧主键索引条目
             if self.primary_index.is_some() {
                 self.primary_index_remove(old_r);
             }
-            
+
             // 删除旧索引条目
             if !self.indexes.is_empty() {
                 self.remove_indexes_for_rows(&[old_r.clone()], &[row_id]);
             }
-            
+
             // 标记向量索引中的旧条目为 tombstone
             if !self.vector_indexes.is_empty() {
                 self.remove_vector_indexes_for_rows(&[row_id]);
             }
         }
-        
+
         // 插入新索引条目
         if let Some(ref new_r) = updated_row {
             // Perf03：插入新主键索引条目
             if self.primary_index.is_some() {
                 self.primary_index_insert(new_r, row_id);
             }
-            
+
             if !self.indexes.is_empty() {
                 self.update_indexes_for_row(row_id, new_r)?;
             }
-            
+
             if !self.vector_indexes.is_empty() {
                 self.update_vector_indexes_for_row(row_id, new_r);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// 更新单行的二级索引（内部辅助方法）
     fn update_indexes_for_row(&mut self, row_id: u32, row: &[Value]) -> Result<()> {
         for idx_def in self.def.indexes.clone() {
             if let Some(index) = self.indexes.get_mut(&idx_def.name) {
                 let key = row[idx_def.key_columns[0]].clone();
-                let included_vals: Vec<Value> = idx_def.included_columns.iter()
-                    .map(|&ci| row[ci].clone())
-                    .collect();
+                let included_vals: Vec<Value> = idx_def.included_columns.iter().map(|&ci| row[ci].clone()).collect();
                 if idx_def.unique && !index.insert_with_included(key.clone(), row_id, &included_vals) {
-                    return Err(EngramDbError::ConstraintViolation(
-                        format!("UNIQUE constraint failed: index '{}'", idx_def.name)
-                    ));
+                    return Err(EngramDbError::ConstraintViolation(format!(
+                        "UNIQUE constraint failed: index '{}'",
+                        idx_def.name
+                    )));
                 }
                 if !idx_def.unique {
                     index.insert_with_included(key, row_id, &included_vals);
@@ -1924,7 +1957,7 @@ impl Table {
         }
         Ok(())
     }
-    
+
     /// 更新单行的向量索引（内部辅助方法）
     fn update_vector_indexes_for_row(&mut self, _row_id: u32, row: &[Value]) {
         // 向量索引更新逻辑：遍历 vector_indexes，尝试插入
@@ -1959,13 +1992,13 @@ impl Table {
                     // 取键列值（目前只支持单列键）
                     let key = row[idx_def.key_columns[0]].clone();
                     // 取覆盖列值
-                    let included_vals: Vec<Value> = idx_def.included_columns.iter()
-                        .map(|&ci| row[ci].clone())
-                        .collect();
+                    let included_vals: Vec<Value> =
+                        idx_def.included_columns.iter().map(|&ci| row[ci].clone()).collect();
                     let inserted = index.insert_with_included(key, row_id, &included_vals);
                     if idx_def.unique && !inserted {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: index '{}'", idx_def.name
+                            "UNIQUE constraint failed: index '{}'",
+                            idx_def.name
                         )));
                     }
                 }
@@ -1984,7 +2017,10 @@ impl Table {
             // 简化实现：遍历所有列，找到 Vector 类型的列
             // 注意：更精确的方式是在创建索引时记录列索引，
             // 这里为了简化，假设每个向量索引对应第一个 Vector 列
-            let col_idx = self.def.columns.iter()
+            let col_idx = self
+                .def
+                .columns
+                .iter()
                 .position(|c| matches!(c.data_type, crate::common::types::DataType::Vector { .. }));
 
             if let Some(col_idx) = col_idx {
@@ -2043,7 +2079,12 @@ impl Table {
                 }
             }
 
-            CompactStrategy::Adaptive { min_threshold, max_threshold, pct_of_table, batch_size } => {
+            CompactStrategy::Adaptive {
+                min_threshold,
+                max_threshold,
+                pct_of_table,
+                batch_size,
+            } => {
                 let base_rows = self.def.row_count as f64;
                 let pct_based = (base_rows * pct_of_table) as usize;
                 let threshold = pct_based.clamp(min_threshold, max_threshold);
@@ -2069,7 +2110,10 @@ impl Table {
             // T-TTL: 整个 RowGroup 全部过期（无存活行）→ 整组跳过
             if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
                 let cutoff_val = Value::Timestamp(cut);
-                if self.column_store.can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val) {
+                if self
+                    .column_store
+                    .can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val)
+                {
                     continue;
                 }
             }
@@ -2190,7 +2234,9 @@ impl Table {
                         continue;
                     }
                 }
-                if column_indices.is_empty() { continue; }
+                if column_indices.is_empty() {
+                    continue;
+                }
                 seg_store.ensure_columns_decompressed(rg_idx, column_indices)?;
                 let row_count = match seg_store.get_column(rg_idx, column_indices[0]) {
                     Some(c) => c.len(),
@@ -2213,11 +2259,18 @@ impl Table {
                             }
                             _ => (batch_start..batch_end).collect(),
                         };
-                        if pred_pos.is_some() { Some(sel) } else { None }
+                        if pred_pos.is_some() {
+                            Some(sel)
+                        } else {
+                            None
+                        }
                     };
                     let mut columns: Vec<Vector> = Vec::with_capacity(column_indices.len());
                     if let Some(sel) = &survivors {
-                        if sel.is_empty() { batch_start += batch_len; continue; }
+                        if sel.is_empty() {
+                            batch_start += batch_len;
+                            continue;
+                        }
                         for &col_idx in column_indices {
                             let col = seg_store.get_column(rg_idx, col_idx).unwrap();
                             columns.push(Vector::Typed(col.gather(sel)));
@@ -2229,7 +2282,10 @@ impl Table {
                         }
                     }
                     let out_count = survivors.as_ref().map_or(batch_len, |sel| sel.len());
-                    chunks.push(DataChunk { count: out_count, columns });
+                    chunks.push(DataChunk {
+                        count: out_count,
+                        columns,
+                    });
                     batch_start += batch_len;
                 }
             }
@@ -2246,7 +2302,10 @@ impl Table {
             // T-TTL: 整个 RowGroup 全部过期（created < cutoff 无存活行）→ 整组跳过
             if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
                 let cutoff_val = Value::Timestamp(cut);
-                if self.column_store.can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val) {
+                if self
+                    .column_store
+                    .can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val)
+                {
                     continue;
                 }
             }
@@ -2356,7 +2415,8 @@ impl Table {
             }
             // PREWHERE：Delta 行级筛选（匹配 scan 层语义）
             if let Some((ci, op, val)) = &skip_pred {
-                let matches = delta_cols.get(*ci)
+                let matches = delta_cols
+                    .get(*ci)
                     .and_then(|c| c.get(idx))
                     .map_or(true, |cell| matches_predicate(cell, *op, val));
                 if !matches {
@@ -2372,10 +2432,7 @@ impl Table {
                 };
                 columns.push(Vector::Flat(vec![v]));
             }
-            chunks.push(DataChunk {
-                count: 1,
-                columns,
-            });
+            chunks.push(DataChunk { count: 1, columns });
             let _ = rid;
         }
 
@@ -2422,9 +2479,9 @@ impl Table {
         let ttl_cutoff: Option<i64> = self.def.ttl_cutoff_ms();
 
         // 谓词列在 output column_indices 中的位置
-        let pred_col_pos_in_output: Option<usize> = skip_pred.as_ref().and_then(|(col_idx, _, _)| {
-            column_indices.iter().position(|&c| c == *col_idx)
-        });
+        let pred_col_pos_in_output: Option<usize> = skip_pred
+            .as_ref()
+            .and_then(|(col_idx, _, _)| column_indices.iter().position(|&c| c == *col_idx));
 
         for rg_idx in 0..self.column_store.row_group_count() {
             // P2.4/P3.2：MinMax 跳过索引 —— 整个 row group 可跳过时不解压
@@ -2436,7 +2493,10 @@ impl Table {
             // T-TTL: 整个 RowGroup 全部过期（created < cutoff 无存活行）→ 整组跳过
             if let (Some(ttl_col), Some(cut)) = (self.def.ttl_column, ttl_cutoff) {
                 let cutoff_val = Value::Timestamp(cut);
-                if self.column_store.can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val) {
+                if self
+                    .column_store
+                    .can_skip_predicate(rg_idx, ttl_col, PredicateOp::GtEq, &cutoff_val)
+                {
                     continue;
                 }
             }
@@ -2511,7 +2571,8 @@ impl Table {
             }
             // PREWHERE 行级筛选
             if let Some((ci, op, val)) = &skip_pred {
-                let matches = delta_cols.get(*ci)
+                let matches = delta_cols
+                    .get(*ci)
                     .and_then(|c| c.get(idx))
                     .map_or(true, |cell| matches_predicate(cell, *op, val));
                 if !matches {
@@ -2520,13 +2581,11 @@ impl Table {
             }
             let mut projected = Vec::with_capacity(column_indices.len());
             for &col_idx in column_indices {
-                projected.push(
-                    if col_idx < n_cols {
-                        delta_cols.get(col_idx).and_then(|c| c.get(idx)).cloned().unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    }
-                );
+                projected.push(if col_idx < n_cols {
+                    delta_cols.get(col_idx).and_then(|c| c.get(idx)).cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                });
             }
             rows.push(projected);
         }
@@ -2681,9 +2740,7 @@ impl Table {
 
         // 计算 Delta 行的全局 row_id 基准（删除前）
         let delta_base_row_id = (self.def.row_count - self.delta_store.len() as u64) as u32;
-        let row_ids: Vec<u32> = delta_row_indices.iter()
-            .map(|&i| delta_base_row_id + i as u32)
-            .collect();
+        let row_ids: Vec<u32> = delta_row_indices.iter().map(|&i| delta_base_row_id + i as u32).collect();
 
         // 先收集被删除的行（用于索引维护）
         let deleted_rows = self.delta_store.delete_rows(delta_row_indices);
@@ -2775,9 +2832,8 @@ impl Table {
                 for idx_def in self.def.indexes.clone() {
                     if let Some(index) = self.indexes.get_mut(&idx_def.name) {
                         let key = new_row[idx_def.key_columns[0]].clone();
-                        let included_vals: Vec<Value> = idx_def.included_columns.iter()
-                            .map(|&ci| new_row[ci].clone())
-                            .collect();
+                        let included_vals: Vec<Value> =
+                            idx_def.included_columns.iter().map(|&ci| new_row[ci].clone()).collect();
                         index.insert_with_included(key, row_id, &included_vals);
                     }
                 }
@@ -2793,7 +2849,10 @@ impl Table {
             let index_names: Vec<String> = self.vector_indexes.keys().cloned().collect();
             for index_name in index_names {
                 // 找到该索引对应的向量列
-                let col_idx = self.def.columns.iter()
+                let col_idx = self
+                    .def
+                    .columns
+                    .iter()
                     .position(|c| matches!(c.data_type, crate::common::types::DataType::Vector { .. }));
 
                 if let Some(col_idx) = col_idx {
@@ -2854,10 +2913,7 @@ impl Table {
                     // 在映射中反向查找 hnsw_id
                     // 注意：row_id 是全局行号，映射是 hnsw_id -> row_id
                     // 这里用线性查找（删除操作不频繁，可接受）
-                    if let Some(hnsw_id) = id_mapping.iter()
-                        .position(|&rid| rid == row_id)
-                        .map(|idx| idx as u32)
-                    {
+                    if let Some(hnsw_id) = id_mapping.iter().position(|&rid| rid == row_id).map(|idx| idx as u32) {
                         hnsw.mark_deleted(hnsw_id);
                     }
                 }
@@ -2874,7 +2930,10 @@ impl Table {
         // 检查列类型是否为 Varchar
         let col_idx = self.def.column_index(column_name).unwrap();
         if self.def.columns[col_idx].data_type != crate::common::types::DataType::Varchar {
-            return Err(EngramDbError::Parse(format!("FTS index requires VARCHAR column, got {:?}", self.def.columns[col_idx].data_type)));
+            return Err(EngramDbError::Parse(format!(
+                "FTS index requires VARCHAR column, got {:?}",
+                self.def.columns[col_idx].data_type
+            )));
         }
         let idx = match crate::storage::compression::global_tokenizer() {
             Some(tok) => TokenInvertedIndex::with_vocab(tok.version()),
@@ -2926,7 +2985,9 @@ impl Table {
         let max_len = 64usize;
         let mut out: Vec<(u32, f32)> = Vec::new();
         for row in candidates {
-            let Some(text) = self.row_text(row, column_name) else { continue };
+            let Some(text) = self.row_text(row, column_name) else {
+                continue;
+            };
             let text = {
                 // 前缀窗口截断（字节安全）——模糊匹配只 tokenize 文档前缀
                 const MAX_BYTES: usize = 2048;
@@ -2976,7 +3037,9 @@ impl Table {
         // 阶段 2：可变借用读行打分
         let mut out: Vec<(u32, f32)> = Vec::new();
         for row in candidates {
-            let Some(text) = self.row_text(row, column_name) else { continue };
+            let Some(text) = self.row_text(row, column_name) else {
+                continue;
+            };
             let text = {
                 // 前缀窗口截断（字节安全）——模糊匹配只 tokenize 文档前缀
                 const MAX_BYTES: usize = 2048;
@@ -3064,19 +3127,12 @@ impl Table {
         // 并行段：tokenize + prepare（行×列独立无共享）。postings push 必须
         // 主线程按行序串行（行号严格递增，并行乱序损坏 delta 流——v0.21.2
         // 分片锁方案实测损坏回退）
-        let prepared: Vec<(
-            Vec<crate::common::tokenizer::Token>,
-            Vec<(u32, u32)>,
-            u32,
-        )> = if let Some(tok) = &tok {
+        let prepared: Vec<(Vec<crate::common::tokenizer::Token>, Vec<(u32, u32)>, u32)> = if let Some(tok) = &tok {
             use rayon::prelude::*;
             jobs.par_iter()
                 .map(|(_, _, _, text)| {
                     let tokens = tok.tokenize(text);
-                    let (pairs, n) = crate::search::sparse::TokenInvertedIndex::prepare_document(
-                        &tokens,
-                        text,
-                    );
+                    let (pairs, n) = crate::search::sparse::TokenInvertedIndex::prepare_document(&tokens, text);
                     (tokens, pairs, n)
                 })
                 .collect()
@@ -3117,20 +3173,20 @@ impl Table {
             if let Some(col_idx) = self.def.column_index(&col_name) {
                 if col_idx < row.len() {
                     if let Value::Varchar(text) = &row[col_idx] {
-                            if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
-                                if let Some(tok) = crate::storage::compression::global_tokenizer() {
-                                    let tokens = tok.tokenize(text);
-                                    idx.add_document_with_tokens(row_id, text, &tokens);
-                                    if td_enabled {
-                                        crate::storage::compression::token_stream_cache::TOKEN_STREAM_CACHE
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner())
-                                            .insert_row(col_idx as u32, text, &tokens, &tok);
-                                    }
-                                } else {
-                                    idx.add_document(row_id, text, None);
+                        if let Some(idx) = self.fts_indexes.get_mut(&col_name) {
+                            if let Some(tok) = crate::storage::compression::global_tokenizer() {
+                                let tokens = tok.tokenize(text);
+                                idx.add_document_with_tokens(row_id, text, &tokens);
+                                if td_enabled {
+                                    crate::storage::compression::token_stream_cache::TOKEN_STREAM_CACHE
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .insert_row(col_idx as u32, text, &tokens, &tok);
                                 }
+                            } else {
+                                idx.add_document(row_id, text, None);
                             }
+                        }
                     }
                 }
             }
@@ -3194,19 +3250,11 @@ impl crate::storage::engine::EngineTableOps for Table {
         self.insert(rows)
     }
 
-    fn insert_row(
-        &mut self,
-        row_id: u32,
-        row: &[crate::Value],
-    ) -> crate::common::error::Result<()> {
+    fn insert_row(&mut self, row_id: u32, row: &[crate::Value]) -> crate::common::error::Result<()> {
         self.insert_row(row_id, row)
     }
 
-    fn update_row(
-        &mut self,
-        row_id: u32,
-        new_row: &[crate::Value],
-    ) -> crate::common::error::Result<()> {
+    fn update_row(&mut self, row_id: u32, new_row: &[crate::Value]) -> crate::common::error::Result<()> {
         self.update_row(row_id, new_row)
     }
 
@@ -3226,10 +3274,7 @@ impl crate::storage::engine::EngineTableOps for Table {
         self.scan_to_chunks_with_skip(column_indices, skip_pred)
     }
 
-    fn get_row_by_id(
-        &mut self,
-        row_id: u32,
-    ) -> crate::common::error::Result<Option<Vec<crate::Value>>> {
+    fn get_row_by_id(&mut self, row_id: u32) -> crate::common::error::Result<Option<Vec<crate::Value>>> {
         self.get_row_by_id(row_id)
     }
 
@@ -3315,7 +3360,11 @@ mod tests {
         let mut t = Table::new(make_def(true), CompactStrategy::manual());
         let cols = vec![
             vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)],
-            vec![Value::Varchar("a".into()), Value::Varchar("b".into()), Value::Varchar("c".into())],
+            vec![
+                Value::Varchar("a".into()),
+                Value::Varchar("b".into()),
+                Value::Varchar("c".into()),
+            ],
         ];
         t.insert_columns(cols).unwrap();
         assert_eq!(t.row_count(), 3);
@@ -3323,7 +3372,7 @@ mod tests {
         assert_eq!(t.get_row_by_id(2).unwrap().unwrap(), row(3, "c"));
     }
 
-        #[test]
+    #[test]
     fn test_insert_with_check_skips_pk_check_non_auto() {
         // skip=true 且主键非 auto_increment：PK 复检被跳过（预检已覆盖）
         let mut t = Table::new(make_def(true), CompactStrategy::manual());
@@ -3378,8 +3427,12 @@ mod tests {
         assert_eq!(t.row_count(), 100, "compact 只迁移数据，行数不变");
         // 前 30 行在列存，后 70 行在 Delta——绝对 row_id 读取必须稳定
         for i in [0usize, 29, 30, 60, 99] {
-            assert_eq!(t.get_row_by_id(i as u32).unwrap().unwrap()[0], Value::Int64(i as i64),
-                "compact 后 row_id={} 读取错位", i);
+            assert_eq!(
+                t.get_row_by_id(i as u32).unwrap().unwrap()[0],
+                Value::Int64(i as i64),
+                "compact 后 row_id={} 读取错位",
+                i
+            );
         }
         // 再次 compact 至全部迁移
         t.compact_delta_partial(1000).unwrap();
@@ -3445,13 +3498,18 @@ mod tests {
         t.insert(rows).unwrap();
         // 行 0 迁移主键到 3（已被行 3 占用）→ 报错
         let err = t.update_delta_rows(&[(0, vec![(0, Value::Int64(3))])]).unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        assert!(matches!(
+            err,
+            crate::common::error::EngramDbError::ConstraintViolation(_)
+        ));
         // 同批自重复迁移
-        let err2 = t.update_delta_rows(&[
-            (1, vec![(0, Value::Int64(50))]),
-            (2, vec![(0, Value::Int64(50))]),
-        ]).unwrap_err();
-        assert!(matches!(err2, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        let err2 = t
+            .update_delta_rows(&[(1, vec![(0, Value::Int64(50))]), (2, vec![(0, Value::Int64(50))])])
+            .unwrap_err();
+        assert!(matches!(
+            err2,
+            crate::common::error::EngramDbError::ConstraintViolation(_)
+        ));
         // 原主键未被破坏
         assert_eq!(t.lookup_primary_key(&Value::Int64(3)), Some(3));
         assert_eq!(t.row_count(), 5);
@@ -3462,7 +3520,10 @@ mod tests {
         let mut t = Table::new(make_def(true), CompactStrategy::manual());
         t.insert(vec![row(1, "a")]).unwrap();
         let err = t.insert(vec![row(1, "dup")]).unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        assert!(matches!(
+            err,
+            crate::common::error::EngramDbError::ConstraintViolation(_)
+        ));
         assert_eq!(t.row_count(), 1, "冲突插入零副作用");
     }
 
@@ -3475,7 +3536,11 @@ mod tests {
     }
 
     fn ttl_row(id: i64, v: &str, created_ms: i64) -> Vec<Value> {
-        vec![Value::Int64(id), Value::Varchar(v.to_string()), Value::Timestamp(created_ms)]
+        vec![
+            Value::Int64(id),
+            Value::Varchar(v.to_string()),
+            Value::Timestamp(created_ms),
+        ]
     }
 
     fn now_ms_ago(millis: i64) -> i64 {
@@ -3497,23 +3562,17 @@ mod tests {
         // 直接列式路径（>=30720 行），成批进列存；过期 created 显式给出
         let mut rows = Vec::new();
         for i in 0..32_000 {
-            rows.push(
-                if i % 3 == 0 {
-                    // 过期：120 秒前（ttl=60s）
-                    ttl_row(i, &format!("expired{}", i), now_ms_ago(120_000))
-                } else {
-                    ttl_row(i, &format!("ok{}", i), now_ms_ago(1))
-                },
-            );
+            rows.push(if i % 3 == 0 {
+                // 过期：120 秒前（ttl=60s）
+                ttl_row(i, &format!("expired{}", i), now_ms_ago(120_000))
+            } else {
+                ttl_row(i, &format!("ok{}", i), now_ms_ago(1))
+            });
         }
         t.insert(rows).unwrap();
 
         // 列存路径（批量插入直接进列，不走 Delta）
-        assert_eq!(
-            t.column_store.row_group_count(),
-            1,
-            "列存 RowGroup 已建立，扫描走列存",
-        );
+        assert_eq!(t.column_store.row_group_count(), 1, "列存 RowGroup 已建立，扫描走列存",);
 
         // chunks 路径：只有存活行（2/3 = 21334 行）
         let chunks = t.scan_to_chunks(&[0, 1]).unwrap();

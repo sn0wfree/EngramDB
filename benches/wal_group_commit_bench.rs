@@ -17,9 +17,9 @@
 //!   **完全禁用组提交**，每次 commit 都 fsync（true baseline）
 //! - 任一非零 → 启用组提交模式（按 size/bytes/timeout 任一触发 fsync）
 
-use std::time::{Duration, Instant};
 use engramdb::common::config::Config;
 use engramdb::Connection;
+use std::time::{Duration, Instant};
 
 const ITERS: usize = 10;
 const N_TXNS: usize = 5_000;
@@ -30,11 +30,21 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 }
 
 fn fmt_rate(d: Duration, n: usize) -> String {
-    format!("{:.0} txn/s ({:.2} ms total)", n as f64 / d.as_secs_f64(), d.as_secs_f64() * 1000.0)
+    format!(
+        "{:.0} txn/s ({:.2} ms total)",
+        n as f64 / d.as_secs_f64(),
+        d.as_secs_f64() * 1000.0
+    )
 }
 
 fn bench(group_size: usize, group_bytes: usize, timeout_ms: u64, n: usize) -> Duration {
-    let path = format!("/tmp/wal_gc_{}_{}_{}_{}.hdb", group_size, group_bytes, timeout_ms, std::process::id());
+    let path = format!(
+        "/tmp/wal_gc_{}_{}_{}_{}.hdb",
+        group_size,
+        group_bytes,
+        timeout_ms,
+        std::process::id()
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path));
 
@@ -77,8 +87,8 @@ fn main() {
 
     println!();
     let m16 = measure("group=16/64K/10ms  (Phase 1 默认)", 16, 65536, 10, N_TXNS);
-    let m64 = measure("group=64/64K/10ms  (大组)",         64, 65536, 10, N_TXNS);
-    let m128 = measure("group=128/64K/10ms (超大批)",      128, 65536, 10, N_TXNS);
+    let m64 = measure("group=64/64K/10ms  (大组)", 64, 65536, 10, N_TXNS);
+    let m128 = measure("group=128/64K/10ms (超大批)", 128, 65536, 10, N_TXNS);
     let m_only_size = measure("group=16/0/0   (仅 size 触发)", 16, 0, 0, N_TXNS);
     let _ = m_only_size;
     let m_only_bytes = measure("group=0/64K/0  (仅 bytes 触发)", 0, 65536, 0, N_TXNS);
@@ -90,10 +100,25 @@ fn main() {
     let speedup_128 = baseline.as_secs_f64() / m128.as_secs_f64();
 
     println!("=== 总结 ===");
-    println!("  基线 (true group=0):  {} txn/s", (N_TXNS as f64 / baseline.as_secs_f64()) as i64);
-    println!("  group=16 default:     {} txn/s ({:.2}×)", (N_TXNS as f64 / m16.as_secs_f64()) as i64, speedup_16);
-    println!("  group=64:             {} txn/s ({:.2}×)", (N_TXNS as f64 / m64.as_secs_f64()) as i64, speedup_64);
-    println!("  group=128:            {} txn/s ({:.2}×)", (N_TXNS as f64 / m128.as_secs_f64()) as i64, speedup_128);
+    println!(
+        "  基线 (true group=0):  {} txn/s",
+        (N_TXNS as f64 / baseline.as_secs_f64()) as i64
+    );
+    println!(
+        "  group=16 default:     {} txn/s ({:.2}×)",
+        (N_TXNS as f64 / m16.as_secs_f64()) as i64,
+        speedup_16
+    );
+    println!(
+        "  group=64:             {} txn/s ({:.2}×)",
+        (N_TXNS as f64 / m64.as_secs_f64()) as i64,
+        speedup_64
+    );
+    println!(
+        "  group=128:            {} txn/s ({:.2}×)",
+        (N_TXNS as f64 / m128.as_secs_f64()) as i64,
+        speedup_128
+    );
     println!();
     if speedup_16 >= 3.0 {
         println!("✅ KPI 达成: group=16 vs true group=0 = {:.2}× ≥ 3×", speedup_16);

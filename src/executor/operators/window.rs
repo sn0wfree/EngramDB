@@ -10,9 +10,9 @@
 
 use crate::common::error::Result;
 use crate::common::value_cmp::total_cmp;
-use crate::executor::physical_plan::{WindowFunctionExpr, WindowFuncType};
+use crate::executor::physical_plan::{WindowFuncType, WindowFunctionExpr};
 use crate::executor::vector::DataChunk;
-use crate::sql::ast::{WindowSpec, WindowFrameBound, Expression};
+use crate::sql::ast::{Expression, WindowFrameBound, WindowSpec};
 use crate::Value;
 
 pub fn execute(
@@ -80,7 +80,10 @@ fn sort_rows(rows: &[Vec<Value>], spec: &WindowSpec, column_names: &[String]) ->
 
 fn find_partitions(rows: &[Vec<Value>], spec: &WindowSpec, column_names: &[String]) -> Vec<Partition> {
     if rows.is_empty() || spec.partition_by.is_empty() {
-        return vec![Partition { start: 0, end: rows.len() }];
+        return vec![Partition {
+            start: 0,
+            end: rows.len(),
+        }];
     }
     let mut partitions = Vec::new();
     let mut start = 0;
@@ -120,17 +123,23 @@ fn compute_single_window_function(rows: &[Vec<Value>], current_idx: usize, wf: &
     match wf.func {
         WindowFuncType::RowNumber => Value::Int64((current_idx + 1) as i64),
         WindowFuncType::Rank => {
-            if current_idx == 0 { return Value::Int64(1); }
+            if current_idx == 0 {
+                return Value::Int64(1);
+            }
             let mut rank = current_idx as i64 + 1;
             for j in (0..current_idx).rev() {
                 if rows_equal_on_order(&rows[current_idx], &rows[j], &wf.window_spec) {
                     rank = j as i64 + 1;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             Value::Int64(rank)
         }
         WindowFuncType::DenseRank => {
-            if current_idx == 0 { return Value::Int64(1); }
+            if current_idx == 0 {
+                return Value::Int64(1);
+            }
             let mut dr = 1i64;
             for j in 1..=current_idx {
                 if !rows_equal_on_order(&rows[j], &rows[j - 1], &wf.window_spec) {
@@ -163,14 +172,18 @@ fn compute_single_window_function(rows: &[Vec<Value>], current_idx: usize, wf: &
         }
         WindowFuncType::FirstValue => {
             if let Some(col) = wf.input_column {
-                if col < rows[0].len() { return rows[0][col].clone(); }
+                if col < rows[0].len() {
+                    return rows[0][col].clone();
+                }
             }
             Value::Null
         }
         WindowFuncType::LastValue => {
             if let Some(col) = wf.input_column {
                 if let Some(last) = rows.last() {
-                    if col < last.len() { return last[col].clone(); }
+                    if col < last.len() {
+                        return last[col].clone();
+                    }
                 }
             }
             Value::Null
@@ -180,8 +193,12 @@ fn compute_single_window_function(rows: &[Vec<Value>], current_idx: usize, wf: &
             let mut count = 0i64;
             for j in start..end {
                 if let Some(col) = wf.input_column {
-                    if col < rows[j].len() && !rows[j][col].is_null() { count += 1; }
-                } else { count += 1; }
+                    if col < rows[j].len() && !rows[j][col].is_null() {
+                        count += 1;
+                    }
+                } else {
+                    count += 1;
+                }
             }
             Value::Int64(count)
         }
@@ -192,11 +209,18 @@ fn compute_single_window_function(rows: &[Vec<Value>], current_idx: usize, wf: &
             for j in start..end {
                 if let Some(col) = wf.input_column {
                     if col < rows[j].len() {
-                        if let Some(f) = rows[j][col].as_f64() { sum += f; has = true; }
+                        if let Some(f) = rows[j][col].as_f64() {
+                            sum += f;
+                            has = true;
+                        }
                     }
                 }
             }
-            if has { Value::Float64(sum) } else { Value::Null }
+            if has {
+                Value::Float64(sum)
+            } else {
+                Value::Null
+            }
         }
         WindowFuncType::Avg => {
             let (start, end) = compute_frame_bounds(rows.len(), current_idx, &wf.window_spec);
@@ -205,11 +229,18 @@ fn compute_single_window_function(rows: &[Vec<Value>], current_idx: usize, wf: &
             for j in start..end {
                 if let Some(col) = wf.input_column {
                     if col < rows[j].len() {
-                        if let Some(f) = rows[j][col].as_f64() { sum += f; cnt += 1; }
+                        if let Some(f) = rows[j][col].as_f64() {
+                            sum += f;
+                            cnt += 1;
+                        }
                     }
                 }
             }
-            if cnt > 0 { Value::Float64(sum / cnt as f64) } else { Value::Null }
+            if cnt > 0 {
+                Value::Float64(sum / cnt as f64)
+            } else {
+                Value::Null
+            }
         }
         WindowFuncType::Min => {
             let (start, end) = compute_frame_bounds(rows.len(), current_idx, &wf.window_spec);
@@ -311,22 +342,22 @@ fn rows_to_chunks(rows: &[Vec<Value>]) -> Vec<DataChunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::physical_plan::WindowFunctionExpr;
     use crate::executor::physical_plan::WindowFuncType;
+    use crate::executor::physical_plan::WindowFunctionExpr;
     use crate::sql::ast::WindowSpec;
 
     #[test]
     fn test_row_number() {
-        let rows = vec![
-            vec![Value::Int64(1)],
-            vec![Value::Int64(2)],
-            vec![Value::Int64(3)],
-        ];
+        let rows = vec![vec![Value::Int64(1)], vec![Value::Int64(2)], vec![Value::Int64(3)]];
         let chunk = rows_to_chunks(&rows);
         let wf = WindowFunctionExpr {
             func: WindowFuncType::RowNumber,
             input_column: None,
-            window_spec: WindowSpec { partition_by: vec![], order_by: vec![], window_frame: None },
+            window_spec: WindowSpec {
+                partition_by: vec![],
+                order_by: vec![],
+                window_frame: None,
+            },
             output_name: "rn".to_string(),
         };
         let result = execute(&chunk, &[wf], &["val".to_string()]).unwrap();
@@ -339,16 +370,16 @@ mod tests {
 
     #[test]
     fn test_lag() {
-        let rows = vec![
-            vec![Value::Int64(10)],
-            vec![Value::Int64(20)],
-            vec![Value::Int64(30)],
-        ];
+        let rows = vec![vec![Value::Int64(10)], vec![Value::Int64(20)], vec![Value::Int64(30)]];
         let chunk = rows_to_chunks(&rows);
         let wf = WindowFunctionExpr {
             func: WindowFuncType::Lag(1),
             input_column: Some(0),
-            window_spec: WindowSpec { partition_by: vec![], order_by: vec![], window_frame: None },
+            window_spec: WindowSpec {
+                partition_by: vec![],
+                order_by: vec![],
+                window_frame: None,
+            },
             output_name: "lag".to_string(),
         };
         let result = execute(&chunk, &[wf], &["val".to_string()]).unwrap();
@@ -360,16 +391,16 @@ mod tests {
 
     #[test]
     fn test_lead() {
-        let rows = vec![
-            vec![Value::Int64(10)],
-            vec![Value::Int64(20)],
-            vec![Value::Int64(30)],
-        ];
+        let rows = vec![vec![Value::Int64(10)], vec![Value::Int64(20)], vec![Value::Int64(30)]];
         let chunk = rows_to_chunks(&rows);
         let wf = WindowFunctionExpr {
             func: WindowFuncType::Lead(1),
             input_column: Some(0),
-            window_spec: WindowSpec { partition_by: vec![], order_by: vec![], window_frame: None },
+            window_spec: WindowSpec {
+                partition_by: vec![],
+                order_by: vec![],
+                window_frame: None,
+            },
             output_name: "lead".to_string(),
         };
         let result = execute(&chunk, &[wf], &["val".to_string()]).unwrap();

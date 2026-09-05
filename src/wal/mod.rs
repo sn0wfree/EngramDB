@@ -7,12 +7,12 @@
 //! - LSN 单调递增
 //! - 崩溃恢复：Redo + Undo
 
-pub mod writer;
 pub mod reader;
 pub mod recovery;
+pub mod writer;
 
-pub use writer::WalWriter;
 pub use reader::WalReader;
+pub use writer::WalWriter;
 
 use crate::common::error::Result;
 use crate::Value;
@@ -131,13 +131,10 @@ impl WalRecord {
         //    engine 回退 Columnar。CRC 校验区不同 → 双解析互不误判。
         // 新格式（engine@11, payload_len@12..16, crc@16+len..20+len）
         if data.len() >= WAL_RECORD_HEADER_SIZE {
-            let payload_len =
-                u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+            let payload_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
             let total_len = WAL_RECORD_HEADER_SIZE + payload_len;
             if data.len() >= total_len {
-                let stored_crc = u32::from_le_bytes(
-                    data[16 + payload_len..20 + payload_len].try_into().unwrap(),
-                );
+                let stored_crc = u32::from_le_bytes(data[16 + payload_len..20 + payload_len].try_into().unwrap());
                 let computed_crc = crc32(&data[..16 + payload_len]);
                 if stored_crc == computed_crc {
                     let payload = data[16..16 + payload_len].to_vec();
@@ -160,8 +157,7 @@ impl WalRecord {
             let payload_len = u32::from_le_bytes(data[11..15].try_into().unwrap()) as usize;
             let total_len = 19 + payload_len;
             if data.len() >= total_len {
-                let stored_crc =
-                    u32::from_le_bytes(data[15 + payload_len..19 + payload_len].try_into().unwrap());
+                let stored_crc = u32::from_le_bytes(data[15 + payload_len..19 + payload_len].try_into().unwrap());
                 let computed_crc = crc32(&data[..15 + payload_len]);
                 if stored_crc == computed_crc {
                     let payload = data[15..15 + payload_len].to_vec();
@@ -484,39 +480,55 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
     match data[0] {
         0 => Some((Value::Null, 1)),
         1 => {
-            if data.len() < 2 { return None; }
+            if data.len() < 2 {
+                return None;
+            }
             Some((Value::Boolean(data[1] != 0), 2))
         }
         2 => {
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let v = i32::from_le_bytes(data[1..5].try_into().unwrap());
             Some((Value::Int32(v), 5))
         }
         3 => {
-            if data.len() < 9 { return None; }
+            if data.len() < 9 {
+                return None;
+            }
             let v = i64::from_le_bytes(data[1..9].try_into().unwrap());
             Some((Value::Int64(v), 9))
         }
         4 => {
-            if data.len() < 9 { return None; }
+            if data.len() < 9 {
+                return None;
+            }
             let v = f64::from_le_bytes(data[1..9].try_into().unwrap());
             Some((Value::Float64(v), 9))
         }
         9 => {
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let v = f32::from_le_bytes(data[1..5].try_into().unwrap());
             Some((Value::Float32(v), 5))
         }
         10 => {
-            if data.len() < 9 { return None; }
+            if data.len() < 9 {
+                return None;
+            }
             let v = i64::from_le_bytes(data[1..9].try_into().unwrap());
             Some((Value::Timestamp(v), 9))
         }
         11 => {
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let dim = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
             let byte_len = dim;
-            if 5 + byte_len > data.len() { return None; }
+            if 5 + byte_len > data.len() {
+                return None;
+            }
             let mut vec = Vec::with_capacity(dim);
             for i in 0..dim {
                 vec.push(data[5 + i] as i8);
@@ -524,24 +536,36 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
             Some((Value::VectorInt8(vec), 5 + byte_len))
         }
         5 => {
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-            if data.len() < 5 + len { return None; }
+            if data.len() < 5 + len {
+                return None;
+            }
             let s = String::from_utf8_lossy(&data[5..5 + len]).to_string();
             Some((Value::Varchar(s), 5 + len))
         }
         6 => {
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-            if data.len() < 5 + len { return None; }
+            if data.len() < 5 + len {
+                return None;
+            }
             let s = String::from_utf8_lossy(&data[5..5 + len]).to_string();
             Some((Value::Json(s), 5 + len))
         }
         7 => {
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let dim = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
             let byte_len = dim * 4;
-            if data.len() < 5 + byte_len { return None; }
+            if data.len() < 5 + byte_len {
+                return None;
+            }
             let mut vec = Vec::with_capacity(dim);
             for i in 0..dim {
                 let start = 5 + i * 4;
@@ -551,46 +575,64 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
             Some((Value::Vector(vec), 5 + byte_len))
         }
         8 => {
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-            if data.len() < 5 + len { return None; }
+            if data.len() < 5 + len {
+                return None;
+            }
             Some((Value::Blob(data[5..5 + len].to_vec()), 5 + len))
         }
         // v0.22.0 新增类型
         12 => {
             // Jsonb
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-            if data.len() < 5 + len { return None; }
+            if data.len() < 5 + len {
+                return None;
+            }
             let s = String::from_utf8_lossy(&data[5..5 + len]).to_string();
             Some((Value::Jsonb(s), 5 + len))
         }
         13 => {
             // Date (i32)
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let v = i32::from_le_bytes(data[1..5].try_into().unwrap());
             Some((Value::Date(v), 5))
         }
         14 => {
             // Time (i32)
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let v = i32::from_le_bytes(data[1..5].try_into().unwrap());
             Some((Value::Time(v), 5))
         }
         15 => {
             // Uuid (u128)
-            if data.len() < 17 { return None; }
+            if data.len() < 17 {
+                return None;
+            }
             let v = u128::from_le_bytes(data[1..17].try_into().unwrap());
             Some((Value::Uuid(v), 17))
         }
         16 => {
             // Array
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
             let mut offset = 5;
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                if offset >= data.len() { return None; }
+                if offset >= data.len() {
+                    return None;
+                }
                 let (item, consumed) = deserialize_value(&data[offset..])?;
                 items.push(item);
                 offset += consumed;
@@ -599,19 +641,27 @@ fn deserialize_value(data: &[u8]) -> Option<(Value, usize)> {
         }
         17 => {
             // Enum (String)
-            if data.len() < 5 { return None; }
+            if data.len() < 5 {
+                return None;
+            }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-            if data.len() < 5 + len { return None; }
+            if data.len() < 5 + len {
+                return None;
+            }
             let s = String::from_utf8_lossy(&data[5..5 + len]).to_string();
             Some((Value::Enum(s), 5 + len))
         }
         18 => {
-            if data.len() < 3 { return None; }
+            if data.len() < 3 {
+                return None;
+            }
             let v = i16::from_le_bytes(data[1..3].try_into().unwrap());
             Some((Value::Int16(v), 3))
         }
         19 => {
-            if data.len() < 18 { return None; }
+            if data.len() < 18 {
+                return None;
+            }
             let v = i128::from_le_bytes(data[1..17].try_into().unwrap());
             let s = data[17];
             Some((Value::Decimal(v, s), 18))
@@ -738,7 +788,7 @@ mod tests {
                 record_type: t,
                 txn_id: 7,
                 table_id: 3,
-            engine_type: crate::common::types::EngineType::Columnar,
+                engine_type: crate::common::types::EngineType::Columnar,
                 payload: vec![10, 20],
             };
             let bytes = rec.to_bytes();
@@ -819,11 +869,7 @@ mod tests {
 
     #[test]
     fn test_insert_payload_mixed_types() {
-        let row = vec![
-            Value::Int64(1),
-            Value::Varchar("hello".into()),
-            Value::Float64(3.14),
-        ];
+        let row = vec![Value::Int64(1), Value::Varchar("hello".into()), Value::Float64(3.14)];
         let payload = make_insert_payload(100, &row);
         let (rowid, parsed) = parse_insert_payload(&payload).unwrap();
         assert_eq!(rowid, 100);
@@ -910,7 +956,11 @@ mod tests {
     fn test_insert_batch_payload_mixed_types() {
         let rows = vec![
             vec![Value::Null, Value::Int32(-5), Value::Vector(vec![1.0, 2.0])],
-            vec![Value::Varchar("x".into()), Value::Timestamp(1700000000000), Value::Blob(vec![1, 2, 3])],
+            vec![
+                Value::Varchar("x".into()),
+                Value::Timestamp(1700000000000),
+                Value::Blob(vec![1, 2, 3]),
+            ],
         ];
         let payload = make_insert_batch_payload(1, &rows);
         let (base, parsed) = parse_insert_batch_payload(&payload).unwrap();

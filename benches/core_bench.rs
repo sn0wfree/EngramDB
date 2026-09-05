@@ -2,8 +2,8 @@
 // 测试: 列存写入/读取、稀疏索引、向量过滤、两阶段聚合
 // 直接用 rustc 编译，无需 cargo 下载依赖
 
-use std::time::{Duration, Instant};
 use std::convert::TryInto;
+use std::time::{Duration, Instant};
 
 // ========== 基础类型 ==========
 
@@ -68,8 +68,12 @@ impl ColumnChunk {
             }
             Value::Int(min) => {
                 let max = if let Value::Int(m) = &self.max_val { *m } else { 0 };
-                if val < *min { self.min_val = Value::Int(val); }
-                if val > max { self.max_val = Value::Int(val); }
+                if val < *min {
+                    self.min_val = Value::Int(val);
+                }
+                if val > max {
+                    self.max_val = Value::Int(val);
+                }
             }
             _ => {}
         }
@@ -85,8 +89,12 @@ impl ColumnChunk {
             }
             Value::Double(min) => {
                 let max = if let Value::Double(m) = &self.max_val { *m } else { 0.0 };
-                if val < *min { self.min_val = Value::Double(val); }
-                if val > max { self.max_val = Value::Double(val); }
+                if val < *min {
+                    self.min_val = Value::Double(val);
+                }
+                if val > max {
+                    self.max_val = Value::Double(val);
+                }
             }
             _ => {}
         }
@@ -178,7 +186,10 @@ impl SelectionVector {
     }
 
     fn empty(capacity: usize) -> Self {
-        SelectionVector { indices: Vec::with_capacity(capacity), count: 0 }
+        SelectionVector {
+            indices: Vec::with_capacity(capacity),
+            count: 0,
+        }
     }
 
     fn push(&mut self, idx: usize) {
@@ -223,15 +234,23 @@ impl PartialAggState {
     fn accumulate_double(&mut self, val: f64) {
         self.sum += val;
         self.count += 1;
-        if val < self.min { self.min = val; }
-        if val > self.max { self.max = val; }
+        if val < self.min {
+            self.min = val;
+        }
+        if val > self.max {
+            self.max = val;
+        }
     }
 
     fn merge(&mut self, other: &PartialAggState) {
         self.sum += other.sum;
         self.count += other.count;
-        if other.min < self.min { self.min = other.min; }
-        if other.max > self.max { self.max = other.max; }
+        if other.min < self.min {
+            self.min = other.min;
+        }
+        if other.max > self.max {
+            self.max = other.max;
+        }
     }
 
     fn finalize(&self) -> Value {
@@ -239,7 +258,11 @@ impl PartialAggState {
             AggFunc::Sum => Value::Double(self.sum),
             AggFunc::Count => Value::Int(self.count as i64),
             AggFunc::Avg => {
-                if self.count == 0 { Value::Null } else { Value::Double(self.sum / self.count as f64) }
+                if self.count == 0 {
+                    Value::Null
+                } else {
+                    Value::Double(self.sum / self.count as f64)
+                }
             }
             AggFunc::Min => Value::Double(self.min),
             AggFunc::Max => Value::Double(self.max),
@@ -251,14 +274,23 @@ impl PartialAggState {
 
 fn bench(name: &str, iters: usize, f: impl Fn()) -> Duration {
     // warmup
-    for _ in 0..2 { f(); }
+    for _ in 0..2 {
+        f();
+    }
     // measure
     let start = Instant::now();
-    for _ in 0..iters { f(); }
+    for _ in 0..iters {
+        f();
+    }
     let elapsed = start.elapsed();
     let per_iter = elapsed / iters as u32;
-    println!("  {:<40} {:>12.3} ms/iter  ({} iters, total {:.2}s)",
-             name, per_iter.as_secs_f64() * 1000.0, iters, elapsed.as_secs_f64());
+    println!(
+        "  {:<40} {:>12.3} ms/iter  ({} iters, total {:.2}s)",
+        name,
+        per_iter.as_secs_f64() * 1000.0,
+        iters,
+        elapsed.as_secs_f64()
+    );
     per_iter
 }
 
@@ -501,7 +533,10 @@ fn main() {
         }
         std::hint::black_box(buf.len());
     });
-    println!("     吞吐: {:.1} MB/s", (N * 8) as f64 / ser_time.as_secs_f64() / 1024.0 / 1024.0);
+    println!(
+        "     吞吐: {:.1} MB/s",
+        (N * 8) as f64 / ser_time.as_secs_f64() / 1024.0 / 1024.0
+    );
 
     // 反序列化 INT 列
     let raw_bytes: Vec<u8> = col_int.int_data.iter().flat_map(|&v| v.to_le_bytes().to_vec()).collect();
@@ -509,13 +544,16 @@ fn main() {
         let mut result = Vec::with_capacity(N);
         let mut i = 0;
         while i < raw_bytes.len() {
-            let bytes: [u8; 8] = raw_bytes[i..i+8].try_into().unwrap();
+            let bytes: [u8; 8] = raw_bytes[i..i + 8].try_into().unwrap();
             result.push(i64::from_le_bytes(bytes));
             i += 8;
         }
         std::hint::black_box(result.len());
     });
-    println!("     吞吐: {:.1} MB/s", (N * 8) as f64 / deser_time.as_secs_f64() / 1024.0 / 1024.0);
+    println!(
+        "     吞吐: {:.1} MB/s",
+        (N * 8) as f64 / deser_time.as_secs_f64() / 1024.0 / 1024.0
+    );
     println!();
 
     // ===== 总结 =====
@@ -523,10 +561,22 @@ fn main() {
     println!("║  性能总结 (Rust 原生, 单核)                              ║");
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  列存写入:  {:>10.1} 行/秒                         ║", rows_per_sec);
-    println!("║  向量过滤:  {:>10.1} 行/秒 (高选择性)              ║", N as f64 / filter_time_high.as_secs_f64());
-    println!("║  向量过滤:  {:>10.1} 行/秒 (低选择性)              ║", N as f64 / filter_time_low.as_secs_f64());
+    println!(
+        "║  向量过滤:  {:>10.1} 行/秒 (高选择性)              ║",
+        N as f64 / filter_time_high.as_secs_f64()
+    );
+    println!(
+        "║  向量过滤:  {:>10.1} 行/秒 (低选择性)              ║",
+        N as f64 / filter_time_low.as_secs_f64()
+    );
     println!("║  PREWHERE 加速:  {:>6.2}x (高选择性)                    ║", speedup);
-    println!("║  聚合吞吐:  {:>10.1} 行/秒                         ║", N as f64 / single_agg_time.as_secs_f64());
-    println!("║  序列化:    {:>10.1} MB/s                            ║", (N * 8) as f64 / ser_time.as_secs_f64() / 1024.0 / 1024.0);
+    println!(
+        "║  聚合吞吐:  {:>10.1} 行/秒                         ║",
+        N as f64 / single_agg_time.as_secs_f64()
+    );
+    println!(
+        "║  序列化:    {:>10.1} MB/s                            ║",
+        (N * 8) as f64 / ser_time.as_secs_f64() / 1024.0 / 1024.0
+    );
     println!("╚══════════════════════════════════════════════════════════╝");
 }

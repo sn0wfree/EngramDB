@@ -152,9 +152,7 @@ fn decide_recommendation(data_type: &DataType, stats: &ColumnStats, total_count:
             rationale: "boolean: BooleanPack bit-packing",
         },
 
-        DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-            recommend_integer(stats, total_count)
-        }
+        DataType::Int16 | DataType::Int32 | DataType::Int64 => recommend_integer(stats, total_count),
 
         DataType::Timestamp => {
             if stats.is_strictly_increasing {
@@ -205,29 +203,23 @@ fn decide_recommendation(data_type: &DataType, stats: &ColumnStats, total_count:
             }
         }
 
-        DataType::Json => {
-            Recommendation {
-                codec: CompressionType::Uncompressed,
-                estimated_ratio: 1.0,
-                rationale: "json: Uncompressed (varies too much)",
-            }
-        }
+        DataType::Json => Recommendation {
+            codec: CompressionType::Uncompressed,
+            estimated_ratio: 1.0,
+            rationale: "json: Uncompressed (varies too much)",
+        },
 
-        DataType::Vector { .. } | DataType::VectorInt8 { .. } => {
-            Recommendation {
-                codec: CompressionType::Uncompressed,
-                estimated_ratio: 1.0,
-                rationale: "vector: Uncompressed (specialized codec TBD)",
-            }
-        }
+        DataType::Vector { .. } | DataType::VectorInt8 { .. } => Recommendation {
+            codec: CompressionType::Uncompressed,
+            estimated_ratio: 1.0,
+            rationale: "vector: Uncompressed (specialized codec TBD)",
+        },
 
-        DataType::Blob => {
-            Recommendation {
-                codec: CompressionType::Uncompressed,
-                estimated_ratio: 1.0,
-                rationale: "blob: Uncompressed (binary data)",
-            }
-        }
+        DataType::Blob => Recommendation {
+            codec: CompressionType::Uncompressed,
+            estimated_ratio: 1.0,
+            rationale: "blob: Uncompressed (binary data)",
+        },
 
         // v0.22.0 新增类型 - 默认不压缩
         DataType::Jsonb
@@ -236,13 +228,11 @@ fn decide_recommendation(data_type: &DataType, stats: &ColumnStats, total_count:
         | DataType::Uuid
         | DataType::Array { .. }
         | DataType::Enum { .. }
-        | DataType::Decimal { .. } => {
-            Recommendation {
-                codec: CompressionType::Uncompressed,
-                estimated_ratio: 1.0,
-                rationale: "special type: Uncompressed (no codec)",
-            }
-        }
+        | DataType::Decimal { .. } => Recommendation {
+            codec: CompressionType::Uncompressed,
+            estimated_ratio: 1.0,
+            rationale: "special type: Uncompressed (no codec)",
+        },
     }
 }
 
@@ -302,8 +292,11 @@ mod tests {
     fn test_recommend_monotonic_int() {
         let col = make_int_col((0..1000).collect());
         let r = recommend_for_column(&col, &DataType::Int64);
-        assert!(matches!(r.codec, CompressionType::Delta),
-                "monotonic should pick Delta, got {:?}", r.codec);
+        assert!(
+            matches!(r.codec, CompressionType::Delta),
+            "monotonic should pick Delta, got {:?}",
+            r.codec
+        );
         assert!(r.rationale.contains("Delta"));
     }
 
@@ -311,8 +304,11 @@ mod tests {
     fn test_recommend_monotonic_timestamp() {
         let col = make_ts_col((1_700_000_000_000..1_700_000_001_000).collect());
         let r = recommend_for_column(&col, &DataType::Timestamp);
-        assert!(matches!(r.codec, CompressionType::DoubleDelta),
-                "monotonic timestamp should pick DoubleDelta, got {:?}", r.codec);
+        assert!(
+            matches!(r.codec, CompressionType::DoubleDelta),
+            "monotonic timestamp should pick DoubleDelta, got {:?}",
+            r.codec
+        );
     }
 
     #[test]
@@ -324,23 +320,35 @@ mod tests {
         }
         let col = make_int_col(values);
         let r = recommend_for_column(&col, &DataType::Int64);
-        assert!(matches!(r.codec, CompressionType::Dictionary),
-                "low cardinality should pick Dictionary, got {:?}", r.codec);
+        assert!(
+            matches!(r.codec, CompressionType::Dictionary),
+            "low cardinality should pick Dictionary, got {:?}",
+            r.codec
+        );
     }
 
     #[test]
     fn test_recommend_high_cardinality_int() {
         // 1000 个值，几乎都不同，且非单调（zigzag）
-        let values: Vec<i64> = (0..1000).map(|i| {
-            let v = (i as i64) ^ ((i as i64) << 3) ^ ((i as i64) >> 2);
-            // 混入负值破单调
-            if i % 2 == 0 { v } else { -v }
-        }).collect();
+        let values: Vec<i64> = (0..1000)
+            .map(|i| {
+                let v = (i as i64) ^ ((i as i64) << 3) ^ ((i as i64) >> 2);
+                // 混入负值破单调
+                if i % 2 == 0 {
+                    v
+                } else {
+                    -v
+                }
+            })
+            .collect();
         let col = make_int_col(values);
         let r = recommend_for_column(&col, &DataType::Int64);
         // 高基数 + 非单调 → ForBitPack 或 Rle
-        assert!(matches!(r.codec, CompressionType::ForBitPack | CompressionType::Rle),
-                "high cardinality non-monotonic should pick ForBitPack or Rle, got {:?}", r.codec);
+        assert!(
+            matches!(r.codec, CompressionType::ForBitPack | CompressionType::Rle),
+            "high cardinality non-monotonic should pick ForBitPack or Rle, got {:?}",
+            r.codec
+        );
     }
 
     #[test]
@@ -365,8 +373,11 @@ mod tests {
         let col = make_int_col(values);
         let r = recommend_for_column(&col, &DataType::Int64);
         // 单调 → Delta（采样应仍识别出单调性）
-        assert!(matches!(r.codec, CompressionType::Delta),
-                "monotonic large col should pick Delta, got {:?}", r.codec);
+        assert!(
+            matches!(r.codec, CompressionType::Delta),
+            "monotonic large col should pick Delta, got {:?}",
+            r.codec
+        );
     }
 
     #[test]

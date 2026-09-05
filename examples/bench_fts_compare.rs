@@ -56,7 +56,12 @@ fn build_rows(corpus: &[String]) -> Vec<String> {
         }
     }
     // 2. 独立消息（语料抽样）
-    for (i, t) in corpus.iter().step_by(corpus.len() / INDEPENDENT_MSGS.max(1)).take(INDEPENDENT_MSGS).enumerate() {
+    for (i, t) in corpus
+        .iter()
+        .step_by(corpus.len() / INDEPENDENT_MSGS.max(1))
+        .take(INDEPENDENT_MSGS)
+        .enumerate()
+    {
         let _ = i;
         rows.push(t.clone());
     }
@@ -97,9 +102,17 @@ impl TokenIdx {
         if ids.is_empty() {
             return Vec::new();
         }
-        let mut result: Vec<u32> = self.postings.get(&ids[0]).map(|p| p.iter().map(|(r, _)| *r).collect()).unwrap_or_default();
+        let mut result: Vec<u32> = self
+            .postings
+            .get(&ids[0])
+            .map(|p| p.iter().map(|(r, _)| *r).collect())
+            .unwrap_or_default();
         for id in &ids[1..] {
-            let term: Vec<u32> = self.postings.get(id).map(|p| p.iter().map(|(r, _)| *r).collect()).unwrap_or_default();
+            let term: Vec<u32> = self
+                .postings
+                .get(id)
+                .map(|p| p.iter().map(|(r, _)| *r).collect())
+                .unwrap_or_default();
             result = result.into_iter().filter(|r| term.binary_search(r).is_ok()).collect();
             if result.is_empty() {
                 break;
@@ -212,7 +225,13 @@ fn main() {
     }
 
     // ---- 查询对比 ----
-    println!("\n查询对比（{} 条：中文 {} + 英文 {} + 混合 {}）：", queries.len(), zh.len(), en.len(), 5);
+    println!(
+        "\n查询对比（{} 条：中文 {} + 英文 {} + 混合 {}）：",
+        queries.len(),
+        zh.len(),
+        en.len(),
+        5
+    );
     let mut a_total = 0u128;
     let mut b_total = 0u128;
     let mut a_hits = 0usize;
@@ -236,7 +255,9 @@ fn main() {
         b_hits += b_r.len();
         println!(
             "  {:>24.24} | A {a_us:>5}µs 召回 {:<5} | B {b_us:>5}µs 召回 {:<5}",
-            q, a_r.len(), b_r.len()
+            q,
+            a_r.len(),
+            b_r.len()
         );
     }
     println!(

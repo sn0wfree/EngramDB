@@ -207,7 +207,12 @@ fn encode_varint(out: &mut Vec<u8>, mut v: u32) {
     }
 }
 
-fn static_encode(ids: &[u32], codes: &fxhash::FxHashMap<u32, huffman::Code>, vocab_size: u32, base: Option<&[u8]>) -> Vec<u8> {
+fn static_encode(
+    ids: &[u32],
+    codes: &fxhash::FxHashMap<u32, huffman::Code>,
+    vocab_size: u32,
+    base: Option<&[u8]>,
+) -> Vec<u8> {
     let is_esc = |id: u32| match base {
         Some(b) => id >= vocab_size || b[id as usize] == 0,
         None => true,
@@ -284,32 +289,37 @@ fn main() {
         v.sort_by_key(|s| s.len());
         v.into_iter().rev().take(3).collect()
     };
-    let stream_blocks: Vec<Vec<String>> = long_texts
-        .iter()
-        .map(|t| stream_snapshots(t, &tok, STREAM_SNAPSHOTS))
-        .collect();
+    let stream_blocks: Vec<Vec<String>> =
+        long_texts.iter().map(|t| stream_snapshots(t, &tok, STREAM_SNAPSHOTS)).collect();
     let doc_blocks: Vec<Vec<String>> = corpus.chunks(DOC_BLOCK_SIZE).map(|c| c.to_vec()).collect();
 
-    for (name, blocks) in [
-        ("A 流式追加", &stream_blocks),
-        ("C 独立文档", &doc_blocks),
-    ] {
-        println!("\n=== 场景 {name}（{} 块，{} 事件）===", blocks.len(), blocks.iter().map(|b| b.len()).sum::<usize>());
+    for (name, blocks) in [("A 流式追加", &stream_blocks), ("C 独立文档", &doc_blocks)] {
+        println!(
+            "\n=== 场景 {name}（{} 块，{} 事件）===",
+            blocks.len(),
+            blocks.iter().map(|b| b.len()).sum::<usize>()
+        );
         let p = phase_bench(&tok, blocks);
 
         let total_ent = p.ent_varint_us.min(p.ent_static_us).min(p.ent_huffman_us);
         let total = p.tokenize_us + p.dyn_us + p.delta_us + total_ent;
         println!(
             "{:<20} {:>10} {:>7.1}%",
-            "1. tokenize", p.tokenize_us, p.tokenize_us as f64 / total as f64 * 100.0
+            "1. tokenize",
+            p.tokenize_us,
+            p.tokenize_us as f64 / total as f64 * 100.0
         );
         println!(
             "{:<20} {:>10} {:>7.1}%",
-            "2. 动态字典", p.dyn_us, p.dyn_us as f64 / total as f64 * 100.0
+            "2. 动态字典",
+            p.dyn_us,
+            p.dyn_us as f64 / total as f64 * 100.0
         );
         println!(
             "{:<20} {:>10} {:>7.1}%",
-            "3. 前缀 delta", p.delta_us, p.delta_us as f64 / total as f64 * 100.0
+            "3. 前缀 delta",
+            p.delta_us,
+            p.delta_us as f64 / total as f64 * 100.0
         );
         println!("熵编码（三形态分别，与 1-3 不可直接相加）：");
         for (n, us, size) in [
@@ -317,7 +327,12 @@ fn main() {
             ("  Static", p.ent_static_us, p.ent_static_size),
             ("  Huffman", p.ent_huffman_us, p.ent_huffman_size),
         ] {
-            println!("{:<20} {:>10} ({:>7.1}% of total+该形态) | 熵流 {size} B", n, us, us as f64 / (total + us - total_ent) as f64 * 100.0);
+            println!(
+                "{:<20} {:>10} ({:>7.1}% of total+该形态) | 熵流 {size} B",
+                n,
+                us,
+                us as f64 / (total + us - total_ent) as f64 * 100.0
+            );
         }
         println!(
             "{:<20} {:>10}（= 1+2+3 + 最快熵形态，基准对齐 encode_block）",

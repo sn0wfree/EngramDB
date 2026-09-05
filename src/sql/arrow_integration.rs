@@ -28,10 +28,10 @@ pub enum ArrowDataType {
     Int32,
     Int64,
     Float64,
-    Utf8,       // 可变长度 UTF-8 字符串
-    LargeUtf8,  // 64位偏移的 UTF-8 字符串
-    Binary,     // 可变长度二进制
-    Date32,     // 日期（从 1970-01-01 起的天数）
+    Utf8,      // 可变长度 UTF-8 字符串
+    LargeUtf8, // 64位偏移的 UTF-8 字符串
+    Binary,    // 可变长度二进制
+    Date32,    // 日期（从 1970-01-01 起的天数）
     TimestampSecond,
     TimestampMillisecond,
     TimestampMicrosecond,
@@ -100,13 +100,11 @@ impl ArrowRecordBatch {
     /// 创建 RecordBatch
     pub fn try_new(schema: ArrowSchema, columns: Vec<Box<dyn ArrowArray>>) -> Result<Self> {
         if columns.len() != schema.fields.len() {
-            return Err(DbError::Internal(
-                format!(
-                    "schema has {} fields but {} columns provided",
-                    schema.fields.len(),
-                    columns.len()
-                )
-            ));
+            return Err(DbError::Internal(format!(
+                "schema has {} fields but {} columns provided",
+                schema.fields.len(),
+                columns.len()
+            )));
         }
 
         // 验证所有列长度一致
@@ -114,12 +112,12 @@ impl ArrowRecordBatch {
             let len = columns[0].len();
             for (i, col) in columns.iter().enumerate() {
                 if col.len() != len {
-                    return Err(DbError::Internal(
-                        format!(
-                            "column {} has length {}, expected {}",
-                            i, col.len(), len
-                        )
-                    ));
+                    return Err(DbError::Internal(format!(
+                        "column {} has length {}, expected {}",
+                        i,
+                        col.len(),
+                        len
+                    )));
                 }
             }
         }
@@ -136,7 +134,11 @@ impl ArrowRecordBatch {
     }
 
     pub fn num_rows(&self) -> usize {
-        if self.columns.is_empty() { 0 } else { self.columns[0].len() }
+        if self.columns.is_empty() {
+            0
+        } else {
+            self.columns[0].len()
+        }
     }
 
     pub fn column(&self, i: usize) -> &dyn ArrowArray {
@@ -160,7 +162,7 @@ pub fn value_type_to_arrow(value: &Value) -> ArrowDataType {
         Value::Timestamp(_) => ArrowDataType::Int64, // 简化：映射到 Int64
         Value::Varchar(_) => ArrowDataType::Utf8,
         Value::Json(_) | Value::Jsonb(_) => ArrowDataType::Utf8,
-        Value::Vector(_) => ArrowDataType::Utf8, // 序列化为字符串表示
+        Value::Vector(_) => ArrowDataType::Utf8,     // 序列化为字符串表示
         Value::VectorInt8(_) => ArrowDataType::Utf8, // 序列化为字符串表示
         Value::Blob(_) => ArrowDataType::Binary,
         // v0.22.0 新增类型
@@ -248,13 +250,11 @@ impl ArrowExporter {
     /// - `column_names`: 列名列表（用于构建 Schema）
     pub fn chunk_to_record_batch(chunk: &DataChunk, column_names: &[String]) -> Result<ArrowRecordBatch> {
         if column_names.len() != chunk.num_columns() {
-            return Err(DbError::Internal(
-                format!(
-                    "column_names has {} entries but chunk has {} columns",
-                    column_names.len(),
-                    chunk.num_columns()
-                )
-            ));
+            return Err(DbError::Internal(format!(
+                "column_names has {} entries but chunk has {} columns",
+                column_names.len(),
+                chunk.num_columns()
+            )));
         }
 
         let mut fields = Vec::with_capacity(chunk.num_columns());
@@ -381,7 +381,7 @@ impl ArrowIpcWriter {
     pub fn write_batch(&mut self, batch: ArrowRecordBatch) -> Result<()> {
         if self.schema.is_none() {
             return Err(DbError::Internal(
-                "schema must be written before record batches".to_string()
+                "schema must be written before record batches".to_string(),
             ));
         }
         self.batches.push(batch);
@@ -452,7 +452,10 @@ mod tests {
         assert_eq!(value_type_to_arrow(&Value::Int32(1)), ArrowDataType::Int32);
         assert_eq!(value_type_to_arrow(&Value::Int64(1)), ArrowDataType::Int64);
         assert_eq!(value_type_to_arrow(&Value::Float64(1.0)), ArrowDataType::Float64);
-        assert_eq!(value_type_to_arrow(&Value::Varchar("x".to_string())), ArrowDataType::Utf8);
+        assert_eq!(
+            value_type_to_arrow(&Value::Varchar("x".to_string())),
+            ArrowDataType::Utf8
+        );
     }
 
     #[test]
@@ -485,9 +488,11 @@ mod tests {
     #[test]
     fn test_record_batch_validation() {
         // 列数不匹配
-        let schema = ArrowSchema::new(vec![
-            ArrowField { name: "a".to_string(), data_type: ArrowDataType::Int64, nullable: false },
-        ]);
+        let schema = ArrowSchema::new(vec![ArrowField {
+            name: "a".to_string(),
+            data_type: ArrowDataType::Int64,
+            nullable: false,
+        }]);
         let result = ArrowRecordBatch::try_new(schema, vec![]);
         assert!(result.is_err());
 
@@ -518,12 +523,7 @@ mod tests {
     #[test]
     fn test_vector_backed_array() {
         let array = VectorBackedArray {
-            values: vec![
-                Value::Int64(1),
-                Value::Int64(2),
-                Value::Null,
-                Value::Int64(4),
-            ],
+            values: vec![Value::Int64(1), Value::Int64(2), Value::Null, Value::Int64(4)],
         };
         assert_eq!(array.len(), 4);
         assert!(!array.is_empty());
@@ -536,9 +536,11 @@ mod tests {
     #[test]
     fn test_ipc_writer_basic() {
         let mut writer = ArrowIpcWriter::new(IpcFormat::Stream);
-        let schema = ArrowSchema::new(vec![
-            ArrowField { name: "id".to_string(), data_type: ArrowDataType::Int64, nullable: false },
-        ]);
+        let schema = ArrowSchema::new(vec![ArrowField {
+            name: "id".to_string(),
+            data_type: ArrowDataType::Int64,
+            nullable: false,
+        }]);
         writer.write_schema(schema).unwrap();
 
         // 没有数据也能 finish
@@ -559,9 +561,21 @@ mod tests {
     #[test]
     fn test_importer_schema_to_names() {
         let schema = ArrowSchema::new(vec![
-            ArrowField { name: "a".to_string(), data_type: ArrowDataType::Int32, nullable: false },
-            ArrowField { name: "b".to_string(), data_type: ArrowDataType::Utf8, nullable: true },
-            ArrowField { name: "c".to_string(), data_type: ArrowDataType::Float64, nullable: false },
+            ArrowField {
+                name: "a".to_string(),
+                data_type: ArrowDataType::Int32,
+                nullable: false,
+            },
+            ArrowField {
+                name: "b".to_string(),
+                data_type: ArrowDataType::Utf8,
+                nullable: true,
+            },
+            ArrowField {
+                name: "c".to_string(),
+                data_type: ArrowDataType::Float64,
+                nullable: false,
+            },
         ]);
         let names = ArrowImporter::schema_to_column_names(&schema);
         assert_eq!(names, vec!["a", "b", "c"]);

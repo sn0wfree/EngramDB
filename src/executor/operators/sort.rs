@@ -7,7 +7,7 @@ use crate::common::error::Result;
 use crate::common::value_cmp::total_cmp;
 use crate::Value;
 
-use super::super::physical_plan::{SortKey, SortDirection};
+use super::super::physical_plan::{SortDirection, SortKey};
 use super::super::vector::{DataChunk, Vector};
 
 /// 执行排序
@@ -194,10 +194,7 @@ fn try_execute_typed(input: &[DataChunk], sort_keys: &[SortKey]) -> Option<Vec<D
     for chunk_start in (0..total).step_by(chunk_size) {
         let chunk_end = std::cmp::min(chunk_start + chunk_size, total);
         let sel = &order[chunk_start..chunk_end];
-        let columns: Vec<Vector> = merged_cols
-            .iter()
-            .map(|col| Vector::Typed(col.gather(sel)))
-            .collect();
+        let columns: Vec<Vector> = merged_cols.iter().map(|col| Vector::Typed(col.gather(sel))).collect();
         result.push(DataChunk {
             columns,
             count: chunk_end - chunk_start,
@@ -253,7 +250,11 @@ fn try_radix_sort(all_rows: &mut Vec<Vec<Value>>, key: &SortKey) -> bool {
 #[inline]
 fn int_to_key(v: i64, desc: bool) -> u64 {
     let k = v as u64 ^ (1u64 << 63);
-    if desc { !k } else { k }
+    if desc {
+        !k
+    } else {
+        k
+    }
 }
 
 /// LSD 基数排序：16-bit 分桶，4 趟（覆盖 u64 全范围），稳定
@@ -349,13 +350,16 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::vector::{Vector, DataChunk};
+    use crate::executor::vector::{DataChunk, Vector};
 
     fn make_test_chunk() -> DataChunk {
         // 三列：id (Int64), name (Varchar), score (Float64)
         let ids = Vector::Flat(vec![
-            Value::Int64(3), Value::Int64(1), Value::Int64(2),
-            Value::Int64(5), Value::Int64(4),
+            Value::Int64(3),
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(5),
+            Value::Int64(4),
         ]);
         let names = Vector::Flat(vec![
             Value::Varchar("charlie".into()),
@@ -380,7 +384,10 @@ mod tests {
     #[test]
     fn test_sort_single_asc() {
         let chunk = make_test_chunk();
-        let keys = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let keys = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Asc,
+        }];
         let result = execute(&[chunk], &keys, None).unwrap();
 
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -395,7 +402,10 @@ mod tests {
     #[test]
     fn test_sort_single_desc() {
         let chunk = make_test_chunk();
-        let keys = vec![SortKey { column_index: 0, direction: SortDirection::Desc }];
+        let keys = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Desc,
+        }];
         let result = execute(&[chunk], &keys, None).unwrap();
 
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -409,8 +419,14 @@ mod tests {
         let chunk = make_test_chunk();
         // 先按 score 降序，再按 name 升序
         let keys = vec![
-            SortKey { column_index: 2, direction: SortDirection::Desc },
-            SortKey { column_index: 1, direction: SortDirection::Asc },
+            SortKey {
+                column_index: 2,
+                direction: SortDirection::Desc,
+            },
+            SortKey {
+                column_index: 1,
+                direction: SortDirection::Asc,
+            },
         ];
         let result = execute(&[chunk], &keys, None).unwrap();
 
@@ -429,7 +445,10 @@ mod tests {
     #[test]
     fn test_sort_varchar() {
         let chunk = make_test_chunk();
-        let keys = vec![SortKey { column_index: 1, direction: SortDirection::Asc }];
+        let keys = vec![SortKey {
+            column_index: 1,
+            direction: SortDirection::Asc,
+        }];
         let result = execute(&[chunk], &keys, None).unwrap();
 
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -443,7 +462,10 @@ mod tests {
     #[test]
     fn test_sort_empty() {
         let chunk = DataChunk::new(3);
-        let keys = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let keys = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Asc,
+        }];
         let result = execute(&[chunk], &keys, None).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].count, 0);
@@ -454,7 +476,10 @@ mod tests {
     #[test]
     fn test_sort_desc_top_n() {
         let chunk = make_test_chunk();
-        let keys = vec![SortKey { column_index: 0, direction: SortDirection::Desc }];
+        let keys = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Desc,
+        }];
         // Top-3（desc）：5, 4, 3
         let result = execute(&[chunk], &keys, Some(3)).unwrap();
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -469,8 +494,14 @@ mod tests {
         let chunk = make_test_chunk();
         // score DESC, name ASC；Top-3 应为 95.0 的两行（alice, bob）+ 88.5 的 charlie
         let keys = vec![
-            SortKey { column_index: 2, direction: SortDirection::Desc },
-            SortKey { column_index: 1, direction: SortDirection::Asc },
+            SortKey {
+                column_index: 2,
+                direction: SortDirection::Desc,
+            },
+            SortKey {
+                column_index: 1,
+                direction: SortDirection::Asc,
+            },
         ];
         let result = execute(&[chunk], &keys, Some(3)).unwrap();
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -483,7 +514,10 @@ mod tests {
     #[test]
     fn test_sort_asc_top_n() {
         let chunk = make_test_chunk();
-        let keys = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let keys = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Asc,
+        }];
         // Top-2（asc）：1, 2
         let result = execute(&[chunk], &keys, Some(2)).unwrap();
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
@@ -551,7 +585,10 @@ mod tests {
             }
             for desc in [false, true] {
                 let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
-                let keys_ref = vec![SortKey { column_index: 0, direction: dir }];
+                let keys_ref = vec![SortKey {
+                    column_index: 0,
+                    direction: dir,
+                }];
 
                 let chunk_radix = make_radix_chunk(keys.clone());
                 let r_radix = execute(&[chunk_radix], &keys_ref, None).unwrap();
@@ -561,8 +598,15 @@ mod tests {
                 let r_cmp = execute_force_compare(&[chunk_cmp], &keys_ref).unwrap();
                 let rows_cmp: Vec<Vec<Value>> = r_cmp.iter().flat_map(|c| c.to_rows()).collect();
 
-                assert_eq!(rows_radix.len(), rows_cmp.len(),
-                    "trial {} desc {} radix={} cmp={}", trial, desc, rows_radix.len(), rows_cmp.len());
+                assert_eq!(
+                    rows_radix.len(),
+                    rows_cmp.len(),
+                    "trial {} desc {} radix={} cmp={}",
+                    trial,
+                    desc,
+                    rows_radix.len(),
+                    rows_cmp.len()
+                );
                 for (a, b) in rows_radix.iter().zip(rows_cmp.iter()) {
                     assert_eq!(a[0], b[0], "key mismatch trial {} desc {}", trial, desc);
                     assert_eq!(a[1], b[1], "row order mismatch trial {} desc {}", trial, desc);
@@ -575,20 +619,36 @@ mod tests {
     fn test_radix_null_order() {
         // ASC：NULL 最前；DESC：NULL 最后
         let keys = vec![
-            Value::Int64(5), Value::Null, Value::Int64(1), Value::Null, Value::Int64(3),
+            Value::Int64(5),
+            Value::Null,
+            Value::Int64(1),
+            Value::Null,
+            Value::Int64(3),
         ];
-        let asc = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let asc = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Asc,
+        }];
         let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys.clone())], &asc, None)
-            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.to_rows())
+            .collect();
         assert_eq!(rows[0][0], Value::Null);
         assert_eq!(rows[1][0], Value::Null);
         assert_eq!(rows[2][0], Value::Int64(1));
         assert_eq!(rows[3][0], Value::Int64(3));
         assert_eq!(rows[4][0], Value::Int64(5));
 
-        let desc = vec![SortKey { column_index: 0, direction: SortDirection::Desc }];
+        let desc = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Desc,
+        }];
         let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys)], &desc, None)
-            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.to_rows())
+            .collect();
         assert_eq!(rows[0][0], Value::Int64(5));
         assert_eq!(rows[1][0], Value::Int64(3));
         assert_eq!(rows[2][0], Value::Int64(1));
@@ -600,11 +660,21 @@ mod tests {
     fn test_radix_stability() {
         // 重复键保持原相对顺序（与 sort_by 稳定一致）
         let keys = vec![
-            Value::Int64(2), Value::Int64(1), Value::Int64(2), Value::Int64(1), Value::Int64(2),
+            Value::Int64(2),
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(1),
+            Value::Int64(2),
         ];
-        let asc = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let asc = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Asc,
+        }];
         let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys)], &asc, None)
-            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.to_rows())
+            .collect();
         // 原序号：key=1 的是行 1,3；key=2 的是行 0,2,4
         assert_eq!(rows[0][1], Value::Int64(1));
         assert_eq!(rows[1][1], Value::Int64(3));
@@ -617,7 +687,10 @@ mod tests {
     fn test_radix_fallback_non_integer() {
         // 非整数列（Float64）：radix 不可用，走 sort_by，结果仍正确
         let chunk = make_test_chunk();
-        let keys = vec![SortKey { column_index: 2, direction: SortDirection::Asc }];
+        let keys = vec![SortKey {
+            column_index: 2,
+            direction: SortDirection::Asc,
+        }];
         let result = execute(&[chunk], &keys, None).unwrap();
         let rows: Vec<Vec<Value>> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(rows.len(), 5);
@@ -629,9 +702,15 @@ mod tests {
     fn test_radix_all_null() {
         // 全 NULL 列：保持原序
         let keys = vec![Value::Null, Value::Null, Value::Null];
-        let asc = vec![SortKey { column_index: 0, direction: SortDirection::Asc }];
+        let asc = vec![SortKey {
+            column_index: 0,
+            direction: SortDirection::Asc,
+        }];
         let rows: Vec<Vec<Value>> = execute(&[make_radix_chunk(keys)], &asc, None)
-            .unwrap().iter().flat_map(|c| c.to_rows()).collect();
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.to_rows())
+            .collect();
         assert_eq!(rows[0][1], Value::Int64(0));
         assert_eq!(rows[1][1], Value::Int64(1));
         assert_eq!(rows[2][1], Value::Int64(2));
@@ -666,7 +745,10 @@ mod tests {
             };
             for desc in [false, true] {
                 let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
-                let keys_ref = vec![SortKey { column_index: 0, direction: dir }];
+                let keys_ref = vec![SortKey {
+                    column_index: 0,
+                    direction: dir,
+                }];
                 let typed_out = execute(&[typed.clone()], &keys_ref, None).unwrap();
                 let flat_out = execute_force_compare(&[flat.clone()], &keys_ref).unwrap();
                 let t: Vec<Vec<Value>> = typed_out.iter().flat_map(|c| c.to_rows()).collect();
@@ -681,14 +763,25 @@ mod tests {
         use crate::common::column_data::ColumnData;
         // 多列：先 k1 降序再 k2 升序（索引比较路径）
         let k1 = ColumnData::try_from_values(&vec![Value::Int64(2), Value::Int64(1), Value::Int64(2)]).unwrap();
-        let k2 = ColumnData::try_from_values(&vec![Value::Varchar("b".into()), Value::Varchar("a".into()), Value::Varchar("c".into())]).unwrap();
+        let k2 = ColumnData::try_from_values(&vec![
+            Value::Varchar("b".into()),
+            Value::Varchar("a".into()),
+            Value::Varchar("c".into()),
+        ])
+        .unwrap();
         let typed = DataChunk {
             columns: vec![Vector::Typed(k1), Vector::Typed(k2)],
             count: 3,
         };
         let keys = vec![
-            SortKey { column_index: 0, direction: SortDirection::Desc },
-            SortKey { column_index: 1, direction: SortDirection::Asc },
+            SortKey {
+                column_index: 0,
+                direction: SortDirection::Desc,
+            },
+            SortKey {
+                column_index: 1,
+                direction: SortDirection::Asc,
+            },
         ];
         let out = execute(&[typed], &keys, None).unwrap();
         let rows: Vec<Vec<Value>> = out.iter().flat_map(|c| c.to_rows()).collect();
@@ -702,8 +795,8 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_radix_vs_compare() {
-        use std::time::Instant;
         use rand::Rng;
+        use std::time::Instant;
         let mut rng = rand::thread_rng();
         let n = 1_000_000usize;
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(n);
@@ -713,7 +806,10 @@ mod tests {
                 Value::Int64(i as i64),
             ]);
         }
-        let key = SortKey { column_index: 0, direction: SortDirection::Asc };
+        let key = SortKey {
+            column_index: 0,
+            direction: SortDirection::Asc,
+        };
 
         let mut r1 = rows.clone();
         let t0 = Instant::now();
@@ -725,8 +821,11 @@ mod tests {
         r2.sort_by(|a, b| cmp_rows(a, b, &[key.clone()]));
         let cmp_time = t0.elapsed();
 
-        println!("1M 行: radix = {:?}, sort_by = {:?}, radix 快 {}x",
-                 radix_time, cmp_time,
-                 cmp_time.as_nanos() as f64 / radix_time.as_nanos() as f64);
+        println!(
+            "1M 行: radix = {:?}, sort_by = {:?}, radix 快 {}x",
+            radix_time,
+            cmp_time,
+            cmp_time.as_nanos() as f64 / radix_time.as_nanos() as f64
+        );
     }
 }

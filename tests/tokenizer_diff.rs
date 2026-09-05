@@ -26,11 +26,7 @@ fn parse_ids(ids_str: &str) -> Vec<u32> {
 
 /// 字符边界安全截断（断言显示用，避免中文截断 panic）
 fn safe_preview(text: &str) -> String {
-    let end = text
-        .char_indices()
-        .nth(60)
-        .map(|(idx, _)| idx)
-        .unwrap_or(text.len());
+    let end = text.char_indices().nth(60).map(|(idx, _)| idx).unwrap_or(text.len());
     text[..end].to_string()
 }
 
@@ -92,10 +88,7 @@ fn test_diff_oov_marking() {
             if t.id == UNKNOWN_ID {
                 let c = &text[t.offset.clone()];
                 // 单字符检查：标记的必须是不在词表的字符
-                assert!(
-                    !tok.is_in_vocab(c),
-                    "UNKNOWN 标记了词表内字符：{c:?}"
-                );
+                assert!(!tok.is_in_vocab(c), "UNKNOWN 标记了词表内字符：{c:?}");
                 unknown_chars += 1;
             }
         }
@@ -132,11 +125,7 @@ fn test_diff_incremental_stream() {
         let mut prev = String::new();
         let mut prev_tokens = Vec::new();
         for i in 1..=text.chars().count() {
-            let end = text
-                .char_indices()
-                .nth(i)
-                .map(|(idx, _)| idx)
-                .unwrap_or(text.len());
+            let end = text.char_indices().nth(i).map(|(idx, _)| idx).unwrap_or(text.len());
             let next = text[..end].to_string();
             let full = tok.tokenize(&next);
             let inc = tok.tokenize_incremental(&prev, &prev_tokens, &next);

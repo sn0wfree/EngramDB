@@ -25,7 +25,9 @@ pub fn query_ids(tok: &Tokenizer, query: &str) -> Vec<u32> {
     for t in tok.tokenize(query) {
         if t.id != UNKNOWN_ID
             && !ids.contains(&t.id)
-            && !tok.id_to_token(t.id).map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace))
+            && !tok
+                .id_to_token(t.id)
+                .map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace))
         {
             ids.push(t.id);
         }

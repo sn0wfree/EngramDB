@@ -11,9 +11,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use arrow_array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-};
+use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use datafusion::execution::TaskContext;
 use datafusion_common::{DataFusionError, Result as DfResult};
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
@@ -112,10 +110,7 @@ impl datafusion::catalog::TableProvider for EngramDBTable {
         TableType::Base
     }
 
-    fn supports_filter_pushdown(
-        &self,
-        _filter: &Expr,
-    ) -> DfResult<TableProviderFilterPushDown> {
+    fn supports_filter_pushdown(&self, _filter: &Expr) -> DfResult<TableProviderFilterPushDown> {
         // Phase 1: 暂不支持谓词下推，由 DataFusion 上层 Filter 算子处理
         // Phase 2: 实现 Inexact / Exact 下推
         Ok(TableProviderFilterPushDown::Unsupported)
@@ -172,12 +167,7 @@ fn new_empty_array(dt: &DataType) -> ArrayRef {
 }
 
 /// 将 EngramDB Value 列转为 Arrow Array
-fn values_to_array(
-    dt: &DataType,
-    rows: &[Vec<Value>],
-    col_idx: usize,
-    num_rows: usize,
-) -> DfResult<ArrayRef> {
+fn values_to_array(dt: &DataType, rows: &[Vec<Value>], col_idx: usize, num_rows: usize) -> DfResult<ArrayRef> {
     match dt {
         DataType::Boolean => {
             let mut builder = Vec::with_capacity(num_rows);
@@ -185,9 +175,12 @@ fn values_to_array(
                 match row.get(col_idx) {
                     Some(Value::Boolean(b)) => builder.push(Some(*b)),
                     Some(Value::Null) | None => builder.push(None),
-                    _ => return Err(DataFusionError::Internal(format!(
-                        "Type mismatch: expected Boolean at column {}", col_idx
-                    ))),
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "Type mismatch: expected Boolean at column {}",
+                            col_idx
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(BooleanArray::from(builder)))
@@ -199,9 +192,12 @@ fn values_to_array(
                     Some(Value::Int32(v)) => builder.push(Some(*v)),
                     Some(Value::Int64(v)) => builder.push(Some(*v as i32)),
                     Some(Value::Null) | None => builder.push(None),
-                    _ => return Err(DataFusionError::Internal(format!(
-                        "Type mismatch: expected Int32 at column {}", col_idx
-                    ))),
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "Type mismatch: expected Int32 at column {}",
+                            col_idx
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(Int32Array::from(builder)))
@@ -213,9 +209,12 @@ fn values_to_array(
                     Some(Value::Int64(v)) => builder.push(Some(*v)),
                     Some(Value::Int32(v)) => builder.push(Some(*v as i64)),
                     Some(Value::Null) | None => builder.push(None),
-                    _ => return Err(DataFusionError::Internal(format!(
-                        "Type mismatch: expected Int64 at column {}", col_idx
-                    ))),
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "Type mismatch: expected Int64 at column {}",
+                            col_idx
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(Int64Array::from(builder)))
@@ -228,9 +227,12 @@ fn values_to_array(
                     Some(Value::Int64(v)) => builder.push(Some(*v as f64)),
                     Some(Value::Int32(v)) => builder.push(Some(*v as f64)),
                     Some(Value::Null) | None => builder.push(None),
-                    _ => return Err(DataFusionError::Internal(format!(
-                        "Type mismatch: expected Float64 at column {}", col_idx
-                    ))),
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "Type mismatch: expected Float64 at column {}",
+                            col_idx
+                        )))
+                    }
                 }
             }
             Ok(Arc::new(Float64Array::from(builder)))
@@ -243,15 +245,15 @@ fn values_to_array(
                 match row.get(col_idx) {
                     Some(Value::Varchar(s)) => owned.push(Some(s.clone())),
                     Some(Value::Null) | None => owned.push(None),
-                    _ => return Err(DataFusionError::Internal(format!(
-                        "Type mismatch: expected Varchar at column {}", col_idx
-                    ))),
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "Type mismatch: expected Varchar at column {}",
+                            col_idx
+                        )))
+                    }
                 }
             }
-            let string_vec: Vec<Option<&str>> = owned
-                .iter()
-                .map(|s| s.as_deref())
-                .collect();
+            let string_vec: Vec<Option<&str>> = owned.iter().map(|s| s.as_deref()).collect();
             Ok(Arc::new(StringArray::from(string_vec)))
         }
     }
@@ -270,9 +272,24 @@ mod tests {
             ("active".to_string(), DataType::Boolean, false),
         ];
         let rows = vec![
-            vec![Value::Int64(1), Value::Varchar("alice".into()), Value::Float64(95.5), Value::Boolean(true)],
-            vec![Value::Int64(2), Value::Varchar("bob".into()), Value::Float64(87.0), Value::Boolean(true)],
-            vec![Value::Int64(3), Value::Null, Value::Float64(72.3), Value::Boolean(false)],
+            vec![
+                Value::Int64(1),
+                Value::Varchar("alice".into()),
+                Value::Float64(95.5),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Varchar("bob".into()),
+                Value::Float64(87.0),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Null,
+                Value::Float64(72.3),
+                Value::Boolean(false),
+            ],
         ];
         EngramDBTable::new("test".to_string(), columns, rows)
     }

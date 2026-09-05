@@ -1,9 +1,9 @@
 //! 物理执行计划
 
 use crate::common::types::TableDef;
-use crate::Value;
 use crate::sql::ast::Expression;
 use crate::sql::ast::{AlterTableStmt, PragmaStmt, WindowSpec};
+use crate::Value;
 
 /// 物理计划节点
 #[derive(Debug, Clone)]
@@ -104,9 +104,7 @@ pub enum PhysicalPlan {
         source: Box<PhysicalPlan>,
     },
     /// 创建表
-    CreateTable {
-        table_def: TableDef,
-    },
+    CreateTable { table_def: TableDef },
     /// 创建索引（v0.12.0 新增，覆盖索引）
     CreateIndex {
         table_name: String,
@@ -174,15 +172,9 @@ pub enum PhysicalPlan {
         with_data: bool,
     },
     /// 刷新物化视图
-    RefreshMaterializedView {
-        view_name: String,
-        concurrently: bool,
-    },
+    RefreshMaterializedView { view_name: String, concurrently: bool },
     /// 删除物化视图
-    DropMaterializedView {
-        view_name: String,
-        if_exists: bool,
-    },
+    DropMaterializedView { view_name: String, if_exists: bool },
     /// 创建普通视图（v0.22.0 新增）
     CreateView {
         view_name: String,
@@ -191,19 +183,13 @@ pub enum PhysicalPlan {
         or_replace: bool,
     },
     /// 删除普通视图（v0.22.0 新增）
-    DropView {
-        view_name: String,
-        if_exists: bool,
-    },
+    DropView { view_name: String, if_exists: bool },
     /// 行数元数据级短路查询（Perf01）
     ///
     /// 单表、无 WHERE、无 GROUP BY、无 HAVING、纯 COUNT(*) 等情况下，
     /// 直接从 `Table.def.row_count` 读元数据，跳过 TableScan→Aggregate 的逐行扫路径。
     /// `output_name` 为输出列名（如 `"count(*)"`），`count` 为预取的行数。
-    CountStar {
-        output_name: String,
-        count: i64,
-    },
+    CountStar { output_name: String, count: i64 },
     /// 主键点查物理节点（Perf03）
     ///
     /// 触发条件：单表查询，WHERE 唯一条件为 `pk_col = Literal`，
@@ -227,14 +213,9 @@ pub enum PhysicalPlan {
     /// PRAGMA
     Pragma(PragmaStmt),
     /// DISTINCT 去重
-    Distinct {
-        input: Box<PhysicalPlan>,
-    },
+    Distinct { input: Box<PhysicalPlan> },
     /// EXPLAIN / EXPLAIN ANALYZE
-    Explain {
-        analyze: bool,
-        plan: Box<PhysicalPlan>,
-    },
+    Explain { analyze: bool, plan: Box<PhysicalPlan> },
     /// 窗口函数
     Window {
         input: Box<PhysicalPlan>,
@@ -242,9 +223,7 @@ pub enum PhysicalPlan {
         column_names: Vec<String>,
     },
     /// 子查询扫描（执行子查询计划，返回结果）
-    SubqueryScan {
-        plan: Box<PhysicalPlan>,
-    },
+    SubqueryScan { plan: Box<PhysicalPlan> },
     /// 集合操作：UNION / UNION ALL（v0.15.0 新增）
     ///
     /// 合并 left 和 right 两个子计划的行：
@@ -271,9 +250,7 @@ pub enum PhysicalPlan {
         max_iterations: usize,
     },
     /// TRUNCATE TABLE（v0.15.0 新增）
-    TruncateTable {
-        table_name: String,
-    },
+    TruncateTable { table_name: String },
     /// CREATE TABLE AS SELECT（v0.15.0 新增）
     ///
     /// 创建表并填充 SELECT 查询结果。
@@ -313,7 +290,7 @@ pub enum SetUnionOp {
 #[derive(Debug, Clone)]
 pub struct AggregateExpr {
     pub func: AggregateFunc,
-    pub input: usize, // 输入列索引
+    pub input: usize,   // 输入列索引
     pub distinct: bool, // DISTINCT 去重
 }
 

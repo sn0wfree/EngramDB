@@ -150,10 +150,15 @@ pub fn build_bloom_from_column(
 
 /// Phase 2 P1-A：判断 Value 是否可 hash 进入 Bloom
 pub fn is_bloomable(value: &Value) -> bool {
-    matches!(value,
-        Value::Int32(_) | Value::Int64(_) | Value::Timestamp(_)
-            | Value::Float32(_) | Value::Float64(_)
-            | Value::Varchar(_) | Value::Json(_)
+    matches!(
+        value,
+        Value::Int32(_)
+            | Value::Int64(_)
+            | Value::Timestamp(_)
+            | Value::Float32(_)
+            | Value::Float64(_)
+            | Value::Varchar(_)
+            | Value::Json(_)
     )
 }
 
@@ -182,11 +187,7 @@ pub fn bloomable_key(value: &Value) -> i64 {
 /// IEEE 754：正数保持原位，负数反转所有位（保留排序语义）
 pub fn f32_to_i64_key(f: f32) -> i64 {
     let bits = f.to_bits() as u64;
-    let key = if bits >> 63 == 0 {
-        bits
-    } else {
-        !bits
-    };
+    let key = if bits >> 63 == 0 { bits } else { !bits };
     key as i64
 }
 
@@ -195,11 +196,7 @@ pub fn f32_to_i64_key(f: f32) -> i64 {
 /// 同 f32_to_i64_key，扩展到 64-bit 浮点数。
 pub fn f64_to_i64_key(f: f64) -> i64 {
     let bits = f.to_bits();
-    let key = if bits >> 63 == 0 {
-        bits
-    } else {
-        !bits
-    };
+    let key = if bits >> 63 == 0 { bits } else { !bits };
     key as i64
 }
 
@@ -258,9 +255,7 @@ impl ColumnBloom {
         let mut bits = Vec::with_capacity(n_words);
         let mut offset = 4;
         for _ in 0..n_words {
-            bits.push(u64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ));
+            bits.push(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?));
             offset += 8;
         }
 

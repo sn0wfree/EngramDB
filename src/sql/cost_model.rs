@@ -12,8 +12,8 @@
 //! - 聚合代价：行数 × 每行聚合成本
 //! - 排序代价：行数 × log(行数) × 每行比较成本
 
-use crate::executor::physical_plan::{PhysicalPlan, JoinType, AggregateFunc};
-use crate::sql::ast::{Expression, BinaryOperator};
+use crate::executor::physical_plan::{AggregateFunc, JoinType, PhysicalPlan};
+use crate::sql::ast::{BinaryOperator, Expression};
 use crate::sql::statistics::TableStatistics;
 use crate::Value;
 
@@ -21,15 +21,15 @@ use crate::Value;
 ///
 /// 这些是经验值，可根据实际硬件调整。
 /// 参考 PostgreSQL 的默认配置比例。
-pub const COST_SEQUENTIAL_PAGE: f64 = 1.0;       // 顺序扫描每页成本（基准）
-pub const COST_RANDOM_PAGE: f64 = 4.0;           // 随机扫描每页成本
-pub const COST_CPU_OP: f64 = 0.01;               // 每次 CPU 操作成本
-pub const COST_CPU_COMPARE: f64 = 0.005;         // 每次比较成本
-pub const COST_HASH: f64 = 0.02;                 // 每次哈希计算成本
-pub const COST_HASH_PROBE: f64 = 0.015;          // 每次哈希探测成本
-pub const COST_EXPRESSION: f64 = 0.05;           // 每次表达式求值成本
-pub const COST_AGGREGATE: f64 = 0.08;            // 每次聚合操作成本
-pub const COST_SORT_PER_ROW: f64 = 0.03;         // 排序每行基础成本
+pub const COST_SEQUENTIAL_PAGE: f64 = 1.0; // 顺序扫描每页成本（基准）
+pub const COST_RANDOM_PAGE: f64 = 4.0; // 随机扫描每页成本
+pub const COST_CPU_OP: f64 = 0.01; // 每次 CPU 操作成本
+pub const COST_CPU_COMPARE: f64 = 0.005; // 每次比较成本
+pub const COST_HASH: f64 = 0.02; // 每次哈希计算成本
+pub const COST_HASH_PROBE: f64 = 0.015; // 每次哈希探测成本
+pub const COST_EXPRESSION: f64 = 0.05; // 每次表达式求值成本
+pub const COST_AGGREGATE: f64 = 0.08; // 每次聚合操作成本
+pub const COST_SORT_PER_ROW: f64 = 0.03; // 排序每行基础成本
 
 /// 估算的计划属性（用于代价计算）
 #[derive(Debug, Clone)]
@@ -53,7 +53,10 @@ pub struct Cost {
 
 impl Cost {
     pub fn zero() -> Self {
-        Cost { startup: 0.0, total: 0.0 }
+        Cost {
+            startup: 0.0,
+            total: 0.0,
+        }
     }
 
     pub fn add(self, other: Cost) -> Self {
@@ -83,53 +86,97 @@ impl<'a> CostModel<'a> {
     /// 计算单个节点的代价，返回（输出属性, 代价）
     fn calculate_node(&self, plan: &PhysicalPlan) -> (PlanProperties, Cost) {
         match plan {
-            PhysicalPlan::TableScan { table_name, column_indices } => {
-                self.cost_table_scan(table_name, column_indices)
-            }
+            PhysicalPlan::TableScan {
+                table_name,
+                column_indices,
+            } => self.cost_table_scan(table_name, column_indices),
             // 覆盖索引点查：代价远低于全表扫描（O(log n) + k 行输出）
-            PhysicalPlan::IndexOnlyScan { .. } => {
-                (PlanProperties { row_count: 10.0, num_columns: 1, row_size: 50 }, Cost { startup: 0.001, total: 0.01 })
-            }
+            PhysicalPlan::IndexOnlyScan { .. } => (
+                PlanProperties {
+                    row_count: 10.0,
+                    num_columns: 1,
+                    row_size: 50,
+                },
+                Cost {
+                    startup: 0.001,
+                    total: 0.01,
+                },
+            ),
             // 非覆盖索引点查（P2）：索引 O(log n) 定位 + 回表 k 行，代价介于 IndexOnlyScan 与全表扫描之间
-            PhysicalPlan::IndexScan { .. } => {
-                (PlanProperties { row_count: 10.0, num_columns: 1, row_size: 50 }, Cost { startup: 0.002, total: 0.02 })
-            }
+            PhysicalPlan::IndexScan { .. } => (
+                PlanProperties {
+                    row_count: 10.0,
+                    num_columns: 1,
+                    row_size: 50,
+                },
+                Cost {
+                    startup: 0.002,
+                    total: 0.02,
+                },
+            ),
             // 索引范围扫描（①）：O(log n + k) 有序段扫描 + 回表 k 行，代价与 IndexScan 同级
-            PhysicalPlan::IndexRangeScan { .. } => {
-                (PlanProperties { row_count: 100.0, num_columns: 1, row_size: 50 }, Cost { startup: 0.002, total: 0.03 })
-            }
-            PhysicalPlan::Filter { input, condition } => {
-                self.cost_filter(input, condition)
-            }
-            PhysicalPlan::Projection { input, expressions, .. } => {
-                self.cost_projection(input, expressions)
-            }
-            PhysicalPlan::HashJoin { left, right, join_type, left_keys, right_keys } => {
-                self.cost_hash_join(left, right, *join_type, left_keys.len(), right_keys.len())
-            }
+            PhysicalPlan::IndexRangeScan { .. } => (
+                PlanProperties {
+                    row_count: 100.0,
+                    num_columns: 1,
+                    row_size: 50,
+                },
+                Cost {
+                    startup: 0.002,
+                    total: 0.03,
+                },
+            ),
+            PhysicalPlan::Filter { input, condition } => self.cost_filter(input, condition),
+            PhysicalPlan::Projection { input, expressions, .. } => self.cost_projection(input, expressions),
+            PhysicalPlan::HashJoin {
+                left,
+                right,
+                join_type,
+                left_keys,
+                right_keys,
+            } => self.cost_hash_join(left, right, *join_type, left_keys.len(), right_keys.len()),
             PhysicalPlan::CrossJoin { left, right } => {
                 // CROSS JOIN：笛卡尔积，代价 = left_rows * right_rows
                 let (left_props, _) = self.calculate_node(left);
                 let (right_props, _) = self.calculate_node(right);
                 let total = left_props.row_count.max(1.0) * right_props.row_count.max(1.0);
-                (PlanProperties { row_count: total, num_columns: left_props.num_columns + right_props.num_columns, row_size: left_props.row_size + right_props.row_size }, Cost { startup: 0.0, total })
+                (
+                    PlanProperties {
+                        row_count: total,
+                        num_columns: left_props.num_columns + right_props.num_columns,
+                        row_size: left_props.row_size + right_props.row_size,
+                    },
+                    Cost { startup: 0.0, total },
+                )
             }
-            PhysicalPlan::Aggregate { input, group_by, aggregates } => {
-                self.cost_aggregate(input, group_by.len(), aggregates.len())
-            }
-            PhysicalPlan::Limit { input, limit, .. } => {
-                self.cost_limit(input, *limit)
-            }
-            PhysicalPlan::Sort { input, sort_keys, .. } => {
-                self.cost_sort(input, sort_keys.len())
-            }
+            PhysicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => self.cost_aggregate(input, group_by.len(), aggregates.len()),
+            PhysicalPlan::Limit { input, limit, .. } => self.cost_limit(input, *limit),
+            PhysicalPlan::Sort { input, sort_keys, .. } => self.cost_sort(input, sort_keys.len()),
             // 其他节点代价为 0
-            PhysicalPlan::Insert { .. } | PhysicalPlan::InsertColumns { .. } | PhysicalPlan::CreateTable { .. } => {
-                (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
-            }
-            PhysicalPlan::BeginTransaction | PhysicalPlan::Commit | PhysicalPlan::Rollback | PhysicalPlan::CountStar { .. } | PhysicalPlan::PrimaryKeyLookup { .. } => {
-                (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
-            }
+            PhysicalPlan::Insert { .. } | PhysicalPlan::InsertColumns { .. } | PhysicalPlan::CreateTable { .. } => (
+                PlanProperties {
+                    row_count: 1.0,
+                    num_columns: 1,
+                    row_size: 100,
+                },
+                Cost::zero(),
+            ),
+            PhysicalPlan::BeginTransaction
+            | PhysicalPlan::Commit
+            | PhysicalPlan::Rollback
+            | PhysicalPlan::CountStar { .. }
+            | PhysicalPlan::PrimaryKeyLookup { .. } => (
+                PlanProperties {
+                    row_count: 1.0,
+                    num_columns: 1,
+                    row_size: 100,
+                },
+                Cost::zero(),
+            ),
             // DDL/管理语句：代价为 0
             PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::Delete { .. }
@@ -151,15 +198,23 @@ impl<'a> CostModel<'a> {
             | PhysicalPlan::Savepoint { .. }
             | PhysicalPlan::ReleaseSavepoint { .. }
             | PhysicalPlan::RollbackToSavepoint { .. }
-            | PhysicalPlan::VectorSearch { .. } => {
-                (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
-            }
+            | PhysicalPlan::VectorSearch { .. } => (
+                PlanProperties {
+                    row_count: 1.0,
+                    num_columns: 1,
+                    row_size: 100,
+                },
+                Cost::zero(),
+            ),
             // v0.22.0 新增节点
-            | PhysicalPlan::CreateView { .. }
-            | PhysicalPlan::DropView { .. }
-            | PhysicalPlan::RecursiveCte { .. } => {
-                (PlanProperties { row_count: 1.0, num_columns: 1, row_size: 100 }, Cost::zero())
-            }
+            PhysicalPlan::CreateView { .. } | PhysicalPlan::DropView { .. } | PhysicalPlan::RecursiveCte { .. } => (
+                PlanProperties {
+                    row_count: 1.0,
+                    num_columns: 1,
+                    row_size: 100,
+                },
+                Cost::zero(),
+            ),
         }
     }
 
@@ -186,7 +241,11 @@ impl<'a> CostModel<'a> {
             * engine_weight;
 
         (
-            PlanProperties { row_count, num_columns: num_cols, row_size },
+            PlanProperties {
+                row_count,
+                num_columns: num_cols,
+                row_size,
+            },
             Cost { startup: 0.0, total },
         )
     }
@@ -225,7 +284,8 @@ impl<'a> CostModel<'a> {
         let (input_props, input_cost) = self.calculate_node(input);
 
         // 投影代价：每行 × 表达式数量 × 求值成本
-        let total_expr_cost: f64 = expressions.iter()
+        let total_expr_cost: f64 = expressions
+            .iter()
             .map(|e| estimate_expression_complexity(e) as f64 * COST_EXPRESSION)
             .sum();
 
@@ -267,9 +327,7 @@ impl<'a> CostModel<'a> {
         let probe_cost = left_props.row_count * left_keys as f64 * COST_HASH_PROBE;
 
         // 估计输出行数
-        let output_rows = estimate_join_output_rows(
-            &left_props, &right_props, left_keys, join_type
-        );
+        let output_rows = estimate_join_output_rows(&left_props, &right_props, left_keys, join_type);
 
         let total = left_cost.total + right_cost.total + build_cost + probe_cost;
 
@@ -277,7 +335,11 @@ impl<'a> CostModel<'a> {
         let row_size = left_props.row_size + right_props.row_size;
 
         (
-            PlanProperties { row_count: output_rows, num_columns: num_cols, row_size },
+            PlanProperties {
+                row_count: output_rows,
+                num_columns: num_cols,
+                row_size,
+            },
             Cost {
                 startup: left_cost.startup + right_cost.startup + build_cost,
                 total,
@@ -400,18 +462,10 @@ fn estimate_expression_complexity(expr: &Expression) -> usize {
         Expression::BinaryOp { left, right, .. } => {
             1 + estimate_expression_complexity(left) + estimate_expression_complexity(right)
         }
-        Expression::UnaryOp { expr, .. } => {
-            1 + estimate_expression_complexity(expr)
-        }
-        Expression::Function { args, .. } => {
-            2 + args.iter().map(|a| estimate_expression_complexity(a)).sum::<usize>()
-        }
-        Expression::Cast { expr, .. } => {
-            1 + estimate_expression_complexity(expr)
-        }
-        Expression::IsNull(e) | Expression::IsNotNull(e) => {
-            1 + estimate_expression_complexity(e)
-        }
+        Expression::UnaryOp { expr, .. } => 1 + estimate_expression_complexity(expr),
+        Expression::Function { args, .. } => 2 + args.iter().map(|a| estimate_expression_complexity(a)).sum::<usize>(),
+        Expression::Cast { expr, .. } => 1 + estimate_expression_complexity(expr),
+        Expression::IsNull(e) | Expression::IsNotNull(e) => 1 + estimate_expression_complexity(e),
         Expression::InList { expr, list } => {
             2 + estimate_expression_complexity(expr)
                 + list.iter().map(|e| estimate_expression_complexity(e)).sum::<usize>()
@@ -420,7 +474,8 @@ fn estimate_expression_complexity(expr: &Expression) -> usize {
             3 + estimate_expression_complexity(expr) + estimate_expression_complexity(pattern)
         }
         Expression::Case { when_then, else_expr } => {
-            let when_cost: usize = when_then.iter()
+            let when_cost: usize = when_then
+                .iter()
                 .map(|(w, t)| estimate_expression_complexity(w) + estimate_expression_complexity(t))
                 .sum();
             let else_cost = else_expr.as_ref().map(|e| estimate_expression_complexity(e)).unwrap_or(0);
@@ -450,12 +505,20 @@ fn estimate_filter_selectivity(condition: &Expression, _input_props: &PlanProper
                     // 等值比较：默认 0.1（未知 NDV 时的保守估计）
                     let is_const = matches!(left.as_ref(), Expression::Literal(_))
                         || matches!(right.as_ref(), Expression::Literal(_));
-                    if is_const { 0.1 } else { 0.5 }
+                    if is_const {
+                        0.1
+                    } else {
+                        0.5
+                    }
                 }
                 NotEq => {
                     1.0 - estimate_filter_selectivity(
-                        &Expression::BinaryOp { left: left.clone(), op: Eq, right: right.clone() },
-                        _input_props
+                        &Expression::BinaryOp {
+                            left: left.clone(),
+                            op: Eq,
+                            right: right.clone(),
+                        },
+                        _input_props,
                     )
                 }
                 Lt | LtEq | Gt | GtEq => {
@@ -482,7 +545,7 @@ fn estimate_filter_selectivity(condition: &Expression, _input_props: &PlanProper
                 Negate => estimate_filter_selectivity(expr, _input_props),
             }
         }
-        Expression::IsNull(_) => 0.1,  // 默认 10% NULL
+        Expression::IsNull(_) => 0.1,    // 默认 10% NULL
         Expression::IsNotNull(_) => 0.9, // 90% 非空
         Expression::InList { list, .. } => {
             // IN (list)：list 长度 × 等值选择性
@@ -527,7 +590,7 @@ fn estimate_join_output_rows(
 mod tests {
     use super::*;
     use crate::executor::physical_plan::*;
-    use crate::sql::ast::{Expression, BinaryOperator};
+    use crate::sql::ast::{BinaryOperator, Expression};
 
     fn make_scan(rows: f64, cols: usize) -> PhysicalPlan {
         // 用一个假的 TableScan，代价模型会用默认值
@@ -555,7 +618,10 @@ mod tests {
         let filter = PhysicalPlan::Filter {
             input: Box::new(scan),
             condition: Expression::BinaryOp {
-                left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+                left: Box::new(Expression::ColumnRef {
+                    table: None,
+                    column: "id".into(),
+                }),
                 op: BinaryOperator::Eq,
                 right: Box::new(Expression::Literal(Value::Int64(42))),
             },
@@ -576,13 +642,19 @@ mod tests {
             input: Box::new(scan),
             condition: Expression::BinaryOp {
                 left: Box::new(Expression::BinaryOp {
-                    left: Box::new(Expression::ColumnRef { table: None, column: "a".into() }),
+                    left: Box::new(Expression::ColumnRef {
+                        table: None,
+                        column: "a".into(),
+                    }),
                     op: BinaryOperator::Eq,
                     right: Box::new(Expression::Literal(Value::Int64(1))),
                 }),
                 op: BinaryOperator::And,
                 right: Box::new(Expression::BinaryOp {
-                    left: Box::new(Expression::ColumnRef { table: None, column: "b".into() }),
+                    left: Box::new(Expression::ColumnRef {
+                        table: None,
+                        column: "b".into(),
+                    }),
                     op: BinaryOperator::Eq,
                     right: Box::new(Expression::Literal(Value::Int64(2))),
                 }),

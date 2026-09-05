@@ -9,8 +9,8 @@
 use crate::common::error::Result;
 use crate::sql::ast::Expression;
 
+use super::super::expression::{boolean_to_selection, eval_vectorized, eval_vectorized_with_db};
 use super::super::vector::{DataChunk, LazyDataChunk, SelectionVector};
-use super::super::expression::{eval_vectorized, eval_vectorized_with_db, boolean_to_selection};
 
 /// 执行过滤（向量化 + SelectionVector 懒物化）
 ///
@@ -18,11 +18,7 @@ use super::super::expression::{eval_vectorized, eval_vectorized_with_db, boolean
 /// 1. 向量化求值条件表达式 → 布尔 Vector
 /// 2. 布尔 Vector → SelectionVector（零拷贝过滤）
 /// 3. 保留在 LazyDataChunk 中，下游按需物化
-pub fn execute(
-    input: &[DataChunk],
-    condition: &Expression,
-    column_names: &[String],
-) -> Result<Vec<DataChunk>> {
+pub fn execute(input: &[DataChunk], condition: &Expression, column_names: &[String]) -> Result<Vec<DataChunk>> {
     let mut result = Vec::new();
 
     for chunk in input {
@@ -45,8 +41,7 @@ pub fn execute_with_db(
     column_names: &[String],
     db: &mut crate::storage::Database,
 ) -> Result<Vec<DataChunk>> {
-    let per_row = input.iter().any(|c| c.count > 0)
-        && super::super::expression::contains_subquery(condition);
+    let per_row = input.iter().any(|c| c.count > 0) && super::super::expression::contains_subquery(condition);
 
     if !per_row {
         // 无延迟子查询：整批向量化即可
@@ -68,11 +63,13 @@ pub fn execute_with_db(
             let n_cols = chunk.num_columns();
             let mut out_columns = Vec::with_capacity(n_cols);
             for c in &chunk.columns {
-                let vals: Vec<crate::Value> =
-                    selected.iter().map(|&i| c.get(i)).collect();
+                let vals: Vec<crate::Value> = selected.iter().map(|&i| c.get(i)).collect();
                 out_columns.push(super::super::vector::Vector::Flat(vals));
             }
-            result.push(DataChunk { count: selected.len(), columns: out_columns });
+            result.push(DataChunk {
+                count: selected.len(),
+                columns: out_columns,
+            });
         }
     }
     Ok(result)
@@ -85,14 +82,15 @@ fn filter_chunk_correlated(
     column_names: &[String],
     db: &mut crate::storage::Database,
 ) -> Result<Vec<usize>> {
-    use super::super::expression::{eval_vectorized_with_db, boolean_to_selection};
+    use super::super::expression::{boolean_to_selection, eval_vectorized_with_db};
     use super::super::vector::Vector;
     use crate::Value;
 
     let mut selected = Vec::new();
     for i in 0..chunk.count {
         // 构造外层行上下文：与列名一一对应
-        let outer_row: Vec<(String, Value)> = column_names.iter()
+        let outer_row: Vec<(String, Value)> = column_names
+            .iter()
             .zip(chunk.columns.iter())
             .take(chunk.columns.len())
             .map(|(name, col)| (name.clone(), col.get(i)))
@@ -112,11 +110,7 @@ fn filter_chunk_correlated(
 }
 
 /// 过滤单个 DataChunk（内部使用懒物化）
-fn filter_chunk(
-    chunk: &DataChunk,
-    condition: &Expression,
-    column_names: &[String],
-) -> Result<DataChunk> {
+fn filter_chunk(chunk: &DataChunk, condition: &Expression, column_names: &[String]) -> Result<DataChunk> {
     // 步骤 1：向量化求值条件表达式
     let bool_vec = eval_vectorized(condition, chunk, column_names)?;
 
@@ -166,11 +160,7 @@ fn filter_chunk_with_db(
 ///
 /// 返回 LazyDataChunk，下游算子可直接基于 selection 继续计算，
 /// 直到真正需要数据时才物化。这是 ClickHouse 风格的核心优化。
-pub fn execute_lazy(
-    chunk: DataChunk,
-    condition: &Expression,
-    column_names: &[String],
-) -> Result<LazyDataChunk> {
+pub fn execute_lazy(chunk: DataChunk, condition: &Expression, column_names: &[String]) -> Result<LazyDataChunk> {
     let mut lazy = LazyDataChunk::new(chunk);
 
     // 向量化求值条件
@@ -193,15 +183,18 @@ pub fn execute_lazy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::ast::{Expression, BinaryOperator};
+    use crate::executor::vector::{DataChunk, Vector};
+    use crate::sql::ast::{BinaryOperator, Expression};
     use crate::Value;
-    use crate::executor::vector::{Vector, DataChunk};
 
     fn make_test_chunk() -> DataChunk {
         // 两列：id (Int64), name (Varchar)
         let ids = Vector::Flat(vec![
-            Value::Int64(1), Value::Int64(2), Value::Int64(3),
-            Value::Int64(4), Value::Int64(5),
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(5),
         ]);
         let names = Vector::Flat(vec![
             Value::Varchar("alice".into()),
@@ -220,7 +213,10 @@ mod tests {
     fn test_filter_gt() {
         let chunk = make_test_chunk();
         let condition = Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "id".to_string() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(Expression::Literal(Value::Int64(3))),
         };
@@ -236,7 +232,10 @@ mod tests {
     fn test_filter_eq() {
         let chunk = make_test_chunk();
         let condition = Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "name".to_string() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(Expression::Literal(Value::Varchar("bob".into()))),
         };
@@ -253,13 +252,19 @@ mod tests {
         // id > 2 AND id < 5
         let condition = Expression::BinaryOp {
             left: Box::new(Expression::BinaryOp {
-                left: Box::new(Expression::ColumnRef { table: None, column: "id".to_string() }),
+                left: Box::new(Expression::ColumnRef {
+                    table: None,
+                    column: "id".to_string(),
+                }),
                 op: BinaryOperator::Gt,
                 right: Box::new(Expression::Literal(Value::Int64(2))),
             }),
             op: BinaryOperator::And,
             right: Box::new(Expression::BinaryOp {
-                left: Box::new(Expression::ColumnRef { table: None, column: "id".to_string() }),
+                left: Box::new(Expression::ColumnRef {
+                    table: None,
+                    column: "id".to_string(),
+                }),
                 op: BinaryOperator::Lt,
                 right: Box::new(Expression::Literal(Value::Int64(5))),
             }),
@@ -276,7 +281,10 @@ mod tests {
     fn test_filter_all_pass() {
         let chunk = make_test_chunk();
         let condition = Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "id".to_string() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(Expression::Literal(Value::Int64(0))),
         };
@@ -289,7 +297,10 @@ mod tests {
     fn test_filter_none_pass() {
         let chunk = make_test_chunk();
         let condition = Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "id".to_string() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(Expression::Literal(Value::Int64(100))),
         };
@@ -302,7 +313,10 @@ mod tests {
     fn test_filter_like() {
         let chunk = make_test_chunk();
         let condition = Expression::Like {
-            expr: Box::new(Expression::ColumnRef { table: None, column: "name".to_string() }),
+            expr: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            }),
             pattern: Box::new(Expression::Literal(Value::Varchar("%a%".into()))),
         };
 

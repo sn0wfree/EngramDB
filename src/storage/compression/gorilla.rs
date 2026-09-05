@@ -109,8 +109,8 @@ pub fn decode_f64(data: &[u8]) -> Option<Vec<f64>> {
             let leading = if leading == 31 {
                 reader.read_bits(6)? // 扩展 6 位，完整前导零
             } else {
-                    leading
-                };
+                leading
+            };
 
             // 读有效位长度
             let meaningful = reader.read_bits(6)? + 1;
@@ -191,7 +191,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        BitReader { data, byte_pos: 0, bit_pos: 0 }
+        BitReader {
+            data,
+            byte_pos: 0,
+            bit_pos: 0,
+        }
     }
 
     fn read_bit(&mut self) -> Option<u8> {
@@ -262,7 +266,12 @@ mod tests {
         }
         let encoded = encode_f64(&values);
         let original_size = values.len() * 8; // 800 bytes
-        assert!(encoded.len() < original_size, "no compression: {} >= {}", encoded.len(), original_size);
+        assert!(
+            encoded.len() < original_size,
+            "no compression: {} >= {}",
+            encoded.len(),
+            original_size
+        );
         let decoded = decode_f64(&encoded).unwrap();
         assert_eq!(decoded.len(), values.len());
         for (a, b) in decoded.iter().zip(values.iter()) {
@@ -323,8 +332,13 @@ mod tests {
         let values: Vec<f64> = (0..1000).map(|i| i as f64).collect();
         let encoded = encode_f64(&values);
         let original_size = values.len() * 8; // 8000 bytes
-        // 整数等间隔浮点，XOR 相同，压缩率应该很高
-        assert!(encoded.len() < original_size / 2, "compression too low: {} / {}", encoded.len(), original_size);
+                                              // 整数等间隔浮点，XOR 相同，压缩率应该很高
+        assert!(
+            encoded.len() < original_size / 2,
+            "compression too low: {} / {}",
+            encoded.len(),
+            original_size
+        );
         let decoded = decode_f64(&encoded).unwrap();
         assert_eq!(decoded.len(), values.len());
         for (a, b) in decoded.iter().zip(values.iter()) {

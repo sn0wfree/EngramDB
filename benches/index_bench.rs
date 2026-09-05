@@ -3,32 +3,48 @@
 // 测试维度: 构建时间 / 点查询 / 范围查询 / 内存占用
 // 零外部依赖，直接 rustc -O --edition 2021 编译运行
 
-use std::time::{Duration, Instant};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 // ========== 工具函数 ==========
 
 fn bench(name: &str, iters: usize, f: impl Fn()) -> Duration {
-    for _ in 0..2 { f(); }
+    for _ in 0..2 {
+        f();
+    }
     let start = Instant::now();
-    for _ in 0..iters { f(); }
+    for _ in 0..iters {
+        f();
+    }
     let elapsed = start.elapsed();
     let per_iter = elapsed / iters as u32;
-    println!("  {:<48} {:>10.3} ms  ({} iters)",
-             name, per_iter.as_secs_f64() * 1000.0, iters);
+    println!(
+        "  {:<48} {:>10.3} ms  ({} iters)",
+        name,
+        per_iter.as_secs_f64() * 1000.0,
+        iters
+    );
     per_iter
 }
 
 fn fmt_num(n: usize) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1_000.0) }
-    else { format!("{}", n) }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
 }
 
 fn fmt_bytes(n: usize) -> String {
-    if n >= 1024 * 1024 { format!("{:.1} MB", n as f64 / 1024.0 / 1024.0) }
-    else if n >= 1024 { format!("{:.1} KB", n as f64 / 1024.0) }
-    else { format!("{} B", n) }
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / 1024.0 / 1024.0)
+    } else if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{} B", n)
+    }
 }
 
 // ========== 1. 跳表索引 (SkipList) ==========
@@ -38,7 +54,7 @@ const P: f64 = 0.25;
 
 struct SkipNode {
     key: i64,
-    value: u32, // row id
+    value: u32,                  // row id
     forward: Vec<Option<usize>>, // index into arena
 }
 
@@ -58,7 +74,12 @@ impl SkipList {
         };
         let mut arena = Vec::with_capacity(1024);
         arena.push(head);
-        SkipList { arena, head: 0, level: 1, len: 0 }
+        SkipList {
+            arena,
+            head: 0,
+            level: 1,
+            len: 0,
+        }
     }
 
     fn random_level() -> usize {
@@ -174,7 +195,10 @@ struct Bitmap {
 
 impl Bitmap {
     fn new(n: usize) -> Self {
-        Bitmap { bits: vec![0u64; (n + 63) / 64], len: n }
+        Bitmap {
+            bits: vec![0u64; (n + 63) / 64],
+            len: n,
+        }
     }
 
     fn set(&mut self, idx: usize) {
@@ -184,7 +208,9 @@ impl Bitmap {
     }
 
     fn get(&self, idx: usize) -> bool {
-        if idx >= self.len { return false; }
+        if idx >= self.len {
+            return false;
+        }
         (self.bits[idx / 64] >> (idx % 64)) & 1 != 0
     }
 
@@ -232,7 +258,9 @@ impl BitmapIndex {
         for &k in &unique {
             let mut bm = Bitmap::new(num_rows);
             for (row, &key) in keys.iter().enumerate() {
-                if key == k { bm.set(row); }
+                if key == k {
+                    bm.set(row);
+                }
             }
             map.push((k, bm));
         }
@@ -253,7 +281,9 @@ impl BitmapIndex {
         result
     }
 
-    fn num_keys(&self) -> usize { self.map.len() }
+    fn num_keys(&self) -> usize {
+        self.map.len()
+    }
 
     fn memory_bytes(&self) -> usize {
         self.map.iter().map(|(_, b)| b.memory_bytes() + 8).sum()
@@ -324,10 +354,12 @@ fn gen_sorted_int(n: usize) -> Vec<i64> {
 
 fn gen_random_int(n: usize, range: i64) -> Vec<i64> {
     let mut seed: u64 = 42;
-    (0..n).map(|_| {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (seed % range as u64) as i64
-    }).collect()
+    (0..n)
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed % range as u64) as i64
+        })
+        .collect()
 }
 
 fn gen_low_cardinality_int(n: usize, num_distinct: usize) -> Vec<i64> {
@@ -365,14 +397,20 @@ fn main() {
     for (i, &k) in sorted_data.iter().enumerate() {
         sl_sorted.insert(k, i as u32);
     }
-    println!("  节点数: {}, 内存: {}", fmt_num(sl_sorted.len), fmt_bytes(sl_sorted.memory_bytes()));
+    println!(
+        "  节点数: {}, 内存: {}",
+        fmt_num(sl_sorted.len),
+        fmt_bytes(sl_sorted.memory_bytes())
+    );
 
     // 点查询
     let queries: Vec<i64> = (0..1000).map(|i| (i * 100) as i64).collect();
     bench("  点查询 (1000 次)", 200, || {
         let mut hits = 0;
         for &q in &queries {
-            if sl_sorted.get(q).is_some() { hits += 1; }
+            if sl_sorted.get(q).is_some() {
+                hits += 1;
+            }
         }
         std::hint::black_box(hits);
     });
@@ -403,13 +441,19 @@ fn main() {
     for (i, &k) in random_data.iter().enumerate() {
         sl_random.insert(k, i as u32);
     }
-    println!("  节点数: {}, 内存: {}", fmt_num(sl_random.len), fmt_bytes(sl_random.memory_bytes()));
+    println!(
+        "  节点数: {}, 内存: {}",
+        fmt_num(sl_random.len),
+        fmt_bytes(sl_random.memory_bytes())
+    );
 
     let rand_queries: Vec<i64> = random_data.iter().step_by(100).copied().collect();
     bench("  点查询 (1000 次)", 200, || {
         let mut hits = 0;
         for &q in &rand_queries {
-            if sl_random.get(q).is_some() { hits += 1; }
+            if sl_random.get(q).is_some() {
+                hits += 1;
+            }
         }
         std::hint::black_box(hits);
     });
@@ -433,7 +477,11 @@ fn main() {
     println!("── 场景 B1: 低基数 (10 个不同值, 10 万行) ──");
     let low_card = gen_low_cardinality_int(N, 10);
     let bm_idx_10 = BitmapIndex::build(&low_card, N);
-    println!("  基数: {}, 内存: {}", bm_idx_10.num_keys(), fmt_bytes(bm_idx_10.memory_bytes()));
+    println!(
+        "  基数: {}, 内存: {}",
+        bm_idx_10.num_keys(),
+        fmt_bytes(bm_idx_10.memory_bytes())
+    );
 
     bench("  构建 (10 基数)", 10, || {
         let idx = BitmapIndex::build(&low_card, N);
@@ -465,7 +513,11 @@ fn main() {
     println!("── 场景 B2: 中等基数 (100 个不同值, 10 万行) ──");
     let med_card = gen_low_cardinality_int(N, 100);
     let bm_idx_100 = BitmapIndex::build(&med_card, N);
-    println!("  基数: {}, 内存: {}", bm_idx_100.num_keys(), fmt_bytes(bm_idx_100.memory_bytes()));
+    println!(
+        "  基数: {}, 内存: {}",
+        bm_idx_100.num_keys(),
+        fmt_bytes(bm_idx_100.memory_bytes())
+    );
 
     bench("  构建 (100 基数)", 5, || {
         let idx = BitmapIndex::build(&med_card, N);
@@ -505,14 +557,22 @@ fn main() {
         }
         std::hint::black_box(b.memory_bytes());
     });
-    for &item in &bf_data { bf.insert(item); }
-    println!("  位数: {}, 哈希数: {}, 内存: {}",
-             fmt_num(bf.num_bits), bf.num_hashes, fmt_bytes(bf.memory_bytes()));
+    for &item in &bf_data {
+        bf.insert(item);
+    }
+    println!(
+        "  位数: {}, 哈希数: {}, 内存: {}",
+        fmt_num(bf.num_bits),
+        bf.num_hashes,
+        fmt_bytes(bf.memory_bytes())
+    );
 
     bench("  存在性查询 (1000 次命中)", 500, || {
         let mut hits = 0;
         for i in 0..1000 {
-            if bf.contains(i as i64) { hits += 1; }
+            if bf.contains(i as i64) {
+                hits += 1;
+            }
         }
         std::hint::black_box(hits);
     });
@@ -521,7 +581,9 @@ fn main() {
     let mut false_positives = 0;
     let mut total_negative = 0;
     for i in (N as i64)..(N as i64 + 10000) {
-        if bf.contains(i) { false_positives += 1; }
+        if bf.contains(i) {
+            false_positives += 1;
+        }
         total_negative += 1;
     }
     let fpr = false_positives as f64 / total_negative as f64;
@@ -531,21 +593,31 @@ fn main() {
     println!();
     println!("── 场景 BF2: 0.1% 误报率, 10 万元素 ──");
     let mut bf2 = BloomFilter::new(N, 0.001);
-    for &item in &bf_data { bf2.insert(item); }
-    println!("  位数: {}, 哈希数: {}, 内存: {}",
-             fmt_num(bf2.num_bits), bf2.num_hashes, fmt_bytes(bf2.memory_bytes()));
+    for &item in &bf_data {
+        bf2.insert(item);
+    }
+    println!(
+        "  位数: {}, 哈希数: {}, 内存: {}",
+        fmt_num(bf2.num_bits),
+        bf2.num_hashes,
+        fmt_bytes(bf2.memory_bytes())
+    );
 
     bench("  存在性查询 (1000 次命中)", 500, || {
         let mut hits = 0;
         for i in 0..1000 {
-            if bf2.contains(i as i64) { hits += 1; }
+            if bf2.contains(i as i64) {
+                hits += 1;
+            }
         }
         std::hint::black_box(hits);
     });
 
     let mut fp2 = 0;
     for i in (N as i64)..(N as i64 + 10000) {
-        if bf2.contains(i) { fp2 += 1; }
+        if bf2.contains(i) {
+            fp2 += 1;
+        }
     }
     println!("  实测误报率: {:.3}% (目标 0.1%)", fp2 as f64 / 100.0);
 

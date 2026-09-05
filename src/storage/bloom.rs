@@ -87,11 +87,7 @@ fn numeric_forms(value: &Value) -> Vec<Value> {
     use Value::*;
     match value {
         Int32(v) => vec![Int64(*v as i64), Timestamp(*v as i64), Float64(*v as f64)],
-        Int64(v) => vec![
-            Int32(*v as i32),
-            Timestamp(*v),
-            Float64(*v as f64),
-        ],
+        Int64(v) => vec![Int32(*v as i32), Timestamp(*v), Float64(*v as f64)],
         Timestamp(v) => vec![Int64(*v), Int32(*v as i32), Float64(*v as f64)],
         Float64(v) => {
             // 整数值浮点 → 整数形式互查（Float64 列 + Int 字面量场景）
@@ -140,10 +136,7 @@ mod tests {
                 hits += 1;
             }
         }
-        assert!(
-            hits < 500,
-            "false positive too high: {hits}/10000 (need < 5%)"
-        );
+        assert!(hits < 500, "false positive too high: {hits}/10000 (need < 5%)");
     }
 
     #[test]

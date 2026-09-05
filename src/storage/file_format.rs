@@ -1,6 +1,6 @@
 //! 文件格式定义
 
-use crate::common::config::{Config, CompressionType};
+use crate::common::config::{CompressionType, Config};
 use crate::common::error::{EngramDbError, Result};
 
 /// 文件魔数
@@ -141,18 +141,14 @@ impl FileHeader {
         // 副本 B（页内偏移 256）
         if data.len() >= HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE + 4 {
             let core = &data[HEADER_REPLICA_OFFSET..];
-            let stored = u32::from_le_bytes(
-                core[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].try_into().unwrap(),
-            );
+            let stored = u32::from_le_bytes(core[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].try_into().unwrap());
             if stored != 0 && stored == crate::wal::crc32(&core[..HEADER_CORE_SIZE]) {
                 return Self::parse_core(core);
             }
         }
         // 副本 A（页首）
         if data.len() >= HEADER_CORE_SIZE + 4 {
-            let stored = u32::from_le_bytes(
-                data[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].try_into().unwrap(),
-            );
+            let stored = u32::from_le_bytes(data[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].try_into().unwrap());
             if stored != 0 && stored == crate::wal::crc32(&data[..HEADER_CORE_SIZE]) {
                 return Self::parse_core(data);
             }
@@ -167,32 +163,30 @@ impl FileHeader {
     /// 存在性判断，因此调用方应传入"核心区起点到页尾"的切片以保留可选字段。
     fn parse_core(data: &[u8]) -> Result<Self> {
         if data.len() < 100 {
-            return Err(EngramDbError::InvalidFormat(
-                "File header too short".into()
-            ));
+            return Err(EngramDbError::InvalidFormat("File header too short".into()));
         }
 
         // 检查魔数
         if &data[..MAGIC.len()] != MAGIC {
             return Err(EngramDbError::InvalidFormat(
-                "Invalid magic number, not a EngramDB file".into()
+                "Invalid magic number, not a EngramDB file".into(),
             ));
         }
 
         let magic_len = MAGIC.len();
-        let version = u16::from_le_bytes(data[magic_len..magic_len+2].try_into().unwrap());
-        let page_size = u32::from_le_bytes(data[magic_len+2..magic_len+6].try_into().unwrap());
-        let block_size = u32::from_le_bytes(data[magic_len+6..magic_len+10].try_into().unwrap());
-        let meta_root = u32::from_le_bytes(data[magic_len+10..magic_len+14].try_into().unwrap());
-        let total_rows = u64::from_le_bytes(data[magic_len+14..magic_len+22].try_into().unwrap());
-        let total_data_blocks = u64::from_le_bytes(data[magic_len+22..magic_len+30].try_into().unwrap());
-        let schema_cookie = u32::from_le_bytes(data[magic_len+30..magic_len+34].try_into().unwrap());
-        let checkpoint_lsn = u64::from_le_bytes(data[magic_len+34..magic_len+42].try_into().unwrap());
+        let version = u16::from_le_bytes(data[magic_len..magic_len + 2].try_into().unwrap());
+        let page_size = u32::from_le_bytes(data[magic_len + 2..magic_len + 6].try_into().unwrap());
+        let block_size = u32::from_le_bytes(data[magic_len + 6..magic_len + 10].try_into().unwrap());
+        let meta_root = u32::from_le_bytes(data[magic_len + 10..magic_len + 14].try_into().unwrap());
+        let total_rows = u64::from_le_bytes(data[magic_len + 14..magic_len + 22].try_into().unwrap());
+        let total_data_blocks = u64::from_le_bytes(data[magic_len + 22..magic_len + 30].try_into().unwrap());
+        let schema_cookie = u32::from_le_bytes(data[magic_len + 30..magic_len + 34].try_into().unwrap());
+        let checkpoint_lsn = u64::from_le_bytes(data[magic_len + 34..magic_len + 42].try_into().unwrap());
 
         let mut uuid = [0u8; 16];
-        uuid.copy_from_slice(&data[magic_len+42..magic_len+58]);
+        uuid.copy_from_slice(&data[magic_len + 42..magic_len + 58]);
 
-        let compression_default = match data[magic_len+58] {
+        let compression_default = match data[magic_len + 58] {
             0 => CompressionType::Uncompressed,
             1 => CompressionType::Rle,
             2 => CompressionType::BitPacking,
@@ -200,29 +194,40 @@ impl FileHeader {
             4 => CompressionType::For,
             5 => CompressionType::Delta,
             6 => CompressionType::Zstd,
-            _ => return Err(EngramDbError::InvalidFormat(
-                format!("Unknown compression type: {}", data[74])
-            )),
+            _ => {
+                return Err(EngramDbError::InvalidFormat(format!(
+                    "Unknown compression type: {}",
+                    data[74]
+                )))
+            }
         };
 
         // Index root + size (v0.12.0)
-        let index_root = u32::from_le_bytes(data[magic_len+59..magic_len+63].try_into().unwrap());
-        let index_size = u32::from_le_bytes(data[magic_len+63..magic_len+67].try_into().unwrap());
+        let index_root = u32::from_le_bytes(data[magic_len + 59..magic_len + 63].try_into().unwrap());
+        let index_size = u32::from_le_bytes(data[magic_len + 63..magic_len + 67].try_into().unwrap());
 
         // Catalog + Data 段（v0.12.1 新增）
         // 老文件无此字段，默认为 0（无 catalog/数据，按空库处理）
         let catalog_root = if data.len() >= magic_len + 75 {
-            u32::from_le_bytes(data[magic_len+67..magic_len+71].try_into().unwrap())
-        } else { 0 };
+            u32::from_le_bytes(data[magic_len + 67..magic_len + 71].try_into().unwrap())
+        } else {
+            0
+        };
         let catalog_size = if data.len() >= magic_len + 79 {
-            u32::from_le_bytes(data[magic_len+71..magic_len+75].try_into().unwrap())
-        } else { 0 };
+            u32::from_le_bytes(data[magic_len + 71..magic_len + 75].try_into().unwrap())
+        } else {
+            0
+        };
         let data_root = if data.len() >= magic_len + 83 {
-            u32::from_le_bytes(data[magic_len+75..magic_len+79].try_into().unwrap())
-        } else { 0 };
+            u32::from_le_bytes(data[magic_len + 75..magic_len + 79].try_into().unwrap())
+        } else {
+            0
+        };
         let data_size = if data.len() >= magic_len + 87 {
-            u32::from_le_bytes(data[magic_len+79..magic_len+83].try_into().unwrap())
-        } else { 0 };
+            u32::from_le_bytes(data[magic_len + 79..magic_len + 83].try_into().unwrap())
+        } else {
+            0
+        };
 
         Ok(Self {
             magic: MAGIC.clone(),

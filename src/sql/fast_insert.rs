@@ -9,8 +9,8 @@
 //!
 //! 不支持时返回 None，由调用方回退到完整 sqlparser。
 
-use crate::Value;
 use super::ast::*;
+use crate::Value;
 
 /// 尝试快速解析 INSERT 语句
 ///
@@ -148,8 +148,7 @@ fn eat_keyword(bytes: &[u8], pos: &mut usize, keyword: &[u8]) -> bool {
     if slice.eq_ignore_ascii_case(keyword) {
         // 确保后面是空白或特殊字符（不是标识符的一部分）
         if *pos + keyword.len() >= bytes.len()
-            || !bytes[*pos + keyword.len()].is_ascii_alphanumeric()
-            && bytes[*pos + keyword.len()] != b'_'
+            || !bytes[*pos + keyword.len()].is_ascii_alphanumeric() && bytes[*pos + keyword.len()] != b'_'
         {
             *pos += keyword.len();
             return true;
@@ -186,9 +185,7 @@ fn parse_identifier(bytes: &[u8], pos: &mut usize) -> Option<String> {
     if !bytes[*pos].is_ascii_alphabetic() && bytes[*pos] != b'_' {
         return None;
     }
-    while *pos < bytes.len()
-        && (bytes[*pos].is_ascii_alphanumeric() || bytes[*pos] == b'_')
-    {
+    while *pos < bytes.len() && (bytes[*pos].is_ascii_alphanumeric() || bytes[*pos] == b'_') {
         *pos += 1;
     }
 
@@ -255,7 +252,8 @@ fn parse_value(bytes: &[u8], pos: &mut usize) -> Option<Expression> {
     }
 
     // 数字（整数或浮点数）
-    if b.is_ascii_digit() || (b == b'-' && *pos + 1 < bytes.len() && bytes[*pos + 1].is_ascii_digit())
+    if b.is_ascii_digit()
+        || (b == b'-' && *pos + 1 < bytes.len() && bytes[*pos + 1].is_ascii_digit())
         || (b == b'+' && *pos + 1 < bytes.len() && bytes[*pos + 1].is_ascii_digit())
     {
         let start = *pos;
@@ -468,7 +466,10 @@ mod tests {
         assert!(result.is_some());
         if let Some(Statement::Insert(stmt)) = result {
             assert!(matches!(&stmt.values[0][0], Expression::Literal(Value::Varchar(v)) if v == "a,b(c)"));
-            assert!(matches!(&stmt.values[0][1], Expression::Literal(Value::Varchar(v)) if v == "it's"), "'' 转义单引号");
+            assert!(
+                matches!(&stmt.values[0][1], Expression::Literal(Value::Varchar(v)) if v == "it's"),
+                "'' 转义单引号"
+            );
         }
     }
 
@@ -514,8 +515,10 @@ mod tests {
     #[test]
     fn test_fallback_quoted_identifier_table() {
         // 带引号表名走回退（fast 路径不保证，但不应 panic）
-        assert!(try_parse_insert("INSERT INTO \"my table\" VALUES (1)").is_none()
-            || try_parse_insert("INSERT INTO \"my table\" VALUES (1)").is_some());
+        assert!(
+            try_parse_insert("INSERT INTO \"my table\" VALUES (1)").is_none()
+                || try_parse_insert("INSERT INTO \"my table\" VALUES (1)").is_some()
+        );
     }
 
     #[test]

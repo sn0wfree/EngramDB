@@ -16,8 +16,8 @@
 
 use std::time::{Duration, Instant};
 
+use engramdb::{Config, Connection, Value};
 use std::io::Write;
-use engramdb::{Connection, Config, Value};
 
 const ITERS: usize = 5;
 const HDB_PATH: &str = "/tmp/v0.13_acceptance.hdb";
@@ -110,11 +110,8 @@ fn a1_sqlite() -> Duration {
          PRAGMA synchronous = NORMAL;",
     )
     .unwrap();
-    conn.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)", [])
+        .unwrap();
 
     let start = Instant::now();
     for i in 0..1000 {
@@ -183,11 +180,8 @@ fn a1b_sqlite(n: usize) -> Duration {
          PRAGMA synchronous = NORMAL;",
     )
     .unwrap();
-    conn.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)", [])
+        .unwrap();
 
     const SQL_BATCH: usize = 50_000;
     let start = Instant::now();
@@ -251,8 +245,7 @@ fn a2_setup_engramdb(seed: u64) {
     }
 
     // 创建覆盖索引：id 为键，val 为覆盖列，支持 IndexOnlyScan
-    conn.execute("CREATE INDEX idx_t_id ON t (id) INCLUDE (val)")
-        .unwrap();
+    conn.execute("CREATE INDEX idx_t_id ON t (id) INCLUDE (val)").unwrap();
 
     conn.close().unwrap();
     let _ = seed; // 当前未用, 保留占位
@@ -291,9 +284,7 @@ fn a2_sqlite() -> Duration {
     let start = Instant::now();
     for &id in &query_ids {
         let r: Vec<(i64, f64)> = stmt
-            .query_map(rusqlite::params![id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_map(rusqlite::params![id], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .map(|x| x.unwrap())
             .collect();
@@ -327,9 +318,7 @@ fn a3_sqlite() -> Duration {
     let conn = rusqlite::Connection::open(SQLITE_PATH).unwrap();
 
     let start = Instant::now();
-    let v: i64 = conn
-        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
-        .unwrap();
+    let v: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
     let elapsed = start.elapsed();
     debug_eq_i64(v, POINT_QUERY_TABLE_SIZE as i64);
 
@@ -381,11 +370,8 @@ fn b4_setup_sqlite() {
          PRAGMA temp_store = MEMORY;",
     )
     .unwrap();
-    conn.execute(
-        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT)", [])
+        .unwrap();
 
     let mut rng = SimpleRng::new(7);
     const BATCH: usize = 50_000;
@@ -451,7 +437,9 @@ struct SimpleRng {
 
 impl SimpleRng {
     fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) }
+        Self {
+            state: seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407),
+        }
     }
     fn gen_range(&mut self, range: std::ops::Range<i64>) -> i64 {
         self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -468,7 +456,12 @@ impl SimpleRng {
 // 主流程
 // ============================================================
 
-fn run_scenario(name: &str, target_ratio: f64, mut engramdb_fn: impl FnMut() -> Duration, mut sqlite_fn: impl FnMut() -> Duration) {
+fn run_scenario(
+    name: &str,
+    target_ratio: f64,
+    mut engramdb_fn: impl FnMut() -> Duration,
+    mut sqlite_fn: impl FnMut() -> Duration,
+) {
     println!("\n--- {} ---", name);
     println!("  目标: EngramDB / SQLite ≤ {:.1}x", target_ratio);
 
@@ -477,8 +470,13 @@ fn run_scenario(name: &str, target_ratio: f64, mut engramdb_fn: impl FnMut() -> 
     for i in 1..=ITERS {
         let h = engramdb_fn();
         let s = sqlite_fn();
-        println!("  第{}轮  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x",
-                 i, fmt_ms(h), fmt_ms(s), h.as_secs_f64() / s.as_secs_f64());
+        println!(
+            "  第{}轮  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x",
+            i,
+            fmt_ms(h),
+            fmt_ms(s),
+            h.as_secs_f64() / s.as_secs_f64()
+        );
         h_samples.push(h);
         s_samples.push(s);
     }
@@ -492,8 +490,13 @@ fn run_scenario(name: &str, target_ratio: f64, mut engramdb_fn: impl FnMut() -> 
         ratio <= target_ratio
     };
     let status = if pass { "✅ PASS" } else { "❌ FAIL" };
-    println!("  中位数  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x  {}",
-             fmt_ms(h_med), fmt_ms(s_med), ratio, status);
+    println!(
+        "  中位数  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x  {}",
+        fmt_ms(h_med),
+        fmt_ms(s_med),
+        ratio,
+        status
+    );
 }
 
 fn main() {
@@ -538,12 +541,7 @@ fn main() {
     println!("  SQLite setup done in {}", fmt_ms(t0.elapsed()));
 
     // A-2: 索引点查
-    run_scenario(
-        "A-2: 索引点查 (1M 行表, 1000 次随机等值)",
-        5.0,
-        a2_engramdb,
-        a2_sqlite,
-    );
+    run_scenario("A-2: 索引点查 (1M 行表, 1000 次随机等值)", 5.0, a2_engramdb, a2_sqlite);
 
     // A-3: COUNT(*)
     run_scenario("A-3: COUNT(*) (1M 行, 无 WHERE)", 1.05, a3_engramdb, a3_sqlite);
@@ -581,7 +579,7 @@ fn main() {
     // 1% 选择性：val > 990（val ∈ [0, 1000] 均匀）
     run_scenario(
         "A-4a: WHERE val > 990 (1% 选择性, 1M 行)",
-        10.0,  // 目标：从 21.1x 降到 10x 以内
+        10.0, // 目标：从 21.1x 降到 10x 以内
         a4a_engramdb,
         a4a_sqlite,
     );
@@ -618,7 +616,8 @@ fn main() {
 fn a4_setup_engramdb() {
     cleanup_files();
     let mut conn = open_hdb();
-    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)").unwrap();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)")
+        .unwrap();
 
     const BATCH: usize = 50_000;
     for chunk_start in (0..POINT_QUERY_TABLE_SIZE).step_by(BATCH) {
@@ -650,11 +649,8 @@ fn a4_setup_sqlite() {
          PRAGMA temp_store = MEMORY;",
     )
     .unwrap();
-    conn.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)", [])
+        .unwrap();
 
     const BATCH: usize = 50_000;
     let tx = conn.unchecked_transaction().unwrap();
@@ -758,11 +754,8 @@ fn setup_sqlite_1m() {
          PRAGMA temp_store = MEMORY;",
     )
     .unwrap();
-    conn.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)", [])
+        .unwrap();
 
     const BATCH: usize = 50_000;
     let tx = conn.unchecked_transaction().unwrap();

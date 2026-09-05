@@ -7,9 +7,9 @@
 //! - 列级：NDV（不同值数量）、空值率、Min/Max、直方图
 //! - 简单统计即可支撑大部分优化决策（PostgreSQL 风格）
 
-use crate::Value;
 use crate::common::value_cmp::total_cmp;
 use crate::executor::vector::{DataChunk, Vector};
+use crate::Value;
 
 /// 表级统计信息
 #[derive(Debug, Clone)]
@@ -61,9 +61,7 @@ impl Histogram {
         }
 
         // 只对数值类型构建直方图
-        let numeric_values: Vec<f64> = values.iter()
-            .filter_map(|v| v.as_f64())
-            .collect();
+        let numeric_values: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
 
         if numeric_values.is_empty() {
             return None;
@@ -160,11 +158,7 @@ impl TableStatistics {
                 }
             }
 
-            let col_stats = ColumnStatistics::from_values(
-                &column_names[col_idx],
-                &all_values,
-                with_histogram,
-            );
+            let col_stats = ColumnStatistics::from_values(&column_names[col_idx], &all_values, with_histogram);
             columns.push(col_stats);
         }
 
@@ -308,13 +302,19 @@ fn value_greater(a: &Value, b: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::vector::{Vector, DataChunk};
+    use crate::executor::vector::{DataChunk, Vector};
 
     fn make_test_chunk() -> DataChunk {
         let ids = Vector::Flat(vec![
-            Value::Int64(1), Value::Int64(2), Value::Int64(3),
-            Value::Int64(4), Value::Int64(5), Value::Int64(6),
-            Value::Int64(7), Value::Int64(8), Value::Int64(9),
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(5),
+            Value::Int64(6),
+            Value::Int64(7),
+            Value::Int64(8),
+            Value::Int64(9),
             Value::Int64(10),
         ]);
         let names = Vector::Flat(vec![
@@ -329,7 +329,10 @@ mod tests {
             Value::Varchar("a".into()),
             Value::Varchar("f".into()),
         ]);
-        DataChunk { columns: vec![ids, names], count: 10 }
+        DataChunk {
+            columns: vec![ids, names],
+            count: 10,
+        }
     }
 
     #[test]
@@ -337,7 +340,11 @@ mod tests {
         let chunk = make_test_chunk();
         let cols = vec!["id".to_string(), "name".to_string()];
         let stats = TableStatistics::from_chunks(
-            "test", crate::common::types::EngineType::Columnar, &cols, &[chunk], false
+            "test",
+            crate::common::types::EngineType::Columnar,
+            &cols,
+            &[chunk],
+            false,
         );
 
         assert_eq!(stats.row_count, 10);
@@ -353,7 +360,11 @@ mod tests {
         let chunk = make_test_chunk();
         let cols = vec!["id".to_string(), "name".to_string()];
         let stats = TableStatistics::from_chunks(
-            "test", crate::common::types::EngineType::Columnar, &cols, &[chunk], false
+            "test",
+            crate::common::types::EngineType::Columnar,
+            &cols,
+            &[chunk],
+            false,
         );
 
         // name 列：a,b,c,d,e,f = 6 个不同值
@@ -388,8 +399,11 @@ mod tests {
     #[test]
     fn test_null_stats() {
         let values = vec![
-            Value::Int64(1), Value::Null, Value::Int64(3),
-            Value::Null, Value::Int64(5),
+            Value::Int64(1),
+            Value::Null,
+            Value::Int64(3),
+            Value::Null,
+            Value::Int64(5),
         ];
         let stats = ColumnStatistics::from_values("col", &values, false);
 

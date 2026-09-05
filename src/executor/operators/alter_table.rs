@@ -1,6 +1,6 @@
-use crate::common::error::{Result, EngramDbError};
+use crate::common::error::{EngramDbError, Result};
+use crate::sql::ast::{AlterTableOp, AlterTableStmt, ColumnDef};
 use crate::storage::Database;
-use crate::sql::ast::{AlterTableStmt, AlterTableOp, ColumnDef};
 use crate::QueryResult;
 
 pub fn execute(db: &mut Database, stmt: AlterTableStmt) -> Result<QueryResult> {
@@ -15,68 +15,89 @@ pub fn execute(db: &mut Database, stmt: AlterTableStmt) -> Result<QueryResult> {
                 auto_increment: false,
                 check_expr: None,
             };
-            let table = db.get_table_mut(&stmt.table_name)
+            let table = db
+                .get_table_mut(&stmt.table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
-            
+
             // 检查列名是否已存在
             if table.def().columns.iter().any(|c| c.name == def.name) {
-                return Err(EngramDbError::ConstraintViolation(
-                    format!("Column '{}' already exists in table '{}'", def.name, stmt.table_name)
-                ));
+                return Err(EngramDbError::ConstraintViolation(format!(
+                    "Column '{}' already exists in table '{}'",
+                    def.name, stmt.table_name
+                )));
             }
-            
+
             table.def_mut().columns.push(def);
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar(format!("Column added to {}", stmt.table_name))]],
+                rows: vec![vec![crate::Value::Varchar(format!(
+                    "Column added to {}",
+                    stmt.table_name
+                ))]],
                 rows_affected: 0,
             })
         }
         AlterTableOp::DropColumn { column_name } => {
-            let table = db.get_table_mut(&stmt.table_name)
+            let table = db
+                .get_table_mut(&stmt.table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
-            let col_idx = table.def().column_index(&column_name)
+            let col_idx = table
+                .def()
+                .column_index(&column_name)
                 .ok_or_else(|| EngramDbError::ColumnNotFound(column_name.clone()))?;
-            
+
             // 检查是否是主键列
             if table.def().columns[col_idx].is_primary_key {
-                return Err(EngramDbError::ConstraintViolation(
-                    format!("Cannot drop primary key column '{}'", column_name)
-                ));
+                return Err(EngramDbError::ConstraintViolation(format!(
+                    "Cannot drop primary key column '{}'",
+                    column_name
+                )));
             }
-            
+
             // 检查是否是唯一列（有唯一索引）
             if table.def().indexes.iter().any(|idx| idx.key_columns.contains(&col_idx)) {
-                return Err(EngramDbError::ConstraintViolation(
-                    format!("Cannot drop column '{}' with index, drop index first", column_name)
-                ));
+                return Err(EngramDbError::ConstraintViolation(format!(
+                    "Cannot drop column '{}' with index, drop index first",
+                    column_name
+                )));
             }
-            
+
             table.def_mut().columns.remove(col_idx);
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar(format!("Column '{}' dropped from {}", column_name, stmt.table_name))]],
+                rows: vec![vec![crate::Value::Varchar(format!(
+                    "Column '{}' dropped from {}",
+                    column_name, stmt.table_name
+                ))]],
                 rows_affected: 0,
             })
         }
         AlterTableOp::RenameColumn { old_name, new_name } => {
-            let table = db.get_table_mut(&stmt.table_name)
+            let table = db
+                .get_table_mut(&stmt.table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(stmt.table_name.clone()))?;
-            
+
             // 检查新列名是否已存在
             if table.def().columns.iter().any(|c| c.name == new_name) {
-                return Err(EngramDbError::ConstraintViolation(
-                    format!("Column '{}' already exists in table '{}'", new_name, stmt.table_name)
-                ));
+                return Err(EngramDbError::ConstraintViolation(format!(
+                    "Column '{}' already exists in table '{}'",
+                    new_name, stmt.table_name
+                )));
             }
-            
-            let col = table.def_mut().columns.iter_mut()
+
+            let col = table
+                .def_mut()
+                .columns
+                .iter_mut()
                 .find(|c| c.name == old_name)
                 .ok_or_else(|| EngramDbError::ColumnNotFound(old_name.clone()))?;
             col.name = new_name.clone();
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar(format!("Column '{}' renamed to '{}'", old_name, new_name))]],
+                rows: vec![vec![crate::Value::Varchar(format!(
+                    "Column '{}' renamed to '{}'",
+                    old_name, new_name
+                ))]],
                 rows_affected: 0,
             })
         }
@@ -98,9 +119,13 @@ mod tests {
 
     fn mk_col(name: &str, dt: crate::common::types::DataType) -> crate::common::types::ColumnDef {
         crate::common::types::ColumnDef {
-            name: name.into(), data_type: dt, nullable: true,
-            is_primary_key: false, default_value: None, auto_increment: false,
-                    check_expr: None,
+            name: name.into(),
+            data_type: dt,
+            nullable: true,
+            is_primary_key: false,
+            default_value: None,
+            auto_increment: false,
+            check_expr: None,
         }
     }
 
@@ -113,10 +138,16 @@ mod tests {
                 mk_col("a", crate::common::types::DataType::Int32),
                 mk_col("b", crate::common::types::DataType::Varchar),
             ],
-            row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
+            row_count: 0,
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
             engine: crate::common::types::EngineType::Columnar,
-            next_auto_increment_id: 0, ttl_seconds: None, ttl_column: None,
-        }).unwrap();
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+        })
+        .unwrap();
         db
     }
 
@@ -127,8 +158,12 @@ mod tests {
             table_name: "t".into(),
             operation: AlterTableOp::AddColumn {
                 column_def: ColumnDef {
-                    name: "c".into(), data_type: crate::common::types::DataType::Int64,
-                    nullable: true, primary_key: false, auto_increment: false, unique: false,
+                    name: "c".into(),
+                    data_type: crate::common::types::DataType::Int64,
+                    nullable: true,
+                    primary_key: false,
+                    auto_increment: false,
+                    unique: false,
                     check_expr: None,
                 },
                 position: None,
@@ -149,8 +184,12 @@ mod tests {
             table_name: "missing".into(),
             operation: AlterTableOp::AddColumn {
                 column_def: ColumnDef {
-                    name: "c".into(), data_type: crate::common::types::DataType::Int32,
-                    nullable: true, primary_key: false, auto_increment: false, unique: false,
+                    name: "c".into(),
+                    data_type: crate::common::types::DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    auto_increment: false,
+                    unique: false,
                     check_expr: None,
                 },
                 position: None,
@@ -165,7 +204,9 @@ mod tests {
         let mut db = open_db();
         let stmt = AlterTableStmt {
             table_name: "t".into(),
-            operation: AlterTableOp::DropColumn { column_name: "b".into() },
+            operation: AlterTableOp::DropColumn {
+                column_name: "b".into(),
+            },
         };
         let r = execute(&mut db, stmt).unwrap();
         assert_eq!(r.rows[0][0], crate::Value::Varchar("Column 'b' dropped from t".into()));
@@ -174,15 +215,25 @@ mod tests {
         // 列不存在
         let stmt = AlterTableStmt {
             table_name: "t".into(),
-            operation: AlterTableOp::DropColumn { column_name: "zzz".into() },
+            operation: AlterTableOp::DropColumn {
+                column_name: "zzz".into(),
+            },
         };
-        assert!(matches!(execute(&mut db, stmt).unwrap_err(), EngramDbError::ColumnNotFound(_)));
+        assert!(matches!(
+            execute(&mut db, stmt).unwrap_err(),
+            EngramDbError::ColumnNotFound(_)
+        ));
         // 表不存在
         let stmt = AlterTableStmt {
             table_name: "missing".into(),
-            operation: AlterTableOp::DropColumn { column_name: "a".into() },
+            operation: AlterTableOp::DropColumn {
+                column_name: "a".into(),
+            },
         };
-        assert!(matches!(execute(&mut db, stmt).unwrap_err(), EngramDbError::TableNotFound(_)));
+        assert!(matches!(
+            execute(&mut db, stmt).unwrap_err(),
+            EngramDbError::TableNotFound(_)
+        ));
     }
 
     #[test]
@@ -190,7 +241,10 @@ mod tests {
         let mut db = open_db();
         let stmt = AlterTableStmt {
             table_name: "t".into(),
-            operation: AlterTableOp::RenameColumn { old_name: "b".into(), new_name: "bb".into() },
+            operation: AlterTableOp::RenameColumn {
+                old_name: "b".into(),
+                new_name: "bb".into(),
+            },
         };
         let r = execute(&mut db, stmt).unwrap();
         assert_eq!(r.rows[0][0], crate::Value::Varchar("Column 'b' renamed to 'bb'".into()));
@@ -198,15 +252,27 @@ mod tests {
         // 旧列不存在
         let stmt = AlterTableStmt {
             table_name: "t".into(),
-            operation: AlterTableOp::RenameColumn { old_name: "zzz".into(), new_name: "x".into() },
+            operation: AlterTableOp::RenameColumn {
+                old_name: "zzz".into(),
+                new_name: "x".into(),
+            },
         };
-        assert!(matches!(execute(&mut db, stmt).unwrap_err(), EngramDbError::ColumnNotFound(_)));
+        assert!(matches!(
+            execute(&mut db, stmt).unwrap_err(),
+            EngramDbError::ColumnNotFound(_)
+        ));
         // 表不存在
         let stmt = AlterTableStmt {
             table_name: "missing".into(),
-            operation: AlterTableOp::RenameColumn { old_name: "a".into(), new_name: "x".into() },
+            operation: AlterTableOp::RenameColumn {
+                old_name: "a".into(),
+                new_name: "x".into(),
+            },
         };
-        assert!(matches!(execute(&mut db, stmt).unwrap_err(), EngramDbError::TableNotFound(_)));
+        assert!(matches!(
+            execute(&mut db, stmt).unwrap_err(),
+            EngramDbError::TableNotFound(_)
+        ));
     }
 
     #[test]
@@ -226,21 +292,35 @@ mod tests {
             table_name: "missing".into(),
             operation: AlterTableOp::RenameTable { new_name: "x".into() },
         };
-        assert!(matches!(execute(&mut db, stmt).unwrap_err(), EngramDbError::TableNotFound(_)));
+        assert!(matches!(
+            execute(&mut db, stmt).unwrap_err(),
+            EngramDbError::TableNotFound(_)
+        ));
         // 重命名到已存在的表名 → 冲突
         db.create_table(crate::common::types::TableDef {
             id: 0,
             name: "other".into(),
             columns: vec![mk_col("a", crate::common::types::DataType::Int32)],
-            row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
+            row_count: 0,
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
             engine: crate::common::types::EngineType::Columnar,
-            next_auto_increment_id: 0, ttl_seconds: None, ttl_column: None,
-        }).unwrap();
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+        })
+        .unwrap();
         let stmt = AlterTableStmt {
             table_name: "t2".into(),
-            operation: AlterTableOp::RenameTable { new_name: "other".into() },
+            operation: AlterTableOp::RenameTable {
+                new_name: "other".into(),
+            },
         };
-        assert!(matches!(execute(&mut db, stmt).unwrap_err(), EngramDbError::ConstraintViolation(_)));
+        assert!(matches!(
+            execute(&mut db, stmt).unwrap_err(),
+            EngramDbError::ConstraintViolation(_)
+        ));
         // 冲突后原表仍可用
         assert!(db.get_table("t2").is_some());
     }

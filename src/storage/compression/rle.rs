@@ -206,13 +206,19 @@ mod tests {
         // 多个不同长度的 run
         let mut data = Vec::new();
         // run 1: 5 个 A
-        for _ in 0..5 { data.extend_from_slice(&0xAAAAAAAAu64.to_le_bytes()); }
+        for _ in 0..5 {
+            data.extend_from_slice(&0xAAAAAAAAu64.to_le_bytes());
+        }
         // run 2: 1 个 B
         data.extend_from_slice(&0xBBBBBBBBu64.to_le_bytes());
         // run 3: 20 个 C
-        for _ in 0..20 { data.extend_from_slice(&0xCCCCCCCCu64.to_le_bytes()); }
+        for _ in 0..20 {
+            data.extend_from_slice(&0xCCCCCCCCu64.to_le_bytes());
+        }
         // run 4: 3 个 D
-        for _ in 0..3 { data.extend_from_slice(&0xDDDDDDDDu64.to_le_bytes()); }
+        for _ in 0..3 {
+            data.extend_from_slice(&0xDDDDDDDDu64.to_le_bytes());
+        }
 
         let encoded = encode(&data);
         let decoded = decode(&encoded);

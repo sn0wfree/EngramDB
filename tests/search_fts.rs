@@ -19,9 +19,21 @@ fn make_tokenizer() -> Tokenizer {
         Vec::new(),
         vec![("你".into(), "好".into()), ("世".into(), "界".into())],
         vec![
-            "你".into(), "好".into(), "世".into(), "界".into(), "！".into(),
-            "h".into(), "e".into(), "l".into(), "o".into(), " ".into(),
-            "w".into(), "r".into(), "d".into(), "你好".into(), "世界".into(),
+            "你".into(),
+            "好".into(),
+            "世".into(),
+            "界".into(),
+            "！".into(),
+            "h".into(),
+            "e".into(),
+            "l".into(),
+            "o".into(),
+            " ".into(),
+            "w".into(),
+            "r".into(),
+            "d".into(),
+            "你好".into(),
+            "世界".into(),
         ],
     );
     Tokenizer::from_vocab_file(vf).unwrap()
@@ -46,7 +58,11 @@ fn test_token_inverted_and_or_search() {
     let q = ids(&tok, "你好");
     assert_eq!(idx.search_and(&q), vec![0, 1], "AND 应命中含「你好」的行");
     let q2 = ids(&tok, "你好世界");
-    assert_eq!(idx.search_and(&q2), vec![0, 1], "AND 交集（你好+世界）：文档 1 两者均含");
+    assert_eq!(
+        idx.search_and(&q2),
+        vec![0, 1],
+        "AND 交集（你好+世界）：文档 1 两者均含"
+    );
     let q3 = ids(&tok, "world");
     assert_eq!(idx.search_or(&q3), vec![1, 2], "doc1 含 o/l，doc2 全含——OR 都召回");
     assert_eq!(idx.doc_len(0), 2, "「你好世界」= 你好+世界 = 2 token");
@@ -77,7 +93,7 @@ fn test_token_inverted_tinv1_compat() {
     buf.extend_from_slice(&(tok.version() as i16).to_le_bytes());
     buf.extend_from_slice(&2u32.to_le_bytes()); // n_docs
     buf.extend_from_slice(&1u32.to_le_bytes()); // postings count
-    // token "你好" id
+                                                // token "你好" id
     let nid = tok.token_to_id("你好").unwrap();
     buf.extend_from_slice(&nid.to_le_bytes());
     buf.extend_from_slice(&2u32.to_le_bytes()); // count
@@ -176,7 +192,11 @@ fn test_fuzzy_edit_distance_banded() {
         }
         brute = prev[y.len()];
     }
-    assert_eq!(edit_distance(&ids(&tok, "你好世界"), &ids(&tok, "你好世界！"), 8), brute, "banded 与全宽一致");
+    assert_eq!(
+        edit_distance(&ids(&tok, "你好世界"), &ids(&tok, "你好世界！"), 8),
+        brute,
+        "banded 与全宽一致"
+    );
 }
 
 #[test]
@@ -224,7 +244,10 @@ fn test_table_fts_persist_roundtrip() {
         let def = TableDef::new(
             1,
             "t",
-            vec![ColumnDef::new("id", DataType::Int64), ColumnDef::new("content", DataType::Varchar)],
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("content", DataType::Varchar),
+            ],
         );
         db.create_table(def).unwrap();
         // DB open 会按 config 覆盖全局 Tokenizer（默认 None）——这里在 open 后重新注册
@@ -237,12 +260,19 @@ fn test_table_fts_persist_roundtrip() {
         let _ = fts_ready;
 
         for (i, text) in ["你好世界", "hello world", "世界你好你好"].iter().enumerate() {
-            db.get_table_mut("t").unwrap().insert(vec![vec![Value::Int64(i as i64), Value::Varchar(text.to_string())]])
+            db.get_table_mut("t")
+                .unwrap()
+                .insert(vec![vec![Value::Int64(i as i64), Value::Varchar(text.to_string())]])
                 .unwrap();
         }
         let table = db.get_table_mut("t").unwrap();
         let idx = table.fts_indexes().get("content").unwrap();
-        eprintln!("DBG idx ver={:?} keys={} docs={}", idx.vocab_version(), idx.postings().len(), idx.n_docs());
+        eprintln!(
+            "DBG idx ver={:?} keys={} docs={}",
+            idx.vocab_version(),
+            idx.postings().len(),
+            idx.n_docs()
+        );
         let hits = table.search_fts("content", "你好");
         assert_eq!(hits, vec![0, 2], "中文词级命中：{:?}", hits);
         let bm25 = table.search_bm25("content", "你好", 3);
@@ -319,11 +349,10 @@ fn test_table_hybrid_search() {
     .enumerate()
     {
         let _ = i;
-        db.get_table_mut("t").unwrap().insert(vec![vec![
-            Value::Varchar(text.to_string()),
-            Value::Vector(vec.clone()),
-        ]])
-        .unwrap();
+        db.get_table_mut("t")
+            .unwrap()
+            .insert(vec![vec![Value::Varchar(text.to_string()), Value::Vector(vec.clone())]])
+            .unwrap();
     }
     let query_vec = vec![0.2f32, 0.3, 0.4, 0.5]; // 近文档 0
     let merged = db

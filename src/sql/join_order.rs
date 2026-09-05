@@ -13,7 +13,7 @@
 //! - 限制最大表数（超过 8 个表改用贪心算法）
 
 use crate::common::error::Result;
-use crate::executor::physical_plan::{PhysicalPlan, JoinType};
+use crate::executor::physical_plan::{JoinType, PhysicalPlan};
 use crate::sql::cost_model::{CostModel, PlanProperties};
 
 /// 连接图中的一个关系节点
@@ -63,7 +63,7 @@ pub fn optimize_join_order(
 
     if n == 0 {
         return Err(crate::common::error::EngramDbError::Parse(
-            "Cannot optimize join order with 0 relations".into()
+            "Cannot optimize join order with 0 relations".into(),
         ));
     }
 
@@ -107,13 +107,9 @@ pub fn optimize_join_order(
                 let right_mask = mask ^ left_mask;
 
                 if left_mask != 0 && right_mask != 0 {
-                    if let (Some(left_state), Some(right_state)) =
-                        (&dp[left_mask], &dp[right_mask])
-                    {
+                    if let (Some(left_state), Some(right_state)) = (&dp[left_mask], &dp[right_mask]) {
                         // 检查这两个子集之间是否有连接条件
-                        if let Some(cond) = find_join_condition(
-                            left_mask, right_mask, conditions, &relations,
-                        ) {
+                        if let Some(cond) = find_join_condition(left_mask, right_mask, conditions, &relations) {
                             // 构建连接计划（左深树：左边大的在左）
                             let join_plan = PhysicalPlan::HashJoin {
                                 left: Box::new(left_state.plan.clone()),
@@ -129,20 +125,16 @@ pub fn optimize_join_order(
                             // 更新最优
                             if best.as_ref().map_or(true, |b| total_cost < b.cost) {
                                 // 估算输出属性（简化）
-                                let output_rows = estimate_join_rows(
-                                    &left_state.props, &right_state.props,
-                                    cond.0.len(), join_type,
-                                );
-                                let num_cols = left_state.props.num_columns
-                                    + right_state.props.num_columns;
+                                let output_rows =
+                                    estimate_join_rows(&left_state.props, &right_state.props, cond.0.len(), join_type);
+                                let num_cols = left_state.props.num_columns + right_state.props.num_columns;
 
                                 best = Some(DpState {
                                     plan: join_plan,
                                     props: PlanProperties {
                                         row_count: output_rows,
                                         num_columns: num_cols,
-                                        row_size: left_state.props.row_size
-                                            + right_state.props.row_size,
+                                        row_size: left_state.props.row_size + right_state.props.row_size,
                                     },
                                     cost: total_cost,
                                 });
@@ -207,14 +199,14 @@ fn greedy_join_order(
             for j in (i + 1)..relations.len() {
                 // 查找连接条件
                 let cond = conditions.iter().find(|(a, b, _)| {
-                    (*a == relations[i].id && *b == relations[j].id)
-                        || (*a == relations[j].id && *b == relations[i].id)
+                    (*a == relations[i].id && *b == relations[j].id) || (*a == relations[j].id && *b == relations[i].id)
                 });
 
                 if let Some((_, _, c)) = cond {
-                    let (left_keys, right_keys) = if conditions.iter().any(
-                        |(a, b, _)| *a == relations[i].id && *b == relations[j].id
-                    ) {
+                    let (left_keys, right_keys) = if conditions
+                        .iter()
+                        .any(|(a, b, _)| *a == relations[i].id && *b == relations[j].id)
+                    {
                         (c.left_keys.clone(), c.right_keys.clone())
                     } else {
                         (c.right_keys.clone(), c.left_keys.clone())
@@ -241,7 +233,11 @@ fn greedy_join_order(
             // 合并 i 和 j
             let props = estimate_merged_props(&relations[i].props, &relations[j].props, join_type);
             let new_id = relations.len(); // 新 ID
-            let new_rel = JoinRelation { id: new_id, plan, props };
+            let new_rel = JoinRelation {
+                id: new_id,
+                plan,
+                props,
+            };
 
             // 移除 j 和 i（注意顺序），添加新关系
             if j > i {
@@ -265,7 +261,11 @@ fn greedy_join_order(
             let new_id = relations.len();
             relations.remove(1);
             relations.remove(0);
-            relations.push(JoinRelation { id: new_id, plan, props });
+            relations.push(JoinRelation {
+                id: new_id,
+                plan,
+                props,
+            });
         }
     }
 
@@ -330,11 +330,7 @@ fn find_join_condition(
 }
 
 /// 估计连接后的输出属性
-fn estimate_merged_props(
-    left: &PlanProperties,
-    right: &PlanProperties,
-    join_type: JoinType,
-) -> PlanProperties {
+fn estimate_merged_props(left: &PlanProperties, right: &PlanProperties, join_type: JoinType) -> PlanProperties {
     let row_count = match join_type {
         JoinType::Inner => left.row_count.min(right.row_count),
         JoinType::Left => left.row_count,
@@ -352,12 +348,7 @@ fn estimate_merged_props(
 }
 
 /// 估计连接输出行数（简化版）
-fn estimate_join_rows(
-    left: &PlanProperties,
-    right: &PlanProperties,
-    num_keys: usize,
-    join_type: JoinType,
-) -> f64 {
+fn estimate_join_rows(left: &PlanProperties, right: &PlanProperties, num_keys: usize, join_type: JoinType) -> f64 {
     let match_rate = 0.1 / (num_keys as f64).max(1.0);
     let inner_rows = left.row_count * right.row_count * match_rate;
 
@@ -411,10 +402,14 @@ mod tests {
         let stats = vec![];
         let model = CostModel::new(&stats);
         let rels = vec![make_rel(0, 100.0, 2), make_rel(1, 50.0, 2)];
-        let conds = vec![(0, 1, JoinCondition {
-            left_keys: vec![0],
-            right_keys: vec![0],
-        })];
+        let conds = vec![(
+            0,
+            1,
+            JoinCondition {
+                left_keys: vec![0],
+                right_keys: vec![0],
+            },
+        )];
 
         let result = optimize_join_order(rels, &conds, JoinType::Inner, &model).unwrap();
         assert!(matches!(result, PhysicalPlan::HashJoin { .. }));
@@ -430,8 +425,22 @@ mod tests {
             make_rel(2, 10.0, 2),   // 小表
         ];
         let conds = vec![
-            (0, 1, JoinCondition { left_keys: vec![0], right_keys: vec![0] }),
-            (1, 2, JoinCondition { left_keys: vec![0], right_keys: vec![0] }),
+            (
+                0,
+                1,
+                JoinCondition {
+                    left_keys: vec![0],
+                    right_keys: vec![0],
+                },
+            ),
+            (
+                1,
+                2,
+                JoinCondition {
+                    left_keys: vec![0],
+                    right_keys: vec![0],
+                },
+            ),
         ];
 
         let result = optimize_join_order(rels, &conds, JoinType::Inner, &model).unwrap();
@@ -447,10 +456,14 @@ mod tests {
         let rels: Vec<_> = (0..10).map(|i| make_rel(i, 100.0 * (i as f64 + 1.0), 2)).collect();
         let mut conds = vec![];
         for i in 0..9 {
-            conds.push((i, i + 1, JoinCondition {
-                left_keys: vec![0],
-                right_keys: vec![0],
-            }));
+            conds.push((
+                i,
+                i + 1,
+                JoinCondition {
+                    left_keys: vec![0],
+                    right_keys: vec![0],
+                },
+            ));
         }
 
         let result = greedy_join_order(rels, &conds, JoinType::Inner, &model);

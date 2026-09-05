@@ -183,14 +183,12 @@ impl SparseIndex {
 
     /// 序列化（bincode：granules + granule_size）
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(&(&self.granules, self.granule_size))
-            .unwrap_or_default()
+        bincode::serialize(&(&self.granules, self.granule_size)).unwrap_or_default()
     }
 
     /// 反序列化（失败返回 None）
     pub fn from_bytes(data: &[u8]) -> Option<SparseIndex> {
-        let (granules, granule_size): (Vec<IndexGranule>, u32) =
-            bincode::deserialize(data).ok()?;
+        let (granules, granule_size): (Vec<IndexGranule>, u32) = bincode::deserialize(data).ok()?;
         Some(SparseIndex { granules, granule_size })
     }
 }
@@ -387,11 +385,7 @@ mod tests {
     #[test]
     fn test_sparse_index_null_key() {
         let mut idx = SparseIndex::new(4);
-        let keys = vec![
-            Value::Null,
-            Value::Int32(1),
-            Value::Int32(2),
-        ];
+        let keys = vec![Value::Null, Value::Int32(1), Value::Int32(2)];
         idx.build_from_keys(&keys);
 
         assert_eq!(idx.granule_count(), 1);
@@ -478,13 +472,19 @@ mod tests {
         // 重复键：find_first_gt 二分在全部相等时正确
         let mut idx = SparseIndex::new(2);
         let keys = vec![
-            Value::Int32(7), Value::Int32(7),
-            Value::Int32(7), Value::Int32(8),
+            Value::Int32(7),
+            Value::Int32(7),
+            Value::Int32(7),
+            Value::Int32(8),
             Value::Int32(8),
         ];
         idx.build_from_keys(&keys);
         assert_eq!(idx.granule_count(), 3);
-        assert_eq!(idx.locate_eq(&Value::Int32(7)), Some(1), "最后一个 first_key<=7 的 granule");
+        assert_eq!(
+            idx.locate_eq(&Value::Int32(7)),
+            Some(1),
+            "最后一个 first_key<=7 的 granule"
+        );
         assert_eq!(idx.locate_eq(&Value::Int32(8)), Some(2));
         // 全部键都小于 target：返回最后一个 granule
         assert_eq!(idx.locate_eq(&Value::Int32(100)), Some(2));

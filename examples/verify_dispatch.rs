@@ -34,13 +34,19 @@ fn varchar_column(texts: &[String]) -> Vec<u8> {
 }
 
 fn main() {
-    let corpus_path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/engram_corpus/full_corpus.jsonl".into());
+    let corpus_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/engram_corpus/full_corpus.jsonl".into());
     let corpus = load_corpus(&corpus_path);
     assert!(!corpus.is_empty());
     let vocab = std::fs::read("data/vocab/engram_vocab_v1.bin").expect("vocab");
     let tok = Tokenizer::from_bytes(&vocab).expect("tokenizer");
-    println!("vocab v{} ({} tokens, {} static code-lengths)",
-        tok.version(), tok.vocab_size(), tok.static_lengths().iter().filter(|l| **l > 0).count());
+    println!(
+        "vocab v{} ({} tokens, {} static code-lengths)",
+        tok.version(),
+        tok.vocab_size(),
+        tok.static_lengths().iter().filter(|l| **l > 0).count()
+    );
     set_global_tokenizer(Some(tok));
 
     // 场景 A'：流式追加（最长文本的 610 前缀快照）
@@ -56,8 +62,14 @@ fn main() {
     }
     let data = varchar_column(&snaps);
     let (ctype, comp) = compress(&data, &DataType::Varchar).unwrap();
-    println!("场景A' 流式追加: {} 事件 {}B -> {:?} {}B ({:.1}x)",
-        snaps.len(), data.len(), ctype, comp.len(), data.len() as f64 / comp.len() as f64);
+    println!(
+        "场景A' 流式追加: {} 事件 {}B -> {:?} {}B ({:.1}x)",
+        snaps.len(),
+        data.len(),
+        ctype,
+        comp.len(),
+        data.len() as f64 / comp.len() as f64
+    );
     let dec = decompress(&comp, ctype, &DataType::Varchar).unwrap();
     assert_eq!(dec, data, "roundtrip 失败");
     println!("  roundtrip OK");
@@ -66,8 +78,14 @@ fn main() {
     let docs: Vec<String> = corpus.iter().take(64).cloned().collect();
     let data2 = varchar_column(&docs);
     let (ctype2, comp2) = compress(&data2, &DataType::Varchar).unwrap();
-    println!("场景C' 独立文档: {} 事件 {}B -> {:?} {}B ({:.1}x)",
-        docs.len(), data2.len(), ctype2, comp2.len(), data2.len() as f64 / comp2.len() as f64);
+    println!(
+        "场景C' 独立文档: {} 事件 {}B -> {:?} {}B ({:.1}x)",
+        docs.len(),
+        data2.len(),
+        ctype2,
+        comp2.len(),
+        data2.len() as f64 / comp2.len() as f64
+    );
     let dec2 = decompress(&comp2, ctype2, &DataType::Varchar).unwrap();
     assert_eq!(dec2, data2, "roundtrip 失败");
     println!("  roundtrip OK");

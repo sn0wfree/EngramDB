@@ -2,19 +2,27 @@
 // 测试: RLE / Dictionary / Bit-packing (FOR) 的压缩率和编解码速度
 // 零外部依赖，直接 rustc -O --edition 2021 编译
 
-use std::time::{Duration, Instant};
 use std::convert::TryInto;
+use std::time::{Duration, Instant};
 
 // ========== 工具函数 ==========
 
 fn bench(name: &str, iters: usize, f: impl Fn()) -> Duration {
-    for _ in 0..2 { f(); } // warmup
+    for _ in 0..2 {
+        f();
+    } // warmup
     let start = Instant::now();
-    for _ in 0..iters { f(); }
+    for _ in 0..iters {
+        f();
+    }
     let elapsed = start.elapsed();
     let per_iter = elapsed / iters as u32;
-    println!("  {:<45} {:>10.3} ms  ({} iters)",
-             name, per_iter.as_secs_f64() * 1000.0, iters);
+    println!(
+        "  {:<45} {:>10.3} ms  ({} iters)",
+        name,
+        per_iter.as_secs_f64() * 1000.0,
+        iters
+    );
     per_iter
 }
 
@@ -31,7 +39,9 @@ fn fmt_bytes(n: usize) -> String {
 // ========== RLE ==========
 
 fn rle_encode_i64(values: &[i64]) -> Vec<u8> {
-    if values.is_empty() { return Vec::new(); }
+    if values.is_empty() {
+        return Vec::new();
+    }
     let mut result = Vec::with_capacity(values.len() / 4);
     let mut current_val = values[0];
     let mut run_len: u32 = 1;
@@ -54,11 +64,13 @@ fn rle_decode_i64(data: &[u8], count: usize) -> Vec<i64> {
     let mut result = Vec::with_capacity(count);
     let mut pos = 0;
     while pos + 12 <= data.len() {
-        let run = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-        let val = i64::from_le_bytes(data[pos+4..pos+12].try_into().unwrap());
+        let run = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let val = i64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
         pos += 12;
         result.reserve(run);
-        for _ in 0..run { result.push(val); }
+        for _ in 0..run {
+            result.push(val);
+        }
     }
     result
 }
@@ -88,29 +100,59 @@ fn dict_encode_i64(values: &[i64]) -> DictEncoded {
         };
         indices.push(idx);
     }
-    let width: u8 = if dict.len() <= 256 { 1 } else if dict.len() <= 65536 { 2 } else { 4 };
+    let width: u8 = if dict.len() <= 256 {
+        1
+    } else if dict.len() <= 65536 {
+        2
+    } else {
+        4
+    };
     let mut packed = Vec::with_capacity(values.len() * width as usize);
     match width {
-        1 => for &idx in &indices { packed.push(idx as u8); },
-        2 => for &idx in &indices { packed.extend_from_slice(&(idx as u16).to_le_bytes()); },
-        4 => for &idx in &indices { packed.extend_from_slice(&idx.to_le_bytes()); },
+        1 => {
+            for &idx in &indices {
+                packed.push(idx as u8);
+            }
+        }
+        2 => {
+            for &idx in &indices {
+                packed.extend_from_slice(&(idx as u16).to_le_bytes());
+            }
+        }
+        4 => {
+            for &idx in &indices {
+                packed.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
         _ => unreachable!(),
     }
-    DictEncoded { dict, indices: packed, width }
+    DictEncoded {
+        dict,
+        indices: packed,
+        width,
+    }
 }
 
 fn dict_decode_i64(enc: &DictEncoded, count: usize) -> Vec<i64> {
     let mut result = Vec::with_capacity(count);
     match enc.width {
-        1 => for i in 0..count { result.push(enc.dict[enc.indices[i] as usize]); },
-        2 => for i in 0..count {
-            let idx = u16::from_le_bytes(enc.indices[i*2..i*2+2].try_into().unwrap()) as usize;
-            result.push(enc.dict[idx]);
-        },
-        4 => for i in 0..count {
-            let idx = u32::from_le_bytes(enc.indices[i*4..i*4+4].try_into().unwrap()) as usize;
-            result.push(enc.dict[idx]);
-        },
+        1 => {
+            for i in 0..count {
+                result.push(enc.dict[enc.indices[i] as usize]);
+            }
+        }
+        2 => {
+            for i in 0..count {
+                let idx = u16::from_le_bytes(enc.indices[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
+                result.push(enc.dict[idx]);
+            }
+        }
+        4 => {
+            for i in 0..count {
+                let idx = u32::from_le_bytes(enc.indices[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+                result.push(enc.dict[idx]);
+            }
+        }
         _ => unreachable!(),
     }
     result
@@ -130,16 +172,31 @@ struct BitPacked {
 }
 
 fn bitpack_encode_i64(values: &[i64]) -> BitPacked {
-    if values.is_empty() { return BitPacked { frame: 0, bit_width: 0, count: 0, data: Vec::new() }; }
+    if values.is_empty() {
+        return BitPacked {
+            frame: 0,
+            bit_width: 0,
+            count: 0,
+            data: Vec::new(),
+        };
+    }
     let mut min_val = values[0];
     let mut max_val = values[0];
     for &v in &values[1..] {
-        if v < min_val { min_val = v; }
-        if v > max_val { max_val = v; }
+        if v < min_val {
+            min_val = v;
+        }
+        if v > max_val {
+            max_val = v;
+        }
     }
     let frame = min_val;
     let max_delta = (max_val - min_val) as u64;
-    let bit_width = if max_delta == 0 { 1 } else { (64 - max_delta.leading_zeros()) as u8 };
+    let bit_width = if max_delta == 0 {
+        1
+    } else {
+        (64 - max_delta.leading_zeros()) as u8
+    };
     let total_bits = values.len() * bit_width as usize;
     let total_bytes = (total_bits + 7) / 8;
     let mut data = vec![0u8; total_bytes];
@@ -150,16 +207,27 @@ fn bitpack_encode_i64(values: &[i64]) -> BitPacked {
             let bit = (delta >> b) & 1;
             let byte_idx = (bit_pos + b) / 8;
             let bit_idx = (bit_pos + b) % 8;
-            if bit == 1 { data[byte_idx] |= 1 << bit_idx; }
+            if bit == 1 {
+                data[byte_idx] |= 1 << bit_idx;
+            }
         }
         bit_pos += bit_width as usize;
     }
-    BitPacked { frame, bit_width, count: values.len(), data }
+    BitPacked {
+        frame,
+        bit_width,
+        count: values.len(),
+        data,
+    }
 }
 
 fn bitpack_decode_i64(packed: &BitPacked) -> Vec<i64> {
     let mut result = Vec::with_capacity(packed.count);
-    let mask = if packed.bit_width == 64 { u64::MAX } else { (1u64 << packed.bit_width) - 1 };
+    let mask = if packed.bit_width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << packed.bit_width) - 1
+    };
     let mut bit_pos: usize = 0;
     for _ in 0..packed.count {
         let mut delta: u64 = 0;
@@ -167,7 +235,9 @@ fn bitpack_decode_i64(packed: &BitPacked) -> Vec<i64> {
             let byte_idx = (bit_pos + b) / 8;
             let bit_idx = (bit_pos + b) % 8;
             let bit = (packed.data[byte_idx] >> bit_idx) & 1;
-            if bit == 1 { delta |= 1 << b; }
+            if bit == 1 {
+                delta |= 1 << b;
+            }
         }
         delta &= mask;
         result.push(packed.frame + delta as i64);
@@ -184,9 +254,13 @@ fn gen_high_repeat(n: usize) -> Vec<i64> {
     let num_distinct = 10;
     let per_val = n / num_distinct;
     for i in 0..num_distinct {
-        for _ in 0..per_val { v.push(i as i64); }
+        for _ in 0..per_val {
+            v.push(i as i64);
+        }
     }
-    while v.len() < n { v.push(0); }
+    while v.len() < n {
+        v.push(0);
+    }
     v
 }
 
@@ -252,20 +326,43 @@ fn main() {
     let bp_enc = bitpack_encode_i64(&data);
     let bp_size = bp_enc.data.len() + 17;
     let bp_ratio = orig_bytes as f64 / bp_size as f64;
-    println!("    Bit-packing:  {:.1}x  ({})  (bit_width={})", bp_ratio, fmt_bytes(bp_size), bp_enc.bit_width);
+    println!(
+        "    Bit-packing:  {:.1}x  ({})  (bit_width={})",
+        bp_ratio,
+        fmt_bytes(bp_size),
+        bp_enc.bit_width
+    );
 
     println!("  编码速度:");
-    bench("  RLE encode", 50, || { let e = rle_encode_i64(&data); std::hint::black_box(e.len()); });
-    bench("  Dict encode", 50, || { let e = dict_encode_i64(&data); std::hint::black_box(dict_total_bytes(&e)); });
-    bench("  BitPack encode", 50, || { let e = bitpack_encode_i64(&data); std::hint::black_box(e.data.len()); });
+    bench("  RLE encode", 50, || {
+        let e = rle_encode_i64(&data);
+        std::hint::black_box(e.len());
+    });
+    bench("  Dict encode", 50, || {
+        let e = dict_encode_i64(&data);
+        std::hint::black_box(dict_total_bytes(&e));
+    });
+    bench("  BitPack encode", 50, || {
+        let e = bitpack_encode_i64(&data);
+        std::hint::black_box(e.data.len());
+    });
 
     println!("  解码速度:");
     let rle_data = rle_encode_i64(&data);
     let dict_data = dict_encode_i64(&data);
     let bp_data = bitpack_encode_i64(&data);
-    bench("  RLE decode", 50, || { let d = rle_decode_i64(&rle_data, N); std::hint::black_box(d.len()); });
-    bench("  Dict decode", 50, || { let d = dict_decode_i64(&dict_data, N); std::hint::black_box(d.len()); });
-    bench("  BitPack decode", 50, || { let d = bitpack_decode_i64(&bp_data); std::hint::black_box(d.len()); });
+    bench("  RLE decode", 50, || {
+        let d = rle_decode_i64(&rle_data, N);
+        std::hint::black_box(d.len());
+    });
+    bench("  Dict decode", 50, || {
+        let d = dict_decode_i64(&dict_data, N);
+        std::hint::black_box(d.len());
+    });
+    bench("  BitPack decode", 50, || {
+        let d = bitpack_decode_i64(&bp_data);
+        std::hint::black_box(d.len());
+    });
 
     // 验证正确性
     let rle_dec = rle_decode_i64(&rle_data, N);
@@ -294,20 +391,43 @@ fn main() {
     let bp_enc = bitpack_encode_i64(&data);
     let bp_size = bp_enc.data.len() + 17;
     let bp_ratio = orig_bytes as f64 / bp_size as f64;
-    println!("    Bit-packing:  {:.1}x  ({})  (bit_width={})", bp_ratio, fmt_bytes(bp_size), bp_enc.bit_width);
+    println!(
+        "    Bit-packing:  {:.1}x  ({})  (bit_width={})",
+        bp_ratio,
+        fmt_bytes(bp_size),
+        bp_enc.bit_width
+    );
 
     println!("  编码速度:");
-    bench("  RLE encode", 30, || { let e = rle_encode_i64(&data); std::hint::black_box(e.len()); });
-    bench("  Dict encode", 30, || { let e = dict_encode_i64(&data); std::hint::black_box(dict_total_bytes(&e)); });
-    bench("  BitPack encode", 30, || { let e = bitpack_encode_i64(&data); std::hint::black_box(e.data.len()); });
+    bench("  RLE encode", 30, || {
+        let e = rle_encode_i64(&data);
+        std::hint::black_box(e.len());
+    });
+    bench("  Dict encode", 30, || {
+        let e = dict_encode_i64(&data);
+        std::hint::black_box(dict_total_bytes(&e));
+    });
+    bench("  BitPack encode", 30, || {
+        let e = bitpack_encode_i64(&data);
+        std::hint::black_box(e.data.len());
+    });
 
     println!("  解码速度:");
     let rle_data = rle_encode_i64(&data);
     let dict_data = dict_encode_i64(&data);
     let bp_data = bitpack_encode_i64(&data);
-    bench("  RLE decode", 30, || { let d = rle_decode_i64(&rle_data, N); std::hint::black_box(d.len()); });
-    bench("  Dict decode", 30, || { let d = dict_decode_i64(&dict_data, N); std::hint::black_box(d.len()); });
-    bench("  BitPack decode", 30, || { let d = bitpack_decode_i64(&bp_data); std::hint::black_box(d.len()); });
+    bench("  RLE decode", 30, || {
+        let d = rle_decode_i64(&rle_data, N);
+        std::hint::black_box(d.len());
+    });
+    bench("  Dict decode", 30, || {
+        let d = dict_decode_i64(&dict_data, N);
+        std::hint::black_box(d.len());
+    });
+    bench("  BitPack decode", 30, || {
+        let d = bitpack_decode_i64(&bp_data);
+        std::hint::black_box(d.len());
+    });
 
     let dict_dec = dict_decode_i64(&dict_data, N);
     let bp_dec = bitpack_decode_i64(&bp_data);
@@ -333,20 +453,43 @@ fn main() {
     let bp_enc = bitpack_encode_i64(&data);
     let bp_size = bp_enc.data.len() + 17;
     let bp_ratio = orig_bytes as f64 / bp_size as f64;
-    println!("    Bit-packing:  {:.1}x  ({})  (bit_width={})", bp_ratio, fmt_bytes(bp_size), bp_enc.bit_width);
+    println!(
+        "    Bit-packing:  {:.1}x  ({})  (bit_width={})",
+        bp_ratio,
+        fmt_bytes(bp_size),
+        bp_enc.bit_width
+    );
 
     println!("  编码速度:");
-    bench("  RLE encode", 30, || { let e = rle_encode_i64(&data); std::hint::black_box(e.len()); });
-    bench("  Dict encode", 30, || { let e = dict_encode_i64(&data); std::hint::black_box(dict_total_bytes(&e)); });
-    bench("  BitPack encode", 30, || { let e = bitpack_encode_i64(&data); std::hint::black_box(e.data.len()); });
+    bench("  RLE encode", 30, || {
+        let e = rle_encode_i64(&data);
+        std::hint::black_box(e.len());
+    });
+    bench("  Dict encode", 30, || {
+        let e = dict_encode_i64(&data);
+        std::hint::black_box(dict_total_bytes(&e));
+    });
+    bench("  BitPack encode", 30, || {
+        let e = bitpack_encode_i64(&data);
+        std::hint::black_box(e.data.len());
+    });
 
     println!("  解码速度:");
     let rle_data = rle_encode_i64(&data);
     let dict_data = dict_encode_i64(&data);
     let bp_data = bitpack_encode_i64(&data);
-    bench("  RLE decode", 30, || { let d = rle_decode_i64(&rle_data, N); std::hint::black_box(d.len()); });
-    bench("  Dict decode", 30, || { let d = dict_decode_i64(&dict_data, N); std::hint::black_box(d.len()); });
-    bench("  BitPack decode", 30, || { let d = bitpack_decode_i64(&bp_data); std::hint::black_box(d.len()); });
+    bench("  RLE decode", 30, || {
+        let d = rle_decode_i64(&rle_data, N);
+        std::hint::black_box(d.len());
+    });
+    bench("  Dict decode", 30, || {
+        let d = dict_decode_i64(&dict_data, N);
+        std::hint::black_box(d.len());
+    });
+    bench("  BitPack decode", 30, || {
+        let d = bitpack_decode_i64(&bp_data);
+        std::hint::black_box(d.len());
+    });
 
     let rle_dec = rle_decode_i64(&rle_data, N);
     let dict_dec = dict_decode_i64(&dict_data, N);
@@ -364,17 +507,30 @@ fn main() {
     let rle_enc = rle_encode_i64(&data);
     let rle_ratio = orig_bytes as f64 / rle_enc.len() as f64;
     println!("  压缩率:");
-    println!("    RLE:          {:.3}x  ({})  (负压缩)", rle_ratio, fmt_bytes(rle_enc.len()));
+    println!(
+        "    RLE:          {:.3}x  ({})  (负压缩)",
+        rle_ratio,
+        fmt_bytes(rle_enc.len())
+    );
 
     let dict_enc = dict_encode_i64(&data);
     let dict_size = dict_total_bytes(&dict_enc);
     let dict_ratio = orig_bytes as f64 / dict_size as f64;
-    println!("    Dictionary:   {:.3}x  ({})  (负压缩)", dict_ratio, fmt_bytes(dict_size));
+    println!(
+        "    Dictionary:   {:.3}x  ({})  (负压缩)",
+        dict_ratio,
+        fmt_bytes(dict_size)
+    );
 
     let bp_enc = bitpack_encode_i64(&data);
     let bp_size = bp_enc.data.len() + 17;
     let bp_ratio = orig_bytes as f64 / bp_size as f64;
-    println!("    Bit-packing:  {:.3}x  ({})  (bit_width={})", bp_ratio, fmt_bytes(bp_size), bp_enc.bit_width);
+    println!(
+        "    Bit-packing:  {:.3}x  ({})  (bit_width={})",
+        bp_ratio,
+        fmt_bytes(bp_size),
+        bp_enc.bit_width
+    );
     println!("  ⚠ 随机数据三种轻量级压缩均无效，应回退为不压缩或用 zstd");
     println!();
 
@@ -383,17 +539,41 @@ fn main() {
     println!("║  压缩率总结 (越高越好)                                    ║");
     println!("╠══════════════════════════════════════════════════════════╣");
 
-    let high_rle = { let e = rle_encode_i64(&gen_high_repeat(N)); orig_bytes as f64 / e.len() as f64 };
-    let high_dict = { let e = dict_encode_i64(&gen_high_repeat(N)); orig_bytes as f64 / dict_total_bytes(&e) as f64 };
-    let high_bp = { let e = bitpack_encode_i64(&gen_high_repeat(N)); orig_bytes as f64 / (e.data.len() + 17) as f64 };
+    let high_rle = {
+        let e = rle_encode_i64(&gen_high_repeat(N));
+        orig_bytes as f64 / e.len() as f64
+    };
+    let high_dict = {
+        let e = dict_encode_i64(&gen_high_repeat(N));
+        orig_bytes as f64 / dict_total_bytes(&e) as f64
+    };
+    let high_bp = {
+        let e = bitpack_encode_i64(&gen_high_repeat(N));
+        orig_bytes as f64 / (e.data.len() + 17) as f64
+    };
 
-    let low_dict = { let e = dict_encode_i64(&gen_low_cardinality(N)); orig_bytes as f64 / dict_total_bytes(&e) as f64 };
-    let low_bp = { let e = bitpack_encode_i64(&gen_low_cardinality(N)); orig_bytes as f64 / (e.data.len() + 17) as f64 };
+    let low_dict = {
+        let e = dict_encode_i64(&gen_low_cardinality(N));
+        orig_bytes as f64 / dict_total_bytes(&e) as f64
+    };
+    let low_bp = {
+        let e = bitpack_encode_i64(&gen_low_cardinality(N));
+        orig_bytes as f64 / (e.data.len() + 17) as f64
+    };
 
-    let narrow_bp = { let e = bitpack_encode_i64(&gen_narrow_range(N)); orig_bytes as f64 / (e.data.len() + 17) as f64 };
+    let narrow_bp = {
+        let e = bitpack_encode_i64(&gen_narrow_range(N));
+        orig_bytes as f64 / (e.data.len() + 17) as f64
+    };
 
-    println!("║  高重复(10值)  RLE {:>6.1}x  Dict {:>5.1}x  BP {:>5.1}x  ║", high_rle, high_dict, high_bp);
-    println!("║  低基数(200值)  RLE  ~1.0x  Dict {:>5.1}x  BP {:>5.1}x  ║", low_dict, low_bp);
+    println!(
+        "║  高重复(10值)  RLE {:>6.1}x  Dict {:>5.1}x  BP {:>5.1}x  ║",
+        high_rle, high_dict, high_bp
+    );
+    println!(
+        "║  低基数(200值)  RLE  ~1.0x  Dict {:>5.1}x  BP {:>5.1}x  ║",
+        low_dict, low_bp
+    );
     println!("║  窄范围(10K)    RLE  ~1.0x  Dict  ~1.0x  BP {:>5.1}x  ║", narrow_bp);
     println!("║  随机64位       全部负压缩，应回退不压缩或 zstd          ║");
     println!("╠══════════════════════════════════════════════════════════╣");

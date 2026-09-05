@@ -321,11 +321,7 @@ impl TokenInvertedIndex {
                 }
                 for id in ids {
                     if let Some(cp) = self.postings[id as usize].as_mut() {
-                        let kept: Vec<(u32, u32)> = cp
-                            .decode()
-                            .into_iter()
-                            .filter(|(r, _)| *r != row_id)
-                            .collect();
+                        let kept: Vec<(u32, u32)> = cp.decode().into_iter().filter(|(r, _)| *r != row_id).collect();
                         if kept.is_empty() {
                             self.postings[id as usize] = None;
                         } else {
@@ -469,11 +465,7 @@ impl TokenInvertedIndex {
 
     /// postings 流内存字节（不含槽数组开销）
     pub fn postings_memory_bytes(&self) -> usize {
-        self.postings
-            .iter()
-            .flatten()
-            .map(|p| p.memory_bytes())
-            .sum()
+        self.postings.iter().flatten().map(|p| p.memory_bytes()).sum()
     }
 
     // ------------------------------------------------------------------
@@ -560,8 +552,7 @@ impl TokenInvertedIndex {
             let rows_len = u32_at(rd(&mut pos, 4, "rows len")?) as usize;
             let rows = rd(&mut pos, rows_len, "rows")?;
             let tfs = rd(&mut pos, count, "tfs")?;
-            idx.postings[id as usize] =
-                Some(CompressedPostings::from_wire(rows, tfs, count as u32));
+            idx.postings[id as usize] = Some(CompressedPostings::from_wire(rows, tfs, count as u32));
         }
         let n_lens = u32_at(rd(&mut pos, 4, "doc lens count")?) as usize;
         let lens = rd(&mut pos, n_lens * 4, "doc lens")?;
@@ -646,7 +637,8 @@ impl TokenInvertedIndex {
 
 /// 空白 token 判定（词表内全空白字符的 id——BM25 文档长度/查询均排除）
 fn is_ws_token(tok: &Tokenizer, id: u32) -> bool {
-    tok.id_to_token(id).map_or(false, |t| !t.is_empty() && t.chars().all(char::is_whitespace))
+    tok.id_to_token(id)
+        .map_or(false, |t| !t.is_empty() && t.chars().all(char::is_whitespace))
 }
 
 /// 字符串降级分词（原 InvertedIndex::tokenize 语义）

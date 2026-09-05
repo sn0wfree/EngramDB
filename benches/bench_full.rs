@@ -2,9 +2,9 @@
 //! 对比日常使用场景：数据加载、扫描、过滤、聚合、Join、排序
 
 use engramdb::Connection;
-use std::time::Instant;
 use rand::Rng;
 use rand::SeedableRng;
+use std::time::Instant;
 
 struct BenchResult {
     name: &'static str,
@@ -14,7 +14,11 @@ struct BenchResult {
 
 impl BenchResult {
     fn new(name: &'static str, rows: usize, duration_ms: f64) -> Self {
-        Self { name, rows, duration_ms }
+        Self {
+            name,
+            rows,
+            duration_ms,
+        }
     }
 
     fn throughput(&self) -> f64 {
@@ -46,7 +50,8 @@ fn main() {
 
     // --- 1. CREATE TABLE ---
     let start = Instant::now();
-    conn.execute("CREATE TABLE t1 (id INT, category INT, value DOUBLE, name VARCHAR);").unwrap();
+    conn.execute("CREATE TABLE t1 (id INT, category INT, value DOUBLE, name VARCHAR);")
+        .unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("CREATE TABLE", 1, dur));
     println!("{:<25} {:>10.2} ms", "CREATE TABLE", dur);
@@ -71,28 +76,49 @@ fn main() {
     }
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("INSERT (batch)", n_rows, dur));
-    println!("{:<25} {:>10.2} ms  ({:>10.0} rows/s)", "INSERT (batch)", dur, n_rows as f64 / (dur / 1000.0));
+    println!(
+        "{:<25} {:>10.2} ms  ({:>10.0} rows/s)",
+        "INSERT (batch)",
+        dur,
+        n_rows as f64 / (dur / 1000.0)
+    );
 
     // --- 3. 全表扫描 SELECT * ---
     let start = Instant::now();
     let r = conn.execute("SELECT * FROM t1;").unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("SELECT * (full scan)", r.rows.len(), dur));
-    println!("{:<25} {:>10.2} ms  ({:>10.0} rows/s)", "SELECT * (full scan)", dur, r.rows.len() as f64 / (dur / 1000.0));
+    println!(
+        "{:<25} {:>10.2} ms  ({:>10.0} rows/s)",
+        "SELECT * (full scan)",
+        dur,
+        r.rows.len() as f64 / (dur / 1000.0)
+    );
 
     // --- 4. 投影扫描 SELECT 部分列 ---
     let start = Instant::now();
     let r = conn.execute("SELECT id, value FROM t1;").unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("SELECT projection", r.rows.len(), dur));
-    println!("{:<25} {:>10.2} ms  ({:>10.0} rows/s)", "SELECT projection", dur, r.rows.len() as f64 / (dur / 1000.0));
+    println!(
+        "{:<25} {:>10.2} ms  ({:>10.0} rows/s)",
+        "SELECT projection",
+        dur,
+        r.rows.len() as f64 / (dur / 1000.0)
+    );
 
     // --- 5. 过滤查询 WHERE ---
     let start = Instant::now();
     let r = conn.execute("SELECT id, value FROM t1 WHERE value > 500.0;").unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("SELECT WHERE filter", r.rows.len(), dur));
-    println!("{:<25} {:>10.2} ms  ({:>10.0} rows/s, {} rows)", "SELECT WHERE filter", dur, r.rows.len() as f64 / (dur / 1000.0), r.rows.len());
+    println!(
+        "{:<25} {:>10.2} ms  ({:>10.0} rows/s, {} rows)",
+        "SELECT WHERE filter",
+        dur,
+        r.rows.len() as f64 / (dur / 1000.0),
+        r.rows.len()
+    );
 
     // --- 6. 聚合 COUNT ---
     let start = Instant::now();
@@ -110,7 +136,9 @@ fn main() {
 
     // --- 8. GROUP BY 聚合 ---
     let start = Instant::now();
-    let r = conn.execute("SELECT category, COUNT(*) as cnt, AVG(value) as avg_val FROM t1 GROUP BY category;").unwrap();
+    let r = conn
+        .execute("SELECT category, COUNT(*) as cnt, AVG(value) as avg_val FROM t1 GROUP BY category;")
+        .unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("GROUP BY + AGG", r.rows.len(), dur));
     println!("{:<25} {:>10.2} ms  ({} groups)", "GROUP BY + AGG", dur, r.rows.len());
@@ -120,7 +148,12 @@ fn main() {
     let r = conn.execute("SELECT id, value FROM t1 ORDER BY value DESC;").unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("ORDER BY (full sort)", r.rows.len(), dur));
-    println!("{:<25} {:>10.2} ms  ({:>10.0} rows/s)", "ORDER BY (full sort)", dur, r.rows.len() as f64 / (dur / 1000.0));
+    println!(
+        "{:<25} {:>10.2} ms  ({:>10.0} rows/s)",
+        "ORDER BY (full sort)",
+        dur,
+        r.rows.len() as f64 / (dur / 1000.0)
+    );
 
     // --- 10. LIMIT ---
     let start = Instant::now();
@@ -130,7 +163,8 @@ fn main() {
     println!("{:<25} {:>10.2} ms", "ORDER BY + LIMIT 100", dur);
 
     // --- 11. CREATE TABLE 第二张表 ---
-    conn.execute("CREATE TABLE t2 (cat_id INT, cat_name VARCHAR, cat_weight DOUBLE);").unwrap();
+    conn.execute("CREATE TABLE t2 (cat_id INT, cat_name VARCHAR, cat_weight DOUBLE);")
+        .unwrap();
     let mut t2_values = Vec::new();
     for i in 0..100 {
         t2_values.push(format!("({}, 'category_{}', {:.2})", i, i, rng.gen_range(0.5..5.0)));
@@ -140,17 +174,28 @@ fn main() {
 
     // --- 12. JOIN 查询 ---
     let start = Instant::now();
-    let r = conn.execute("SELECT t1.id, t1.value, t2.cat_name FROM t1 JOIN t2 ON t1.category = t2.cat_id WHERE t1.value > 800.0;").unwrap();
+    let r = conn
+        .execute(
+            "SELECT t1.id, t1.value, t2.cat_name FROM t1 JOIN t2 ON t1.category = t2.cat_id WHERE t1.value > 800.0;",
+        )
+        .unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("JOIN + filter", r.rows.len(), dur));
     println!("{:<25} {:>10.2} ms  ({} rows)", "JOIN + filter", dur, r.rows.len());
 
     // --- 13. 子查询 / 复杂查询 ---
     let start = Instant::now();
-    let r = conn.execute("SELECT category, AVG(value) as avg_val FROM t1 GROUP BY category HAVING AVG(value) > 500.0;").unwrap();
+    let r = conn
+        .execute("SELECT category, AVG(value) as avg_val FROM t1 GROUP BY category HAVING AVG(value) > 500.0;")
+        .unwrap();
     let dur = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchResult::new("GROUP BY + HAVING", r.rows.len(), dur));
-    println!("{:<25} {:>10.2} ms  ({} groups)", "GROUP BY + HAVING", dur, r.rows.len());
+    println!(
+        "{:<25} {:>10.2} ms  ({} groups)",
+        "GROUP BY + HAVING",
+        dur,
+        r.rows.len()
+    );
 
     // --- 输出汇总 ---
     println!();

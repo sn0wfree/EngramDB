@@ -45,17 +45,16 @@ fn profile_tokenize(tok: &Tokenizer, texts: &[String]) -> (u128, u128, u128, u12
             let mut symbols: Vec<(u32, u32)> = Vec::with_capacity(word.len());
             for c in word.chars() {
                 let cp = c as u32;
-                let id = if cp < 0x10000 {
-                    tok_bmp_id(tok, cp)
-                } else {
-                    UNKNOWN_ID
-                };
+                let id = if cp < 0x10000 { tok_bmp_id(tok, cp) } else { UNKNOWN_ID };
                 symbols.push((id, c.len_utf8() as u32));
             }
             init += t1.elapsed().as_nanos();
             let t2 = Instant::now();
-            let mut heap: std::collections::BinaryHeap<(std::cmp::Reverse<u32>, std::cmp::Reverse<u32>, std::cmp::Reverse<u32>)> =
-                std::collections::BinaryHeap::new();
+            let mut heap: std::collections::BinaryHeap<(
+                std::cmp::Reverse<u32>,
+                std::cmp::Reverse<u32>,
+                std::cmp::Reverse<u32>,
+            )> = std::collections::BinaryHeap::new();
             for i in 0..symbols.len() as u32 {
                 heap.push((std::cmp::Reverse(u32::MAX), std::cmp::Reverse(0), std::cmp::Reverse(i)));
             }
@@ -66,7 +65,10 @@ fn profile_tokenize(tok: &Tokenizer, texts: &[String]) -> (u128, u128, u128, u12
             let t3 = Instant::now();
             let mut toks: Vec<Token> = Vec::with_capacity(symbols.len());
             for (id, len) in &symbols {
-                toks.push(Token { id: *id, offset: 0..(*len as usize) });
+                toks.push(Token {
+                    id: *id,
+                    offset: 0..(*len as usize),
+                });
             }
             out += t3.elapsed().as_nanos();
         }
@@ -99,7 +101,12 @@ fn main() {
     let (seg, init, merge, out) = profile_tokenize(&tok, &texts);
     let total = seg + init + merge + out;
     let mb = bytes as f64 / 1048576.0;
-    println!("{} 行 / {:.1}MB（行均 {:.0}B）", texts.len(), mb, bytes as f64 / texts.len() as f64);
+    println!(
+        "{} 行 / {:.1}MB（行均 {:.0}B）",
+        texts.len(),
+        mb,
+        bytes as f64 / texts.len() as f64
+    );
     for (name, us) in [
         ("A. 预分割(分类+段)", seg),
         ("B. 字符初始化(查表)", init),
@@ -114,11 +121,18 @@ fn main() {
             us as f64 / 1e6 / mb
         );
     }
-    println!("合计（不含真实 merges 合并与重放段）: {:.1}ms/MB", total as f64 / 1e6 / mb);
+    println!(
+        "合计（不含真实 merges 合并与重放段）: {:.1}ms/MB",
+        total as f64 / 1e6 / mb
+    );
     let t = Instant::now();
     let mut n = 0usize;
     for text in &texts {
         n += tok.tokenize(text).len();
     }
-    println!("真实 tokenize 全量: {:.1}ms/MB（{} tokens）", t.elapsed().as_micros() as f64 / 1e3 / mb, n);
+    println!(
+        "真实 tokenize 全量: {:.1}ms/MB（{} tokens）",
+        t.elapsed().as_micros() as f64 / 1e3 / mb,
+        n
+    );
 }

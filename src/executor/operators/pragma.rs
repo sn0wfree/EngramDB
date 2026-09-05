@@ -1,7 +1,7 @@
 use crate::common::config::WalFlushMode;
 use crate::common::error::Result;
-use crate::storage::Database;
 use crate::sql::ast::PragmaStmt;
+use crate::storage::Database;
 use crate::QueryResult;
 use crate::Value;
 
@@ -9,7 +9,8 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
     match stmt.name.to_lowercase().as_str() {
         "table_info" => {
             if let Some(table_name) = stmt.arg {
-                let table = db.get_table(&table_name)
+                let table = db
+                    .get_table(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 let mut rows = Vec::with_capacity(table.def.columns.len());
                 for (i, col) in table.def.columns.iter().enumerate() {
@@ -23,25 +24,32 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                     ]);
                 }
                 Ok(QueryResult {
-                    columns: vec!["cid".into(), "name".into(), "type".into(), "notnull".into(), "dflt_value".into(), "pk".into()],
+                    columns: vec![
+                        "cid".into(),
+                        "name".into(),
+                        "type".into(),
+                        "notnull".into(),
+                        "dflt_value".into(),
+                        "pk".into(),
+                    ],
                     rows,
                     rows_affected: 0,
                 })
             } else {
-                Err(crate::common::error::EngramDbError::Parse("PRAGMA table_info requires table name".into()))
+                Err(crate::common::error::EngramDbError::Parse(
+                    "PRAGMA table_info requires table name".into(),
+                ))
             }
         }
-        "database_list" => {
-            Ok(QueryResult {
-                columns: vec!["seq".into(), "name".into(), "file".into()],
-                rows: vec![vec![
-                    Value::Int32(0),
-                    Value::Varchar("main".into()),
-                    Value::Varchar(db.path().to_string_lossy().to_string()),
-                ]],
-                rows_affected: 0,
-            })
-        }
+        "database_list" => Ok(QueryResult {
+            columns: vec!["seq".into(), "name".into(), "file".into()],
+            rows: vec![vec![
+                Value::Int32(0),
+                Value::Varchar("main".into()),
+                Value::Varchar(db.path().to_string_lossy().to_string()),
+            ]],
+            rows_affected: 0,
+        }),
         "information_schema_tables" | "tables" => {
             let mut rows = Vec::new();
             let mut names: Vec<String> = db.table_names().keys().cloned().collect();
@@ -60,7 +68,14 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                 }
             }
             Ok(QueryResult {
-                columns: vec!["table_name".into(), "table_type".into(), "row_count".into(), "column_count".into(), "primary_key".into(), "has_ttl".into()],
+                columns: vec![
+                    "table_name".into(),
+                    "table_type".into(),
+                    "row_count".into(),
+                    "column_count".into(),
+                    "primary_key".into(),
+                    "has_ttl".into(),
+                ],
                 rows,
                 rows_affected: 0,
             })
@@ -85,7 +100,15 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                 }
             }
             Ok(QueryResult {
-                columns: vec!["table_name".into(), "column_name".into(), "ordinal_position".into(), "data_type".into(), "nullable".into(), "is_primary_key".into(), "auto_increment".into()],
+                columns: vec![
+                    "table_name".into(),
+                    "column_name".into(),
+                    "ordinal_position".into(),
+                    "data_type".into(),
+                    "nullable".into(),
+                    "is_primary_key".into(),
+                    "auto_increment".into(),
+                ],
                 rows,
                 rows_affected: 0,
             })
@@ -97,10 +120,14 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
             for tbl_name in &names {
                 if let Some(table) = db.get_table(tbl_name) {
                     for idx in &table.def.indexes {
-                        let key_cols: Vec<String> = idx.key_columns.iter()
+                        let key_cols: Vec<String> = idx
+                            .key_columns
+                            .iter()
                             .map(|&i| table.def.columns.get(i).map(|c| c.name.clone()).unwrap_or_default())
                             .collect();
-                        let incl_cols: Vec<String> = idx.included_columns.iter()
+                        let incl_cols: Vec<String> = idx
+                            .included_columns
+                            .iter()
                             .map(|&i| table.def.columns.get(i).map(|c| c.name.clone()).unwrap_or_default())
                             .collect();
                         rows.push(vec![
@@ -108,14 +135,25 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                             Value::Varchar(idx.name.clone()),
                             Value::Varchar(idx.index_type.clone()),
                             Value::Varchar(key_cols.join(", ")),
-                            Value::Varchar(if incl_cols.is_empty() { "".into() } else { incl_cols.join(", ") }),
+                            Value::Varchar(if incl_cols.is_empty() {
+                                "".into()
+                            } else {
+                                incl_cols.join(", ")
+                            }),
                             Value::Boolean(idx.unique),
                         ]);
                     }
                 }
             }
             Ok(QueryResult {
-                columns: vec!["table_name".into(), "index_name".into(), "index_type".into(), "key_columns".into(), "included_columns".into(), "unique".into()],
+                columns: vec![
+                    "table_name".into(),
+                    "index_name".into(),
+                    "index_type".into(),
+                    "key_columns".into(),
+                    "included_columns".into(),
+                    "unique".into(),
+                ],
                 rows,
                 rows_affected: 0,
             })
@@ -124,7 +162,8 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
         // P03: PRAGMA index_info / index_list — 索引详细信息
         "index_info" => {
             if let Some(table_name) = stmt.arg {
-                let table = db.get_table(&table_name)
+                let table = db
+                    .get_table(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 let mut rows = Vec::new();
                 for idx in &table.def.indexes {
@@ -143,16 +182,21 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                     rows_affected: 0,
                 })
             } else {
-                Err(crate::common::error::EngramDbError::Parse("PRAGMA index_info requires table name".into()))
+                Err(crate::common::error::EngramDbError::Parse(
+                    "PRAGMA index_info requires table name".into(),
+                ))
             }
         }
         "index_list" => {
             if let Some(table_name) = stmt.arg {
-                let table = db.get_table(&table_name)
+                let table = db
+                    .get_table(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 let mut rows = Vec::new();
                 for (seq, idx) in table.def.indexes.iter().enumerate() {
-                    let key_cols: Vec<String> = idx.key_columns.iter()
+                    let key_cols: Vec<String> = idx
+                        .key_columns
+                        .iter()
                         .map(|&i| table.def.columns.get(i).map(|c| c.name.clone()).unwrap_or_default())
                         .collect();
                     rows.push(vec![
@@ -164,12 +208,20 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                     ]);
                 }
                 Ok(QueryResult {
-                    columns: vec!["seq".into(), "name".into(), "key_columns".into(), "unique".into(), "type".into()],
+                    columns: vec![
+                        "seq".into(),
+                        "name".into(),
+                        "key_columns".into(),
+                        "unique".into(),
+                        "type".into(),
+                    ],
                     rows,
                     rows_affected: 0,
                 })
             } else {
-                Err(crate::common::error::EngramDbError::Parse("PRAGMA index_list requires table name".into()))
+                Err(crate::common::error::EngramDbError::Parse(
+                    "PRAGMA index_list requires table name".into(),
+                ))
             }
         }
 
@@ -180,7 +232,12 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                     "wal" => WalFlushMode::Sync,
                     "delete" | "truncate" | "persist" => WalFlushMode::Periodic,
                     "memory" | "off" => WalFlushMode::BufferFull,
-                    _ => { return Err(crate::common::error::EngramDbError::Parse(format!("unknown journal_mode: {}", arg))); }
+                    _ => {
+                        return Err(crate::common::error::EngramDbError::Parse(format!(
+                            "unknown journal_mode: {}",
+                            arg
+                        )));
+                    }
                 };
                 db.set_wal_flush_mode(new_mode);
                 arg.to_uppercase()
@@ -189,7 +246,8 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                     WalFlushMode::Sync => "wal",
                     WalFlushMode::Periodic => "delete",
                     WalFlushMode::BufferFull => "off",
-                }.to_string()
+                }
+                .to_string()
             };
             Ok(QueryResult {
                 columns: vec!["journal_mode".into()],
@@ -214,14 +272,20 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
                         db.set_wal_flush_mode(WalFlushMode::Sync);
                         "2".to_string()
                     }
-                    _ => { return Err(crate::common::error::EngramDbError::Parse(format!("unknown synchronous level: {}", arg))); }
+                    _ => {
+                        return Err(crate::common::error::EngramDbError::Parse(format!(
+                            "unknown synchronous level: {}",
+                            arg
+                        )));
+                    }
                 }
             } else {
                 match db.config().wal_flush_mode {
                     WalFlushMode::Sync => "2",
                     WalFlushMode::Periodic => "1",
                     WalFlushMode::BufferFull => "0",
-                }.to_string()
+                }
+                .to_string()
             };
             Ok(QueryResult {
                 columns: vec!["synchronous".into()],
@@ -233,10 +297,14 @@ pub fn execute(db: &mut Database, stmt: PragmaStmt) -> Result<QueryResult> {
         // P06: PRAGMA cache_size — 缓存大小设置
         "cache_size" => {
             let size = if let Some(arg) = stmt.arg {
-                let kb: i64 = arg.parse().map_err(|_| {
-                    crate::common::error::EngramDbError::Parse(format!("invalid cache_size: {}", arg))
-                })?;
-                let bytes = if kb >= 0 { kb as usize * 1024 } else { ((-kb) as usize) * 1024 };
+                let kb: i64 = arg
+                    .parse()
+                    .map_err(|_| crate::common::error::EngramDbError::Parse(format!("invalid cache_size: {}", arg)))?;
+                let bytes = if kb >= 0 {
+                    kb as usize * 1024
+                } else {
+                    ((-kb) as usize) * 1024
+                };
                 db.cache().set_max_memory(bytes);
                 kb
             } else {
@@ -290,15 +358,27 @@ mod tests {
     fn exec(db: &mut crate::storage::Database, name: &str, arg: Option<&str>) -> QueryResult {
         execute(
             db,
-            PragmaStmt { name: name.into(), arg: arg.map(|s| s.into()) },
-        ).unwrap()
+            PragmaStmt {
+                name: name.into(),
+                arg: arg.map(|s| s.into()),
+            },
+        )
+        .unwrap()
     }
 
-    fn exec_err(db: &mut crate::storage::Database, name: &str, arg: Option<&str>) -> crate::common::error::EngramDbError {
+    fn exec_err(
+        db: &mut crate::storage::Database,
+        name: &str,
+        arg: Option<&str>,
+    ) -> crate::common::error::EngramDbError {
         execute(
             db,
-            PragmaStmt { name: name.into(), arg: arg.map(|s| s.into()) },
-        ).unwrap_err()
+            PragmaStmt {
+                name: name.into(),
+                arg: arg.map(|s| s.into()),
+            },
+        )
+        .unwrap_err()
     }
 
     #[test]
@@ -309,20 +389,34 @@ mod tests {
             name: "users".into(),
             columns: vec![
                 crate::common::types::ColumnDef {
-                    name: "id".into(), data_type: crate::common::types::DataType::Int32,
-                    nullable: false, is_primary_key: true, default_value: None, auto_increment: false,
+                    name: "id".into(),
+                    data_type: crate::common::types::DataType::Int32,
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    auto_increment: false,
                     check_expr: None,
                 },
                 crate::common::types::ColumnDef {
-                    name: "name".into(), data_type: crate::common::types::DataType::Varchar,
-                    nullable: true, is_primary_key: false, default_value: None, auto_increment: false,
+                    name: "name".into(),
+                    data_type: crate::common::types::DataType::Varchar,
+                    nullable: true,
+                    is_primary_key: false,
+                    default_value: None,
+                    auto_increment: false,
                     check_expr: None,
                 },
             ],
-            row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
+            row_count: 0,
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
             engine: crate::common::types::EngineType::Columnar,
-            next_auto_increment_id: 0, ttl_seconds: None, ttl_column: None,
-        }).unwrap();
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+        })
+        .unwrap();
 
         let r = exec(&mut db, "table_info", Some("users"));
         assert_eq!(r.rows.len(), 2);
@@ -344,10 +438,16 @@ mod tests {
         let mut db = open_db();
         // 缺表名
         let err = exec_err(&mut db, "table_info", None);
-        assert!(matches!(err, crate::common::error::EngramDbError::Parse(_)), "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::Parse(_)),
+            "got: {err:?}"
+        );
         // 表不存在
         let err = exec_err(&mut db, "table_info", Some("nope"));
-        assert!(matches!(err, crate::common::error::EngramDbError::TableNotFound(_)), "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::TableNotFound(_)),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -363,19 +463,42 @@ mod tests {
     fn test_tables_and_columns_info() {
         let mut db = open_db();
         let mk_col = |name: &str, dt: crate::common::types::DataType| crate::common::types::ColumnDef {
-            name: name.into(), data_type: dt, nullable: true,
-            is_primary_key: false, default_value: None, auto_increment: false,
-                    check_expr: None,
+            name: name.into(),
+            data_type: dt,
+            nullable: true,
+            is_primary_key: false,
+            default_value: None,
+            auto_increment: false,
+            check_expr: None,
         };
-        let mk_def = |name: &str, cols: Vec<crate::common::types::ColumnDef>, engine: crate::common::types::EngineType| {
-            crate::common::types::TableDef {
-                id: 0, name: name.into(), columns: cols, row_count: 0, indexes: vec![],
-                cluster_key: None, foreign_keys: vec![], engine,
-                next_auto_increment_id: 0, ttl_seconds: None, ttl_column: None,
-            }
-        };
-        db.create_table(mk_def("b_tbl", vec![mk_col("c1", crate::common::types::DataType::Int32)], crate::common::types::EngineType::Columnar)).unwrap();
-        db.create_table(mk_def("a_tbl", vec![mk_col("x", crate::common::types::DataType::Varchar)], crate::common::types::EngineType::Memory)).unwrap();
+        let mk_def =
+            |name: &str, cols: Vec<crate::common::types::ColumnDef>, engine: crate::common::types::EngineType| {
+                crate::common::types::TableDef {
+                    id: 0,
+                    name: name.into(),
+                    columns: cols,
+                    row_count: 0,
+                    indexes: vec![],
+                    cluster_key: None,
+                    foreign_keys: vec![],
+                    engine,
+                    next_auto_increment_id: 0,
+                    ttl_seconds: None,
+                    ttl_column: None,
+                }
+            };
+        db.create_table(mk_def(
+            "b_tbl",
+            vec![mk_col("c1", crate::common::types::DataType::Int32)],
+            crate::common::types::EngineType::Columnar,
+        ))
+        .unwrap();
+        db.create_table(mk_def(
+            "a_tbl",
+            vec![mk_col("x", crate::common::types::DataType::Varchar)],
+            crate::common::types::EngineType::Memory,
+        ))
+        .unwrap();
 
         // information_schema_tables：按名称排序
         let r = exec(&mut db, "information_schema_tables", None);
@@ -406,20 +529,34 @@ mod tests {
             name: "t".into(),
             columns: vec![
                 crate::common::types::ColumnDef {
-                    name: "id".into(), data_type: crate::common::types::DataType::Int32,
-                    nullable: false, is_primary_key: true, default_value: None, auto_increment: false,
+                    name: "id".into(),
+                    data_type: crate::common::types::DataType::Int32,
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    auto_increment: false,
                     check_expr: None,
                 },
                 crate::common::types::ColumnDef {
-                    name: "v".into(), data_type: crate::common::types::DataType::Int32,
-                    nullable: true, is_primary_key: false, default_value: None, auto_increment: false,
+                    name: "v".into(),
+                    data_type: crate::common::types::DataType::Int32,
+                    nullable: true,
+                    is_primary_key: false,
+                    default_value: None,
+                    auto_increment: false,
                     check_expr: None,
                 },
             ],
-            row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
+            row_count: 0,
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
             engine: crate::common::types::EngineType::Columnar,
-            next_auto_increment_id: 0, ttl_seconds: None, ttl_column: None,
-        }).unwrap();
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
+        })
+        .unwrap();
         db.create_index("t", "idx_v", &[1usize], &[], false).unwrap();
 
         // information_schema_indexes
@@ -443,8 +580,14 @@ mod tests {
         assert_eq!(r.rows[0][2], Value::Varchar("idx_v".into()));
 
         // 缺表名 / 表不存在
-        assert!(matches!(exec_err(&mut db, "index_info", None), crate::common::error::EngramDbError::Parse(_)));
-        assert!(matches!(exec_err(&mut db, "index_list", Some("nope")), crate::common::error::EngramDbError::TableNotFound(_)));
+        assert!(matches!(
+            exec_err(&mut db, "index_info", None),
+            crate::common::error::EngramDbError::Parse(_)
+        ));
+        assert!(matches!(
+            exec_err(&mut db, "index_list", Some("nope")),
+            crate::common::error::EngramDbError::TableNotFound(_)
+        ));
     }
 
     #[test]
@@ -464,7 +607,10 @@ mod tests {
         assert_eq!(db.config().wal_flush_mode, WalFlushMode::Sync);
         // 未知模式
         let err = exec_err(&mut db, "journal_mode", Some("bogus"));
-        assert!(matches!(err, crate::common::error::EngramDbError::Parse(_)), "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::Parse(_)),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -481,7 +627,10 @@ mod tests {
         assert_eq!(r.rows[0][0], Value::Varchar("2".into()));
         assert_eq!(db.config().wal_flush_mode, WalFlushMode::Sync);
         // 未知级别
-        assert!(matches!(exec_err(&mut db, "synchronous", Some("9")), crate::common::error::EngramDbError::Parse(_)));
+        assert!(matches!(
+            exec_err(&mut db, "synchronous", Some("9")),
+            crate::common::error::EngramDbError::Parse(_)
+        ));
     }
 
     #[test]
@@ -497,7 +646,10 @@ mod tests {
         exec(&mut db, "cache_size", Some("-2048"));
         assert_eq!(db.cache().max_memory(), 2048 * 1024);
         // 非法值
-        assert!(matches!(exec_err(&mut db, "cache_size", Some("abc")), crate::common::error::EngramDbError::Parse(_)));
+        assert!(matches!(
+            exec_err(&mut db, "cache_size", Some("abc")),
+            crate::common::error::EngramDbError::Parse(_)
+        ));
     }
 
     #[test]
@@ -507,7 +659,10 @@ mod tests {
         assert_eq!(r.rows[0][0], Value::Int64(db.config().block_size as i64));
         // page_count：文件大小 > 0
         let r = exec(&mut db, "page_count", None);
-        assert_eq!(r.rows[0][0], Value::Int64((std::fs::metadata(db.path()).unwrap().len() / db.config().block_size as u64) as i64));
+        assert_eq!(
+            r.rows[0][0],
+            Value::Int64((std::fs::metadata(db.path()).unwrap().len() / db.config().block_size as u64) as i64)
+        );
     }
 
     #[test]

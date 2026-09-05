@@ -7,27 +7,45 @@ use std::time::{Duration, Instant};
 // ========== 工具函数 ==========
 
 fn bench(name: &str, iters: usize, f: impl Fn()) -> Duration {
-    for _ in 0..2 { f(); } // warmup
+    for _ in 0..2 {
+        f();
+    } // warmup
     let start = Instant::now();
-    for _ in 0..iters { f(); }
+    for _ in 0..iters {
+        f();
+    }
     let elapsed = start.elapsed();
     let per_iter = elapsed / iters as u32;
-    println!("  {:<45} {:>10.3} ms  ({} iters)",
-             name, per_iter.as_secs_f64() * 1000.0, iters);
+    println!(
+        "  {:<45} {:>10.3} ms  ({} iters)",
+        name,
+        per_iter.as_secs_f64() * 1000.0,
+        iters
+    );
     per_iter
 }
 
 fn fmt_num(n: usize) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1_000.0) }
-    else { format!("{}", n) }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
 }
 
 // ========== 距离函数 ==========
 
 #[inline]
 fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| { let d = x - y; d * d }).sum()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
 }
 
 #[inline]
@@ -41,7 +59,11 @@ fn norm(v: &[f32]) -> f32 {
 
 fn normalize(v: &mut [f32]) {
     let n = norm(v);
-    if n > 0.0 { for x in v.iter_mut() { *x /= n; } }
+    if n > 0.0 {
+        for x in v.iter_mut() {
+            *x /= n;
+        }
+    }
 }
 
 // ========== 随机向量生成 ==========
@@ -64,11 +86,21 @@ struct BruteForce {
 }
 
 impl BruteForce {
-    fn new(dim: usize) -> Self { BruteForce { dim, vectors: Vec::new() } }
-    fn insert(&mut self, v: Vec<f32>) { self.vectors.push(v); }
+    fn new(dim: usize) -> Self {
+        BruteForce {
+            dim,
+            vectors: Vec::new(),
+        }
+    }
+    fn insert(&mut self, v: Vec<f32>) {
+        self.vectors.push(v);
+    }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<(f32, u32)> {
-        let mut results: Vec<(f32, u32)> = self.vectors.iter().enumerate()
+        let mut results: Vec<(f32, u32)> = self
+            .vectors
+            .iter()
+            .enumerate()
             .map(|(i, v)| (l2_distance_sq(query, v), i as u32))
             .collect();
         results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -79,19 +111,32 @@ impl BruteForce {
 
 // ========== HNSW 简化实现（benchmark 专用，内联优化） ==========
 
-use std::collections::BinaryHeap;
 use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 #[derive(Debug, Clone)]
-struct Candidate { dist: f32, id: u32 }
-impl PartialEq for Candidate { fn eq(&self, o: &Self) -> bool { self.dist == o.dist && self.id == o.id } }
+struct Candidate {
+    dist: f32,
+    id: u32,
+}
+impl PartialEq for Candidate {
+    fn eq(&self, o: &Self) -> bool {
+        self.dist == o.dist && self.id == o.id
+    }
+}
 impl Eq for Candidate {}
 // max-heap by distance (farthest first) — 用于 results 堆，堆顶是最远的便于淘汰
 // candidates 堆用 Reverse<Candidate> 变成 min-heap（最近的先探索）
 impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { self.dist.partial_cmp(&other.dist) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.dist.partial_cmp(&other.dist)
+    }
 }
-impl Ord for Candidate { fn cmp(&self, other: &Self) -> Ordering { self.partial_cmp(other).unwrap_or(Ordering::Equal) } }
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
 
 struct HnswNode {
     vector: Vec<f32>,
@@ -112,8 +157,14 @@ struct HnswIndex {
 impl HnswIndex {
     fn new(dim: usize, m: usize, ef_construction: usize, ef_search: usize) -> Self {
         HnswIndex {
-            dim, m, m_max0: m * 2, ef_construction, ef_search,
-            nodes: Vec::new(), enter_point: None, max_level: -1,
+            dim,
+            m,
+            m_max0: m * 2,
+            ef_construction,
+            ef_search,
+            nodes: Vec::new(),
+            enter_point: None,
+            max_level: -1,
         }
     }
 
@@ -121,7 +172,9 @@ impl HnswIndex {
         let mut seed = self.nodes.len() as u64;
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let r = (seed as f64) / (u64::MAX as f64);
-        if r <= 0.0 { return 0; }
+        if r <= 0.0 {
+            return 0;
+        }
         // 论文公式: level = floor(-ln(r) / ln(M))，其中 m_L = 1/ln(M)
         let m_l = 1.0 / (self.m as f64).ln();
         let level = (-r.ln() * m_l) as i32;
@@ -144,15 +197,21 @@ impl HnswIndex {
         while let Some(Reverse(c)) = candidates.pop() {
             if results.len() >= ef {
                 if let Some(farthest) = results.peek() {
-                    if c.dist > farthest.dist { break; }
+                    if c.dist > farthest.dist {
+                        break;
+                    }
                 }
             }
 
             let node = &self.nodes[c.id as usize];
-            if level as usize >= node.layers.len() { continue; }
+            if level as usize >= node.layers.len() {
+                continue;
+            }
 
             for &nid in &node.layers[level as usize] {
-                if visited[nid as usize] { continue; }
+                if visited[nid as usize] {
+                    continue;
+                }
                 visited[nid as usize] = true;
 
                 let d = l2_distance_sq(query, &self.nodes[nid as usize].vector);
@@ -179,7 +238,9 @@ impl HnswIndex {
         let new_level = self.random_level();
         let num_layers = (new_level + 1) as usize;
         let mut layers = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers { layers.push(Vec::with_capacity(self.m)); }
+        for _ in 0..num_layers {
+            layers.push(Vec::with_capacity(self.m));
+        }
         self.nodes.push(HnswNode { vector, layers });
 
         if self.enter_point.is_none() {
@@ -198,10 +259,16 @@ impl HnswIndex {
             while changed {
                 changed = false;
                 let node = &self.nodes[ep as usize];
-                if level as usize >= node.layers.len() { break; }
+                if level as usize >= node.layers.len() {
+                    break;
+                }
                 for &nid in &node.layers[level as usize] {
                     let d = l2_distance_sq(qv, &self.nodes[nid as usize].vector);
-                    if d < ep_dist { ep_dist = d; ep = nid; changed = true; }
+                    if d < ep_dist {
+                        ep_dist = d;
+                        ep = nid;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -219,7 +286,9 @@ impl HnswIndex {
                 self.nodes[id as usize].layers[level as usize].push(nid);
                 // 连接邻居 -> 新节点
                 let neighbor_layers_len = self.nodes[nid as usize].layers.len();
-                if level as usize >= neighbor_layers_len { continue; }
+                if level as usize >= neighbor_layers_len {
+                    continue;
+                }
 
                 let neighbor_layer_len = self.nodes[nid as usize].layers[level as usize].len();
                 if neighbor_layer_len < m_max {
@@ -232,7 +301,10 @@ impl HnswIndex {
                     let mut farthest_dist = dist;
                     for (j, &other_id) in self.nodes[nid as usize].layers[level as usize].iter().enumerate() {
                         let d = l2_distance_sq(&vec_ref, &self.nodes[other_id as usize].vector);
-                        if d > farthest_dist { farthest_dist = d; farthest_idx = j; }
+                        if d > farthest_dist {
+                            farthest_dist = d;
+                            farthest_idx = j;
+                        }
                     }
                     if dist < farthest_dist {
                         self.nodes[nid as usize].layers[level as usize][farthest_idx] = id;
@@ -251,7 +323,9 @@ impl HnswIndex {
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<(f32, u32)> {
-        if self.nodes.is_empty() { return Vec::new(); }
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
         let ef = self.ef_search.max(k);
         let mut ep = self.enter_point.unwrap();
         let mut ep_dist = l2_distance_sq(query, &self.nodes[ep as usize].vector);
@@ -261,10 +335,16 @@ impl HnswIndex {
             while changed {
                 changed = false;
                 let node = &self.nodes[ep as usize];
-                if level as usize >= node.layers.len() { break; }
+                if level as usize >= node.layers.len() {
+                    break;
+                }
                 for &nid in &node.layers[level as usize] {
                     let d = l2_distance_sq(query, &self.nodes[nid as usize].vector);
-                    if d < ep_dist { ep_dist = d; ep = nid; changed = true; }
+                    if d < ep_dist {
+                        ep_dist = d;
+                        ep = nid;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -276,8 +356,16 @@ impl HnswIndex {
 
     fn stats(&self) -> (usize, i32, f64) {
         let mut total = 0usize;
-        for n in &self.nodes { for l in &n.layers { total += l.len(); } }
-        let avg = if self.nodes.is_empty() { 0.0 } else { total as f64 / self.nodes.len() as f64 };
+        for n in &self.nodes {
+            for l in &n.layers {
+                total += l.len();
+            }
+        }
+        let avg = if self.nodes.is_empty() {
+            0.0
+        } else {
+            total as f64 / self.nodes.len() as f64
+        };
         (self.nodes.len(), self.max_level, avg)
     }
 }
@@ -286,7 +374,7 @@ impl HnswIndex {
 
 fn main() {
     const DIM: usize = 128;
-    const N: usize = 10_000;  // 1 万向量
+    const N: usize = 10_000; // 1 万向量
     const K: usize = 10;
 
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -315,7 +403,9 @@ fn main() {
     // ===== 1. 暴力搜索 baseline =====
     println!("━━━ 1. 暴力搜索 (Brute Force, baseline) ━━━");
     let mut bf = BruteForce::new(DIM);
-    for v in &vectors { bf.insert(v.clone()); }
+    for v in &vectors {
+        bf.insert(v.clone());
+    }
 
     // 计算 ground truth
     let mut ground_truth: Vec<Vec<u32>> = Vec::with_capacity(num_queries);
@@ -346,7 +436,9 @@ fn main() {
 
     // 实际构建一次用于后续测试
     let mut hnsw = HnswIndex::new(DIM, 16, 100, 50);
-    for v in &vectors { hnsw.insert(v.clone()); }
+    for v in &vectors {
+        hnsw.insert(v.clone());
+    }
 
     let (num_nodes, max_level, avg_conn) = hnsw.stats();
     println!("  节点数: {}, 最大层数: {}", num_nodes, max_level);
@@ -360,7 +452,9 @@ fn main() {
     // 不同 ef_search 的性能 vs 召回率
     for &ef in &[10, 20, 50, 100, 200] {
         let mut hnsw_ef = HnswIndex::new(DIM, 16, 100, ef);
-        for v in &vectors { hnsw_ef.insert(v.clone()); }
+        for v in &vectors {
+            hnsw_ef.insert(v.clone());
+        }
 
         // 测召回率
         let mut total_hit = 0usize;
@@ -368,7 +462,9 @@ fn main() {
             let results = hnsw_ef.search(q, K);
             let gt = &ground_truth[qi];
             for r in &results {
-                if gt.contains(&r.1) { total_hit += 1; }
+                if gt.contains(&r.1) {
+                    total_hit += 1;
+                }
             }
         }
         let recall = total_hit as f64 / (num_queries * K) as f64;
@@ -382,8 +478,12 @@ fn main() {
         });
 
         let per_query = search_time.as_secs_f64() * 1000.0 / num_queries as f64;
-        println!("    → 单查询: {:.3} ms, 召回率: {:.3}, QPS: {:.0}",
-                 per_query, recall, 1.0 / search_time.as_secs_f64() * num_queries as f64);
+        println!(
+            "    → 单查询: {:.3} ms, 召回率: {:.3}, QPS: {:.0}",
+            per_query,
+            recall,
+            1.0 / search_time.as_secs_f64() * num_queries as f64
+        );
     }
     println!();
 
@@ -392,20 +492,32 @@ fn main() {
     for &m in &[8, 16, 32, 64] {
         let mut hnsw_m = HnswIndex::new(DIM, m, 100, 50);
         let build_start = Instant::now();
-        for v in &vectors { hnsw_m.insert(v.clone()); }
+        for v in &vectors {
+            hnsw_m.insert(v.clone());
+        }
         let build_t = build_start.elapsed();
 
         let mut total_hit = 0usize;
         for (qi, q) in queries.iter().enumerate() {
             let results = hnsw_m.search(q, K);
             let gt = &ground_truth[qi];
-            for r in &results { if gt.contains(&r.1) { total_hit += 1; } }
+            for r in &results {
+                if gt.contains(&r.1) {
+                    total_hit += 1;
+                }
+            }
         }
         let recall = total_hit as f64 / (num_queries * K) as f64;
 
         let (_, max_l, avg_c) = hnsw_m.stats();
-        println!("  M={:<3}  构建: {:>7.2}ms  最大层: {:>2}  平均连接: {:>5.1}  召回率: {:.3}",
-                 m, build_t.as_secs_f64() * 1000.0, max_l, avg_c, recall);
+        println!(
+            "  M={:<3}  构建: {:>7.2}ms  最大层: {:>2}  平均连接: {:>5.1}  召回率: {:.3}",
+            m,
+            build_t.as_secs_f64() * 1000.0,
+            max_l,
+            avg_c,
+            recall
+        );
     }
     println!();
 
@@ -413,7 +525,9 @@ fn main() {
     println!("━━━ 5. 数据规模扩展性 ━━━");
     for &size in &[1000, 2000, 5000, 10000] {
         let mut hnsw_s = HnswIndex::new(DIM, 16, 100, 50);
-        for i in 0..size { hnsw_s.insert(vectors[i].clone()); }
+        for i in 0..size {
+            hnsw_s.insert(vectors[i].clone());
+        }
 
         let search_time = bench(&format!("  搜索 ({} vectors, ef=50)", fmt_num(size)), 10, || {
             for q in &queries {
@@ -423,7 +537,11 @@ fn main() {
         });
 
         let per_query = search_time.as_secs_f64() * 1000.0 / num_queries as f64;
-        println!("    → 单查询: {:.3} ms, QPS: {:.0}", per_query, 1.0 / search_time.as_secs_f64() * num_queries as f64);
+        println!(
+            "    → 单查询: {:.3} ms, QPS: {:.0}",
+            per_query,
+            1.0 / search_time.as_secs_f64() * num_queries as f64
+        );
     }
     println!();
 
@@ -432,12 +550,18 @@ fn main() {
     for &dim in &[32, 64, 128, 256] {
         let small_n = 5000;
         let mut small_vecs = Vec::with_capacity(small_n);
-        for i in 0..small_n { small_vecs.push(random_vector(dim, i as u32)); }
+        for i in 0..small_n {
+            small_vecs.push(random_vector(dim, i as u32));
+        }
         let mut small_queries = Vec::with_capacity(50);
-        for q in 0..50 { small_queries.push(random_vector(dim, 50000 + q as u32)); }
+        for q in 0..50 {
+            small_queries.push(random_vector(dim, 50000 + q as u32));
+        }
 
         let mut hnsw_d = HnswIndex::new(dim, 16, 100, 50);
-        for v in &small_vecs { hnsw_d.insert(v.clone()); }
+        for v in &small_vecs {
+            hnsw_d.insert(v.clone());
+        }
 
         let search_time = bench(&format!("  搜索 dim={} (5K vectors)", dim), 10, || {
             for q in &small_queries {

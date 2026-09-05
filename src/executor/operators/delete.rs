@@ -4,12 +4,12 @@
 //! - 事务路径（enable_transaction=true）：保证 ACID，通过 WAL + MVCC
 //! - 非事务路径（enable_transaction=false）：高性能直接写入，跳过 WAL/MVCC
 
-use log::{error, warn, info, debug, trace};
+use log::{debug, error, info, trace, warn};
 
-use crate::common::error::{Result, EngramDbError};
-use crate::sql::ast::Expression;
+use crate::common::error::{EngramDbError, Result};
 use crate::executor::operators;
 use crate::executor::vector::DataChunk;
+use crate::sql::ast::Expression;
 use crate::storage::Database;
 use crate::Value;
 
@@ -21,42 +21,50 @@ use crate::Value;
 /// - `condition`: 可选的 WHERE 条件
 ///
 /// 返回：删除的行数
-pub fn execute(
-    db: &mut Database,
-    table_name: &str,
-    condition: Option<Expression>,
-) -> Result<usize> {
-    trace!("delete::execute called: table_name={}, has_condition={}", table_name, condition.is_some());
-    
+pub fn execute(db: &mut Database, table_name: &str, condition: Option<Expression>) -> Result<usize> {
+    trace!(
+        "delete::execute called: table_name={}, has_condition={}",
+        table_name,
+        condition.is_some()
+    );
+
     // 防御性检查：事务路径需要 txn_manager 已初始化
     if db.config().enable_transaction {
         debug!("Transaction path enabled, checking txn_manager readiness...");
-        
+
         if !db.txn_manager().is_ready() {
             error!("Transaction manager not ready");
             error!("Config: enable_transaction=true but txn_manager is not initialized");
             error!("This is likely a bug in Database initialization");
-            
+
             // 生产环境降级到非事务路径
             warn!("Falling back to non-transaction path due to txn_manager not ready");
             return execute_without_txn(db, table_name, condition);
         }
         debug!("✓ txn_manager is ready");
     }
-    
+
     // 防御性检查：表存在
     debug!("Checking if table '{}' exists...", table_name);
-    let _table_id = db.table_names().get(table_name)
-        .ok_or_else(|| {
-            error!("Table '{}' not found", table_name);
-            EngramDbError::TableNotFound(table_name.into())
-        })?;
+    let _table_id = db.table_names().get(table_name).ok_or_else(|| {
+        error!("Table '{}' not found", table_name);
+        EngramDbError::TableNotFound(table_name.into())
+    })?;
     debug!("✓ Table '{}' exists", table_name);
-    
+
     // 根据配置选择路径
-    let path = if db.config().enable_transaction { "txn" } else { "direct" };
-    info!("Executing DELETE: table={}, has_condition={}, path={}", table_name, condition.is_some(), path);
-    
+    let path = if db.config().enable_transaction {
+        "txn"
+    } else {
+        "direct"
+    };
+    info!(
+        "Executing DELETE: table={}, has_condition={}, path={}",
+        table_name,
+        condition.is_some(),
+        path
+    );
+
     if db.config().enable_transaction {
         execute_with_txn(db, table_name, condition)
     } else {
@@ -72,17 +80,14 @@ pub fn execute(
 /// 3. 事务内逐行删除（写 WAL + MVCC）
 /// 4. 提交事务（fsync WAL）
 /// 5. 将 apply_ops 应用到存储层
-fn execute_with_txn(
-    db: &mut Database,
-    table_name: &str,
-    condition: Option<Expression>,
-) -> Result<usize> {
+fn execute_with_txn(db: &mut Database, table_name: &str, condition: Option<Expression>) -> Result<usize> {
     debug!("Starting transaction path DELETE execution...");
-    
+
     // 步骤 1：先收集要删除的行（在开启事务之前，避免借用冲突）
     // 引擎分派（M2）：Columnar = Delta 层行（现有语义），Memory = 全部存活行
     let rows_to_delete = {
-        let table = db.get_engine_table_mut(table_name)
+        let table = db
+            .get_engine_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
         let num_cols = table.def().columns.len();
@@ -111,40 +116,53 @@ fn execute_with_txn(
 
         rows_to_delete
     };
-    
+
     if rows_to_delete.is_empty() {
         debug!("No rows to delete in table '{}'", table_name);
         return Ok(0);
     }
-    
+
     debug!("Found {} rows to delete in Delta layer", rows_to_delete.len());
-    
+
     // 步骤 2：开启事务
     debug!("Beginning transaction...");
     let isolation = db.config().default_isolation_level;
     let txn_id = db.txn_manager_mut().begin(isolation)?;
     info!("Transaction started: txn_id={}, isolation={:?}", txn_id, isolation);
-    
+
     // 步骤 3：事务内删除每行
     let table_id = *db.table_names().get(table_name).unwrap();
-    
+
     for (idx, (row_id, old_row)) in rows_to_delete.iter().enumerate() {
         trace!("Deleting row {} (row_id={})", idx, row_id);
-        
+
         db.txn_manager_mut().delete(txn_id, table_id, *row_id, old_row.clone())?;
-        
+
         if idx % 100 == 0 {
-            debug!("Deleted {}/{} rows in transaction {}", idx + 1, rows_to_delete.len(), txn_id);
+            debug!(
+                "Deleted {}/{} rows in transaction {}",
+                idx + 1,
+                rows_to_delete.len(),
+                txn_id
+            );
         }
     }
-    debug!("✓ All {} rows marked for deletion in transaction {}", rows_to_delete.len(), txn_id);
-    
+    debug!(
+        "✓ All {} rows marked for deletion in transaction {}",
+        rows_to_delete.len(),
+        txn_id
+    );
+
     // 步骤 4：提交事务（会 fsync WAL）
     debug!("Committing transaction {}...", txn_id);
     let result = db.txn_manager_mut().commit(txn_id)?;
-    info!("Transaction {} committed: commit_ts={}, apply_ops_count={}",
-          txn_id, result.commit_ts, result.apply_ops.len());
-    
+    info!(
+        "Transaction {} committed: commit_ts={}, apply_ops_count={}",
+        txn_id,
+        result.commit_ts,
+        result.apply_ops.len()
+    );
+
     // 步骤 5：应用到存储层；失败必须 abort 事务（清理 MVCC 残留）
     debug!("Applying {} operations to storage...", result.apply_ops.len());
     if let Err(e) = operators::insert::apply_to_storage(db, result.apply_ops) {
@@ -152,7 +170,7 @@ fn execute_with_txn(
         return Err(e);
     }
     info!("✓ Applied {} operations to storage", rows_to_delete.len());
-    
+
     info!("Transaction path completed: {} rows deleted", rows_to_delete.len());
     Ok(rows_to_delete.len())
 }
@@ -160,14 +178,11 @@ fn execute_with_txn(
 /// 非事务路径执行 DELETE：高性能直接写入
 ///
 /// 直接调用 table.delete_delta_rows()，跳过 WAL 和 MVCC
-fn execute_without_txn(
-    db: &mut Database,
-    table_name: &str,
-    condition: Option<Expression>,
-) -> Result<usize> {
+fn execute_without_txn(db: &mut Database, table_name: &str, condition: Option<Expression>) -> Result<usize> {
     debug!("Starting non-transaction path DELETE execution...");
-    
-    let engine = db.get_engine_table_mut(table_name)
+
+    let engine = db
+        .get_engine_table_mut(table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
     let num_cols = engine.def().columns.len();
@@ -274,7 +289,10 @@ mod tests {
 
     fn gt_id(n: i32) -> Expression {
         Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "id".into(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(Expression::Literal(Value::Int32(n))),
         }
@@ -341,12 +359,18 @@ mod tests {
         let mut cfg = Config::default();
         cfg.enable_transaction = false;
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
-        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory").unwrap();
+        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory")
+            .unwrap();
         conn.execute("INSERT INTO mem VALUES (1, 10), (2, 20)").unwrap();
         let db = conn.database_mut();
         assert_eq!(execute(db, "mem", Some(gt_id(1))).unwrap(), 1);
-        let remaining = db.get_engine_table_mut("mem").unwrap().as_memory_mut().unwrap()
-            .scan_to_rows_direct(&[0, 1], None).unwrap();
+        let remaining = db
+            .get_engine_table_mut("mem")
+            .unwrap()
+            .as_memory_mut()
+            .unwrap()
+            .scan_to_rows_direct(&[0, 1], None)
+            .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0][0], Value::Int64(1));
     }

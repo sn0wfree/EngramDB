@@ -5,8 +5,8 @@
 //! 场景：等值查询命中"范围内但不存在"的值（MinMax 无法跳过，
 //! 无 Bloom 时需全扫逐行匹配）——Bloom 将整组判定为 O(1) 跳过。
 
-use std::time::{Duration, Instant};
 use engramdb::{Connection, Value};
+use std::time::{Duration, Instant};
 
 const ITERS: usize = 5;
 const N: usize = 1_000_000;

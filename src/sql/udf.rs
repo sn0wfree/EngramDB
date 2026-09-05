@@ -156,9 +156,7 @@ impl UdfRegistry {
     pub fn register(&mut self, udf: UserDefinedFunction) -> Result<()> {
         let name = udf.name.clone();
         if self.functions.contains_key(&name) {
-            return Err(DbError::Internal(
-                format!("function '{}' already registered", name)
-            ));
+            return Err(DbError::Internal(format!("function '{}' already registered", name)));
         }
         self.functions.insert(name, udf);
         Ok(())
@@ -190,36 +188,33 @@ impl UdfRegistry {
     /// # 返回
     /// 结果向量
     pub fn call_scalar(&self, name: &str, args: &[Vector]) -> Result<Vector> {
-        let udf = self.get(name)
-            .ok_or_else(|| DbError::Internal(
-                format!("function '{}' not found", name)
-            ))?;
+        let udf = self
+            .get(name)
+            .ok_or_else(|| DbError::Internal(format!("function '{}' not found", name)))?;
 
         if udf.kind != UdfKind::Scalar {
-            return Err(DbError::Internal(
-                format!("function '{}' is not a scalar function", name)
-            ));
+            return Err(DbError::Internal(format!(
+                "function '{}' is not a scalar function",
+                name
+            )));
         }
 
         if !udf.check_arg_count(args.len()) {
-            return Err(DbError::Internal(
-                format!(
-                    "function '{}' expects {} arguments, got {}",
-                    name,
-                    if udf.signature.is_variadic {
-                        format!("at least {}", udf.signature.arg_types.len().saturating_sub(1))
-                    } else {
-                        udf.signature.arg_types.len().to_string()
-                    },
-                    args.len()
-                )
-            ));
+            return Err(DbError::Internal(format!(
+                "function '{}' expects {} arguments, got {}",
+                name,
+                if udf.signature.is_variadic {
+                    format!("at least {}", udf.signature.arg_types.len().saturating_sub(1))
+                } else {
+                    udf.signature.arg_types.len().to_string()
+                },
+                args.len()
+            )));
         }
 
-        let func = udf.scalar_fn
-            .ok_or_else(|| DbError::Internal(
-                format!("function '{}' has no implementation", name)
-            ))?;
+        let func = udf
+            .scalar_fn
+            .ok_or_else(|| DbError::Internal(format!("function '{}' has no implementation", name)))?;
 
         func(args)
     }
@@ -354,12 +349,7 @@ mod tests {
         let mut registry = UdfRegistry::new();
         register_example_udfs(&mut registry).unwrap();
 
-        let input = Vector::from_values(vec![
-            Value::Int32(3),
-            Value::Int64(5),
-            Value::Float64(2.5),
-            Value::Null,
-        ]);
+        let input = Vector::from_values(vec![Value::Int32(3), Value::Int64(5), Value::Float64(2.5), Value::Null]);
 
         let result = registry.call_scalar("square", &[input]).unwrap();
         assert_eq!(result.len(), 4);

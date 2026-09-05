@@ -55,7 +55,7 @@ pub enum LargeFileStrategy {
 impl Default for LargeFileStrategy {
     fn default() -> Self {
         LargeFileStrategy::RegionMmap {
-            threshold: 64 * 1024 * 1024, // 64MB
+            threshold: 64 * 1024 * 1024,   // 64MB
             region_size: 16 * 1024 * 1024, // 16MB region
         }
     }
@@ -67,8 +67,7 @@ impl Default for LargeFileStrategy {
 ///
 /// 当切片跨越多个 region 时，拷贝到此池分配的缓冲区。
 /// 使用 OnceLock + Mutex 实现线程安全的 buffer 复用（DB 生命周期）。
-static CROSS_REGION_POOL: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<u8>>>> =
-    std::sync::OnceLock::new();
+static CROSS_REGION_POOL: std::sync::OnceLock<std::sync::Mutex<Vec<Vec<u8>>>> = std::sync::OnceLock::new();
 
 /// ## 两种模式
 /// - **FullMmap**：文件 ≤ threshold 时整文件 mmap（最快）
@@ -105,10 +104,7 @@ impl MmapReader {
     }
 
     /// 打开并 mmap 文件（自定义策略）
-    pub fn open_with_strategy<P: AsRef<Path>>(
-        path: P,
-        strategy: LargeFileStrategy,
-    ) -> Result<Self> {
+    pub fn open_with_strategy<P: AsRef<Path>>(path: P, strategy: LargeFileStrategy) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
         let len = file.metadata()?.len();
@@ -266,9 +262,7 @@ impl RegionMmapReader {
                 #[cfg(target_os = "linux")]
                 {
                     let region_offset = (offset_cur % self.region_size) as usize;
-                    let chunk_len = len_remaining.min(
-                        (self.region_size - offset_cur % self.region_size) as usize,
-                    );
+                    let chunk_len = len_remaining.min((self.region_size - offset_cur % self.region_size) as usize);
                     let result = unsafe {
                         libc::madvise(
                             mmap.as_ptr().add(region_offset) as *mut libc::c_void,
@@ -283,9 +277,7 @@ impl RegionMmapReader {
                 #[cfg(target_os = "macos")]
                 {
                     let region_offset = (offset_cur % self.region_size) as usize;
-                    let chunk_len = len_remaining.min(
-                        (self.region_size - offset_cur % self.region_size) as usize,
-                    );
+                    let chunk_len = len_remaining.min((self.region_size - offset_cur % self.region_size) as usize);
                     let result = unsafe {
                         libc::madvise(
                             mmap.as_ptr().add(region_offset) as *mut libc::c_void,
@@ -363,22 +355,16 @@ impl RegionMmapReader {
     fn ensure_region(&self, region_idx: u64) -> &[u8] {
         // 命中缓存
         if let Some(mmap) = self.cache.borrow().get(&region_idx) {
-            return unsafe {
-                std::slice::from_raw_parts(mmap.as_ptr(), mmap.len())
-            };
+            return unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
         }
 
         // 加载 region
         let region_offset = region_idx * self.region_size;
-        let region_size = std::cmp::min(
-            self.region_size,
-            self.total_len - region_offset,
-        );
+        let region_size = std::cmp::min(self.region_size, self.total_len - region_offset);
 
         // 临时打开文件 + 偏移到 region 起点
         let mut file = self.file.try_clone().expect("file clone failed");
-        file.seek(SeekFrom::Start(region_offset))
-            .expect("seek failed");
+        file.seek(SeekFrom::Start(region_offset)).expect("seek failed");
 
         // 创建临时 mmap（mmap2 限制：必须从文件偏移 0 开始）
         // 所以策略：用 read + anonymous mmap（避免文件依赖）
@@ -396,11 +382,7 @@ impl RegionMmapReader {
 
         // 拷贝数据到 mmap（map_anon 返回 MmapMut 可写）
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                buffer.as_ptr(),
-                mmap.as_mut_ptr(),
-                region_size as usize,
-            );
+            std::ptr::copy_nonoverlapping(buffer.as_ptr(), mmap.as_mut_ptr(), region_size as usize);
         }
         // 防止 buffer drop 释放 mmap 之前的内容（已 copy 到 mmap）
         std::mem::forget(buffer);
@@ -447,12 +429,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         let tid = format!("{:?}", std::thread::current().id());
         let safe = tid.replace(['(', ')', ':', ' '], "_");
-        p.push(format!(
-            "engramdb_mmap_{}_{}_{}.hdb",
-            name,
-            std::process::id(),
-            safe
-        ));
+        p.push(format!("engramdb_mmap_{}_{}_{}.hdb", name, std::process::id(), safe));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -555,8 +532,12 @@ mod tests {
         // RegionMmap 阈值 50KB → 100KB 文件触发 RegionMmap
         let reader = MmapReader::open_with_strategy(
             &path,
-            LargeFileStrategy::RegionMmap { threshold: 50_000, region_size: 4_000 }
-        ).unwrap();
+            LargeFileStrategy::RegionMmap {
+                threshold: 50_000,
+                region_size: 4_000,
+            },
+        )
+        .unwrap();
         assert!(matches!(reader, MmapReader::Region(_)));
     }
 

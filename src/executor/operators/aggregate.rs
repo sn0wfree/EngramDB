@@ -48,7 +48,10 @@ impl PartialAggState {
     pub fn new(func: AggregateFunc) -> Self {
         match func {
             AggregateFunc::Count => PartialAggState::Count { count: 0 },
-            AggregateFunc::Sum => PartialAggState::Sum { sum: 0.0, has_value: false },
+            AggregateFunc::Sum => PartialAggState::Sum {
+                sum: 0.0,
+                has_value: false,
+            },
             AggregateFunc::Avg => PartialAggState::Avg { sum: 0.0, count: 0 },
             AggregateFunc::Min => PartialAggState::Min { value: None },
             AggregateFunc::Max => PartialAggState::Max { value: None },
@@ -112,14 +115,20 @@ impl PartialAggState {
             }
             (
                 PartialAggState::Sum { sum, has_value },
-                PartialAggState::Sum { sum: other_sum, has_value: other_hv },
+                PartialAggState::Sum {
+                    sum: other_sum,
+                    has_value: other_hv,
+                },
             ) => {
                 *sum += other_sum;
                 *has_value = *has_value || *other_hv;
             }
             (
                 PartialAggState::Avg { sum, count },
-                PartialAggState::Avg { sum: other_sum, count: other_count },
+                PartialAggState::Avg {
+                    sum: other_sum,
+                    count: other_count,
+                },
             ) => {
                 *sum += other_sum;
                 *count += other_count;
@@ -184,10 +193,7 @@ impl PartialAggState {
 ///
 /// 使用两阶段聚合：每个 chunk 先 partial，再 merge。
 /// 对于 DISTINCT 聚合，使用 HashSet 去重路径。
-pub fn execute(
-    input: &[DataChunk],
-    aggregates: &[(AggregateFunc, usize, bool)],
-) -> Result<Vec<DataChunk>> {
+pub fn execute(input: &[DataChunk], aggregates: &[(AggregateFunc, usize, bool)]) -> Result<Vec<DataChunk>> {
     if input.is_empty() {
         // SQL 语义：无 GROUP BY 聚合在空输入下仍返回一行
         // （COUNT → 0，SUM/AVG/MIN/MAX → NULL——finalize 空态即正确值）
@@ -304,7 +310,9 @@ fn aggregate_typed_partial(col: &Vector, func: AggregateFunc, count: usize) -> O
                     min = Some(min.map_or(v[i], |m| m.min(v[i])));
                 }
             }
-            Some(PartialAggState::Min { value: min.map(Value::Int64) })
+            Some(PartialAggState::Min {
+                value: min.map(Value::Int64),
+            })
         }
         (ColumnValue::Int64(v), AggregateFunc::Max) => {
             let mut max: Option<i64> = None;
@@ -313,7 +321,9 @@ fn aggregate_typed_partial(col: &Vector, func: AggregateFunc, count: usize) -> O
                     max = Some(max.map_or(v[i], |m| m.max(v[i])));
                 }
             }
-            Some(PartialAggState::Max { value: max.map(Value::Int64) })
+            Some(PartialAggState::Max {
+                value: max.map(Value::Int64),
+            })
         }
         (ColumnValue::Float64(v), AggregateFunc::Sum) => {
             let mut sum = 0.0f64;
@@ -353,7 +363,9 @@ fn aggregate_typed_partial(col: &Vector, func: AggregateFunc, count: usize) -> O
                     min = Some(min.map_or(v[i], |m| m.min(v[i])));
                 }
             }
-            Some(PartialAggState::Min { value: min.map(Value::Float64) })
+            Some(PartialAggState::Min {
+                value: min.map(Value::Float64),
+            })
         }
         (ColumnValue::Float64(v), AggregateFunc::Max) => {
             let mut max: Option<f64> = None;
@@ -362,7 +374,9 @@ fn aggregate_typed_partial(col: &Vector, func: AggregateFunc, count: usize) -> O
                     max = Some(max.map_or(v[i], |m| m.max(v[i])));
                 }
             }
-            Some(PartialAggState::Max { value: max.map(Value::Float64) })
+            Some(PartialAggState::Max {
+                value: max.map(Value::Float64),
+            })
         }
         _ => None,
     }
@@ -455,7 +469,8 @@ fn execute_grouped_distinct(
 
     for chunk in input {
         for row_idx in 0..chunk.count {
-            let key: Vec<Value> = group_by.iter()
+            let key: Vec<Value> = group_by
+                .iter()
                 .map(|&col| {
                     if col < chunk.columns.len() {
                         chunk.columns[col].get(row_idx).clone()
@@ -466,7 +481,8 @@ fn execute_grouped_distinct(
                 .collect();
 
             let sets = group_sets.entry(key).or_insert_with(|| {
-                aggregates.iter()
+                aggregates
+                    .iter()
                     .map(|(_, _, d)| if *d { Some(FxHashSet::default()) } else { None })
                     .collect()
             });
@@ -594,9 +610,7 @@ fn try_execute_grouped_int(
                     }
                 };
                 let k = key_to_i64(&v, t)?;
-                let states = map
-                    .entry(k)
-                    .or_insert_with(|| new_states(aggregates));
+                let states = map.entry(k).or_insert_with(|| new_states(aggregates));
                 accumulate_all(states, chunk, row_idx, aggregates);
             }
         }
@@ -675,7 +689,12 @@ fn ensure_states(states: &mut Option<Vec<PartialAggState>>, aggregates: &[(Aggre
 }
 
 #[inline]
-fn accumulate_all(states: &mut [PartialAggState], chunk: &DataChunk, row_idx: usize, aggregates: &[(AggregateFunc, usize, bool)]) {
+fn accumulate_all(
+    states: &mut [PartialAggState],
+    chunk: &DataChunk,
+    row_idx: usize,
+    aggregates: &[(AggregateFunc, usize, bool)],
+) {
     for (agg_idx, (_, col_idx, _)) in aggregates.iter().enumerate() {
         if *col_idx < chunk.columns.len() {
             let val = chunk.columns[*col_idx].get(row_idx);
@@ -703,7 +722,8 @@ fn aggregate_chunk_grouped_partial(
     let mut map: FxHashMap<Vec<Value>, Vec<PartialAggState>> = FxHashMap::default();
 
     for row_idx in 0..chunk.count {
-        let key: Vec<Value> = group_by.iter()
+        let key: Vec<Value> = group_by
+            .iter()
             .map(|&col| {
                 if col < chunk.columns.len() {
                     chunk.columns[col].get(row_idx).clone()
@@ -713,11 +733,9 @@ fn aggregate_chunk_grouped_partial(
             })
             .collect();
 
-        let states = map.entry(key).or_insert_with(|| {
-            aggregates.iter()
-                .map(|(func, _, _)| PartialAggState::new(*func))
-                .collect()
-        });
+        let states = map
+            .entry(key)
+            .or_insert_with(|| aggregates.iter().map(|(func, _, _)| PartialAggState::new(*func)).collect());
 
         for (agg_idx, (_, col_idx, _)) in aggregates.iter().enumerate() {
             if *col_idx < chunk.columns.len() {
@@ -772,19 +790,30 @@ fn value_greater(a: &Value, b: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::vector::{Vector, DataChunk};
+    use crate::executor::vector::{DataChunk, Vector};
 
     fn make_test_chunk() -> DataChunk {
         // dept_id, salary
         let dept = Vector::Flat(vec![
-            Value::Int64(10), Value::Int64(20), Value::Int64(10),
-            Value::Int64(30), Value::Int64(20), Value::Int64(10),
+            Value::Int64(10),
+            Value::Int64(20),
+            Value::Int64(10),
+            Value::Int64(30),
+            Value::Int64(20),
+            Value::Int64(10),
         ]);
         let salary = Vector::Flat(vec![
-            Value::Int64(5000), Value::Int64(6000), Value::Int64(5500),
-            Value::Int64(7000), Value::Int64(6500), Value::Int64(4500),
+            Value::Int64(5000),
+            Value::Int64(6000),
+            Value::Int64(5500),
+            Value::Int64(7000),
+            Value::Int64(6500),
+            Value::Int64(4500),
         ]);
-        DataChunk { columns: vec![dept, salary], count: 6 }
+        DataChunk {
+            columns: vec![dept, salary],
+            count: 6,
+        }
     }
 
     #[test]
@@ -841,9 +870,10 @@ mod tests {
         let chunk = make_test_chunk();
         let result = execute_grouped(
             &[chunk],
-            &[0],  // GROUP BY dept_id
+            &[0], // GROUP BY dept_id
             &[(AggregateFunc::Count, 1, false)],
-        ).unwrap();
+        )
+        .unwrap();
 
         let total_rows: usize = result.iter().map(|c| c.count).sum();
         assert_eq!(total_rows, 3); // 3 个部门
@@ -871,7 +901,8 @@ mod tests {
             &[chunk],
             &[0],
             &[(AggregateFunc::Sum, 1, false), (AggregateFunc::Avg, 1, false)],
-        ).unwrap();
+        )
+        .unwrap();
 
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
 
@@ -903,7 +934,8 @@ mod tests {
             &[chunk1, chunk2],
             &[0],
             &[(AggregateFunc::Count, 1, false), (AggregateFunc::Sum, 1, false)],
-        ).unwrap();
+        )
+        .unwrap();
 
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(all_rows.len(), 4); // 4 个部门 (10, 20, 30, 40)
@@ -922,22 +954,24 @@ mod tests {
         let chunk = DataChunk {
             columns: vec![
                 Vector::Flat(vec![
-                    Value::Int64(1), Value::Int64(1), Value::Null,
-                    Value::Int64(2), Value::Null,
+                    Value::Int64(1),
+                    Value::Int64(1),
+                    Value::Null,
+                    Value::Int64(2),
+                    Value::Null,
                 ]),
                 Vector::Flat(vec![
-                    Value::Int64(10), Value::Int64(20), Value::Int64(30),
-                    Value::Int64(40), Value::Int64(50),
+                    Value::Int64(10),
+                    Value::Int64(20),
+                    Value::Int64(30),
+                    Value::Int64(40),
+                    Value::Int64(50),
                 ]),
             ],
             count: 5,
         };
 
-        let result = execute_grouped(
-            &[chunk],
-            &[0],
-            &[(AggregateFunc::Count, 1, false)],
-        ).unwrap();
+        let result = execute_grouped(&[chunk], &[0], &[(AggregateFunc::Count, 1, false)]).unwrap();
 
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
 
@@ -952,23 +986,21 @@ mod tests {
 
     #[test]
     fn test_empty_input() {
-        let result = execute_grouped(
-            &[],
-            &[0],
-            &[(AggregateFunc::Count, 1, false)],
-        ).unwrap();
+        let result = execute_grouped(&[], &[0], &[(AggregateFunc::Count, 1, false)]).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_count_distinct() {
         let chunk = DataChunk {
-            columns: vec![
-                Vector::Flat(vec![
-                    Value::Int64(10), Value::Int64(20), Value::Int64(10),
-                    Value::Int64(30), Value::Int64(20), Value::Int64(10),
-                ]),
-            ],
+            columns: vec![Vector::Flat(vec![
+                Value::Int64(10),
+                Value::Int64(20),
+                Value::Int64(10),
+                Value::Int64(30),
+                Value::Int64(20),
+                Value::Int64(10),
+            ])],
             count: 6,
         };
         let result = execute(&[chunk], &[(AggregateFunc::Count, 0, true)]).unwrap();
@@ -979,11 +1011,7 @@ mod tests {
     #[test]
     fn test_count_distinct_all_null() {
         let chunk = DataChunk {
-            columns: vec![
-                Vector::Flat(vec![
-                    Value::Null, Value::Null, Value::Null,
-                ]),
-            ],
+            columns: vec![Vector::Flat(vec![Value::Null, Value::Null, Value::Null])],
             count: 3,
         };
         let result = execute(&[chunk], &[(AggregateFunc::Count, 0, true)]).unwrap();
@@ -1032,11 +1060,7 @@ mod tests {
     }
 
     fn sorted_rows(chunks: &[DataChunk]) -> Vec<String> {
-        let mut rows: Vec<String> = chunks
-            .iter()
-            .flat_map(|c| c.to_rows())
-            .map(|r| format!("{:?}", r))
-            .collect();
+        let mut rows: Vec<String> = chunks.iter().flat_map(|c| c.to_rows()).map(|r| format!("{:?}", r)).collect();
         rows.sort();
         rows
     }
@@ -1062,9 +1086,7 @@ mod tests {
                     }
                 }
             }
-            let vals: Vec<Value> = (0..n)
-                .map(|_| Value::Int64(rng.gen_range(0..1000)))
-                .collect();
+            let vals: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
             let chunk = DataChunk {
                 columns: vec![Vector::Flat(keys), Vector::Flat(vals)],
                 count: n,
@@ -1086,10 +1108,18 @@ mod tests {
         let chunk = DataChunk {
             columns: vec![
                 Vector::Flat(vec![
-                    Value::Int64(10), Value::Null, Value::Int64(10), Value::Null, Value::Int64(20),
+                    Value::Int64(10),
+                    Value::Null,
+                    Value::Int64(10),
+                    Value::Null,
+                    Value::Int64(20),
                 ]),
                 Vector::Flat(vec![
-                    Value::Int64(1), Value::Int64(2), Value::Int64(3), Value::Int64(4), Value::Int64(5),
+                    Value::Int64(1),
+                    Value::Int64(2),
+                    Value::Int64(3),
+                    Value::Int64(4),
+                    Value::Int64(5),
                 ]),
             ],
             count: 5,
@@ -1098,7 +1128,8 @@ mod tests {
             &[chunk],
             &[0],
             &[(AggregateFunc::Count, 1, false), (AggregateFunc::Sum, 1, false)],
-        ).unwrap();
+        )
+        .unwrap();
 
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(all_rows.len(), 3); // 10 / NULL / 20
@@ -1118,20 +1149,23 @@ mod tests {
         let chunk = DataChunk {
             columns: vec![
                 Vector::Flat(vec![
-                    Value::Boolean(true), Value::Boolean(false), Value::Boolean(true),
-                    Value::Boolean(false), Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Null,
                 ]),
                 Vector::Flat(vec![
-                    Value::Int64(1), Value::Int64(2), Value::Int64(3), Value::Int64(4), Value::Int64(5),
+                    Value::Int64(1),
+                    Value::Int64(2),
+                    Value::Int64(3),
+                    Value::Int64(4),
+                    Value::Int64(5),
                 ]),
             ],
             count: 5,
         };
-        let result = execute_grouped(
-            &[chunk],
-            &[0],
-            &[(AggregateFunc::Sum, 1, false)],
-        ).unwrap();
+        let result = execute_grouped(&[chunk], &[0], &[(AggregateFunc::Sum, 1, false)]).unwrap();
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(all_rows.len(), 3);
         let g_true = all_rows.iter().find(|r| r[0] == Value::Boolean(true)).unwrap();
@@ -1140,17 +1174,15 @@ mod tests {
         let ts_chunk = DataChunk {
             columns: vec![
                 Vector::Flat(vec![
-                    Value::Timestamp(100), Value::Timestamp(200), Value::Timestamp(100),
+                    Value::Timestamp(100),
+                    Value::Timestamp(200),
+                    Value::Timestamp(100),
                 ]),
                 Vector::Flat(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]),
             ],
             count: 3,
         };
-        let result = execute_grouped(
-            &[ts_chunk],
-            &[0],
-            &[(AggregateFunc::Sum, 1, false)],
-        ).unwrap();
+        let result = execute_grouped(&[ts_chunk], &[0], &[(AggregateFunc::Sum, 1, false)]).unwrap();
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(all_rows.len(), 2);
         let g100 = all_rows.iter().find(|r| r[0] == Value::Timestamp(100)).unwrap();
@@ -1167,11 +1199,7 @@ mod tests {
             ],
             count: 2,
         };
-        let result = execute_grouped(
-            &[chunk],
-            &[0],
-            &[(AggregateFunc::Sum, 1, false)],
-        ).unwrap();
+        let result = execute_grouped(&[chunk], &[0], &[(AggregateFunc::Sum, 1, false)]).unwrap();
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
         // 两组：Int32(1) sum=10、Int64(1) sum=20
         assert_eq!(all_rows.len(), 2);
@@ -1191,11 +1219,7 @@ mod tests {
             ],
             count: 3,
         };
-        let result = execute_grouped(
-            &[chunk],
-            &[0],
-            &[(AggregateFunc::Sum, 1, false)],
-        ).unwrap();
+        let result = execute_grouped(&[chunk], &[0], &[(AggregateFunc::Sum, 1, false)]).unwrap();
         let all_rows: Vec<_> = result.iter().flat_map(|c| c.to_rows()).collect();
         assert_eq!(all_rows.len(), 1);
         assert_eq!(all_rows[0][0], Value::Null);
@@ -1259,14 +1283,17 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_grouped_int_vs_vec_key() {
-        use std::time::Instant;
         use rand::Rng;
+        use std::time::Instant;
         let mut rng = rand::thread_rng();
         let n = 1_000_000usize;
         // 1000 组，均匀分布
         let keys: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
         let vals: Vec<Value> = (0..n).map(|_| Value::Int64(rng.gen_range(0..1000))).collect();
-        let chunk = DataChunk { columns: vec![Vector::Flat(keys), Vector::Flat(vals)], count: n };
+        let chunk = DataChunk {
+            columns: vec![Vector::Flat(keys), Vector::Flat(vals)],
+            count: n,
+        };
         let aggs = vec![(AggregateFunc::Sum, 1, false), (AggregateFunc::Count, 1, false)];
 
         let t0 = Instant::now();
@@ -1279,8 +1306,11 @@ mod tests {
         let orig_time = t0.elapsed();
         assert!(!orig.is_empty());
 
-        println!("1M 行: int_key = {:?}, vec_key = {:?}, int 快 {}x",
-                 fast_time, orig_time,
-                 orig_time.as_nanos() as f64 / fast_time.as_nanos() as f64);
+        println!(
+            "1M 行: int_key = {:?}, vec_key = {:?}, int 快 {}x",
+            fast_time,
+            orig_time,
+            orig_time.as_nanos() as f64 / fast_time.as_nanos() as f64
+        );
     }
 }

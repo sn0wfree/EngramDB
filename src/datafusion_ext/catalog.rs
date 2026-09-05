@@ -28,10 +28,7 @@ impl EngramDBCatalog {
             schemas: HashMap::new(),
         };
         // 默认 public schema
-        catalog.schemas.insert(
-            "public".to_string(),
-            Arc::new(EngramDBSchema::new()),
-        );
+        catalog.schemas.insert("public".to_string(), Arc::new(EngramDBSchema::new()));
         catalog
     }
 
@@ -39,10 +36,7 @@ impl EngramDBCatalog {
     pub fn from_database(db: &Database) -> Self {
         let schema = EngramDBSchema::from_database(db);
         let mut catalog = Self::new();
-        catalog.schemas.insert(
-            "public".to_string(),
-            Arc::new(schema),
-        );
+        catalog.schemas.insert("public".to_string(), Arc::new(schema));
         catalog
     }
 
@@ -74,9 +68,7 @@ impl CatalogProvider for EngramDBCatalog {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas
-            .get(name)
-            .map(|s| s.clone() as Arc<dyn SchemaProvider>)
+        self.schemas.get(name).map(|s| s.clone() as Arc<dyn SchemaProvider>)
     }
 }
 
@@ -140,9 +132,7 @@ impl SchemaProvider for EngramDBSchema {
 
     fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
         let tables = self.tables.read().unwrap();
-        Ok(tables
-            .get(name)
-            .map(|t| t.clone() as Arc<dyn TableProvider>))
+        Ok(tables.get(name).map(|t| t.clone() as Arc<dyn TableProvider>))
     }
 
     fn table_exist(&self, name: &str) -> bool {

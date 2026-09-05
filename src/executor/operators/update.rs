@@ -4,12 +4,12 @@
 //! - 事务路径（enable_transaction=true）：保证 ACID，通过 WAL + MVCC
 //! - 非事务路径（enable_transaction=false）：高性能直接写入，跳过 WAL/MVCC
 
-use log::{error, warn, info, debug, trace};
+use log::{debug, error, info, trace, warn};
 
-use crate::common::error::{Result, EngramDbError};
-use crate::sql::ast::Expression;
+use crate::common::error::{EngramDbError, Result};
 use crate::executor::operators;
 use crate::executor::vector::DataChunk;
+use crate::sql::ast::Expression;
 use crate::storage::Database;
 use crate::Value;
 
@@ -28,39 +28,51 @@ pub fn execute(
     assignments: &[(usize, Expression)],
     condition: Option<Expression>,
 ) -> Result<usize> {
-    trace!("update::execute called: table_name={}, assignments_count={}, has_condition={}", 
-           table_name, assignments.len(), condition.is_some());
-    
+    trace!(
+        "update::execute called: table_name={}, assignments_count={}, has_condition={}",
+        table_name,
+        assignments.len(),
+        condition.is_some()
+    );
+
     // 防御性检查：事务路径需要 txn_manager 已初始化
     if db.config().enable_transaction {
         debug!("Transaction path enabled, checking txn_manager readiness...");
-        
+
         if !db.txn_manager().is_ready() {
             error!("Transaction manager not ready");
             error!("Config: enable_transaction=true but txn_manager is not initialized");
             error!("This is likely a bug in Database initialization");
-            
+
             // 生产环境降级到非事务路径
             warn!("Falling back to non-transaction path due to txn_manager not ready");
             return execute_without_txn(db, table_name, assignments, condition);
         }
         debug!("✓ txn_manager is ready");
     }
-    
+
     // 防御性检查：表存在
     debug!("Checking if table '{}' exists...", table_name);
-    let _table_id = db.table_names().get(table_name)
-        .ok_or_else(|| {
-            error!("Table '{}' not found", table_name);
-            EngramDbError::TableNotFound(table_name.into())
-        })?;
+    let _table_id = db.table_names().get(table_name).ok_or_else(|| {
+        error!("Table '{}' not found", table_name);
+        EngramDbError::TableNotFound(table_name.into())
+    })?;
     debug!("✓ Table '{}' exists", table_name);
-    
+
     // 根据配置选择路径
-    let path = if db.config().enable_transaction { "txn" } else { "direct" };
-    info!("Executing UPDATE: table={}, assignments={}, has_condition={}, path={}", 
-          table_name, assignments.len(), condition.is_some(), path);
-    
+    let path = if db.config().enable_transaction {
+        "txn"
+    } else {
+        "direct"
+    };
+    info!(
+        "Executing UPDATE: table={}, assignments={}, has_condition={}, path={}",
+        table_name,
+        assignments.len(),
+        condition.is_some(),
+        path
+    );
+
     if db.config().enable_transaction {
         execute_with_txn(db, table_name, assignments, condition)
     } else {
@@ -84,11 +96,12 @@ fn execute_with_txn(
     condition: Option<Expression>,
 ) -> Result<usize> {
     debug!("Starting transaction path UPDATE execution...");
-    
+
     // 步骤 1：先收集要更新的行并计算新值（在开启事务之前，避免借用冲突）
     // 引擎分派（M2）：Columnar = Delta 层行（现有语义），Memory = 全部存活行
     let updates = {
-        let table = db.get_engine_table_mut(table_name)
+        let table = db
+            .get_engine_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
         let num_cols = table.def().columns.len();
@@ -113,11 +126,11 @@ fn execute_with_txn(
                     continue;
                 }
             }
-            
+
             // 计算每个 SET 列的新值
             let mut new_row = row.clone();
             let mut updated = false;
-            
+
             for &(col_idx, ref expr) in assignments {
                 // 简单表达式求值：通过 projection 模块
                 let chunks = rows_to_chunks(&[row.clone()]);
@@ -125,7 +138,7 @@ fn execute_with_txn(
                     &chunks,
                     &[expr.clone()],
                     &col_names,
-                    &[],  // output column_names（DataChunk 不使用）
+                    &[], // output column_names（DataChunk 不使用）
                 )?;
                 if !result.is_empty() && result[0].count > 0 {
                     let val = result[0].columns[0].get(0).clone();
@@ -135,48 +148,53 @@ fn execute_with_txn(
                     }
                 }
             }
-            
+
             if updated {
                 updates.push((row_id, row, new_row));
             }
         }
-        
+
         updates
     };
-    
+
     if updates.is_empty() {
         debug!("No rows to update in table '{}'", table_name);
         return Ok(0);
     }
-    
+
     debug!("Found {} rows to update in Delta layer", updates.len());
-    
+
     // 步骤 2：开启事务
     debug!("Beginning transaction...");
     let isolation = db.config().default_isolation_level;
     let txn_id = db.txn_manager_mut().begin(isolation)?;
     info!("Transaction started: txn_id={}, isolation={:?}", txn_id, isolation);
-    
+
     // 步骤 3：事务内更新每行
     let table_id = *db.table_names().get(table_name).unwrap();
-    
+
     for (idx, (row_id, old_row, new_row)) in updates.iter().enumerate() {
         trace!("Updating row {} (row_id={})", idx, row_id);
-        
-        db.txn_manager_mut().update(txn_id, table_id, *row_id, old_row.clone(), new_row.clone())?;
-        
+
+        db.txn_manager_mut()
+            .update(txn_id, table_id, *row_id, old_row.clone(), new_row.clone())?;
+
         if idx % 100 == 0 {
             debug!("Updated {}/{} rows in transaction {}", idx + 1, updates.len(), txn_id);
         }
     }
     debug!("✓ All {} rows updated in transaction {}", updates.len(), txn_id);
-    
+
     // 步骤 4：提交事务（会 fsync WAL）
     debug!("Committing transaction {}...", txn_id);
     let result = db.txn_manager_mut().commit(txn_id)?;
-    info!("Transaction {} committed: commit_ts={}, apply_ops_count={}",
-          txn_id, result.commit_ts, result.apply_ops.len());
-    
+    info!(
+        "Transaction {} committed: commit_ts={}, apply_ops_count={}",
+        txn_id,
+        result.commit_ts,
+        result.apply_ops.len()
+    );
+
     // 步骤 5：应用到存储层；失败必须 abort 事务（清理 MVCC 残留）
     debug!("Applying {} operations to storage...", result.apply_ops.len());
     if let Err(e) = operators::insert::apply_to_storage(db, result.apply_ops) {
@@ -184,7 +202,7 @@ fn execute_with_txn(
         return Err(e);
     }
     info!("✓ Applied {} operations to storage", updates.len());
-    
+
     info!("Transaction path completed: {} rows updated", updates.len());
     Ok(updates.len())
 }
@@ -199,8 +217,9 @@ fn execute_without_txn(
     condition: Option<Expression>,
 ) -> Result<usize> {
     debug!("Starting non-transaction path UPDATE execution...");
-    
-    let engine = db.get_engine_table_mut(table_name)
+
+    let engine = db
+        .get_engine_table_mut(table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
     let num_cols = engine.def().columns.len();
@@ -231,12 +250,7 @@ fn execute_without_txn(
             let mut new_vals: Vec<(usize, Value)> = Vec::new();
             for &(col_idx, ref expr) in assignments {
                 let chunks = rows_to_chunks(&[row.clone()]);
-                let result = operators::projection::execute(
-                    &chunks,
-                    &[expr.clone()],
-                    &col_names,
-                    &[],
-                )?;
+                let result = operators::projection::execute(&chunks, &[expr.clone()], &col_names, &[])?;
                 if !result.is_empty() && result[0].count > 0 {
                     new_vals.push((col_idx, result[0].columns[0].get(0).clone()));
                 }
@@ -266,18 +280,18 @@ fn execute_without_txn(
 
     let delta_total = table.delta_store().len();
     let cs_rows = table.def.row_count as usize - delta_total;
-    
+
     // 找出匹配的 Delta 行，并计算新值
     let mut updates: Vec<(usize, Vec<(usize, Value)>)> = Vec::new();
     // (delta_idx, Vec<(col_idx, new_value)>)
-    
+
     for (row_idx, row) in all_rows.iter().enumerate() {
         // 只处理 Delta 层的行
         if row_idx < cs_rows {
             continue;
         }
         let delta_idx = row_idx - cs_rows;
-        
+
         // 评估 WHERE 条件
         if let Some(ref cond) = condition {
             let chunks = rows_to_chunks(&[row.clone()]);
@@ -286,30 +300,25 @@ fn execute_without_txn(
                 continue;
             }
         }
-        
+
         // 计算每个 SET 列的新值
         let mut new_vals: Vec<(usize, Value)> = Vec::new();
-        
+
         for &(col_idx, ref expr) in assignments {
             // 简单表达式求值
             let chunks = rows_to_chunks(&[row.clone()]);
-            let result = operators::projection::execute(
-                &chunks,
-                &[expr.clone()],
-                &col_names,
-                &[],
-            )?;
+            let result = operators::projection::execute(&chunks, &[expr.clone()], &col_names, &[])?;
             if !result.is_empty() && result[0].count > 0 {
                 let val = result[0].columns[0].get(0).clone();
                 new_vals.push((col_idx, val));
             }
         }
-        
+
         if !new_vals.is_empty() {
             updates.push((delta_idx, new_vals));
         }
     }
-    
+
     let count = table.update_delta_rows(&updates)?;
     info!("Non-transaction path completed: {} rows updated", count);
     Ok(count)
@@ -329,7 +338,10 @@ mod tests {
 
     fn gt_id(n: i64) -> Expression {
         Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "id".into(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(Expression::Literal(Value::Int64(n))),
         }
@@ -349,11 +361,17 @@ mod tests {
         let db = conn.database_mut();
 
         // v = v + 1 WHERE id > 1
-        let assign = vec![(1usize, Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "v".into() }),
-            op: BinaryOperator::Plus,
-            right: Box::new(Expression::Literal(Value::Int64(1))),
-        })];
+        let assign = vec![(
+            1usize,
+            Expression::BinaryOp {
+                left: Box::new(Expression::ColumnRef {
+                    table: None,
+                    column: "v".into(),
+                }),
+                op: BinaryOperator::Plus,
+                right: Box::new(Expression::Literal(Value::Int64(1))),
+            },
+        )];
         assert_eq!(execute(db, "t", &assign, Some(gt_id(1))).unwrap(), 2);
         let after = rows(db);
         assert_eq!(after.len(), 3);
@@ -406,13 +424,19 @@ mod tests {
         let mut cfg = Config::default();
         cfg.enable_transaction = false;
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
-        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory").unwrap();
+        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory")
+            .unwrap();
         conn.execute("INSERT INTO mem VALUES (1, 10), (2, 20)").unwrap();
         let db = conn.database_mut();
         let assign = vec![(1usize, Expression::Literal(Value::Int64(7)))];
         assert_eq!(execute(db, "mem", &assign, Some(gt_id(1))).unwrap(), 1);
-        let remaining = db.get_engine_table_mut("mem").unwrap().as_memory_mut().unwrap()
-            .scan_to_rows_direct(&[0, 1], None).unwrap();
+        let remaining = db
+            .get_engine_table_mut("mem")
+            .unwrap()
+            .as_memory_mut()
+            .unwrap()
+            .scan_to_rows_direct(&[0, 1], None)
+            .unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0][1], Value::Int64(10));
         assert_eq!(remaining[1][1], Value::Int64(7));

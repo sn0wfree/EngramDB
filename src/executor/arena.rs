@@ -95,7 +95,9 @@ impl QueryArenaGuard {
     /// 每次构造 guard 都 reset 一次 arena，确保跨查询无污染。
     pub fn new() -> Self {
         reset_arena_internal();
-        Self { arena: get_or_init_arena() }
+        Self {
+            arena: get_or_init_arena(),
+        }
     }
 
     /// 在 arena 内分配 T

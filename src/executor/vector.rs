@@ -2,8 +2,8 @@
 //!
 //! DataChunk: 一批行数据，包含多个 Vector（每列一个）
 
-use crate::Value;
 use crate::common::column_data::ColumnData;
+use crate::Value;
 
 /// Vector 大小（每批行数）
 pub const VECTOR_SIZE: usize = 2048;
@@ -182,9 +182,7 @@ pub fn from_rows_batched(rows: &[Vec<Value>]) -> Vec<DataChunk> {
     if rows.is_empty() {
         return Vec::new();
     }
-    rows.chunks(VECTOR_SIZE)
-        .map(DataChunk::from_rows)
-        .collect()
+    rows.chunks(VECTOR_SIZE).map(DataChunk::from_rows).collect()
 }
 
 /// 将多个 `DataChunk` 扁平化为 `Vec<Vec<Value>>`（统一各算子输出边界）
@@ -198,7 +196,6 @@ pub fn flatten_to_rows(chunks: &[DataChunk]) -> Vec<Vec<Value>> {
     }
     all_rows
 }
-
 
 // ============================================================================
 // 选择向量 (Selection Vector)
@@ -230,10 +227,7 @@ impl SelectionVector {
     pub fn all(count: usize) -> Self {
         let indices: Vec<usize> = (0..count).collect();
         let n = indices.len();
-        Self {
-            indices,
-            count: n,
-        }
+        Self { indices, count: n }
     }
 
     /// 从索引列表创建
@@ -277,13 +271,9 @@ impl SelectionVector {
                 }
                 Vector::Flat(result)
             }
-            Vector::Constant(val, _) => {
-                Vector::Constant(val.clone(), self.count)
-            }
+            Vector::Constant(val, _) => Vector::Constant(val.clone(), self.count),
             // S2-M2：Typed 列直接按索引 gather（类型数组零 Value 转换）
-            Vector::Typed(data) => {
-                Vector::Typed(data.gather(&self.indices))
-            }
+            Vector::Typed(data) => Vector::Typed(data.gather(&self.indices)),
         }
     }
 
@@ -294,11 +284,7 @@ impl SelectionVector {
             return chunk.clone();
         }
 
-        let columns = chunk
-            .columns
-            .iter()
-            .map(|col| self.apply_to_vector(col))
-            .collect();
+        let columns = chunk.columns.iter().map(|col| self.apply_to_vector(col)).collect();
 
         DataChunk {
             columns,
@@ -329,10 +315,7 @@ pub struct LazyDataChunk {
 impl LazyDataChunk {
     /// 从 DataChunk 创建（默认全选）
     pub fn new(chunk: DataChunk) -> Self {
-        Self {
-            chunk,
-            selection: None,
-        }
+        Self { chunk, selection: None }
     }
 
     /// 有效行数
@@ -554,10 +537,7 @@ mod tests {
 
     #[test]
     fn test_lazy_chunk_all_pass_keeps_none() {
-        let chunk = DataChunk::from_rows(&[
-            vec![Value::Int64(1)],
-            vec![Value::Int64(2)],
-        ]);
+        let chunk = DataChunk::from_rows(&[vec![Value::Int64(1)], vec![Value::Int64(2)]]);
         let mut lazy = LazyDataChunk::new(chunk);
         lazy.filter(|_| true);
         assert!(lazy.selection.is_none(), "全通过保持 None（全选优化）");

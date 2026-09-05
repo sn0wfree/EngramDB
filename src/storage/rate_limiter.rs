@@ -232,9 +232,9 @@ mod tests {
     #[test]
     fn test_rate_limiter_stats() {
         let mut rl = RateLimiter::new();
-        rl.check("a", 1, 60);  // allowed
-        rl.check("a", 1, 60);  // denied
-        rl.check("b", 1, 60);  // allowed
+        rl.check("a", 1, 60); // allowed
+        rl.check("a", 1, 60); // denied
+        rl.check("b", 1, 60); // allowed
         let stats = rl.stats();
         assert_eq!(stats.total_checks, 3);
         assert_eq!(stats.total_allowed, 2);

@@ -19,9 +19,9 @@
 use crate::common::error::Result;
 use std::path::Path;
 
-use super::mmap_writer::MmapWriter;
-use super::mmap_integration;
 use super::engine::EngineTable;
+use super::mmap_integration;
+use super::mmap_writer::MmapWriter;
 
 /// Phase 6：compact + mmap 集成
 ///
@@ -30,11 +30,7 @@ use super::engine::EngineTable;
 /// - checkpoint 写入 mmap 后端
 /// - 大表 compact 后持久化
 /// - 冷数据迁移（Auto → Log/Columnar）
-pub fn compact_to_mmap(
-    table: &mut EngineTable,
-    mmap_path: &Path,
-    compress: bool,
-) -> Result<u64> {
+pub fn compact_to_mmap(table: &mut EngineTable, mmap_path: &Path, compress: bool) -> Result<u64> {
     match table {
         EngineTable::Columnar(t) => compact_columnar_to_mmap(t, mmap_path, compress),
         EngineTable::Log(t) => compact_log_to_mmap(t, mmap_path),
@@ -46,11 +42,7 @@ pub fn compact_to_mmap(
 }
 
 /// Columnar 引擎 compact + mmap
-fn compact_columnar_to_mmap(
-    table: &mut super::table::Table,
-    mmap_path: &Path,
-    compress: bool,
-) -> Result<u64> {
+fn compact_columnar_to_mmap(table: &mut super::table::Table, mmap_path: &Path, compress: bool) -> Result<u64> {
     // 1. compact_delta：合并 Delta → 列存
     let delta_rows = table.delta_store().len() as u64;
     table.compact_delta()?;
@@ -76,10 +68,7 @@ fn compact_columnar_to_mmap(
 }
 
 /// Log 引擎 compact + mmap
-fn compact_log_to_mmap(
-    table: &mut super::log_engine::LogTable,
-    mmap_path: &Path,
-) -> Result<u64> {
+fn compact_log_to_mmap(table: &mut super::log_engine::LogTable, mmap_path: &Path) -> Result<u64> {
     use crate::storage::log_engine::LogTable;
 
     // Log 引擎数据直接从内存 dump

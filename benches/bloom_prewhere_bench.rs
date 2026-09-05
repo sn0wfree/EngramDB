@@ -70,7 +70,10 @@ fn main() {
         let _ = r;
         samples.push(t0.elapsed().as_nanos());
     }
-    println!("  等值查询 (Bloom Filter 跳读): median={}", fmt_us(median(samples.clone())));
+    println!(
+        "  等值查询 (Bloom Filter 跳读): median={}",
+        fmt_us(median(samples.clone()))
+    );
     println!();
 
     // -------- 场景 C：手动验证 Bloom Filter 在 PREWHERE 中的效果 --------
@@ -92,7 +95,10 @@ fn main() {
             skipped += 1;
         }
     }
-    println!("  Bloom Filter skip rate (out of {probe} non-existent): {skipped} / {probe} = {:.1}%", skipped as f64 / probe as f64 * 100.0);
+    println!(
+        "  Bloom Filter skip rate (out of {probe} non-existent): {skipped} / {probe} = {:.1}%",
+        skipped as f64 / probe as f64 * 100.0
+    );
 
     // 测试 must_probe（存在）
     let mut probe_existing = 0;
@@ -103,12 +109,21 @@ fn main() {
             hits += 1;
         }
     }
-    println!("  Bloom Filter hit rate (out of {probe_existing} existing): {hits} / {probe_existing} = {:.1}%",
-             hits as f64 / probe_existing as f64 * 100.0);
+    println!(
+        "  Bloom Filter hit rate (out of {probe_existing} existing): {hits} / {probe_existing} = {:.1}%",
+        hits as f64 / probe_existing as f64 * 100.0
+    );
 
     println!();
     println!("=== Phase 2 P1-A KPI ===");
-    println!("  Bloom Filter 跳读率 ≥ 50%: {}", if skipped as f64 / probe as f64 >= 0.5 { "✅ 达成" } else { "⚠️  待集成" });
+    println!(
+        "  Bloom Filter 跳读率 ≥ 50%: {}",
+        if skipped as f64 / probe as f64 >= 0.5 {
+            "✅ 达成"
+        } else {
+            "⚠️  待集成"
+        }
+    );
     println!("  假阴性率 = 0%: ✅（Bloom 数学保证）");
     println!("  Phase 2 集成：ColumnBloom 与 can_skip_predicate 配合的 PREWHERE 路径 — 待下个迭代");
 }

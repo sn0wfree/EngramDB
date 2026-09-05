@@ -98,10 +98,7 @@ pub fn ngram_overlap(a: &[Vec<u32>], b: &[Vec<u32>]) -> f32 {
 
 /// 候选召回：query token 的 postings OR（上限 CANDIDATE_LIMIT）
 pub fn candidate_rows(idx: &TokenInvertedIndex, ids: &[u32]) -> Vec<u32> {
-    idx.search_or(ids)
-        .into_iter()
-        .take(CANDIDATE_LIMIT)
-        .collect()
+    idx.search_or(ids).into_iter().take(CANDIDATE_LIMIT).collect()
 }
 
 /// 编辑距离打分（纯函数）：相似度 ∈ [0,1]，前缀加成 0.1；剪枝返回 None
@@ -151,7 +148,12 @@ pub fn search_edit(
         let doc_ids: Vec<u32> = tok
             .tokenize(prefix_window(&text))
             .iter()
-            .filter(|t| t.id != UNKNOWN_ID && !tok.id_to_token(t.id).map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace)))
+            .filter(|t| {
+                t.id != UNKNOWN_ID
+                    && !tok
+                        .id_to_token(t.id)
+                        .map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace))
+            })
             .map(|t| t.id)
             .collect();
         if let Some(score) = score_edit(&ids, &doc_ids, max_score_len) {
@@ -182,7 +184,12 @@ pub fn search_ngram(
         let doc_ids: Vec<u32> = tok
             .tokenize(prefix_window(&text))
             .iter()
-            .filter(|t| t.id != UNKNOWN_ID && !tok.id_to_token(t.id).map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace)))
+            .filter(|t| {
+                t.id != UNKNOWN_ID
+                    && !tok
+                        .id_to_token(t.id)
+                        .map_or(false, |s| !s.is_empty() && s.chars().all(char::is_whitespace))
+            })
             .map(|t| t.id)
             .collect();
         let s = score_ngram(&ids, &doc_ids, gram);

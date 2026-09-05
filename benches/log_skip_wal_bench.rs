@@ -30,7 +30,11 @@ fn fmt_rate(d: Duration, n: usize) -> String {
 }
 
 fn bench(skip_wal: bool) -> Duration {
-    let path = format!("/tmp/log_skip_{}_{}.hdb", if skip_wal { 1 } else { 0 }, std::process::id());
+    let path = format!(
+        "/tmp/log_skip_{}_{}.hdb",
+        if skip_wal { 1 } else { 0 },
+        std::process::id()
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path));
 
@@ -46,8 +50,7 @@ fn bench(skip_wal: bool) -> Duration {
 
     let t0 = Instant::now();
     for i in 0..N_ROWS {
-        conn.execute(&format!("INSERT INTO t VALUES ({}, 'row-{}')", i, i))
-            .unwrap();
+        conn.execute(&format!("INSERT INTO t VALUES ({}, 'row-{}')", i, i)).unwrap();
     }
     let d = t0.elapsed();
     conn.close().unwrap();
@@ -86,14 +89,8 @@ fn main() {
     let speedup = baseline.as_secs_f64() / skip_wal.as_secs_f64();
     println!();
     println!("=== 总结 ===");
-    println!(
-        "  WAL 开 (baseline):    {}",
-        fmt_rate(baseline, N_ROWS)
-    );
-    println!(
-        "  WAL 关 (skip_wal=true): {}",
-        fmt_rate(skip_wal, N_ROWS)
-    );
+    println!("  WAL 开 (baseline):    {}", fmt_rate(baseline, N_ROWS));
+    println!("  WAL 关 (skip_wal=true): {}", fmt_rate(skip_wal, N_ROWS));
     println!("  加速比:                {:.2}×", speedup);
     println!();
     if speedup >= 1.3 {
@@ -101,6 +98,9 @@ fn main() {
     } else if speedup >= 1.1 {
         println!("ℹ️  skip_wal=true 提速 {:.1}%（>10% 但 <30%）", (speedup - 1.0) * 100.0);
     } else {
-        println!("⚠️  skip_wal=true 提速仅 {:.1}%（<10%，可能受其他瓶颈限制）", (speedup - 1.0) * 100.0);
+        println!(
+            "⚠️  skip_wal=true 提速仅 {:.1}%（<10%，可能受其他瓶颈限制）",
+            (speedup - 1.0) * 100.0
+        );
     }
 }

@@ -60,22 +60,17 @@ impl InsertBatcher {
         if rows.is_empty() {
             return false;
         }
-        let entry = self
-            .buffers
-            .entry(table_name.to_string())
-            .or_insert_with(|| BatchedRows {
-                rows: Vec::new(),
-                bytes: 0,
-                first_ts: Instant::now(),
-                pk_seen: HashSet::new(),
-                unique_seen: HashMap::new(),
-            });
+        let entry = self.buffers.entry(table_name.to_string()).or_insert_with(|| BatchedRows {
+            rows: Vec::new(),
+            bytes: 0,
+            first_ts: Instant::now(),
+            pk_seen: HashSet::new(),
+            unique_seen: HashMap::new(),
+        });
         entry.bytes += rows.iter().map(|r| r.len()).sum::<usize>();
         let total = entry.rows.len() + rows.len();
         entry.rows.extend(rows);
-        total >= self.max_rows
-            || entry.bytes >= self.max_bytes
-            || entry.first_ts.elapsed() >= self.timeout
+        total >= self.max_rows || entry.bytes >= self.max_bytes || entry.first_ts.elapsed() >= self.timeout
     }
 
     /// 攒入一批行并做约束预检（v0.20：约束表攒批用）
@@ -97,16 +92,13 @@ impl InsertBatcher {
         if rows.is_empty() {
             return Ok(false);
         }
-        let entry = self
-            .buffers
-            .entry(table_name.to_string())
-            .or_insert_with(|| BatchedRows {
-                rows: Vec::new(),
-                bytes: 0,
-                first_ts: Instant::now(),
-                pk_seen: HashSet::new(),
-                unique_seen: HashMap::new(),
-            });
+        let entry = self.buffers.entry(table_name.to_string()).or_insert_with(|| BatchedRows {
+            rows: Vec::new(),
+            bytes: 0,
+            first_ts: Instant::now(),
+            pk_seen: HashSet::new(),
+            unique_seen: HashMap::new(),
+        });
         // 两阶段：先全量校验（批内自重复 + 与已攒行重复），全部通过再落批，
         // 避免中途失败留下脏 seen（零副作用语义）
         let mut local_pk: HashSet<Value> = HashSet::new();
@@ -114,23 +106,23 @@ impl InsertBatcher {
         for row in &rows {
             if let Some(pk) = pk_col {
                 if let Some(cell) = row.get(pk) {
-                    if !cell.is_null()
-                        && (entry.pk_seen.contains(cell) || !local_pk.insert(cell.clone()))
-                    {
+                    if !cell.is_null() && (entry.pk_seen.contains(cell) || !local_pk.insert(cell.clone())) {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: pk={:?}", cell
+                            "UNIQUE constraint failed: pk={:?}",
+                            cell
                         )));
                     }
                 }
             }
             for (idx_name, key_col) in unique_cols {
                 if let Some(cell) = row.get(*key_col) {
-                    let entry_seen = entry.unique_seen.contains_key(idx_name)
-                        && entry.unique_seen[idx_name].contains(cell);
+                    let entry_seen =
+                        entry.unique_seen.contains_key(idx_name) && entry.unique_seen[idx_name].contains(cell);
                     let local_seen = local_unique.entry(idx_name).or_default();
                     if entry_seen || !local_seen.insert(cell.clone()) {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: index '{}'", idx_name
+                            "UNIQUE constraint failed: index '{}'",
+                            idx_name
                         )));
                     }
                 }
@@ -144,9 +136,7 @@ impl InsertBatcher {
         entry.bytes += rows.iter().map(|r| r.len()).sum::<usize>();
         let total = entry.rows.len() + rows.len();
         entry.rows.extend(rows);
-        Ok(total >= self.max_rows
-            || entry.bytes >= self.max_bytes
-            || entry.first_ts.elapsed() >= self.timeout)
+        Ok(total >= self.max_rows || entry.bytes >= self.max_bytes || entry.first_ts.elapsed() >= self.timeout)
     }
 
     /// 某表当前缓冲行（v0.20 攒批入批预检用；冲突点查需与已攒行对比）
@@ -161,10 +151,7 @@ impl InsertBatcher {
 
     /// 取走全部表的缓冲（非 INSERT 语句 / close / checkpoint 前置）
     pub fn drain_all(&mut self) -> Vec<(String, Vec<Vec<Value>>)> {
-        self.buffers
-            .drain()
-            .map(|(t, e)| (t, e.rows))
-            .collect()
+        self.buffers.drain().map(|(t, e)| (t, e.rows)).collect()
     }
 
     /// 当前缓冲行数（监控用）

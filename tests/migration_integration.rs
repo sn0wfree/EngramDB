@@ -116,8 +116,7 @@ fn test_migration_loop_protection() {
     let _ = std::fs::remove_file(format!("{}-wal", path));
 
     let mut conn = Connection::open(path).unwrap();
-    conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY) ENGINE = Auto")
-        .unwrap();
+    conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY) ENGINE = Auto").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
     let id = conn.database_mut().table_id_by_name("t").unwrap();
@@ -142,8 +141,7 @@ fn test_migration_via_on_commit_tick() {
     let _ = std::fs::remove_file(format!("{}-wal", path));
 
     let mut conn = Connection::open(path).unwrap();
-    conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY) ENGINE = Auto")
-        .unwrap();
+    conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY) ENGINE = Auto").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
     let id = conn.database_mut().table_id_by_name("t").unwrap();

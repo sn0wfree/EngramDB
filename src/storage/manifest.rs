@@ -8,9 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::common::error::{EngramDbError, Result};
 use crate::storage::bloom_filter::ColumnBloom;
 use crate::storage::segment::SegmentEntry;
-use crate::common::error::{EngramDbError, Result};
 
 /// 清单（段文件注册表）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -51,16 +51,15 @@ impl Manifest {
             return Ok(Self::new());
         }
         let data = std::fs::read_to_string(path)?;
-        let manifest: Manifest = serde_json::from_str(&data)
-            .map_err(|e| EngramDbError::Serialization(e.to_string()))?;
+        let manifest: Manifest =
+            serde_json::from_str(&data).map_err(|e| EngramDbError::Serialization(e.to_string()))?;
         Ok(manifest)
     }
 
     /// 原子保存清单（临时文件 + rename）
     pub fn save(&self, path: &Path) -> Result<()> {
         let tmp_path = path.with_extension("tmp");
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| EngramDbError::Serialization(e.to_string()))?;
+        let json = serde_json::to_string_pretty(self).map_err(|e| EngramDbError::Serialization(e.to_string()))?;
         std::fs::write(&tmp_path, json)?;
         std::fs::rename(&tmp_path, path)?;
         Ok(())

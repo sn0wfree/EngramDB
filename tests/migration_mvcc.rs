@@ -26,15 +26,13 @@ fn test_migration_updates_table_engines() {
     }
 
     // 迁移前：def.engine 是 Auto
-    let engine_before = conn.database_mut().get_engine_table_mut_by_id(id).unwrap()
-        .def().engine;
+    let engine_before = conn.database_mut().get_engine_table_mut_by_id(id).unwrap().def().engine;
     assert_eq!(engine_before, EngineType::Auto);
 
     conn.migrate_all_auto();
 
     // 迁移后：def.engine 是 Memory（高频小表）
-    let engine_after = conn.database_mut().get_engine_table_mut_by_id(id).unwrap()
-        .def().engine;
+    let engine_after = conn.database_mut().get_engine_table_mut_by_id(id).unwrap().def().engine;
     assert_eq!(engine_after, EngineType::Memory);
 }
 
@@ -72,8 +70,10 @@ fn test_migration_unmarks_memory_to_log() {
 
     // 验证：Memory 表创建后自动标 non_persistent
     let id = conn.database_mut().table_id_by_name("t").unwrap();
-    assert!(!conn.database_mut().txn_manager_is_persistent(id),
-            "Memory 表创建后应自动标 non_persistent");
+    assert!(
+        !conn.database_mut().txn_manager_is_persistent(id),
+        "Memory 表创建后应自动标 non_persistent"
+    );
 
     // Phase 3.5：模拟内存表手动转为持久化（unmark）
     // 当前 API：migrate_all_auto 只能处理 Auto 表，Memory → Log 需直接调用
@@ -105,8 +105,7 @@ fn test_migration_preserves_data_after_changing_engine() {
 
     // 迁移到 Memory
     conn.migrate_all_auto();
-    let engine1 = conn.database_mut().get_engine_table_mut_by_id(id).unwrap()
-        .def().engine;
+    let engine1 = conn.database_mut().get_engine_table_mut_by_id(id).unwrap().def().engine;
     assert_eq!(engine1, EngineType::Memory);
 
     // 验证数据完整

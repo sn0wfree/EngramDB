@@ -6,7 +6,9 @@
 //!
 //! 如需引用本模块，会触发 `#[deprecated]` 警告，请改用 `crate::storage::mmap_reader::MmapReader`。
 
-#![deprecated(note = "Use crate::storage::mmap_reader::MmapReader instead. BufferPool is unused; planned removal in Phase 2 cleanup.")]
+#![deprecated(
+    note = "Use crate::storage::mmap_reader::MmapReader instead. BufferPool is unused; planned removal in Phase 2 cleanup."
+)]
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -115,11 +117,7 @@ impl BufferPool {
 
     /// 刷新所有脏页到磁盘
     pub fn flush_all(&mut self) -> Result<()> {
-        let dirty_pages: Vec<PageId> = self.pages
-            .iter()
-            .filter(|(_, p)| p.is_dirty)
-            .map(|(id, _)| *id)
-            .collect();
+        let dirty_pages: Vec<PageId> = self.pages.iter().filter(|(_, p)| p.is_dirty).map(|(id, _)| *id).collect();
 
         for page_id in dirty_pages {
             self.flush_page(page_id)?;
@@ -131,9 +129,7 @@ impl BufferPool {
     fn flush_page(&mut self, page_id: PageId) -> Result<()> {
         if let Some(page) = self.pages.get(&page_id) {
             if page.is_dirty {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&self.file_path)?;
+                let mut file = std::fs::OpenOptions::new().write(true).open(&self.file_path)?;
                 file.seek(SeekFrom::Start((page_id as u64) * (self.page_size as u64)))?;
                 file.write_all(&page.data)?;
                 file.sync_all()?;
@@ -147,9 +143,7 @@ impl BufferPool {
             self.evict()?;
         }
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&self.file_path)?;
+        let mut file = std::fs::OpenOptions::new().read(true).open(&self.file_path)?;
 
         let offset = (page_id as u64) * (self.page_size as u64);
         let file_size = file.metadata()?.len();

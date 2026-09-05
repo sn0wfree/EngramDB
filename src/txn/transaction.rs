@@ -14,7 +14,7 @@ use crate::executor::operators::insert::apply_to_storage;
 use crate::storage::Database;
 use crate::Value;
 
-use super::{TxnState, IsolationLevel, TxnId};
+use super::{IsolationLevel, TxnId, TxnState};
 
 /// 事务句柄
 ///
@@ -30,13 +30,21 @@ impl<'a> Transaction<'a> {
     /// 开始一个新事务（由 Database 调用）
     pub(crate) fn begin(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
         let txn_id = db.txn_manager_mut().begin(isolation_level)?;
-        Ok(Self { id: txn_id, db, read_only: false })
+        Ok(Self {
+            id: txn_id,
+            db,
+            read_only: false,
+        })
     }
 
     /// 开始一个只读事务（跳过 WAL，v0.15.0 Txn09）
     pub(crate) fn begin_readonly(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
         let txn_id = db.txn_manager_mut().begin_readonly(isolation_level)?;
-        Ok(Self { id: txn_id, db, read_only: true })
+        Ok(Self {
+            id: txn_id,
+            db,
+            read_only: true,
+        })
     }
 
     /// 是否为只读事务
@@ -82,7 +90,9 @@ impl<'a> Transaction<'a> {
             return Ok(0);
         }
         // 表存在性校验（攒批不落盘，表不存在在此尽早暴露）
-        let _ = self.db.get_engine_table(table_name)
+        let _ = self
+            .db
+            .get_engine_table(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
         let trigger = self.db.txn_buffer_push(table_name, rows)?;
         if trigger {
@@ -97,7 +107,8 @@ impl<'a> Transaction<'a> {
     /// 读与 SQL SELECT 同源（引擎读），不做 MVCC 快照隔离。
     pub fn read(&mut self, table_id: u32, rowid: u64) -> Option<Vec<Value>> {
         self.db.flush_txn_buffer().ok()?;
-        self.db.get_engine_table_mut_by_id(table_id)?
+        self.db
+            .get_engine_table_mut_by_id(table_id)?
             .get_row_by_id(rowid as u32)
             .ok()
             .flatten()
@@ -274,7 +285,8 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT, name VARCHAR)").unwrap();
 
         // 多行 VALUES（走 Insert 计划 → execute_with_txn → batch_insert）
-        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+            .unwrap();
 
         let count = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(count.rows[0][0], Value::Int64(4));

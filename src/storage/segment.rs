@@ -10,13 +10,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::Value;
 use crate::common::column_data::ColumnData;
 use crate::common::config::CompressionType;
-use crate::common::types::{DataType, TableDef};
 use crate::common::error::{EngramDbError, Result};
+use crate::common::types::{DataType, TableDef};
 use crate::storage::bloom_filter::ColumnBloom;
 use crate::storage::column_store::{ColumnChunk, ColumnStore, RowGroup};
+use crate::Value;
 
 /// 单段最大字节数（128MB）
 pub const SEGMENT_MAX_SIZE: u64 = 128 * 1024 * 1024;
@@ -172,12 +172,15 @@ pub fn read_segment_from_bytes(data: &[u8]) -> Result<(ColumnStore, SegmentFoote
 
     let column_store = ColumnStore::from_row_groups(row_groups);
 
-    Ok((column_store, SegmentFooter {
-        rg_offsets,
-        zone_maps,
-        blooms,
-        total_rows,
-    }))
+    Ok((
+        column_store,
+        SegmentFooter {
+            rg_offsets,
+            zone_maps,
+            blooms,
+            total_rows,
+        },
+    ))
 }
 
 // ============================================================================
@@ -282,7 +285,15 @@ mod tests {
             TableDef {
                 id: 1,
                 name: "test".into(),
-                columns: vec![ColumnDef { name: "id".into(), data_type: DataType::Int64, nullable: false, is_primary_key: false, default_value: None, auto_increment: false, check_expr: None }],
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_primary_key: false,
+                    default_value: None,
+                    auto_increment: false,
+                    check_expr: None,
+                }],
                 row_count: 0,
                 indexes: vec![],
                 cluster_key: None,

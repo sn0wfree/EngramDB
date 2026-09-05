@@ -29,15 +29,13 @@ pub fn encode(strings: &[&[u8]]) -> DictionaryEncoded {
         indices.push(idx);
     }
 
-    DictionaryEncoded {
-        dictionary,
-        indices,
-    }
+    DictionaryEncoded { dictionary, indices }
 }
 
 /// 字典解码
 pub fn decode(encoded: &DictionaryEncoded) -> Vec<Vec<u8>> {
-    encoded.indices
+    encoded
+        .indices
         .iter()
         .map(|&idx| encoded.dictionary[idx as usize].clone())
         .collect()
@@ -57,9 +55,7 @@ mod tests {
 
     #[test]
     fn test_dictionary_simple() {
-        let strings: Vec<&[u8]> = vec![
-            b"apple", b"banana", b"apple", b"cherry", b"banana", b"apple",
-        ];
+        let strings: Vec<&[u8]> = vec![b"apple", b"banana", b"apple", b"cherry", b"banana", b"apple"];
         let encoded = encode(&strings);
         assert_eq!(encoded.dictionary.len(), 3);
         assert_eq!(encoded.indices.len(), 6);
@@ -100,9 +96,7 @@ mod tests {
 
     #[test]
     fn test_dictionary_all_unique() {
-        let strings: Vec<&[u8]> = vec![
-            b"a", b"b", b"c", b"d", b"e",
-        ];
+        let strings: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d", b"e"];
         let encoded = encode(&strings);
         assert_eq!(encoded.dictionary.len(), 5);
         assert_eq!(encoded.indices.len(), 5);

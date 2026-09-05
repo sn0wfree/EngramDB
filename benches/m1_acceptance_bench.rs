@@ -7,8 +7,8 @@
 //! - M1-2: ORDER BY 整数列 < 30ms
 //! - M1-3: 单列整数 GROUP BY < 5ms
 
+use engramdb::{Config, Connection, Value};
 use std::time::{Duration, Instant};
-use engramdb::{Connection, Config, Value};
 
 const ITERS: usize = 5;
 const N: usize = 100_000;
@@ -46,7 +46,9 @@ struct SimpleRng {
 
 impl SimpleRng {
     fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) }
+        Self {
+            state: seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407),
+        }
     }
     fn gen_range(&mut self, range: std::ops::Range<i64>) -> i64 {
         self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -70,7 +72,8 @@ fn run_scenario(name: &str, target: Duration, mut f: impl FnMut() -> Duration) {
 fn setup() {
     std::fs::remove_file(HDB_PATH).ok();
     let mut conn = open_hdb();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, val INTEGER, payload TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, val INTEGER, payload TEXT)")
+        .unwrap();
     let mut rng = SimpleRng::new(42);
     let mut sql = String::with_capacity(64 * N);
     for chunk_start in (0..N).step_by(1000) {
@@ -81,7 +84,13 @@ fn setup() {
             if i > chunk_start {
                 sql.push(',');
             }
-            sql.push_str(&format!("({}, {}, {}, 'payload_{}')", i, rng.gen_range(0..1000), rng.gen_range(0..1000), i));
+            sql.push_str(&format!(
+                "({}, {}, {}, 'payload_{}')",
+                i,
+                rng.gen_range(0..1000),
+                rng.gen_range(0..1000),
+                i
+            ));
         }
         conn.execute(&sql).unwrap();
     }

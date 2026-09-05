@@ -69,9 +69,11 @@ impl CompressionQueue {
     pub fn new() -> Self {
         Self {
             pending: Arc::new(Mutex::new(Vec::new())),
-            pool: Arc::new(rayon::ThreadPoolBuilder::new()
-                .build()
-                .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap())),
+            pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .build()
+                    .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap()),
+            ),
         }
     }
 
@@ -94,8 +96,8 @@ impl CompressionQueue {
             .par_iter()
             .map(|task| {
                 let bytes = task.data.serialize_typed(&task.data_type);
-                let (ctype, compressed) = compression::compress(&bytes, &task.data_type)
-                    .unwrap_or((CompressionType::Uncompressed, bytes));
+                let (ctype, compressed) =
+                    compression::compress(&bytes, &task.data_type).unwrap_or((CompressionType::Uncompressed, bytes));
                 CompressedBlock {
                     rg_idx: task.rg_idx,
                     compression: ctype,

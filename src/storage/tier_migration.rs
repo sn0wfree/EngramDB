@@ -42,8 +42,7 @@ pub fn tick_decisions(db: &mut Database) -> Vec<MigrationDecision> {
 
     // 收集所有 Auto 表（用 def.engine == Auto 识别）
     let auto_tables: Vec<(u32, EngineType, u64)> = {
-        let table_names: Vec<(u32, String)> = db.table_names_internal()
-            .iter().map(|(k, v)| (*v, k.clone())).collect();
+        let table_names: Vec<(u32, String)> = db.table_names_internal().iter().map(|(k, v)| (*v, k.clone())).collect();
         let mut auto = Vec::new();
         for (id, _name) in table_names {
             if let Some(table) = db.get_engine_table_mut_by_id(id) {
@@ -87,8 +86,7 @@ mod tests {
     use crate::Connection;
 
     fn setup() -> Connection {
-        let tid = format!("{:?}", std::thread::current().id())
-            .replace(['(', ')', ':', ' '], "_");
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')', ':', ' '], "_");
         let path = format!("/tmp/p25_tier_{}_{}_{}.hdb", std::process::id(), tid, line!());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path));
@@ -105,7 +103,8 @@ mod tests {
     #[test]
     fn test_tick_decisions_on_auto_table_high_freq_small() {
         let mut conn = setup();
-        conn.execute("CREATE TABLE hot (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto").unwrap();
+        conn.execute("CREATE TABLE hot (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto")
+            .unwrap();
         conn.execute("INSERT INTO hot VALUES (1, 'a')").unwrap();
 
         let id = conn.database_mut().table_id_by_name("hot").unwrap();
@@ -125,7 +124,8 @@ mod tests {
     #[test]
     fn test_tick_decisions_on_auto_table_cold_large() {
         let mut conn = setup();
-        conn.execute("CREATE TABLE cold (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto").unwrap();
+        conn.execute("CREATE TABLE cold (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto")
+            .unwrap();
         // 模拟 200K 行（无需真插入，仅修改 def.row_count 测试决策逻辑）
         let id = conn.database_mut().table_id_by_name("cold").unwrap();
         {
@@ -145,7 +145,8 @@ mod tests {
     fn test_tick_decisions_no_migration_for_columnar() {
         let mut conn = setup();
         // 显式 Columnar 表不应触发迁移
-        conn.execute("CREATE TABLE fixed (id INT64 PRIMARY KEY) ENGINE = Columnar").unwrap();
+        conn.execute("CREATE TABLE fixed (id INT64 PRIMARY KEY) ENGINE = Columnar")
+            .unwrap();
         conn.execute("INSERT INTO fixed VALUES (1)").unwrap();
 
         let decisions = tick_decisions(conn.database_mut());

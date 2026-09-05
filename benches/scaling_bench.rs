@@ -4,8 +4,8 @@
 //!
 //! 运行：`cargo bench --bench scaling_bench`
 
-use std::time::{Duration, Instant};
 use engramdb::Connection;
+use std::time::{Duration, Instant};
 
 const SCALES: &[usize] = &[1_000, 10_000, 100_000, 1_000_000, 5_000_000];
 const ITERS: usize = 3;
@@ -16,7 +16,11 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 }
 
 fn fmt_rate(d: Duration, n: usize) -> String {
-    format!("{:.0} 行/秒 ({:.1} ms)", n as f64 / d.as_secs_f64(), d.as_secs_f64() * 1000.0)
+    format!(
+        "{:.0} 行/秒 ({:.1} ms)",
+        n as f64 / d.as_secs_f64(),
+        d.as_secs_f64() * 1000.0
+    )
 }
 
 fn fmt_size(bytes: usize) -> String {
@@ -95,17 +99,20 @@ fn main() {
     println!("━━━ 3. SELECT * 扫描扩展性 ━━━");
 
     // 准备数据
-    let paths: Vec<String> = SCALES.iter().map(|&n| {
-        let path = format!("/tmp/scaling_scan_{}.hdb", n);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}-wal", path));
-        let mut conn = Connection::open(&path).unwrap();
-        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT)").unwrap();
-        for i in 0..n {
-            conn.execute(&format!("INSERT INTO t VALUES ({}, 'row-{}')", i, i)).unwrap();
-        }
-        path
-    }).collect();
+    let paths: Vec<String> = SCALES
+        .iter()
+        .map(|&n| {
+            let path = format!("/tmp/scaling_scan_{}.hdb", n);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path));
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT)").unwrap();
+            for i in 0..n {
+                conn.execute(&format!("INSERT INTO t VALUES ({}, 'row-{}')", i, i)).unwrap();
+            }
+            path
+        })
+        .collect();
 
     for (&n, path) in SCALES.iter().zip(&paths) {
         let mut times = Vec::new();
@@ -159,7 +166,11 @@ fn main() {
     println!("━━━ 6. 文件大小对比 ━━━");
     for (&n, path) in SCALES.iter().zip(&paths) {
         let meta = std::fs::metadata(path).unwrap();
-        println!("  {} 行: {}", fmt_size(meta.len() as usize), fmt_size(meta.len() as usize));
+        println!(
+            "  {} 行: {}",
+            fmt_size(meta.len() as usize),
+            fmt_size(meta.len() as usize)
+        );
     }
 
     println!();

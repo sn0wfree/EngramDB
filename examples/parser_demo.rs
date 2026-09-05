@@ -1,28 +1,43 @@
 //! SQL Parser 验证脚本
 //! 使用 sqlparser-rs 作为解析后端，验证 Phase 1 成果
 
-use engramdb::sql::parser::parse;
 use engramdb::sql::ast::*;
+use engramdb::sql::parser::parse;
 
 fn main() {
     let tests = vec![
-        ("CREATE TABLE", "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR NOT NULL, age INT, score DOUBLE)"),
+        (
+            "CREATE TABLE",
+            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR NOT NULL, age INT, score DOUBLE)",
+        ),
         ("INSERT", "INSERT INTO users VALUES (1, 'alice', 25, 95.5)"),
-        ("SELECT simple", "SELECT id, name FROM users WHERE age > 18 ORDER BY name LIMIT 10"),
+        (
+            "SELECT simple",
+            "SELECT id, name FROM users WHERE age > 18 ORDER BY name LIMIT 10",
+        ),
         ("SELECT *", "SELECT * FROM users"),
         ("SELECT alias", "SELECT id AS user_id, name AS user_name FROM users u"),
         ("COUNT(*)", "SELECT COUNT(*) FROM users"),
-        ("GROUP BY + HAVING", "SELECT age, COUNT(*) FROM users GROUP BY age HAVING COUNT(*) > 5"),
+        (
+            "GROUP BY + HAVING",
+            "SELECT age, COUNT(*) FROM users GROUP BY age HAVING COUNT(*) > 5",
+        ),
         ("BEGIN", "BEGIN"),
         ("COMMIT", "COMMIT"),
         ("ROLLBACK", "ROLLBACK"),
         ("START TRANSACTION", "START TRANSACTION"),
-        ("AND/OR", "SELECT * FROM users WHERE age > 18 AND score > 80 OR name = 'test'"),
+        (
+            "AND/OR",
+            "SELECT * FROM users WHERE age > 18 AND score > 80 OR name = 'test'",
+        ),
         ("IS NOT NULL", "SELECT * FROM users WHERE name IS NOT NULL"),
         ("IN list", "SELECT * FROM users WHERE age IN (18, 20, 25)"),
         ("BETWEEN", "SELECT * FROM users WHERE age BETWEEN 18 AND 30"),
         ("LIKE", "SELECT * FROM users WHERE name LIKE 'al%'"),
-        ("CASE WHEN", "SELECT CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END FROM users"),
+        (
+            "CASE WHEN",
+            "SELECT CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END FROM users",
+        ),
         ("CAST", "SELECT CAST(age AS DOUBLE) FROM users"),
         ("NOT IN", "SELECT * FROM users WHERE age NOT IN (10, 20)"),
         ("IS NULL", "SELECT * FROM users WHERE name IS NULL"),

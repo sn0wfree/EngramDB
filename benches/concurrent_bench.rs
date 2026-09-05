@@ -4,10 +4,10 @@
 //!
 //! 运行：`cargo bench --bench concurrent_bench`
 
+use engramdb::Connection;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use engramdb::Connection;
 
 const N_ROWS: usize = 100_000;
 const N_THREADS: usize = 4;
@@ -20,12 +20,19 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 }
 
 fn fmt_rate(d: Duration, n: usize) -> String {
-    format!("{:.0} 行/秒 ({:.1} ms)", n as f64 / d.as_secs_f64(), d.as_secs_f64() * 1000.0)
+    format!(
+        "{:.0} 行/秒 ({:.1} ms)",
+        n as f64 / d.as_secs_f64(),
+        d.as_secs_f64() * 1000.0
+    )
 }
 
 fn main() {
     println!("=== 多线程并发读写测试 ===");
-    println!("线程数: {}, 每线程操作数: {}, 数据规模: {} 行", N_THREADS, N_OPS_PER_THREAD, N_ROWS);
+    println!(
+        "线程数: {}, 每线程操作数: {}, 数据规模: {} 行",
+        N_THREADS, N_OPS_PER_THREAD, N_ROWS
+    );
     println!();
 
     // ==================== 1. 并发写入测试 ====================
@@ -48,21 +55,27 @@ fn main() {
         let path = Arc::new(path);
 
         let t0 = Instant::now();
-        let handles: Vec<_> = (0..N_THREADS).map(|thread_id| {
-            let path = Arc::clone(&path);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                let mut conn = Connection::open(&*path).unwrap();
-                barrier.wait();
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|thread_id| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut conn = Connection::open(&*path).unwrap();
+                    barrier.wait();
 
-                // 每个线程使用不同的 ID 范围避免冲突
-                let base = thread_id * 1_000_000 + 1_000_000;
-                for i in 0..N_OPS_PER_THREAD {
-                    let id = base + i;
-                    conn.execute(&format!("INSERT INTO t VALUES ({}, 'thread-{}-row-{}')", id, thread_id, i)).unwrap();
-                }
+                    // 每个线程使用不同的 ID 范围避免冲突
+                    let base = thread_id * 1_000_000 + 1_000_000;
+                    for i in 0..N_OPS_PER_THREAD {
+                        let id = base + i;
+                        conn.execute(&format!(
+                            "INSERT INTO t VALUES ({}, 'thread-{}-row-{}')",
+                            id, thread_id, i
+                        ))
+                        .unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
@@ -95,18 +108,20 @@ fn main() {
         let barrier = Arc::new(Barrier::new(N_THREADS));
 
         let t0 = Instant::now();
-        let handles: Vec<_> = (0..N_THREADS).map(|_| {
-            let path = read_path.clone();
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                let mut conn = Connection::open(&path).unwrap();
-                barrier.wait();
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|_| {
+                let path = read_path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut conn = Connection::open(&path).unwrap();
+                    barrier.wait();
 
-                for _ in 0..N_OPS_PER_THREAD {
-                    let _r = conn.execute("SELECT * FROM t").unwrap();
-                }
+                    for _ in 0..N_OPS_PER_THREAD {
+                        let _r = conn.execute("SELECT * FROM t").unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
@@ -140,29 +155,35 @@ fn main() {
         let iter_offset = iteration as u64 * 100_000_000; // 每次迭代偏移不同
 
         let t0 = Instant::now();
-        let handles: Vec<_> = (0..N_THREADS).map(|thread_id| {
-            let path = mixed_path.clone();
-            let barrier = Arc::clone(&barrier);
-            let iter = N_OPS_PER_THREAD;
-            let base_id = thread_id as u64 * 50_000_000 + 100_000_000 + iter_offset;
-            thread::spawn(move || {
-                let mut conn = Connection::open(&path).unwrap();
-                barrier.wait();
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|thread_id| {
+                let path = mixed_path.clone();
+                let barrier = Arc::clone(&barrier);
+                let iter = N_OPS_PER_THREAD;
+                let base_id = thread_id as u64 * 50_000_000 + 100_000_000 + iter_offset;
+                thread::spawn(move || {
+                    let mut conn = Connection::open(&path).unwrap();
+                    barrier.wait();
 
-                if thread_id < 2 {
-                    // 写线程
-                    for i in 0..iter {
-                        let id = base_id + i as u64;
-                        conn.execute(&format!("INSERT INTO t VALUES ({}, 'thread-{}-row-{}')", id, thread_id, i)).unwrap();
+                    if thread_id < 2 {
+                        // 写线程
+                        for i in 0..iter {
+                            let id = base_id + i as u64;
+                            conn.execute(&format!(
+                                "INSERT INTO t VALUES ({}, 'thread-{}-row-{}')",
+                                id, thread_id, i
+                            ))
+                            .unwrap();
+                        }
+                    } else {
+                        // 读线程
+                        for _ in 0..iter {
+                            let _r = conn.execute("SELECT * FROM t").unwrap();
+                        }
                     }
-                } else {
-                    // 读线程
-                    for _ in 0..iter {
-                        let _r = conn.execute("SELECT * FROM t").unwrap();
-                    }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
@@ -194,19 +215,21 @@ fn main() {
         let barrier = Arc::new(Barrier::new(N_THREADS));
 
         let t0 = Instant::now();
-        let handles: Vec<_> = (0..N_THREADS).map(|_| {
-            let path = where_path.clone();
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                let mut conn = Connection::open(&path).unwrap();
-                barrier.wait();
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|_| {
+                let path = where_path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut conn = Connection::open(&path).unwrap();
+                    barrier.wait();
 
-                for i in 0..N_OPS_PER_THREAD {
-                    let id = i * (N_ROWS / N_OPS_PER_THREAD);
-                    let _r = conn.execute(&format!("SELECT * FROM t WHERE id = {}", id)).unwrap();
-                }
+                    for i in 0..N_OPS_PER_THREAD {
+                        let id = i * (N_ROWS / N_OPS_PER_THREAD);
+                        let _r = conn.execute(&format!("SELECT * FROM t WHERE id = {}", id)).unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
@@ -238,18 +261,20 @@ fn main() {
         let barrier = Arc::new(Barrier::new(N_THREADS));
 
         let t0 = Instant::now();
-        let handles: Vec<_> = (0..N_THREADS).map(|_| {
-            let path = count_path.clone();
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                let mut conn = Connection::open(&path).unwrap();
-                barrier.wait();
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|_| {
+                let path = count_path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut conn = Connection::open(&path).unwrap();
+                    barrier.wait();
 
-                for _ in 0..N_OPS_PER_THREAD {
-                    let _r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
-                }
+                    for _ in 0..N_OPS_PER_THREAD {
+                        let _r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();

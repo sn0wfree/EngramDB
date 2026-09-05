@@ -77,10 +77,17 @@ fn main() {
     for q in &queries {
         let hits = db.get_table_mut("docs").unwrap().search_fts("content", q);
         let top = db.get_table_mut("docs").unwrap().search_bm25("content", q, 3);
-        println!("「{q}」: FTS 命中 {} 行 | BM25 top: {:?}", hits.len(), top.iter().map(|(r, s)| (*r, s.round() as i32)).collect::<Vec<_>>());
+        println!(
+            "「{q}」: FTS 命中 {} 行 | BM25 top: {:?}",
+            hits.len(),
+            top.iter().map(|(r, s)| (*r, s.round() as i32)).collect::<Vec<_>>()
+        );
     }
     let fuzzy = db.get_table_mut("docs").unwrap().search_fuzzy_edit("content", "人工只能", 3);
-    println!("模糊「人工只能」top: {:?}", fuzzy.iter().map(|(r, s)| (*r, (s * 100.0) as i32)).collect::<Vec<_>>());
+    println!(
+        "模糊「人工只能」top: {:?}",
+        fuzzy.iter().map(|(r, s)| (*r, (s * 100.0) as i32)).collect::<Vec<_>>()
+    );
 
     db.checkpoint().unwrap();
     drop(db);

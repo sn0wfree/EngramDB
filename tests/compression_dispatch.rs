@@ -29,10 +29,7 @@ fn make_tokenizer() -> Tokenizer {
     // 小词表（CJK 段内 merge）：字符 + 双字词，TokenDelta 静态码长表非零
     let vf = VocabFile::new(
         Vec::new(),
-        vec![
-            ("你".into(), "好".into()),
-            ("世".into(), "界".into()),
-        ],
+        vec![("你".into(), "好".into()), ("世".into(), "界".into())],
         vec![
             "你".into(),
             "好".into(),
@@ -76,9 +73,7 @@ fn test_varchar_zstd_priority_dispatch_and_roundtrip() {
     set_global_tokenizer(Some(make_tokenizer()));
     // 单形态配置（v0.21）：小数据块级表头开销大，Varint（无表）最优；
     // 显式设置验证 dispatch + roundtrip
-    engramdb::storage::compression::set_token_delta_entropy(
-        engramdb::common::config::TokenDeltaEntropy::Varint,
-    );
+    engramdb::storage::compression::set_token_delta_entropy(engramdb::common::config::TokenDeltaEntropy::Varint);
 
     // 流式追加（同前缀）：zstd 压缩率达标（≤50%）→ 调度直选 Zstd，
     // TD 启用也不参与比较（v0.21.2 zstd 先行调度语义）
@@ -87,11 +82,7 @@ fn test_varchar_zstd_priority_dispatch_and_roundtrip() {
     let char_count = base.chars().count();
     for i in 1..=50 {
         let take = (i * char_count / 50).min(char_count);
-        let end = base
-            .char_indices()
-            .nth(take)
-            .map(|(idx, _)| idx)
-            .unwrap_or(base.len());
+        let end = base.char_indices().nth(take).map(|(idx, _)| idx).unwrap_or(base.len());
         texts.push(&base[..end]);
     }
     let data = varchar_column(&texts);
@@ -99,7 +90,12 @@ fn test_varchar_zstd_priority_dispatch_and_roundtrip() {
     let (ctype, compressed) = compress(&data, &DataType::Varchar).unwrap();
     // zstd 达标 → 直选 Zstd（不再强制 TD）
     assert_eq!(ctype, CompressionType::Zstd, "zstd 达标块应直选 Zstd");
-    assert!(compressed.len() < data.len(), "zstd 应压缩：{} / {}", compressed.len(), data.len());
+    assert!(
+        compressed.len() < data.len(),
+        "zstd 应压缩：{} / {}",
+        compressed.len(),
+        data.len()
+    );
 
     let decompressed = decompress(&compressed, ctype, &DataType::Varchar).unwrap();
     assert_eq!(decompressed, data, "roundtrip 必须逐字节还原");
@@ -164,9 +160,21 @@ fn test_tokendelta_vocab_version_mismatch_rejected() {
         Vec::new(),
         vec![("你".into(), "好".into()), ("世".into(), "界".into())],
         vec![
-            "你".into(), "好".into(), "世".into(), "界".into(), "！".into(),
-            "h".into(), "e".into(), "l".into(), "o".into(), " ".into(),
-            "w".into(), "r".into(), "d".into(), "你好".into(), "世界".into(),
+            "你".into(),
+            "好".into(),
+            "世".into(),
+            "界".into(),
+            "！".into(),
+            "h".into(),
+            "e".into(),
+            "l".into(),
+            "o".into(),
+            " ".into(),
+            "w".into(),
+            "r".into(),
+            "d".into(),
+            "你好".into(),
+            "世界".into(),
         ],
     );
     vf.version = 1; // 模拟 v1 词表
@@ -209,9 +217,21 @@ fn test_tokendelta_column_persist_roundtrip() {
         Vec::new(),
         vec![("你".into(), "好".into()), ("世".into(), "界".into())],
         vec![
-            "你".into(), "好".into(), "世".into(), "界".into(), "！".into(),
-            "h".into(), "e".into(), "l".into(), "o".into(), " ".into(),
-            "w".into(), "r".into(), "d".into(), "你好".into(), "世界".into(),
+            "你".into(),
+            "好".into(),
+            "世".into(),
+            "界".into(),
+            "！".into(),
+            "h".into(),
+            "e".into(),
+            "l".into(),
+            "o".into(),
+            " ".into(),
+            "w".into(),
+            "r".into(),
+            "d".into(),
+            "你好".into(),
+            "世界".into(),
         ],
     );
     let mut sl = vec![0u8; vf.vocab.len()];

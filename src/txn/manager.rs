@@ -9,13 +9,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::common::config::{Config, WalFlushMode};
 use crate::common::error::Result;
 use crate::common::types::EngineType;
-use crate::common::config::{Config, WalFlushMode};
-use crate::wal::{WalWriter, WalRecordType, make_insert_payload, make_insert_batch_payload, make_update_payload, make_delete_payload};
+use crate::wal::{
+    make_delete_payload, make_insert_batch_payload, make_insert_payload, make_update_payload, WalRecordType, WalWriter,
+};
 use crate::Value;
 
-use super::{TxnState, IsolationLevel, TxnError, TxnId, Timestamp, MvccStore, ActiveTxnTable, ApplyOp, CommitResult};
+use super::{ActiveTxnTable, ApplyOp, CommitResult, IsolationLevel, MvccStore, Timestamp, TxnError, TxnId, TxnState};
 
 /// 事务上下文（单个事务的状态）
 #[derive(Debug)]
@@ -94,10 +96,7 @@ impl TransactionManager {
 
     /// 表引擎（未注册回退 Columnar——旧 WAL 兼容语义）
     fn table_engine(&self, table_id: u32) -> EngineType {
-        self.table_engines
-            .get(&table_id)
-            .copied()
-            .unwrap_or(EngineType::Columnar)
+        self.table_engines.get(&table_id).copied().unwrap_or(EngineType::Columnar)
     }
 
     /// 开始一个新事务
@@ -117,7 +116,8 @@ impl TransactionManager {
 
         // 只读事务跳过 WAL BEGIN 记录（v0.15.0 Txn09）
         if !read_only {
-            self.wal.write_record(WalRecordType::Begin, txn_id, 0, EngineType::Columnar, &[])?;
+            self.wal
+                .write_record(WalRecordType::Begin, txn_id, 0, EngineType::Columnar, &[])?;
         }
 
         let ctx = TxnContext {
@@ -137,13 +137,10 @@ impl TransactionManager {
     /// 提交事务
     pub fn commit(&mut self, txn_id: TxnId) -> Result<CommitResult> {
         // 检查状态
-        let ctx = self.txns.get_mut(&txn_id)
-            .ok_or_else(|| TxnError::NotFound(txn_id))?;
+        let ctx = self.txns.get_mut(&txn_id).ok_or_else(|| TxnError::NotFound(txn_id))?;
 
         if ctx.state != TxnState::Active {
-            return Err(TxnError::InvalidState(
-                format!("Cannot commit: transaction {} is not active", txn_id)
-            ).into());
+            return Err(TxnError::InvalidState(format!("Cannot commit: transaction {} is not active", txn_id)).into());
         }
 
         ctx.state = TxnState::Committed;
@@ -157,12 +154,11 @@ impl TransactionManager {
         // Phase 2 P1-C：LogEngine 表 + log_skip_wal=true 时同样跳过 WAL
         //   （LogEngine 自身即 append-only，数据文件即 WAL）
         let has_persistent_write = write_set.iter().any(|(tid, _)| {
-            self.is_persistent(*tid)
-                && !(self.log_skip_wal
-                    && self.table_engines.get(tid) == Some(&EngineType::Log))
+            self.is_persistent(*tid) && !(self.log_skip_wal && self.table_engines.get(tid) == Some(&EngineType::Log))
         });
         if !read_only && has_persistent_write {
-            self.wal.write_record(WalRecordType::Commit, txn_id, 0, EngineType::Columnar, &[])?;
+            self.wal
+                .write_record(WalRecordType::Commit, txn_id, 0, EngineType::Columnar, &[])?;
             self.wal.commit_flush()?;
         }
 
@@ -175,7 +171,7 @@ impl TransactionManager {
                 store.commit_txn_key(*rowid, txn_id, commit_ts);
             }
         }
-        
+
         // 收集待应用操作（方案 B：返回 apply_ops，由 executor 应用到存储层）
         // 注意：必须在 GC 之前收集，因为 gc_key 会清掉旧版本，导致 has_committed_version_before 失效
         let apply_ops = self.collect_apply_ops(&write_set, txn_id)?;
@@ -190,7 +186,7 @@ impl TransactionManager {
 
         Ok(CommitResult { commit_ts, apply_ops })
     }
-    
+
     /// 收集待应用操作（内部辅助方法）
     ///
     /// 根据 MVCC 版本链判断操作类型：
@@ -199,18 +195,18 @@ impl TransactionManager {
     /// - Delete: rowid 之前有已提交版本，但事务没有创建新版本（删除标记）
     fn collect_apply_ops(&self, write_set: &[(u32, u64)], txn_id: TxnId) -> Result<Vec<ApplyOp>> {
         let mut ops = Vec::new();
-        
+
         for (table_id, rowid) in write_set {
             if let Some(store) = self.mvcc.get(table_id) {
                 // 检查是否有旧版本（用于区分 Insert 和 Update/Delete）
                 let has_old_version = store.has_committed_version_before(*rowid, txn_id);
-                
+
                 // 尝试获取事务创建的新版本
                 let new_version = store.get_txn_version(*rowid, txn_id);
-                
+
                 // 判断是否为删除操作：delete() 用空 Vec 作为 tombstone 标记删除
                 let is_delete = new_version.as_ref().map_or(false, |v| v.is_empty());
-                
+
                 if is_delete {
                     // 删除操作（有旧版本且被删除
                     if has_old_version {
@@ -249,27 +245,26 @@ impl TransactionManager {
                 }
             }
         }
-        
+
         // P-W2c：合并连续同表 Insert 段为 InsertBatch
         // 条件：连续 ≥2 个 Insert、同 table_id、rowid 连续（base + i）
         // 合并后行数据转置为列式，apply_to_storage 直接走 insert_columns
         if ops.len() >= 2 {
             ops = merge_insert_batches(ops);
         }
-        
+
         Ok(ops)
     }
 
     /// 回滚事务
     pub fn rollback(&mut self, txn_id: TxnId) -> Result<()> {
         // 检查状态
-        let ctx = self.txns.get_mut(&txn_id)
-            .ok_or_else(|| TxnError::NotFound(txn_id))?;
+        let ctx = self.txns.get_mut(&txn_id).ok_or_else(|| TxnError::NotFound(txn_id))?;
 
         if ctx.state != TxnState::Active {
-            return Err(TxnError::InvalidState(
-                format!("Cannot rollback: transaction {} is not active", txn_id)
-            ).into());
+            return Err(
+                TxnError::InvalidState(format!("Cannot rollback: transaction {} is not active", txn_id)).into(),
+            );
         }
 
         ctx.state = TxnState::RolledBack;
@@ -282,12 +277,11 @@ impl TransactionManager {
         // 仅涉及非持久化表（MemoryEngine）时同样跳过（M2）。
         // Phase 2 P1-C：LogEngine 表 + log_skip_wal=true 时同样跳过 WAL
         let has_persistent_write = write_set.iter().any(|(tid, _)| {
-            self.is_persistent(*tid)
-                && !(self.log_skip_wal
-                    && self.table_engines.get(tid) == Some(&EngineType::Log))
+            self.is_persistent(*tid) && !(self.log_skip_wal && self.table_engines.get(tid) == Some(&EngineType::Log))
         });
         if !read_only && has_persistent_write {
-            self.wal.write_record(WalRecordType::Rollback, txn_id, 0, EngineType::Columnar, &[])?;
+            self.wal
+                .write_record(WalRecordType::Rollback, txn_id, 0, EngineType::Columnar, &[])?;
             self.wal.commit_flush()?;
         }
 
@@ -309,13 +303,14 @@ impl TransactionManager {
     ///
     /// SAVEPOINT 嵌套支持：每次 SAVEPOINT 会将当前 write_set.len() 压栈。
     pub fn savepoint(&mut self, txn_id: TxnId, name: &str) -> Result<()> {
-        let ctx = self.txns.get_mut(&txn_id)
-            .ok_or_else(|| TxnError::NotFound(txn_id))?;
+        let ctx = self.txns.get_mut(&txn_id).ok_or_else(|| TxnError::NotFound(txn_id))?;
 
         if ctx.state != TxnState::Active {
-            return Err(TxnError::InvalidState(
-                format!("Cannot create savepoint: transaction {} is not active", txn_id)
-            ).into());
+            return Err(TxnError::InvalidState(format!(
+                "Cannot create savepoint: transaction {} is not active",
+                txn_id
+            ))
+            .into());
         }
 
         // 嵌套同名 savepoint 的语义：按 SQLite/MySQL 行为，后定义的覆盖之前的
@@ -329,20 +324,22 @@ impl TransactionManager {
     /// 销毁最近的同名 savepoint，但不影响已写入的数据。
     /// 如果没有同名 savepoint，返回错误。
     pub fn release_savepoint(&mut self, txn_id: TxnId, name: &str) -> Result<()> {
-        let ctx = self.txns.get_mut(&txn_id)
-            .ok_or_else(|| TxnError::NotFound(txn_id))?;
+        let ctx = self.txns.get_mut(&txn_id).ok_or_else(|| TxnError::NotFound(txn_id))?;
 
         if ctx.state != TxnState::Active {
-            return Err(TxnError::InvalidState(
-                format!("Cannot release savepoint: transaction {} is not active", txn_id)
-            ).into());
+            return Err(TxnError::InvalidState(format!(
+                "Cannot release savepoint: transaction {} is not active",
+                txn_id
+            ))
+            .into());
         }
 
         // 从栈顶向下查找第一个匹配的 savepoint
-        let pos = ctx.savepoints.iter().rposition(|(n, _)| n == name)
-            .ok_or_else(|| TxnError::InvalidState(
-                format!("SAVEPOINT {} does not exist", name)
-            ))?;
+        let pos = ctx
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
+            .ok_or_else(|| TxnError::InvalidState(format!("SAVEPOINT {} does not exist", name)))?;
         ctx.savepoints.remove(pos);
         Ok(())
     }
@@ -362,19 +359,21 @@ impl TransactionManager {
         let target_pos;
         let target_write_set_len;
         {
-            let ctx = self.txns.get(&txn_id)
-                .ok_or_else(|| TxnError::NotFound(txn_id))?;
+            let ctx = self.txns.get(&txn_id).ok_or_else(|| TxnError::NotFound(txn_id))?;
 
             if ctx.state != TxnState::Active {
-                return Err(TxnError::InvalidState(
-                    format!("Cannot rollback to savepoint: transaction {} is not active", txn_id)
-                ).into());
+                return Err(TxnError::InvalidState(format!(
+                    "Cannot rollback to savepoint: transaction {} is not active",
+                    txn_id
+                ))
+                .into());
             }
 
-            let pos = ctx.savepoints.iter().rposition(|(n, _)| n == name)
-                .ok_or_else(|| TxnError::InvalidState(
-                    format!("SAVEPOINT {} does not exist", name)
-                ))?;
+            let pos = ctx
+                .savepoints
+                .iter()
+                .rposition(|(n, _)| n == name)
+                .ok_or_else(|| TxnError::InvalidState(format!("SAVEPOINT {} does not exist", name)))?;
             target_pos = pos;
             target_write_set_len = ctx.savepoints[pos].1;
         }
@@ -456,9 +455,7 @@ impl TransactionManager {
         // 写入 MVCC
         let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
         if !store.write(rowid, row, txn_id, write_ts) {
-            return Err(TxnError::WriteConflict(
-                format!("Write conflict on table {} row {}", table_id, rowid)
-            ).into());
+            return Err(TxnError::WriteConflict(format!("Write conflict on table {} row {}", table_id, rowid)).into());
         }
 
         // 记录到 write_set
@@ -476,13 +473,7 @@ impl TransactionManager {
     /// - 1 次 write_set 扩展（替代 N 次 push）
     ///
     /// 行 i 的 rowid = base_rowid + i。失败（写-写冲突）时整批不写。
-    pub fn batch_insert(
-        &mut self,
-        txn_id: TxnId,
-        table_id: u32,
-        base_rowid: u64,
-        rows: Vec<Vec<Value>>,
-    ) -> Result<()> {
+    pub fn batch_insert(&mut self, txn_id: TxnId, table_id: u32, base_rowid: u64, rows: Vec<Vec<Value>>) -> Result<()> {
         self.ensure_active(txn_id)?;
 
         let num_rows = rows.len() as u64;
@@ -508,22 +499,31 @@ impl TransactionManager {
         // 2. 写入 MVCC（单次批量写）
         let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
         if !store.batch_write(base_rowid, rows, txn_id, write_ts) {
-            return Err(TxnError::WriteConflict(
-                format!("Write conflict on table {} rows {}..{}", table_id, base_rowid, base_rowid + num_rows)
-            ).into());
+            return Err(TxnError::WriteConflict(format!(
+                "Write conflict on table {} rows {}..{}",
+                table_id,
+                base_rowid,
+                base_rowid + num_rows
+            ))
+            .into());
         }
 
         // 3. 记录到 write_set（一次扩展）
         let ctx = self.txns.get_mut(&txn_id).unwrap();
-        ctx.write_set.extend(
-            (0..num_rows).map(|i| (table_id, base_rowid + i))
-        );
+        ctx.write_set.extend((0..num_rows).map(|i| (table_id, base_rowid + i)));
 
         Ok(())
     }
 
     /// 事务内更新一行
-    pub fn update(&mut self, txn_id: TxnId, table_id: u32, rowid: u64, old_row: Vec<Value>, new_row: Vec<Value>) -> Result<()> {
+    pub fn update(
+        &mut self,
+        txn_id: TxnId,
+        table_id: u32,
+        rowid: u64,
+        old_row: Vec<Value>,
+        new_row: Vec<Value>,
+    ) -> Result<()> {
         self.ensure_active(txn_id)?;
 
         let ctx = self.txns.get(&txn_id).unwrap();
@@ -544,9 +544,7 @@ impl TransactionManager {
         // 写入 MVCC
         let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
         if !store.write(rowid, new_row, txn_id, write_ts) {
-            return Err(TxnError::WriteConflict(
-                format!("Write conflict on table {} row {}", table_id, rowid)
-            ).into());
+            return Err(TxnError::WriteConflict(format!("Write conflict on table {} row {}", table_id, rowid)).into());
         }
 
         // 记录到 write_set
@@ -580,9 +578,7 @@ impl TransactionManager {
         let store = self.mvcc.entry(table_id).or_insert_with(MvccStore::new);
         // 用空 Vec 表示删除（tombstone）
         if !store.write(rowid, Vec::new(), txn_id, write_ts) {
-            return Err(TxnError::WriteConflict(
-                format!("Write conflict on table {} row {}", table_id, rowid)
-            ).into());
+            return Err(TxnError::WriteConflict(format!("Write conflict on table {} row {}", table_id, rowid)).into());
         }
 
         let ctx = self.txns.get_mut(&txn_id).unwrap();
@@ -612,7 +608,7 @@ impl TransactionManager {
     pub fn active_count(&self) -> usize {
         self.active_table.active_count()
     }
-    
+
     /// 检查事务管理器是否就绪（用于防御性检查）
     ///
     /// 当 enable_transaction=true 时，executor 会检查此方法
@@ -620,7 +616,7 @@ impl TransactionManager {
     pub fn is_ready(&self) -> bool {
         // WAL 已初始化即表示事务管理器就绪
         // current_lsn 为 0 时表示尚未写入任何记录，但 WAL 本身已初始化
-        self.wal.current_lsn() >= 0  // 始终为 true（WAL 创建时即初始化）
+        self.wal.current_lsn() >= 0 // 始终为 true（WAL 创建时即初始化）
     }
 
     /// 获取当前 WAL LSN
@@ -669,7 +665,8 @@ impl TransactionManager {
         // 写入 Checkpoint 记录
         let checkpoint_lsn = self.wal.current_lsn();
         let payload = super::super::wal::make_checkpoint_payload(checkpoint_lsn);
-        self.wal.write_record(WalRecordType::Checkpoint, 0, 0, EngineType::Columnar, &payload)?;
+        self.wal
+            .write_record(WalRecordType::Checkpoint, 0, 0, EngineType::Columnar, &payload)?;
         self.wal.sync()?;
 
         // 截断 WAL（保留 Checkpoint 之后的部分）
@@ -682,8 +679,7 @@ impl TransactionManager {
 
     /// 垃圾回收旧版本
     pub fn gc_old_versions(&mut self) {
-        let oldest_ts = self.active_table.oldest_start_ts()
-            .unwrap_or(self.active_table.current_ts());
+        let oldest_ts = self.active_table.oldest_start_ts().unwrap_or(self.active_table.current_ts());
 
         for store in self.mvcc.values_mut() {
             store.gc(oldest_ts);
@@ -708,13 +704,10 @@ impl TransactionManager {
     // --- 内部方法 ---
 
     fn ensure_active(&self, txn_id: TxnId) -> Result<()> {
-        let ctx = self.txns.get(&txn_id)
-            .ok_or_else(|| TxnError::NotFound(txn_id))?;
+        let ctx = self.txns.get(&txn_id).ok_or_else(|| TxnError::NotFound(txn_id))?;
 
         if ctx.state != TxnState::Active {
-            return Err(TxnError::InvalidState(
-                format!("Transaction {} is not active", txn_id)
-            ).into());
+            return Err(TxnError::InvalidState(format!("Transaction {} is not active", txn_id)).into());
         }
 
         Ok(())
@@ -768,9 +761,8 @@ fn merge_insert_batches(ops: Vec<ApplyOp>) -> Vec<ApplyOp> {
                 ApplyOp::Insert { row_id, .. } => *row_id,
                 _ => unreachable!(),
             };
-            let contiguous = (0..run_len).all(|k| {
-                matches!(&ops[i + k], ApplyOp::Insert { row_id, .. } if *row_id == base_row_id + k as u64)
-            });
+            let contiguous = (0..run_len)
+                .all(|k| matches!(&ops[i + k], ApplyOp::Insert { row_id, .. } if *row_id == base_row_id + k as u64));
 
             if contiguous {
                 // 行 → 列转置（首行列数决定列数）
@@ -815,7 +807,8 @@ mod tests {
     fn setup_manager(name: &str) -> (TransactionManager, String) {
         let mut p = std::env::temp_dir();
         let tid = format!("{:?}", std::thread::current().id())
-            .replace('(', "_").replace(')', "")
+            .replace('(', "_")
+            .replace(')', "")
             .replace([':', ' '], "_");
         p.push(format!("engramdb_txn_{}_{}_{}.hdb", name, std::process::id(), tid));
         let tmp = p.to_string_lossy().to_string();
@@ -968,14 +961,30 @@ mod tests {
     #[test]
     fn test_merge_insert_batches_contiguous() {
         let ops = vec![
-            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0), Value::Varchar("a".into())] },
-            ApplyOp::Insert { table_id: 1, row_id: 1, row: vec![Value::Int64(1), Value::Varchar("b".into())] },
-            ApplyOp::Insert { table_id: 1, row_id: 2, row: vec![Value::Int64(2), Value::Varchar("c".into())] },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 0,
+                row: vec![Value::Int64(0), Value::Varchar("a".into())],
+            },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 1,
+                row: vec![Value::Int64(1), Value::Varchar("b".into())],
+            },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 2,
+                row: vec![Value::Int64(2), Value::Varchar("c".into())],
+            },
         ];
         let merged = merge_insert_batches(ops);
         assert_eq!(merged.len(), 1);
         match &merged[0] {
-            ApplyOp::InsertBatch { table_id, base_row_id, columns } => {
+            ApplyOp::InsertBatch {
+                table_id,
+                base_row_id,
+                columns,
+            } => {
                 assert_eq!(*table_id, 1);
                 assert_eq!(*base_row_id, 0);
                 assert_eq!(columns.len(), 2); // 2 列
@@ -991,10 +1000,26 @@ mod tests {
     fn test_merge_insert_batches_keeps_update() {
         // Insert + Update 混合：Update 打断合并
         let ops = vec![
-            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0)] },
-            ApplyOp::Insert { table_id: 1, row_id: 1, row: vec![Value::Int64(1)] },
-            ApplyOp::Update { table_id: 1, row_id: 0, new_row: vec![Value::Int64(99)] },
-            ApplyOp::Insert { table_id: 1, row_id: 2, row: vec![Value::Int64(2)] },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 0,
+                row: vec![Value::Int64(0)],
+            },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 1,
+                row: vec![Value::Int64(1)],
+            },
+            ApplyOp::Update {
+                table_id: 1,
+                row_id: 0,
+                new_row: vec![Value::Int64(99)],
+            },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 2,
+                row: vec![Value::Int64(2)],
+            },
         ];
         let merged = merge_insert_batches(ops);
         // 前 2 个 Insert 合并为 1 个 InsertBatch；Update 保留；最后一个 Insert 单条
@@ -1008,8 +1033,16 @@ mod tests {
     fn test_merge_insert_batches_non_contiguous_rowids() {
         // 同表但 rowid 不连续：不合并
         let ops = vec![
-            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0)] },
-            ApplyOp::Insert { table_id: 1, row_id: 5, row: vec![Value::Int64(5)] },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 0,
+                row: vec![Value::Int64(0)],
+            },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 5,
+                row: vec![Value::Int64(5)],
+            },
         ];
         let merged = merge_insert_batches(ops);
         assert_eq!(merged.len(), 2);
@@ -1021,10 +1054,26 @@ mod tests {
     fn test_merge_insert_batches_multi_table() {
         // 跨表交替插入：各表独立合并
         let ops = vec![
-            ApplyOp::Insert { table_id: 1, row_id: 0, row: vec![Value::Int64(0)] },
-            ApplyOp::Insert { table_id: 1, row_id: 1, row: vec![Value::Int64(1)] },
-            ApplyOp::Insert { table_id: 2, row_id: 0, row: vec![Value::Int64(10)] },
-            ApplyOp::Insert { table_id: 2, row_id: 1, row: vec![Value::Int64(11)] },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 0,
+                row: vec![Value::Int64(0)],
+            },
+            ApplyOp::Insert {
+                table_id: 1,
+                row_id: 1,
+                row: vec![Value::Int64(1)],
+            },
+            ApplyOp::Insert {
+                table_id: 2,
+                row_id: 0,
+                row: vec![Value::Int64(10)],
+            },
+            ApplyOp::Insert {
+                table_id: 2,
+                row_id: 1,
+                row: vec![Value::Int64(11)],
+            },
         ];
         let merged = merge_insert_batches(ops);
         assert_eq!(merged.len(), 2);
@@ -1095,7 +1144,8 @@ mod tests {
 
         // 更新
         let txn2 = mgr.begin(IsolationLevel::SnapshotIsolation).unwrap();
-        mgr.update(txn2, table_id, 1, vec![Value::Int64(100)], vec![Value::Int64(200)]).unwrap();
+        mgr.update(txn2, table_id, 1, vec![Value::Int64(100)], vec![Value::Int64(200)])
+            .unwrap();
         mgr.commit(txn2).unwrap();
 
         // 读取更新后的值

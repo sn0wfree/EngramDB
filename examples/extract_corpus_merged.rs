@@ -65,11 +65,8 @@ fn main() {
     assert!(!db_path.is_empty() && !out_dir.is_empty());
     let _ = worker_id;
 
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("open db");
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect("open db");
 
     // rowid 范围均分
     let (lo, hi): (i64, i64) = conn

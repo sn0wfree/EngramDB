@@ -11,9 +11,9 @@
 //! - 内存友好（节点大小可变，无内部浪费）
 //! - 并发性能更好（锁粒度更细）
 
-use crate::Value;
-use crate::common::error::{Result, EngramDbError};
+use crate::common::error::{EngramDbError, Result};
 use crate::common::value_cmp::total_cmp;
+use crate::Value;
 use rand::Rng;
 use std::cmp::Ordering;
 
@@ -116,8 +116,13 @@ impl SkipListIndex {
     ///
     /// included_values 长度必须等于 num_included。
     pub fn insert_with_included(&mut self, key: Value, row_id: u32, included_values: &[Value]) -> bool {
-        debug_assert_eq!(included_values.len(), self.num_included,
-            "included_values length mismatch: expected {}, got {}", self.num_included, included_values.len());
+        debug_assert_eq!(
+            included_values.len(),
+            self.num_included,
+            "included_values length mismatch: expected {}, got {}",
+            self.num_included,
+            included_values.len()
+        );
 
         let mut update = vec![0usize; MAX_LEVEL as usize];
         let mut x = 0;
@@ -182,9 +187,7 @@ impl SkipListIndex {
 
     /// 点查询：查找 key 对应的行号（兼容旧 API）
     pub fn get(&self, key: &Value) -> Option<Vec<u32>> {
-        self.get_entries(key).map(|entries| {
-            entries.iter().map(|e| e.row_id).collect()
-        })
+        self.get_entries(key).map(|entries| entries.iter().map(|e| e.row_id).collect())
     }
 
     /// 点查询：返回条目列表（含覆盖列值）
@@ -203,9 +206,7 @@ impl SkipListIndex {
         }
 
         match self.nodes[x].forward[0] {
-            Some(next) if &self.nodes[next].key == key => {
-                Some(&self.nodes[next].entries)
-            }
+            Some(next) if &self.nodes[next].key == key => Some(&self.nodes[next].entries),
             _ => None,
         }
     }
@@ -311,9 +312,8 @@ impl SkipListIndex {
 
     /// 大于等于 key 的第一个值（兼容旧 API，返回 key 和行 ID 列表）
     pub fn lower_bound(&self, key: &Value) -> Option<(&Value, Vec<u32>)> {
-        self.lower_bound_entries(key).map(|(k, entries)| {
-            (k, entries.iter().map(|e| e.row_id).collect())
-        })
+        self.lower_bound_entries(key)
+            .map(|(k, entries)| (k, entries.iter().map(|e| e.row_id).collect()))
     }
 
     /// 大于等于 key 的第一个值（返回条目切片，含覆盖列）
@@ -629,7 +629,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated int32 value".into()));
             }
-            let i = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            let i = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
             Value::Int32(i)
         }
@@ -637,7 +637,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 8 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated int64 value".into()));
             }
-            let i = i64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+            let i = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             offset += 8;
             Value::Int64(i)
         }
@@ -645,7 +645,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 8 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated float64 value".into()));
             }
-            let f = f64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+            let f = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             offset += 8;
             Value::Float64(f)
         }
@@ -653,7 +653,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated float32 value".into()));
             }
-            let f = f32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            let f = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
             Value::Float32(f)
         }
@@ -661,12 +661,12 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated varchar length".into()));
             }
-            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated varchar data".into()));
             }
-            let s = String::from_utf8(data[offset..offset+len].to_vec())
+            let s = String::from_utf8(data[offset..offset + len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
             offset += len;
             Value::Varchar(s)
@@ -675,12 +675,12 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated json length".into()));
             }
-            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated json data".into()));
             }
-            let s = String::from_utf8(data[offset..offset+len].to_vec())
+            let s = String::from_utf8(data[offset..offset + len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
             offset += len;
             Value::Json(s)
@@ -689,7 +689,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated vector dim".into()));
             }
-            let dim = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let dim = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             let byte_len = dim * 4;
             if offset + byte_len > data.len() {
@@ -698,7 +698,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             let mut vec = Vec::with_capacity(dim);
             for i in 0..dim {
                 let start = offset + i * 4;
-                let f = f32::from_le_bytes(data[start..start+4].try_into().unwrap());
+                let f = f32::from_le_bytes(data[start..start + 4].try_into().unwrap());
                 vec.push(f);
             }
             offset += byte_len;
@@ -708,7 +708,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated vector_int8 dim".into()));
             }
-            let dim = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let dim = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + dim > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated vector_int8 data".into()));
@@ -724,12 +724,12 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated blob length".into()));
             }
-            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated blob data".into()));
             }
-            let blob = data[offset..offset+len].to_vec();
+            let blob = data[offset..offset + len].to_vec();
             offset += len;
             Value::Blob(blob)
         }
@@ -737,7 +737,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 8 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated timestamp value".into()));
             }
-            let t = i64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+            let t = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             offset += 8;
             Value::Timestamp(t)
         }
@@ -746,12 +746,12 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated jsonb length".into()));
             }
-            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated jsonb data".into()));
             }
-            let s = String::from_utf8(data[offset..offset+len].to_vec())
+            let s = String::from_utf8(data[offset..offset + len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
             offset += len;
             Value::Jsonb(s)
@@ -760,7 +760,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated date value".into()));
             }
-            let d = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            let d = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
             Value::Date(d)
         }
@@ -768,7 +768,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated time value".into()));
             }
-            let t = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            let t = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
             Value::Time(t)
         }
@@ -776,7 +776,7 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 16 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated uuid value".into()));
             }
-            let u = u128::from_le_bytes(data[offset..offset+16].try_into().unwrap());
+            let u = u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap());
             offset += 16;
             Value::Uuid(u)
         }
@@ -784,12 +784,12 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated array length".into()));
             }
-            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated array data".into()));
             }
-            let json_str = String::from_utf8(data[offset..offset+len].to_vec())
+            let json_str = String::from_utf8(data[offset..offset + len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
             offset += len;
             let items = serde_json::from_str(&json_str)
@@ -800,12 +800,12 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated enum length".into()));
             }
-            let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + len > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated enum data".into()));
             }
-            let s = String::from_utf8(data[offset..offset+len].to_vec())
+            let s = String::from_utf8(data[offset..offset + len].to_vec())
                 .map_err(|e| EngramDbError::InvalidFormat(format!("invalid utf8: {}", e)))?;
             offset += len;
             Value::Enum(s)
@@ -890,9 +890,7 @@ impl SkipListIndex {
 
         // 校验魔数
         if &data[..8] != INDEX_MAGIC {
-            return Err(EngramDbError::InvalidFormat(
-                "invalid index magic number".into()
-            ));
+            return Err(EngramDbError::InvalidFormat("invalid index magic number".into()));
         }
         let mut offset = 8;
 
@@ -908,14 +906,14 @@ impl SkipListIndex {
         if offset + 4 > data.len() {
             return Err(EngramDbError::InvalidFormat("truncated num_included".into()));
         }
-        let num_included = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        let num_included = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         // key_count
         if offset + 4 > data.len() {
             return Err(EngramDbError::InvalidFormat("truncated key_count".into()));
         }
-        let key_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+        let key_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         // 构建跳表
@@ -930,7 +928,7 @@ impl SkipListIndex {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated entry_count".into()));
             }
-            let entry_count = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let entry_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
             for _ in 0..entry_count {
@@ -938,7 +936,7 @@ impl SkipListIndex {
                 if offset + 4 > data.len() {
                     return Err(EngramDbError::InvalidFormat("truncated row_id".into()));
                 }
-                let row_id = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+                let row_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                 offset += 4;
 
                 // included values
@@ -1075,8 +1073,12 @@ mod tests {
         sl.insert(Value::Int64(10), 1);
         sl.insert(Value::Int64(20), 2);
 
-        let keys: Vec<i64> = sl.iter()
-            .map(|(k, _)| match k { Value::Int64(v) => *v, _ => 0 })
+        let keys: Vec<i64> = sl
+            .iter()
+            .map(|(k, _)| match k {
+                Value::Int64(v) => *v,
+                _ => 0,
+            })
             .collect();
         assert_eq!(keys, vec![10, 20, 30]);
     }
@@ -1088,8 +1090,12 @@ mod tests {
         sl.insert(Value::Varchar("apple".into()), 1);
         sl.insert(Value::Varchar("cherry".into()), 3);
 
-        let keys: Vec<String> = sl.iter()
-            .map(|(k, _)| match k { Value::Varchar(v) => v.clone(), _ => String::new() })
+        let keys: Vec<String> = sl
+            .iter()
+            .map(|(k, _)| match k {
+                Value::Varchar(v) => v.clone(),
+                _ => String::new(),
+            })
             .collect();
         assert_eq!(keys, vec!["apple", "banana", "cherry"]);
     }
@@ -1100,8 +1106,12 @@ mod tests {
         sl.insert(Value::Boolean(true), 1);
         sl.insert(Value::Boolean(false), 0);
 
-        let keys: Vec<bool> = sl.iter()
-            .map(|(k, _)| match k { Value::Boolean(v) => *v, _ => false })
+        let keys: Vec<bool> = sl
+            .iter()
+            .map(|(k, _)| match k {
+                Value::Boolean(v) => *v,
+                _ => false,
+            })
             .collect();
         assert_eq!(keys, vec![false, true]);
     }
@@ -1150,16 +1160,19 @@ mod tests {
         assert_eq!(sl.num_included(), 2);
 
         sl.insert_with_included(
-            Value::Varchar("session_1".into()), 100,
-            &[Value::Int64(1000), Value::Varchar("user".into())]
+            Value::Varchar("session_1".into()),
+            100,
+            &[Value::Int64(1000), Value::Varchar("user".into())],
         );
         sl.insert_with_included(
-            Value::Varchar("session_1".into()), 101,
-            &[Value::Int64(2000), Value::Varchar("assistant".into())]
+            Value::Varchar("session_1".into()),
+            101,
+            &[Value::Int64(2000), Value::Varchar("assistant".into())],
         );
         sl.insert_with_included(
-            Value::Varchar("session_2".into()), 200,
-            &[Value::Int64(3000), Value::Varchar("user".into())]
+            Value::Varchar("session_2".into()),
+            200,
+            &[Value::Int64(3000), Value::Varchar("user".into())],
         );
 
         let entries = sl.get_entries(&Value::Varchar("session_1".into())).unwrap();
@@ -1177,10 +1190,7 @@ mod tests {
         let mut sl = SkipListIndex::with_included(false, 1);
 
         for i in 0..5u32 {
-            sl.insert_with_included(
-                Value::Int64(i as i64 * 10), i,
-                &[Value::Int64(i as i64 * 100)]
-            );
+            sl.insert_with_included(Value::Int64(i as i64 * 10), i, &[Value::Int64(i as i64 * 100)]);
         }
 
         let entries = sl.range_entries(&Value::Int64(10), &Value::Int64(30));
@@ -1359,8 +1369,12 @@ mod tests {
         let bytes = sl.to_bytes();
         let restored = SkipListIndex::from_bytes(&bytes).unwrap();
 
-        let keys: Vec<String> = restored.iter()
-            .map(|(k, _)| match k { Value::Varchar(v) => v.clone(), _ => String::new() })
+        let keys: Vec<String> = restored
+            .iter()
+            .map(|(k, _)| match k {
+                Value::Varchar(v) => v.clone(),
+                _ => String::new(),
+            })
             .collect();
         assert_eq!(keys, vec!["apple", "banana", "cherry"]);
     }
@@ -1369,16 +1383,19 @@ mod tests {
     fn test_serialize_covering_index() {
         let mut sl = SkipListIndex::with_included(false, 2);
         sl.insert_with_included(
-            Value::Varchar("session_1".into()), 100,
-            &[Value::Int64(1000), Value::Varchar("user".into())]
+            Value::Varchar("session_1".into()),
+            100,
+            &[Value::Int64(1000), Value::Varchar("user".into())],
         );
         sl.insert_with_included(
-            Value::Varchar("session_1".into()), 101,
-            &[Value::Int64(2000), Value::Varchar("assistant".into())]
+            Value::Varchar("session_1".into()),
+            101,
+            &[Value::Int64(2000), Value::Varchar("assistant".into())],
         );
         sl.insert_with_included(
-            Value::Varchar("session_2".into()), 200,
-            &[Value::Int64(3000), Value::Varchar("user".into())]
+            Value::Varchar("session_2".into()),
+            200,
+            &[Value::Int64(3000), Value::Varchar("user".into())],
         );
 
         let bytes = sl.to_bytes();
@@ -1441,8 +1458,12 @@ mod tests {
         assert_eq!(rows, vec![100]);
 
         // 验证顺序
-        let keys: Vec<f64> = restored.iter()
-            .map(|(k, _)| match k { Value::Float64(v) => *v, _ => 0.0 })
+        let keys: Vec<f64> = restored
+            .iter()
+            .map(|(k, _)| match k {
+                Value::Float64(v) => *v,
+                _ => 0.0,
+            })
             .collect();
         assert_eq!(keys, vec![1.414, 2.718, 3.14]);
     }
@@ -1451,8 +1472,9 @@ mod tests {
     fn test_serialize_json_and_vector() {
         let mut sl = SkipListIndex::with_included(false, 1);
         sl.insert_with_included(
-            Value::Json(r#"{"key":"value"}"#.into()), 1,
-            &[Value::Vector(vec![1.0, 2.0, 3.0])]
+            Value::Json(r#"{"key":"value"}"#.into()),
+            1,
+            &[Value::Vector(vec![1.0, 2.0, 3.0])],
         );
 
         let bytes = sl.to_bytes();

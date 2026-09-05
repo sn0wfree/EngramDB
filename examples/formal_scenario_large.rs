@@ -59,20 +59,24 @@ fn build_rows(corpus: &[String], scale: usize) -> Vec<(i64, i64, String)> {
         }
     }
     // 2. 独立消息（语料循环 × scale，相位偏移避免与流式重复）
-    for (i, t) in corpus
-        .iter()
-        .cycle()
-        .skip(97)
-        .take(independent)
-        .enumerate()
-    {
+    for (i, t) in corpus.iter().cycle().skip(97).take(independent).enumerate() {
         rows.push((STREAM_SESSIONS as i64 + 1, i as i64, t.clone()));
     }
     rows
 }
 
 /// 运行一臂，返回 (磁盘大小, 插入耗时, checkpoint 耗时, 读回校验结果)
-fn run_arm(tag: &str, dir: &str, corpus: &[String], scale: usize, tokenizer: Option<&str>, compress: bool, td_enabled: bool, entropy: TokenDeltaEntropy, with_fts: bool) -> (u64, u128, u128, bool) {
+fn run_arm(
+    tag: &str,
+    dir: &str,
+    corpus: &[String],
+    scale: usize,
+    tokenizer: Option<&str>,
+    compress: bool,
+    td_enabled: bool,
+    entropy: TokenDeltaEntropy,
+    with_fts: bool,
+) -> (u64, u128, u128, bool) {
     let _ = std::fs::remove_file(dir);
     let _ = std::fs::remove_file(format!("{dir}-wal"));
     let mut cfg = Config::default();
@@ -112,7 +116,10 @@ fn run_arm(tag: &str, dir: &str, corpus: &[String], scale: usize, tokenizer: Opt
         ]);
         expect.push((*sid, *seq, content.clone()));
         if batch.len() >= 2048 {
-            db.get_table_mut("session_log").unwrap().insert(std::mem::take(&mut batch)).unwrap();
+            db.get_table_mut("session_log")
+                .unwrap()
+                .insert(std::mem::take(&mut batch))
+                .unwrap();
         }
     }
     if !batch.is_empty() {
@@ -136,12 +143,25 @@ fn run_arm(tag: &str, dir: &str, corpus: &[String], scale: usize, tokenizer: Opt
     let mut ok = scan.len() == expect.len();
     if ok {
         for (idx, (row, (exp_sid, exp_seq, exp_content))) in scan.iter().zip(expect.iter()).enumerate() {
-            let sid = match &row[0] { Value::Int64(v) => *v, _ => i64::MIN };
-            let seq = match &row[1] { Value::Int64(v) => *v, _ => i64::MIN };
-            let content = match &row[2] { Value::Varchar(s) => s.as_str(), _ => "" };
+            let sid = match &row[0] {
+                Value::Int64(v) => *v,
+                _ => i64::MIN,
+            };
+            let seq = match &row[1] {
+                Value::Int64(v) => *v,
+                _ => i64::MIN,
+            };
+            let content = match &row[2] {
+                Value::Varchar(s) => s.as_str(),
+                _ => "",
+            };
             if sid != *exp_sid || seq != *exp_seq || content != exp_content {
                 ok = false;
-                println!("  ⚠ 首个不一致 @ 行 {idx}: sid={exp_sid} seq={exp_seq} expect len={} got len={}", exp_content.len(), content.len());
+                println!(
+                    "  ⚠ 首个不一致 @ 行 {idx}: sid={exp_sid} seq={exp_seq} expect len={} got len={}",
+                    exp_content.len(),
+                    content.len()
+                );
                 break;
             }
         }
@@ -164,8 +184,12 @@ fn run_arm(tag: &str, dir: &str, corpus: &[String], scale: usize, tokenizer: Opt
 }
 
 fn main() {
-    let corpus_path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/engram_corpus/full_corpus.jsonl".into());
-    let vocab_path = std::env::args().nth(2).unwrap_or_else(|| "data/vocab/engram_vocab_v1.bin".into());
+    let corpus_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/engram_corpus/full_corpus.jsonl".into());
+    let vocab_path = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "data/vocab/engram_vocab_v1.bin".into());
     let scale: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(2);
     let corpus = load_corpus(&corpus_path);
     assert!(!corpus.is_empty(), "语料为空");
@@ -183,18 +207,80 @@ fn main() {
     );
     println!();
 
-    let (a_size, a_i, a_c, a_ok) = run_arm("A 裸存          ", "/tmp/formal_large_a", &corpus, scale, None, false, false, TokenDeltaEntropy::Varint, false);
-    let (b_size, b_i, b_c, b_ok) = run_arm("B zstd-3        ", "/tmp/formal_large_b", &corpus, scale, None, true, false, TokenDeltaEntropy::Varint, false);
-    let (v_size, v_i, v_c, v_ok) = run_arm("C1 TD+Varint    ", "/tmp/formal_large_c1", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Varint, false);
-    let (s_size, s_i, s_c, s_ok) = run_arm("C2 TD+Static    ", "/tmp/formal_large_c2", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Static, false);
-    let (h_size, h_i, h_c, h_ok) = run_arm("C3 TD+Huffman   ", "/tmp/formal_large_c3", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Huffman, false);
-    let (d_size, d_i, d_c, d_ok) = run_arm("D TD+FTS(缓存共享)", "/tmp/formal_large_d", &corpus, scale, Some(&vocab_path), true, true, TokenDeltaEntropy::Static, true);
+    let (a_size, a_i, a_c, a_ok) = run_arm(
+        "A 裸存          ",
+        "/tmp/formal_large_a",
+        &corpus,
+        scale,
+        None,
+        false,
+        false,
+        TokenDeltaEntropy::Varint,
+        false,
+    );
+    let (b_size, b_i, b_c, b_ok) = run_arm(
+        "B zstd-3        ",
+        "/tmp/formal_large_b",
+        &corpus,
+        scale,
+        None,
+        true,
+        false,
+        TokenDeltaEntropy::Varint,
+        false,
+    );
+    let (v_size, v_i, v_c, v_ok) = run_arm(
+        "C1 TD+Varint    ",
+        "/tmp/formal_large_c1",
+        &corpus,
+        scale,
+        Some(&vocab_path),
+        true,
+        true,
+        TokenDeltaEntropy::Varint,
+        false,
+    );
+    let (s_size, s_i, s_c, s_ok) = run_arm(
+        "C2 TD+Static    ",
+        "/tmp/formal_large_c2",
+        &corpus,
+        scale,
+        Some(&vocab_path),
+        true,
+        true,
+        TokenDeltaEntropy::Static,
+        false,
+    );
+    let (h_size, h_i, h_c, h_ok) = run_arm(
+        "C3 TD+Huffman   ",
+        "/tmp/formal_large_c3",
+        &corpus,
+        scale,
+        Some(&vocab_path),
+        true,
+        true,
+        TokenDeltaEntropy::Huffman,
+        false,
+    );
+    let (d_size, d_i, d_c, d_ok) = run_arm(
+        "D TD+FTS(缓存共享)",
+        "/tmp/formal_large_d",
+        &corpus,
+        scale,
+        Some(&vocab_path),
+        true,
+        true,
+        TokenDeltaEntropy::Static,
+        true,
+    );
 
     println!("\n==== 对比 ====");
-    println!("磁盘：B/A = {:.2}x，C2(Static)/A = {:.2}x，B/C2 = {:.2}x",
+    println!(
+        "磁盘：B/A = {:.2}x，C2(Static)/A = {:.2}x，B/C2 = {:.2}x",
         a_size as f64 / b_size.max(1) as f64,
         a_size as f64 / s_size.max(1) as f64,
-        b_size as f64 / s_size.max(1) as f64);
+        b_size as f64 / s_size.max(1) as f64
+    );
     println!("压缩率（vs 原文）：A {:.1}x / B {:.1}x / C1(Varint) {:.1}x / C2(Static) {:.1}x / C3(Huffman) {:.1}x / D(FTS缓存) {:.1}x（D 磁盘含 FTS 索引段）",
         text_bytes as f64 / a_size.max(1) as f64,
         text_bytes as f64 / b_size.max(1) as f64,
@@ -202,13 +288,34 @@ fn main() {
         text_bytes as f64 / s_size.max(1) as f64,
         text_bytes as f64 / h_size.max(1) as f64,
         text_bytes as f64 / d_size.max(1) as f64);
-    println!("插入耗时：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s / D {:.2}s",
-        a_i as f64 / 1e6, b_i as f64 / 1e6, v_i as f64 / 1e6, s_i as f64 / 1e6, h_i as f64 / 1e6, d_i as f64 / 1e6);
-    println!("checkpoint：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s / D(FTS缓存) {:.2}s",
-        a_c as f64 / 1e6, b_c as f64 / 1e6, v_c as f64 / 1e6, s_c as f64 / 1e6, h_c as f64 / 1e6, d_c as f64 / 1e6);
+    println!(
+        "插入耗时：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s / D {:.2}s",
+        a_i as f64 / 1e6,
+        b_i as f64 / 1e6,
+        v_i as f64 / 1e6,
+        s_i as f64 / 1e6,
+        h_i as f64 / 1e6,
+        d_i as f64 / 1e6
+    );
+    println!(
+        "checkpoint：A {:.2}s / B {:.2}s / C1 {:.2}s / C2 {:.2}s / C3 {:.2}s / D(FTS缓存) {:.2}s",
+        a_c as f64 / 1e6,
+        b_c as f64 / 1e6,
+        v_c as f64 / 1e6,
+        s_c as f64 / 1e6,
+        h_c as f64 / 1e6,
+        d_c as f64 / 1e6
+    );
     assert!(a_ok && b_ok && v_ok && s_ok && h_ok && d_ok, "存在数据不一致");
     println!("数据完整性：六臂全部逐行一致 ✓");
-    for d in ["/tmp/formal_large_a", "/tmp/formal_large_b", "/tmp/formal_large_c1", "/tmp/formal_large_c2", "/tmp/formal_large_c3", "/tmp/formal_large_d"] {
+    for d in [
+        "/tmp/formal_large_a",
+        "/tmp/formal_large_b",
+        "/tmp/formal_large_c1",
+        "/tmp/formal_large_c2",
+        "/tmp/formal_large_c3",
+        "/tmp/formal_large_d",
+    ] {
         let _ = std::fs::remove_file(d);
         let _ = std::fs::remove_file(format!("{d}-wal"));
     }

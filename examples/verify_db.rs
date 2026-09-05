@@ -31,13 +31,16 @@ fn main() {
     for r in &rows {
         c0.execute(&format!("INSERT INTO log VALUES {r}")).unwrap();
     }
-    
+
     let size_plain = dir_size(dir_a);
     drop(c0); // checkpoint
-    // 段 1 重开读回（验证无 TokenDelta 路径数据完整性）
+              // 段 1 重开读回（验证无 TokenDelta 路径数据完整性）
     let mut d0 = Connection::open(dir_a).unwrap();
     let r0 = d0.execute("SELECT COUNT(*) FROM log").unwrap();
-    let n0 = match &r0.rows[0][0] { engramdb::Value::Int64(v) => *v, _ => -1 };
+    let n0 = match &r0.rows[0][0] {
+        engramdb::Value::Int64(v) => *v,
+        _ => -1,
+    };
     println!("plain 重开 COUNT = {n0}");
     drop(d0);
 
@@ -50,7 +53,7 @@ fn main() {
     for r in &rows {
         c1.execute(&format!("INSERT INTO log VALUES {r}")).unwrap();
     }
-    
+
     let size_td = dir_size(dir_b);
 
     // 读回验证（压缩开启的库）
@@ -59,11 +62,20 @@ fn main() {
     cfg3.tokenizer_path = Some("data/vocab/engram_vocab_v1.bin".into());
     let mut c1 = Connection::open_with_config(dir_b, cfg3).unwrap();
     let result = c1.execute("SELECT COUNT(*) FROM log").unwrap();
-    let n = match &result.rows[0][0] { engramdb::Value::Int64(v) => *v, _ => -1 };
+    let n = match &result.rows[0][0] {
+        engramdb::Value::Int64(v) => *v,
+        _ => -1,
+    };
     let result = c1.execute("SELECT msg FROM log WHERE id = 400").unwrap();
-    let msg400 = match &result.rows[0][0] { engramdb::Value::Varchar(v) => v.clone(), _ => String::new() };
+    let msg400 = match &result.rows[0][0] {
+        engramdb::Value::Varchar(v) => v.clone(),
+        _ => String::new(),
+    };
     let result = c1.execute("SELECT msg FROM log WHERE id = 1").unwrap();
-    let msg1 = match &result.rows[0][0] { engramdb::Value::Varchar(v) => v.clone(), _ => String::new() };
+    let msg1 = match &result.rows[0][0] {
+        engramdb::Value::Varchar(v) => v.clone(),
+        _ => String::new(),
+    };
     let exp400 = base[..base
         .char_indices()
         .nth(400 * char_count / 800)

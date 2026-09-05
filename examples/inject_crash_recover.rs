@@ -11,8 +11,11 @@ use std::env;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let path = args.windows(2).find(|w| w[0] == "--path")
-        .map(|w| w[1].clone()).expect("--path required");
+    let path = args
+        .windows(2)
+        .find(|w| w[0] == "--path")
+        .map(|w| w[1].clone())
+        .expect("--path required");
 
     let conn_result = engramdb::Connection::open(&path);
     match conn_result {

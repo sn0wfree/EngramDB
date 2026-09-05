@@ -98,10 +98,12 @@ fn test_tier_migration_mixed_tables() {
 
     let mut conn = Connection::open(path).unwrap();
     // Auto 高频小表
-    conn.execute("CREATE TABLE hot_auto (id INT64 PRIMARY KEY) ENGINE = Auto").unwrap();
+    conn.execute("CREATE TABLE hot_auto (id INT64 PRIMARY KEY) ENGINE = Auto")
+        .unwrap();
     conn.execute("INSERT INTO hot_auto VALUES (1)").unwrap();
     // Auto 冷大表
-    conn.execute("CREATE TABLE cold_auto (id INT64 PRIMARY KEY) ENGINE = Auto").unwrap();
+    conn.execute("CREATE TABLE cold_auto (id INT64 PRIMARY KEY) ENGINE = Auto")
+        .unwrap();
     {
         let id = conn.database_mut().table_id_by_name("cold_auto").unwrap();
         let table = conn.database_mut().get_engine_table_mut_by_id(id).unwrap();
@@ -110,7 +112,8 @@ fn test_tier_migration_mixed_tables() {
         }
     }
     // Auto 温表（无访问 + 中等大小）
-    conn.execute("CREATE TABLE warm_auto (id INT64 PRIMARY KEY) ENGINE = Auto").unwrap();
+    conn.execute("CREATE TABLE warm_auto (id INT64 PRIMARY KEY) ENGINE = Auto")
+        .unwrap();
     conn.execute("INSERT INTO warm_auto VALUES (1), (2), (3)").unwrap();
     {
         let id = conn.database_mut().table_id_by_name("warm_auto").unwrap();
@@ -120,7 +123,8 @@ fn test_tier_migration_mixed_tables() {
         }
     }
     // 显式 Columnar 不应迁移
-    conn.execute("CREATE TABLE fixed_col (id INT64 PRIMARY KEY) ENGINE = Columnar").unwrap();
+    conn.execute("CREATE TABLE fixed_col (id INT64 PRIMARY KEY) ENGINE = Columnar")
+        .unwrap();
 
     // 给 hot_auto 大量访问
     let hot_id = conn.database_mut().table_id_by_name("hot_auto").unwrap();

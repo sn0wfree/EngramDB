@@ -126,7 +126,11 @@ pub fn segment(text: &str) -> Vec<Piece> {
             }
             Some(cur) => {
                 if cur != class {
-                    pieces.push(Piece { start, end: byte_idx, class: cur });
+                    pieces.push(Piece {
+                        start,
+                        end: byte_idx,
+                        class: cur,
+                    });
                     start = byte_idx;
                     start_class = Some(class);
                 }
@@ -135,7 +139,11 @@ pub fn segment(text: &str) -> Vec<Piece> {
         current = next;
     }
     if let Some(class) = start_class {
-        pieces.push(Piece { start, end: text.len(), class });
+        pieces.push(Piece {
+            start,
+            end: text.len(),
+            class,
+        });
     }
     pieces
 }
@@ -267,21 +275,14 @@ mod tests {
     fn test_segment_digits_punct() {
         let text = "v0.21_alpha-2";
         let pieces = segment(text);
-        let joined: String = pieces
-            .iter()
-            .map(|p| &text[p.start..p.end])
-            .collect::<Vec<_>>()
-            .join("|");
+        let joined: String = pieces.iter().map(|p| &text[p.start..p.end]).collect::<Vec<_>>().join("|");
         assert_eq!(joined, "v|0|.|21|_|alpha|-|2");
     }
 
     #[test]
     fn test_seed_segment() {
         let seeds = vec!["银行".to_string(), "上海".to_string()];
-        let words: Vec<String> = segment_words("上海银行间", &seeds)
-            .into_iter()
-            .map(|(w, _)| w)
-            .collect();
+        let words: Vec<String> = segment_words("上海银行间", &seeds).into_iter().map(|(w, _)| w).collect();
         // 贪心：上海(2) 银行(2) 间(1)
         assert_eq!(words, vec!["上海", "银行", "间"]);
     }

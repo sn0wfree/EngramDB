@@ -13,13 +13,13 @@ pub mod recommender;
 
 pub use recommender::{recommend_for_column, Recommendation};
 
-pub mod rle;
 pub mod bitpacking;
-pub mod dictionary;
-pub mod for_encoding;
 pub mod delta;
-pub mod gorilla;
+pub mod dictionary;
 pub mod double_delta;
+pub mod for_encoding;
+pub mod gorilla;
+pub mod rle;
 pub mod token_delta;
 pub mod token_stream_cache;
 
@@ -84,9 +84,8 @@ pub fn init_tokenizer_from_config(config: &crate::common::config::Config) -> Res
         return Ok(());
     };
     let bytes = std::fs::read(path)?;
-    let tok = Tokenizer::from_bytes(&bytes).map_err(|e| {
-        crate::common::error::EngramDbError::Parse(format!("tokenizer load ({path}): {e}"))
-    })?;
+    let tok = Tokenizer::from_bytes(&bytes)
+        .map_err(|e| crate::common::error::EngramDbError::Parse(format!("tokenizer load ({path}): {e}")))?;
     set_global_tokenizer(Some(tok));
     // set_global_tokenizer 视显式调用为启用意图；config 路径按配置覆盖
     TOKEN_DELTA_ENABLED.store(config.token_delta_enabled, Ordering::Relaxed);
@@ -128,9 +127,7 @@ pub fn compress(data: &[u8], data_type: &DataType) -> Result<(CompressionType, V
         | DataType::VectorInt8 { .. }
         | DataType::Blob
         | DataType::Uuid
-        | DataType::Array { .. } => {
-            Ok((CompressionType::Uncompressed, data.to_vec()))
-        }
+        | DataType::Array { .. } => Ok((CompressionType::Uncompressed, data.to_vec())),
     }
 }
 
@@ -239,7 +236,9 @@ trait IntegerCodec: Sized {
 }
 
 impl IntegerCodec for i32 {
-    fn fixed_size() -> usize { 4 }
+    fn fixed_size() -> usize {
+        4
+    }
 
     fn from_le_bytes(bytes: &[u8]) -> Self {
         i32::from_le_bytes(bytes[..4].try_into().unwrap())
@@ -278,7 +277,9 @@ impl IntegerCodec for i32 {
 }
 
 impl IntegerCodec for i64 {
-    fn fixed_size() -> usize { 8 }
+    fn fixed_size() -> usize {
+        8
+    }
 
     fn from_le_bytes(bytes: &[u8]) -> Self {
         i64::from_le_bytes(bytes[..8].try_into().unwrap())
@@ -315,7 +316,9 @@ impl IntegerCodec for i64 {
 }
 
 impl IntegerCodec for i16 {
-    fn fixed_size() -> usize { 2 }
+    fn fixed_size() -> usize {
+        2
+    }
 
     fn from_le_bytes(bytes: &[u8]) -> Self {
         i16::from_le_bytes(bytes[..2].try_into().unwrap())
@@ -329,7 +332,8 @@ impl IntegerCodec for i16 {
         if data.len() % 2 != 0 {
             return None;
         }
-        let values: Vec<i32> = data.chunks_exact(2)
+        let values: Vec<i32> = data
+            .chunks_exact(2)
             .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as i32)
             .collect();
         let encoded = delta::encode_i32(&values);
@@ -344,7 +348,8 @@ impl IntegerCodec for i16 {
         if data.len() % 2 != 0 {
             return None;
         }
-        let values: Vec<i32> = data.chunks_exact(2)
+        let values: Vec<i32> = data
+            .chunks_exact(2)
             .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as i32)
             .collect();
         let min_val = values.iter().min().copied().unwrap_or(0);
@@ -492,14 +497,14 @@ fn decompress_delta(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> {
     // delta::encode_i32 内部转 i64 编码，decode_i64 可正确解码两者。
     // 关键：输出字节宽度必须匹配列真实类型，否则 deserialize_values 步长错位。
     if let Some(values) = delta::decode_i64(data) {
-    match data_type {
-        DataType::Int32 | DataType::Int16 | DataType::Date | DataType::Time => {
-            // Int32/Int16/Date/Time 列：每值 4 字节
-            Ok(values.iter().flat_map(|v| (*v as i32).to_le_bytes()).collect())
+        match data_type {
+            DataType::Int32 | DataType::Int16 | DataType::Date | DataType::Time => {
+                // Int32/Int16/Date/Time 列：每值 4 字节
+                Ok(values.iter().flat_map(|v| (*v as i32).to_le_bytes()).collect())
+            }
+            // Int64（及其它整数宽度的兜底）：每值 8 字节
+            _ => Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
         }
-        // Int64（及其它整数宽度的兜底）：每值 8 字节
-        _ => Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
-    }
     } else {
         Ok(data.to_vec())
     }
@@ -524,10 +529,7 @@ fn decompress_for_bitpack(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> 
             if uvalues.is_empty() {
                 return Ok(Vec::new());
             }
-            let values: Vec<i16> = uvalues
-                .iter()
-                .map(|&u| (min_val as i64 + u as i64) as i16)
-                .collect();
+            let values: Vec<i16> = uvalues.iter().map(|&u| (min_val as i64 + u as i64) as i16).collect();
             Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
         }
         DataType::Int32 => {
@@ -539,10 +541,7 @@ fn decompress_for_bitpack(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> 
             if uvalues.is_empty() {
                 return Ok(Vec::new());
             }
-            let values: Vec<i32> = uvalues
-                .iter()
-                .map(|&u| (min_val as i64 + u as i64) as i32)
-                .collect();
+            let values: Vec<i32> = uvalues.iter().map(|&u| (min_val as i64 + u as i64) as i32).collect();
             Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
         }
         _ => {
@@ -554,10 +553,7 @@ fn decompress_for_bitpack(data: &[u8], data_type: &DataType) -> Result<Vec<u8>> 
             if uvalues.is_empty() {
                 return Ok(Vec::new());
             }
-            let values: Vec<i64> = uvalues
-                .iter()
-                .map(|&u| min_val.wrapping_add(u as i64))
-                .collect();
+            let values: Vec<i64> = uvalues.iter().map(|&u| min_val.wrapping_add(u as i64)).collect();
             Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
         }
     }
@@ -670,10 +666,7 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
     // v0.21.2：zstd 先行调度——达标块直选 zstd（省 TD 编码），本臂仅难块参与
     if TOKEN_DELTA_ENABLED.load(Ordering::Relaxed) {
         if let Some(tok) = global_tokenizer() {
-            let strs: Vec<&str> = strings
-                .iter()
-                .map(|s| std::str::from_utf8(s).unwrap_or(""))
-                .collect();
+            let strs: Vec<&str> = strings.iter().map(|s| std::str::from_utf8(s).unwrap_or("")).collect();
             if strs.iter().any(|s| !s.is_empty()) {
                 let mode = match TOKEN_DELTA_ENTROPY.load(Ordering::Relaxed) {
                     0 => TokenDeltaEntropy::Varint,
@@ -683,14 +676,11 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
                 let codec = token_delta::TokenDeltaCodec::new(&tok, mode);
                 let blob = {
                     let col_idx = token_stream_cache::CACHE_COL_IDX.load(Ordering::Relaxed);
-                    let mut cache = token_stream_cache::TOKEN_STREAM_CACHE
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
+                    let mut cache = token_stream_cache::TOKEN_STREAM_CACHE.lock().unwrap_or_else(|p| p.into_inner());
                     if col_idx >= 0 {
                         // v0.21.1：逐行匹配缓存（行级内容 hash，行序无关）；
                         // 命中行用预 token 流，miss 行（排序/删除后内容变化）回退自 tokenize
-                        let mut rows: Vec<token_stream_cache::CachedTokenRow> =
-                            Vec::with_capacity(strs.len());
+                        let mut rows: Vec<token_stream_cache::CachedTokenRow> = Vec::with_capacity(strs.len());
                         let mut miss: Vec<usize> = Vec::new();
                         for (i, s) in strs.iter().enumerate() {
                             match cache.take_row(col_idx as u32, s, &tok) {
@@ -707,9 +697,7 @@ fn compress_varchar(data: &[u8]) -> Result<(CompressionType, Vec<u8>)> {
                             use rayon::prelude::*;
                             let miss_rows: Vec<(usize, token_stream_cache::CachedTokenRow)> = miss
                                 .par_iter()
-                                .map(|&i| {
-                                    (i, token_stream_cache::cache_row(strs[i], &tok.tokenize(strs[i])))
-                                })
+                                .map(|&i| (i, token_stream_cache::cache_row(strs[i], &tok.tokenize(strs[i]))))
                                 .collect();
                             for (i, row) in miss_rows {
                                 rows[i] = row;
@@ -891,7 +879,12 @@ mod tests {
         let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let (ctype, compressed) = compress(&data, &DataType::Int64).unwrap();
         assert_eq!(ctype, CompressionType::Delta);
-        assert!(compressed.len() < data.len() / 4, "压缩率不足: {} / {}", compressed.len(), data.len());
+        assert!(
+            compressed.len() < data.len() / 4,
+            "压缩率不足: {} / {}",
+            compressed.len(),
+            data.len()
+        );
         let decompressed = decompress(&compressed, ctype, &DataType::Int64).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -1030,8 +1023,13 @@ mod tests {
 
     #[test]
     fn test_empty_data() {
-        for dt in &[DataType::Boolean, DataType::Int32, DataType::Int64,
-                    DataType::Float64, DataType::Varchar] {
+        for dt in &[
+            DataType::Boolean,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Varchar,
+        ] {
             let (ctype, compressed) = compress(&[], dt).unwrap();
             assert_eq!(ctype, CompressionType::Uncompressed);
             assert!(compressed.is_empty());

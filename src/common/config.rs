@@ -137,10 +137,14 @@ impl CompactStrategy {
     }
 
     /// 便捷构造：手动策略
-    pub fn manual() -> Self { CompactStrategy::Manual }
+    pub fn manual() -> Self {
+        CompactStrategy::Manual
+    }
 
     /// 便捷构造：全量合并策略
-    pub fn full(threshold: usize) -> Self { CompactStrategy::Full { threshold } }
+    pub fn full(threshold: usize) -> Self {
+        CompactStrategy::Full { threshold }
+    }
 
     /// 便捷构造：增量式策略
     pub fn incremental(threshold: usize, batch_size: usize) -> Self {
@@ -268,7 +272,7 @@ pub struct Config {
     pub primary_index_legacy: bool,
     /// 分层索引：列存稀疏索引 granule 行数（默认 8192，与 ClickHouse 一致）
     pub sparse_index_granule_rows: u32,
-    
+
     /// 是否启用事务支持（默认 true）
     ///
     /// - true: SQL INSERT/UPDATE/DELETE 走 WAL + MVCC 事务路径，保证 ACID
@@ -280,7 +284,7 @@ pub struct Config {
     ///
     /// CLI 控制：通过 `--no-transaction` 参数可在启动时关闭事务。
     pub enable_transaction: bool,
-    
+
     /// 事务隔离级别（仅 enable_transaction=true 时生效）
     pub default_isolation_level: IsolationLevel,
 }
@@ -309,7 +313,7 @@ impl Default for Config {
         let row_group_size = 122_880; // 120K rows
         Self {
             page_size: 4096,
-            block_size: 262_144, // 256KB
+            block_size: 262_144,    // 256KB
             buffer_pool_size: 1024, // 4MB (1024 * 4KB)
             row_group_size,
             wal_checkpoint_threshold: 16 * 1024 * 1024, // 16MB
@@ -325,13 +329,13 @@ impl Default for Config {
             // 已摊销 fsync，攒批的增量收益有限。需要极限 autocommit 吞吐、
             // 且接受崩溃丢批内行的场景可显式开启。
             wal_batch_insert: false,
-            insert_batch_rows: 1024, // P0-2：满 1024 行 flush
-            insert_batch_bytes: 65536, // P0-2：满 64KB 估算字节 flush
-            insert_batch_timeout_ms: 10, // P0-2：首行入批 10ms 后 flush（低流量延迟有界）
-            txn_batch_enabled: true, // P0-2 事务级 Batcher：默认开启
-            txn_batch_rows: 8192, // 事务 buffer 满 8192 行提前 flush（内存保护）
+            insert_batch_rows: 1024,                  // P0-2：满 1024 行 flush
+            insert_batch_bytes: 65536,                // P0-2：满 64KB 估算字节 flush
+            insert_batch_timeout_ms: 10,              // P0-2：首行入批 10ms 后 flush（低流量延迟有界）
+            txn_batch_enabled: true,                  // P0-2 事务级 Batcher：默认开启
+            txn_batch_rows: 8192,                     // 事务 buffer 满 8192 行提前 flush（内存保护）
             txn_batch_bypass_constraint_tables: true, // 有约束的表跳过攒批（错误即时暴露）
-            log_block_rows: 0, // P1-5：0 = 默认 8192 行/块
+            log_block_rows: 0,                        // P1-5：0 = 默认 8192 行/块
             default_compression: CompressionType::Uncompressed,
             compress_on_persist: true,
             tokenizer_path: None, // v0.21：统一 Tokenizer 词表文件路径（配置后 Varchar 列可启用 TokenDelta 压缩）
@@ -413,7 +417,12 @@ mod tests {
     fn test_compact_strategy_constructors() {
         let adaptive = CompactStrategy::default_adaptive(8192);
         match adaptive {
-            CompactStrategy::Adaptive { min_threshold, max_threshold, pct_of_table, batch_size } => {
+            CompactStrategy::Adaptive {
+                min_threshold,
+                max_threshold,
+                pct_of_table,
+                batch_size,
+            } => {
                 assert_eq!(min_threshold, 10_000);
                 assert_eq!(max_threshold, 8192);
                 assert!((pct_of_table - 0.10).abs() < 1e-9);
@@ -422,7 +431,16 @@ mod tests {
             _ => panic!("default 应为 Adaptive"),
         }
         assert!(matches!(CompactStrategy::manual(), CompactStrategy::Manual));
-        assert!(matches!(CompactStrategy::full(100), CompactStrategy::Full { threshold: 100 }));
-        assert!(matches!(CompactStrategy::incremental(100, 10), CompactStrategy::Incremental { threshold: 100, batch_size: 10 }));
+        assert!(matches!(
+            CompactStrategy::full(100),
+            CompactStrategy::Full { threshold: 100 }
+        ));
+        assert!(matches!(
+            CompactStrategy::incremental(100, 10),
+            CompactStrategy::Incremental {
+                threshold: 100,
+                batch_size: 10
+            }
+        ));
     }
 }

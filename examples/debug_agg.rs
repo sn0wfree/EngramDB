@@ -7,7 +7,7 @@ fn main() {
         "SELECT SUM(value) FROM t1;",
         "SELECT id, COUNT(*) FROM t1 GROUP BY id;",
     ];
-    
+
     for q in queries {
         println!("\n=== {} ===", q);
         match parser::parse(q) {

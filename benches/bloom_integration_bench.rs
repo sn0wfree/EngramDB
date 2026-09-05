@@ -111,7 +111,10 @@ fn main() {
     let skip_ratio = m_d as f64 / m_a.max(1) as f64;
     println!();
     if skip_ratio >= 5.0 {
-        println!("✅ Phase 2.5 KPI 达成: Bloom 跳读 / 全表扫描 = {:.2}× (≥ 5×)", skip_ratio);
+        println!(
+            "✅ Phase 2.5 KPI 达成: Bloom 跳读 / 全表扫描 = {:.2}× (≥ 5×)",
+            skip_ratio
+        );
     } else if skip_ratio >= 2.0 {
         println!("ℹ️  Bloom 跳读 / 全表扫描 = {:.2}×（< 5×）", skip_ratio);
     } else {

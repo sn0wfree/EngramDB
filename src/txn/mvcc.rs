@@ -8,7 +8,7 @@
 //! - 写-写冲突检测（first-committer-wins）
 //! - 活跃事务表：跟踪所有未提交事务
 
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// 时间戳 / 版本号（单调递增）
 pub type Timestamp = u64;
@@ -137,13 +137,7 @@ impl<T: Clone> MvccStore<T> {
     /// - 版本节点一次性分配后 push
     ///
     /// 返回 true 表示全部写入成功；false 表示存在写-写冲突（整批未写入）。
-    pub fn batch_write(
-        &mut self,
-        base_key: u64,
-        values: Vec<T>,
-        txn_id: TxnId,
-        write_ts: Timestamp,
-    ) -> bool {
+    pub fn batch_write(&mut self, base_key: u64, values: Vec<T>, txn_id: TxnId, write_ts: Timestamp) -> bool {
         // 先做整体冲突检测（不写任何 key，失败时保证零副作用）
         let count = values.len();
         for i in 0..count {
@@ -232,7 +226,9 @@ impl<T: Clone> MvccStore<T> {
     pub fn gc_key(&mut self, key: u64, oldest_active_ts: Timestamp) {
         if let Some(chain) = self.versions.get_mut(&key) {
             chain.retain(|node| {
-                if !node.committed { return true; }
+                if !node.committed {
+                    return true;
+                }
                 node.end_ts.map_or(true, |e| e > oldest_active_ts)
             });
         }
@@ -244,7 +240,7 @@ impl<T: Clone> MvccStore<T> {
             chain.retain(|node| node.committed || node.txn_id != txn_id);
         }
     }
-    
+
     /// 检查某个 key 是否在指定事务之前有已提交的版本
     ///
     /// 用于判断操作类型：
@@ -262,7 +258,7 @@ impl<T: Clone> MvccStore<T> {
         }
         false
     }
-    
+
     /// 获取某个 key 在指定事务的新版本（如果存在）
     ///
     /// 返回新版本的值，用于判断是 Update 还是 Delete
@@ -284,7 +280,9 @@ impl<T: Clone> MvccStore<T> {
         for chain in self.versions.values_mut() {
             chain.retain(|node| {
                 // 未提交版本永远保留
-                if !node.committed { return true; }
+                if !node.committed {
+                    return true;
+                }
                 // 已提交版本：end_ts 为 None（最新）或 end_ts > oldest_active_ts（仍可见）
                 node.end_ts.map_or(true, |e| e > oldest_active_ts)
             });

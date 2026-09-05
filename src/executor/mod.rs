@@ -1,10 +1,10 @@
 //! 向量化执行引擎
 
+pub mod executor;
+pub mod expression;
+pub mod operators;
 pub mod physical_plan;
 pub mod vector;
-pub mod operators;
-pub mod expression;
-pub mod executor;
 
 #[cfg(feature = "query-arena")]
 pub mod arena;

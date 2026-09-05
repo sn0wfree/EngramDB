@@ -23,8 +23,12 @@ fn main() {
         if n >= rows_n {
             break;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let Some(text) = v.get("text").and_then(|x| x.as_str()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(text) = v.get("text").and_then(|x| x.as_str()) else {
+            continue;
+        };
         let tokens = tok.tokenize(text);
         let parts: Vec<String> = tokens
             .iter()

@@ -7,9 +7,11 @@ use engramdb::common::config::{Config, TokenDeltaEntropy};
 use engramdb::common::tokenizer::{Token, Tokenizer, UNKNOWN_ID};
 use engramdb::common::types::{ColumnDef, DataType, TableDef};
 use engramdb::common::vocab_file::VocabFile;
-use engramdb::storage::compression::token_delta::TokenDeltaCodec;
-use engramdb::storage::compression::token_stream_cache::{cache_row, CachedTokenRow, TokenStreamCache, TOKEN_STREAM_CACHE};
 use engramdb::storage::compression::set_global_tokenizer;
+use engramdb::storage::compression::token_delta::TokenDeltaCodec;
+use engramdb::storage::compression::token_stream_cache::{
+    cache_row, CachedTokenRow, TokenStreamCache, TOKEN_STREAM_CACHE,
+};
 use engramdb::storage::Database;
 use engramdb::Value;
 
@@ -18,9 +20,21 @@ fn make_tokenizer() -> Tokenizer {
         Vec::new(),
         vec![("你".into(), "好".into()), ("世".into(), "界".into())],
         vec![
-            "你".into(), "好".into(), "世".into(), "界".into(), "！".into(),
-            "h".into(), "e".into(), "l".into(), "o".into(), " ".into(),
-            "w".into(), "r".into(), "d".into(), "你好".into(), "世界".into(),
+            "你".into(),
+            "好".into(),
+            "世".into(),
+            "界".into(),
+            "！".into(),
+            "h".into(),
+            "e".into(),
+            "l".into(),
+            "o".into(),
+            " ".into(),
+            "w".into(),
+            "r".into(),
+            "d".into(),
+            "你好".into(),
+            "世界".into(),
         ],
     );
     Tokenizer::from_vocab_file(vf).unwrap()

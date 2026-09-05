@@ -22,9 +22,8 @@ fn test_async_compress_doesnt_block_writes() {
 
     // 写入 10K 行（高熵 Float64 → 难以压缩 → 测试压缩路径）
     for i in 0..10_000 {
-        conn.execute(&format!(
-            "INSERT INTO t VALUES ({}, {})", i, (i as f64) * 1.61803398
-        )).unwrap();
+        conn.execute(&format!("INSERT INTO t VALUES ({}, {})", i, (i as f64) * 1.61803398))
+            .unwrap();
     }
     engramdb::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
 
@@ -37,10 +36,16 @@ fn test_async_compress_doesnt_block_writes() {
     // 提交到异步压缩队列
     let queue = engramdb::storage::async_compress::CompressionQueue::new();
     let id = conn.database_mut().table_id_by_name("t").unwrap();
-    let col_data = conn.database_mut()
-        .get_engine_table_mut_by_id(id).unwrap()
-        .as_columnar_mut().unwrap()
-        .column_store_mut().read_column(0, 0).unwrap().clone();
+    let col_data = conn
+        .database_mut()
+        .get_engine_table_mut_by_id(id)
+        .unwrap()
+        .as_columnar_mut()
+        .unwrap()
+        .column_store_mut()
+        .read_column(0, 0)
+        .unwrap()
+        .clone();
     let data_type = engramdb::common::types::DataType::Float64;
     queue.submit(engramdb::storage::async_compress::CompressTask {
         rg_idx: 0,
@@ -60,7 +65,7 @@ fn test_async_compress_doesnt_block_writes() {
 
 #[test]
 fn test_async_compress_multiple_blocks() {
-    use engramdb::storage::async_compress::{CompressionQueue, CompressTask};
+    use engramdb::storage::async_compress::{CompressTask, CompressionQueue};
 
     let path = "/tmp/p3_async_multi.hdb";
     let _ = std::fs::remove_file(path);
@@ -78,14 +83,26 @@ fn test_async_compress_multiple_blocks() {
 
     // 提交多列压缩任务（模拟：VARCHAR 列通常压缩比高）
     let id = conn.database_mut().table_id_by_name("t").unwrap();
-    let col0 = conn.database_mut()
-        .get_engine_table_mut_by_id(id).unwrap()
-        .as_columnar_mut().unwrap()
-        .column_store_mut().read_column(0, 0).unwrap().clone();
-    let col1 = conn.database_mut()
-        .get_engine_table_mut_by_id(id).unwrap()
-        .as_columnar_mut().unwrap()
-        .column_store_mut().read_column(0, 1).unwrap().clone();
+    let col0 = conn
+        .database_mut()
+        .get_engine_table_mut_by_id(id)
+        .unwrap()
+        .as_columnar_mut()
+        .unwrap()
+        .column_store_mut()
+        .read_column(0, 0)
+        .unwrap()
+        .clone();
+    let col1 = conn
+        .database_mut()
+        .get_engine_table_mut_by_id(id)
+        .unwrap()
+        .as_columnar_mut()
+        .unwrap()
+        .column_store_mut()
+        .read_column(0, 1)
+        .unwrap()
+        .clone();
     queue.submit(CompressTask {
         rg_idx: 0,
         data: col0,

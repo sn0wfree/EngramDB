@@ -100,19 +100,15 @@ impl<'a> DocumentIngestor<'a> {
     /// `title`: 文档标题，每个分块会附带此标题。
     ///
     /// 返回摄入的块数。
-    pub fn ingest_text(
-        &mut self,
-        text: &str,
-        title: &str,
-        embedding_fn: &dyn Fn(&str) -> Vec<f32>,
-    ) -> Result<usize> {
+    pub fn ingest_text(&mut self, text: &str, title: &str, embedding_fn: &dyn Fn(&str) -> Vec<f32>) -> Result<usize> {
         let chunks = self.chunk_text(text, title);
         if chunks.is_empty() {
             return Ok(0);
         }
 
         let db = self.conn.database_mut();
-        let table = db.get_table_mut(&self.table_name)
+        let table = db
+            .get_table_mut(&self.table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(self.table_name.clone()))?;
 
         let mut rows = Vec::with_capacity(chunks.len());
@@ -133,13 +129,8 @@ impl<'a> DocumentIngestor<'a> {
     /// 摄入 Markdown 文件
     ///
     /// 读取文件内容，自动解析 Markdown 标题结构并分块。
-    pub fn ingest_file(
-        &mut self,
-        file_path: &str,
-        embedding_fn: &dyn Fn(&str) -> Vec<f32>,
-    ) -> Result<usize> {
-        let content = std::fs::read_to_string(file_path)
-            .map_err(|e| EngramDbError::Io(e))?;
+    pub fn ingest_file(&mut self, file_path: &str, embedding_fn: &dyn Fn(&str) -> Vec<f32>) -> Result<usize> {
+        let content = std::fs::read_to_string(file_path).map_err(|e| EngramDbError::Io(e))?;
         let title = std::path::Path::new(file_path)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -150,7 +141,8 @@ impl<'a> DocumentIngestor<'a> {
     /// 获取文档行数
     pub fn count(&mut self) -> Result<u64> {
         let db = self.conn.database_mut();
-        let table = db.get_table(&self.table_name)
+        let table = db
+            .get_table(&self.table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(self.table_name.clone()))?;
         Ok(table.def.row_count)
     }
@@ -191,10 +183,7 @@ impl<'a> DocumentIngestor<'a> {
                     current_size = 0;
                 }
                 // 提取标题文本（去掉 # 前缀）
-                current_section = trimmed
-                    .trim_start_matches('#')
-                    .trim()
-                    .to_string();
+                current_section = trimmed.trim_start_matches('#').trim().to_string();
                 if current_section.is_empty() {
                     current_section = title.to_string();
                 }
@@ -285,9 +274,7 @@ mod tests {
     #[test]
     fn test_ingest_create_table() {
         let mut conn = Connection::open(":memory:").unwrap();
-        let mut ingestor = DocumentIngestor::new(
-            &mut conn, "docs", 8, ChunkConfig::default(),
-        ).unwrap();
+        let mut ingestor = DocumentIngestor::new(&mut conn, "docs", 8, ChunkConfig::default()).unwrap();
         assert_eq!(ingestor.count().unwrap(), 0);
     }
 
@@ -295,12 +282,16 @@ mod tests {
     fn test_ingest_text() {
         let mut conn = Connection::open(":memory:").unwrap();
         let mut ingestor = DocumentIngestor::new(
-            &mut conn, "docs", 4, ChunkConfig {
+            &mut conn,
+            "docs",
+            4,
+            ChunkConfig {
                 max_chunk_size: 100,
                 chunk_overlap: 20,
                 use_markdown_headers: false,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // 模拟嵌入函数：返回固定向量
         let embedding_fn = |text: &str| {
@@ -308,11 +299,9 @@ mod tests {
             vec![hash, hash * 0.5, hash * 0.25, hash * 0.125]
         };
 
-        let count = ingestor.ingest_text(
-            "Hello world. This is a test document. ",
-            "test",
-            &embedding_fn,
-        ).unwrap();
+        let count = ingestor
+            .ingest_text("Hello world. This is a test document. ", "test", &embedding_fn)
+            .unwrap();
         assert_eq!(count, 1, "短文本应该分 1 块");
 
         // 长文本分多块
@@ -324,9 +313,7 @@ mod tests {
     #[test]
     fn test_ingest_markdown_chunking() {
         let mut conn = Connection::open(":memory:").unwrap();
-        let mut ingestor = DocumentIngestor::new(
-            &mut conn, "docs", 4, ChunkConfig::default(),
-        ).unwrap();
+        let mut ingestor = DocumentIngestor::new(&mut conn, "docs", 4, ChunkConfig::default()).unwrap();
 
         let markdown = r#"# Introduction
 This is the intro section.
@@ -347,9 +334,7 @@ Final thoughts."#;
     #[test]
     fn test_ingest_vector_index() {
         let mut conn = Connection::open(":memory:").unwrap();
-        let mut ingestor = DocumentIngestor::new(
-            &mut conn, "docs", 4, ChunkConfig::default(),
-        ).unwrap();
+        let mut ingestor = DocumentIngestor::new(&mut conn, "docs", 4, ChunkConfig::default()).unwrap();
 
         let embedding_fn = |_text: &str| vec![0.1, 0.2, 0.3, 0.4];
         ingestor.ingest_text("Some content", "title", &embedding_fn).unwrap();

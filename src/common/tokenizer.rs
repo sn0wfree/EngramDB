@@ -16,8 +16,8 @@ use std::ops::Range;
 
 use fxhash::FxHashMap;
 
-use crate::common::error::Result;
 use crate::common::error::EngramDbError;
+use crate::common::error::Result;
 use crate::common::pretokenize;
 use crate::common::vocab_file::VocabFile;
 
@@ -82,8 +82,7 @@ const NONE: u32 = u32::MAX;
 impl Tokenizer {
     /// 从词表文件字节加载（include_bytes! 或外部文件）
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let vf = VocabFile::from_bytes(bytes)
-            .map_err(|e| EngramDbError::Parse(format!("vocab deserialize: {e}")))?;
+        let vf = VocabFile::from_bytes(bytes).map_err(|e| EngramDbError::Parse(format!("vocab deserialize: {e}")))?;
         Self::from_vocab_file(vf)
     }
 
@@ -114,7 +113,9 @@ impl Tokenizer {
             let Some(&aid) = vocab.get(a.as_str()) else { continue };
             let Some(&bid) = vocab.get(b.as_str()) else { continue };
             let merged_text = format!("{a}{b}");
-            let Some(&mid) = vocab.get(merged_text.as_str()) else { continue };
+            let Some(&mid) = vocab.get(merged_text.as_str()) else {
+                continue;
+            };
             merges.insert((aid, bid), (rank as u32, mid));
         }
         Ok(Self {
@@ -221,8 +222,12 @@ impl Tokenizer {
     pub fn hot_words(&self, top_n: usize) -> Vec<u32> {
         let mut out = Vec::new();
         for (a, b) in self.merges_ordered.iter().take(top_n) {
-            let Some(&aid) = self.vocab.get(a.as_str()) else { continue };
-            let Some(&bid) = self.vocab.get(b.as_str()) else { continue };
+            let Some(&aid) = self.vocab.get(a.as_str()) else {
+                continue;
+            };
+            let Some(&bid) = self.vocab.get(b.as_str()) else {
+                continue;
+            };
             if let Some(&(_, mid)) = self.merges.get(&(aid, bid)) {
                 if !out.contains(&mid) {
                     out.push(mid);
@@ -245,12 +250,7 @@ impl Tokenizer {
     /// 仅重放跨界段（公共前缀边界所在词块）与新增尾部。
     /// 跨界合并正确性：BPE merge 词级独立，重放段内结果与全量 tokenize 一致。
     /// 非前缀关系 / 文本变短 → 等价全量（变短时直接截断）。
-    pub fn tokenize_incremental(
-        &self,
-        prev_text: &str,
-        prev_tokens: &[Token],
-        new_text: &str,
-    ) -> Vec<Token> {
+    pub fn tokenize_incremental(&self, prev_text: &str, prev_tokens: &[Token], new_text: &str) -> Vec<Token> {
         // 前缀关系判定（v0.21.2 收紧）：仅 new 以 prev 为前缀（流式追加）或
         // new 是 prev 前缀（截断）时走增量；非前缀（共享长前缀但后续不同）
         // 一律全量——重放段假设 prev 前缀，非前缀重放产生非标准 token 流
@@ -299,7 +299,10 @@ impl Tokenizer {
         let k2 = prev_tokens.iter().take_while(|t| t.offset.end <= seg_start).count();
         let mut tokens = prev_tokens[..k2].to_vec();
         for t in self.tokenize(&new_text[seg_start..]) {
-            tokens.push(Token { id: t.id, offset: (t.offset.start + seg_start)..(t.offset.end + seg_start) });
+            tokens.push(Token {
+                id: t.id,
+                offset: (t.offset.start + seg_start)..(t.offset.end + seg_start),
+            });
         }
         tokens
     }
@@ -346,7 +349,10 @@ impl Tokenizer {
         while i < symbols.len() {
             if symbols[i].active {
                 let byte_len = symbols[i].byte_len as usize;
-                out.push(Token { id: symbols[i].id, offset: offset..offset + byte_len });
+                out.push(Token {
+                    id: symbols[i].id,
+                    offset: offset..offset + byte_len,
+                });
                 offset += byte_len;
             }
             i += 1;
@@ -357,8 +363,7 @@ impl Tokenizer {
     /// 每合并 O(n) 移除 + 2 次 merges 查询；无堆 sift 开销）
     /// 堆贪心合并（最小 rank pair 优先，pop 时校验 pair 未变——对齐 tokenizers merge_all）
     fn merge_heap(&self, symbols: &mut Vec<Symbol>) {
-        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>> =
-            BinaryHeap::with_capacity(symbols.len());
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, u32, u32)>> = BinaryHeap::with_capacity(symbols.len());
         for i in 0..symbols.len() as u32 {
             if let Some((rank, new_id)) = self.pair_rank(symbols, i) {
                 heap.push(std::cmp::Reverse((rank, new_id, i)));
@@ -442,10 +447,7 @@ mod tests {
         // （「！」是 Punct 独立段，与 CJK 段不合并；段内单字符全覆盖保证可逆）
         let vf = VocabFile::new(
             Vec::new(),
-            vec![
-                ("你".into(), "好".into()),
-                ("世".into(), "界".into()),
-            ],
+            vec![("你".into(), "好".into()), ("世".into(), "界".into())],
             vec![
                 "你".into(),
                 "好".into(),
@@ -493,11 +495,7 @@ mod tests {
         let mut prev = String::new();
         let mut prev_tokens: Vec<Token> = Vec::new();
         for i in 1..=base.chars().count() {
-            let end = base
-                .char_indices()
-                .nth(i)
-                .map(|(idx, _)| idx)
-                .unwrap_or(base.len());
+            let end = base.char_indices().nth(i).map(|(idx, _)| idx).unwrap_or(base.len());
             let next = base[..end].to_string();
             let full = tok.tokenize(&next);
             let inc = tok.tokenize_incremental(&prev, &prev_tokens, &next);
@@ -532,11 +530,7 @@ mod tests {
         let text = "你好世界！";
         let tokens = tok.tokenize(text);
         // 段内合并：你好(rank0)、世界(rank1)；「！」Punct 独立段不跨段合并
-        let joined: String = tokens
-            .iter()
-            .map(|t| &text[t.offset.clone()])
-            .collect::<Vec<_>>()
-            .join("|");
+        let joined: String = tokens.iter().map(|t| &text[t.offset.clone()]).collect::<Vec<_>>().join("|");
         assert_eq!(joined, "你好|世界|！");
     }
 

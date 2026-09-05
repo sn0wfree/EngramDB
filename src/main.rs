@@ -9,7 +9,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use engramdb::{Connection, Config};
+use engramdb::{Config, Connection};
 
 fn main() {
     env_logger::init();
@@ -154,7 +154,8 @@ fn print_result(result: &engramdb::QueryResult) {
     }
 
     // 打印表头
-    let col_widths: Vec<usize> = result.columns
+    let col_widths: Vec<usize> = result
+        .columns
         .iter()
         .enumerate()
         .map(|(i, name)| {
@@ -174,7 +175,8 @@ fn print_result(result: &engramdb::QueryResult) {
         .iter()
         .map(|w| format!("+{}", "-".repeat(w + 2)))
         .collect::<Vec<_>>()
-        .join("") + "+";
+        .join("")
+        + "+";
 
     println!("{}", separator);
 

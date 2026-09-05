@@ -210,7 +210,12 @@ mod tests {
         // 对比一阶 Delta 编码：8 + 999 * 1 = 1007 bytes
         // DoubleDelta 略大一点，但对常间隔序列效果接近
         let original_size = values.len() * 8;
-        assert!(encoded.len() < original_size / 4, "compression not good enough: {} vs {}", encoded.len(), original_size);
+        assert!(
+            encoded.len() < original_size / 4,
+            "compression not good enough: {} vs {}",
+            encoded.len(),
+            original_size
+        );
         let decoded = decode_i64(&encoded, values.len()).unwrap();
         assert_eq!(decoded, values);
     }

@@ -11,7 +11,7 @@
 //! 持久化语义：块冻结即不可变（append-only），checkpoint 时全量序列化。
 
 use crate::common::column_data::ColumnData;
-use crate::common::error::{Result, EngramDbError};
+use crate::common::error::{EngramDbError, Result};
 use crate::common::types::{EngineType, TableDef};
 use crate::executor::vector::{DataChunk, Vector};
 use crate::storage::column_store::{matches_predicate_typed, value_greater, value_less, PredicateOp};
@@ -263,17 +263,15 @@ impl LogTable {
     ///
     /// v0.18：读路径走 typed 缓存（冻结块已释放 columns 写入缓冲）。
     pub fn get_row_by_id(&mut self, row_id: u32) -> Result<Option<Vec<Value>>> {
-        let idx = match self
-            .blocks
-            .binary_search_by(|b| {
-                if row_id < b.row_id_base {
-                    std::cmp::Ordering::Greater
-                } else if row_id >= b.row_id_base + b.rows as u32 {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            }) {
+        let idx = match self.blocks.binary_search_by(|b| {
+            if row_id < b.row_id_base {
+                std::cmp::Ordering::Greater
+            } else if row_id >= b.row_id_base + b.rows as u32 {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) {
             Ok(i) => i,
             Err(_) => return Ok(None),
         };
@@ -289,19 +287,13 @@ impl LogTable {
     }
 
     /// 按 row_id 取指定列
-    pub fn get_row_by_id_columns(
-        &mut self,
-        row_id: u32,
-        cols: &[usize],
-    ) -> Result<Option<Vec<Value>>> {
+    pub fn get_row_by_id_columns(&mut self, row_id: u32, cols: &[usize]) -> Result<Option<Vec<Value>>> {
         let row = match self.get_row_by_id(row_id)? {
             Some(r) => r,
             None => return Ok(None),
         };
         Ok(Some(
-            cols.iter()
-                .map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null))
-                .collect(),
+            cols.iter().map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null)).collect(),
         ))
     }
 
@@ -352,10 +344,7 @@ impl LogTable {
                     None => columns.push(Vector::Flat(slice)),
                 }
             }
-            chunks.push(DataChunk {
-                columns,
-                count: len,
-            });
+            chunks.push(DataChunk { columns, count: len });
             start += len;
         }
         Ok(chunks)
@@ -413,9 +402,7 @@ impl LogTable {
         let mut off = 0usize;
         let read_u32 = |off: &mut usize, data: &[u8]| -> Result<u32> {
             if *off + 4 > data.len() {
-                return Err(EngramDbError::InvalidFormat(
-                    "truncated log block header".into(),
-                ));
+                return Err(EngramDbError::InvalidFormat("truncated log block header".into()));
             }
             let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
             *off += 4;
@@ -442,13 +429,10 @@ impl LogTable {
             for _ in 0..col_count {
                 let dt_len = read_u32(&mut off, data)? as usize;
                 if off + dt_len > data.len() {
-                    return Err(EngramDbError::InvalidFormat(
-                        "truncated log data_type".into(),
-                    ));
+                    return Err(EngramDbError::InvalidFormat("truncated log data_type".into()));
                 }
-                let dt: crate::common::types::DataType =
-                    bincode::deserialize(&data[off..off + dt_len])
-                        .map_err(|_| EngramDbError::InvalidFormat("bad log data_type".into()))?;
+                let dt: crate::common::types::DataType = bincode::deserialize(&data[off..off + dt_len])
+                    .map_err(|_| EngramDbError::InvalidFormat("bad log data_type".into()))?;
                 off += dt_len;
                 let min_len = read_u32(&mut off, data)? as usize;
                 if off + min_len > data.len() {
@@ -470,15 +454,9 @@ impl LogTable {
                 off += max_len;
                 let data_len = read_u32(&mut off, data)? as usize;
                 if off + data_len > data.len() {
-                    return Err(EngramDbError::InvalidFormat(
-                        "truncated log column data".into(),
-                    ));
+                    return Err(EngramDbError::InvalidFormat("truncated log column data".into()));
                 }
-                typed.push(ColumnData::deserialize_typed(
-                    &data[off..off + data_len],
-                    &dt,
-                    rows,
-                ));
+                typed.push(ColumnData::deserialize_typed(&data[off..off + data_len], &dt, rows));
                 off += data_len;
             }
             self.blocks.push(LogBlock {
@@ -649,13 +627,34 @@ mod tests {
         }
         t.insert(rows).unwrap();
         // 块 0：ts 0..3；块 1：ts 4..7
-        assert!(block_can_skip(&t.blocks[0], 0, PredicateOp::Gt, &Value::Int64(5)), "ts>5 跳过块 0");
-        assert!(!block_can_skip(&t.blocks[1], 0, PredicateOp::Gt, &Value::Int64(5)), "块 1 含 ts>5");
-        assert!(block_can_skip(&t.blocks[1], 0, PredicateOp::Lt, &Value::Int64(4)), "ts<4 跳过块 1");
-        assert!(block_can_skip(&t.blocks[0], 0, PredicateOp::Eq, &Value::Int64(10)), "ts=10 跳过块 0");
-        assert!(!block_can_skip(&t.blocks[1], 0, PredicateOp::Eq, &Value::Int64(4)), "块 1 含 ts=4");
-        assert!(!block_can_skip(&t.blocks[0], 0, PredicateOp::LtEq, &Value::Int64(0)), "块 0 含 ts=0 满足 ts<=0，不得跳过");
-        assert!(block_can_skip(&t.blocks[0], 0, PredicateOp::LtEq, &Value::Int64(-1)), "ts<=-1 全部大于，跳过块 0");
+        assert!(
+            block_can_skip(&t.blocks[0], 0, PredicateOp::Gt, &Value::Int64(5)),
+            "ts>5 跳过块 0"
+        );
+        assert!(
+            !block_can_skip(&t.blocks[1], 0, PredicateOp::Gt, &Value::Int64(5)),
+            "块 1 含 ts>5"
+        );
+        assert!(
+            block_can_skip(&t.blocks[1], 0, PredicateOp::Lt, &Value::Int64(4)),
+            "ts<4 跳过块 1"
+        );
+        assert!(
+            block_can_skip(&t.blocks[0], 0, PredicateOp::Eq, &Value::Int64(10)),
+            "ts=10 跳过块 0"
+        );
+        assert!(
+            !block_can_skip(&t.blocks[1], 0, PredicateOp::Eq, &Value::Int64(4)),
+            "块 1 含 ts=4"
+        );
+        assert!(
+            !block_can_skip(&t.blocks[0], 0, PredicateOp::LtEq, &Value::Int64(0)),
+            "块 0 含 ts=0 满足 ts<=0，不得跳过"
+        );
+        assert!(
+            block_can_skip(&t.blocks[0], 0, PredicateOp::LtEq, &Value::Int64(-1)),
+            "ts<=-1 全部大于，跳过块 0"
+        );
     }
 
     #[test]
@@ -686,7 +685,11 @@ mod tests {
         assert!(t.blocks.is_empty());
         assert_eq!(t.next_row_id, 0);
         t.insert(vec![row(5, "b")]).unwrap();
-        assert_eq!(t.get_row_by_id(0).unwrap().unwrap(), row(5, "b"), "truncate 后 row_id 重置");
+        assert_eq!(
+            t.get_row_by_id(0).unwrap().unwrap(),
+            row(5, "b"),
+            "truncate 后 row_id 重置"
+        );
     }
 
     #[test]

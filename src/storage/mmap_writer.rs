@@ -14,7 +14,7 @@
 #![cfg(feature = "mmap-read")]
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::common::error::Result;
 
@@ -36,11 +36,7 @@ pub struct MmapWriter {
 impl MmapWriter {
     /// 创建新写入器（覆盖写入）
     pub fn create(path: &std::path::Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -51,10 +47,7 @@ impl MmapWriter {
 
     /// 追加模式打开（写入已有文件）
     pub fn append(path: &std::path::Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         let offset = file.metadata()?.len();
         Ok(Self {
             path: path.to_path_buf(),
@@ -133,9 +126,12 @@ impl std::io::Write for MmapWriter {
 ///
 /// 将 src 原子 rename 到 dst，不阻塞并发读取。
 pub fn atomic_replace(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    std::fs::rename(src, dst).map_err(|e| crate::common::error::EngramDbError::Io(
-        std::io::Error::new(std::io::ErrorKind::Other, format!("atomic rename failed: {}", e)),
-    ))?;
+    std::fs::rename(src, dst).map_err(|e| {
+        crate::common::error::EngramDbError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("atomic rename failed: {}", e),
+        ))
+    })?;
     Ok(())
 }
 

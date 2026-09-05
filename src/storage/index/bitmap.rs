@@ -365,10 +365,10 @@ mod tests {
         bm.not(5); // 取反前 5 位
 
         assert!(!bm.get(0)); // 原 1 → 0
-        assert!(bm.get(1));  // 原 0 → 1
+        assert!(bm.get(1)); // 原 0 → 1
         assert!(!bm.get(2)); // 原 1 → 0
-        assert!(bm.get(3));  // 原 0 → 1
-        assert!(bm.get(4));  // 原 0 → 1
+        assert!(bm.get(3)); // 原 0 → 1
+        assert!(bm.get(4)); // 原 0 → 1
         assert!(!bm.get(5)); // 超出范围，应该为 0
     }
 

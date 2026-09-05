@@ -73,19 +73,19 @@
 static GLOBAL_ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 pub mod common;
-pub mod storage;
-pub mod search;
-pub mod wal;
-pub mod txn;
-pub mod sql;
 pub mod executor;
+pub mod search;
+pub mod sql;
+pub mod storage;
+pub mod txn;
+pub mod wal;
 
 // DataFusion 互操作（需启用 datafusion feature）
 // 提供 TableProvider 实现，可将 EngramDB 表接入 DataFusion 查询引擎
 #[cfg(feature = "datafusion")]
 pub mod datafusion_ext;
 
-pub use common::config::{CompactStrategy, WalFlushMode, Config, CompressionType};
+pub use common::config::{CompactStrategy, CompressionType, Config, WalFlushMode};
 
 use common::error::Result;
 use storage::Database;
@@ -148,22 +148,23 @@ impl Connection {
     /// ROLLBACK / ROLLBACK TO SAVEPOINT 前的"非裸 INSERT 前置冲刷"会把
     /// 事务 buffer 落盘成内部事务，导致回滚失效。
     fn is_txn_rollback_stmt(ast: &crate::sql::ast::Statement) -> bool {
-        matches!(ast,
-            crate::sql::ast::Statement::Rollback
-            | crate::sql::ast::Statement::RollbackToSavepoint { .. })
+        matches!(
+            ast,
+            crate::sql::ast::Statement::Rollback | crate::sql::ast::Statement::RollbackToSavepoint { .. }
+        )
     }
 
     /// 执行 SQL 语句
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
-         use executor::physical_plan::PhysicalPlan;
-         // v0.18 P0-1 计划缓存：命中跳过 parse/plan/optimize（同 SQL 重复场景）
-         if let Some((cached, clean)) = self.db.get_plan_cache(sql).cloned() {
-             // 命中路径同样遵守攒批冲刷语义（非裸 INSERT 语句先 flush）
-             if !clean {
-                 self.flush_batches()?;
-             }
-             return executor::execute(cached, &mut self.db);
-         }
+        use executor::physical_plan::PhysicalPlan;
+        // v0.18 P0-1 计划缓存：命中跳过 parse/plan/optimize（同 SQL 重复场景）
+        if let Some((cached, clean)) = self.db.get_plan_cache(sql).cloned() {
+            // 命中路径同样遵守攒批冲刷语义（非裸 INSERT 语句先 flush）
+            if !clean {
+                self.flush_batches()?;
+            }
+            return executor::execute(cached, &mut self.db);
+        }
         let ast = sql::parser::parse(sql)?;
         // P0-2：非裸 INSERT 语句前置冲刷攒批
         //（ROLLBACK / ROLLBACK TO SAVEPOINT 除外：应丢弃事务 buffer 而非 flush）
@@ -172,62 +173,65 @@ impl Connection {
         if !batcher_clean && !Self::is_txn_rollback_stmt(&ast) {
             self.flush_batches()?;
         }
-         // 结构性 DDL / ANALYZE：不缓存，执行后清空缓存（计划依赖表结构与统计）
-        let is_ddl = matches!(&ast,
+        // 结构性 DDL / ANALYZE：不缓存，执行后清空缓存（计划依赖表结构与统计）
+        let is_ddl = matches!(
+            &ast,
             crate::sql::ast::Statement::CreateTable(_)
-            | crate::sql::ast::Statement::CreateIndex(_)
-            | crate::sql::ast::Statement::AlterTable(_)
-            | crate::sql::ast::Statement::TruncateTable { .. }
-            | crate::sql::ast::Statement::Analyze(_)
-            | crate::sql::ast::Statement::CreateView(_)
-            | crate::sql::ast::Statement::DropView(_)
-            | crate::sql::ast::Statement::CreateMaterializedView(_)
-            | crate::sql::ast::Statement::DropMaterializedView(_)
-            | crate::sql::ast::Statement::RefreshMaterializedView(_));
+                | crate::sql::ast::Statement::CreateIndex(_)
+                | crate::sql::ast::Statement::AlterTable(_)
+                | crate::sql::ast::Statement::TruncateTable { .. }
+                | crate::sql::ast::Statement::Analyze(_)
+                | crate::sql::ast::Statement::CreateView(_)
+                | crate::sql::ast::Statement::DropView(_)
+                | crate::sql::ast::Statement::CreateMaterializedView(_)
+                | crate::sql::ast::Statement::DropMaterializedView(_)
+                | crate::sql::ast::Statement::RefreshMaterializedView(_)
+        );
         let plan = sql::planner::plan(ast, &self.db)?;
         // CountStar 是行数快照（Perf01 元数据短路），缓存即过期 → 不缓存
         // Rollback/RollbackToSavepoint：不缓存（缓存命中路径会前置 flush
         // 事务 buffer，破坏回滚语义；且回滚语句无重复执行价值）
-        let cacheable = !matches!(plan,
-            PhysicalPlan::CountStar { .. }
-            | PhysicalPlan::Rollback
-            | PhysicalPlan::RollbackToSavepoint { .. });
-         // INSERT / CREATE TABLE 等 DDL/DML 语句不需要查询优化，直接执行
-         // 避免对包含大量数据的计划做无谓的 clone 和优化规则遍历
-         let needs_optimize = matches!(plan,
-             PhysicalPlan::TableScan { .. }
-             | PhysicalPlan::Filter { .. }
-             | PhysicalPlan::Projection { .. }
-             | PhysicalPlan::HashJoin { .. }
-             | PhysicalPlan::Aggregate { .. }
-             | PhysicalPlan::Limit { .. }
-         );
-         let result = if needs_optimize {
-             let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
-             let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
-             // 缓存最终（优化后）计划
-             if !is_ddl && cacheable {
-                 self.db.set_plan_cache(sql, optimized.clone(), batcher_clean);
-             }
-             executor::execute(optimized, &mut self.db)
-         } else {
-             if !is_ddl && cacheable {
-                 self.db.set_plan_cache(sql, plan.clone(), batcher_clean);
-             }
-             executor::execute(plan, &mut self.db)
-         }?;
-         if is_ddl {
-             self.db.clear_plan_cache();
-         }
-         // v0.22.4：大批量 DML 后使计划缓存失效——缓存计划基于优化时的
-         // 统计/数据分布，大批量变更后 join order 等 CBO 决策可能严重过时
-         // （灾难计划防护）。阈值避开逐行 UPDATE 场景的缓存抖动；
-         // SELECT 的 rows_affected 恒为 0，不受影响。
-         if result.rows_affected >= 512 {
-             self.db.clear_plan_cache();
-         }
-         Ok(result)
-     }
+        let cacheable = !matches!(
+            plan,
+            PhysicalPlan::CountStar { .. } | PhysicalPlan::Rollback | PhysicalPlan::RollbackToSavepoint { .. }
+        );
+        // INSERT / CREATE TABLE 等 DDL/DML 语句不需要查询优化，直接执行
+        // 避免对包含大量数据的计划做无谓的 clone 和优化规则遍历
+        let needs_optimize = matches!(
+            plan,
+            PhysicalPlan::TableScan { .. }
+                | PhysicalPlan::Filter { .. }
+                | PhysicalPlan::Projection { .. }
+                | PhysicalPlan::HashJoin { .. }
+                | PhysicalPlan::Aggregate { .. }
+                | PhysicalPlan::Limit { .. }
+        );
+        let result = if needs_optimize {
+            let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+            let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
+            // 缓存最终（优化后）计划
+            if !is_ddl && cacheable {
+                self.db.set_plan_cache(sql, optimized.clone(), batcher_clean);
+            }
+            executor::execute(optimized, &mut self.db)
+        } else {
+            if !is_ddl && cacheable {
+                self.db.set_plan_cache(sql, plan.clone(), batcher_clean);
+            }
+            executor::execute(plan, &mut self.db)
+        }?;
+        if is_ddl {
+            self.db.clear_plan_cache();
+        }
+        // v0.22.4：大批量 DML 后使计划缓存失效——缓存计划基于优化时的
+        // 统计/数据分布，大批量变更后 join order 等 CBO 决策可能严重过时
+        // （灾难计划防护）。阈值避开逐行 UPDATE 场景的缓存抖动；
+        // SELECT 的 rows_affected 恒为 0，不受影响。
+        if result.rows_affected >= 512 {
+            self.db.clear_plan_cache();
+        }
+        Ok(result)
+    }
 
     /// 解释 SQL 执行计划（用于调试和验证优化器）
     pub fn explain(&mut self, sql: &str) -> Result<String> {
@@ -235,10 +239,7 @@ impl Connection {
         let plan = sql::planner::plan(ast, &self.db)?;
         let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
         let optimized = sql::optimizer::optimize_with_stats(plan.clone(), &stats)?;
-        Ok(format!(
-            "原始计划:\n{:#?}\n\n优化后:\n{:#?}",
-            plan, optimized
-        ))
+        Ok(format!("原始计划:\n{:#?}\n\n优化后:\n{:#?}", plan, optimized))
     }
 
     /// 预编译 SQL 语句
@@ -269,7 +270,8 @@ impl Connection {
                 // 求值用直接索引省去逐列越界检查
                 if params.len() < stmt.param_count {
                     return Err(crate::common::error::EngramDbError::Parse(format!(
-                        "Parameter index out of bounds ({} params provided)", params.len()
+                        "Parameter index out of bounds ({} params provided)",
+                        params.len()
                     )));
                 }
                 // 无列名：内联 eval 循环（免函数调用与表访问，insert 算子内部校验表存在）
@@ -281,9 +283,11 @@ impl Connection {
                             row.push(match expr {
                                 crate::sql::ast::Expression::Literal(v) => v.clone(),
                                 crate::sql::ast::Expression::Placeholder(idx) => params[*idx].clone(),
-                                _ => return Err(crate::common::error::EngramDbError::Parse(
-                                    "Non-constant expression in VALUES not supported".into()
-                                )),
+                                _ => {
+                                    return Err(crate::common::error::EngramDbError::Parse(
+                                        "Non-constant expression in VALUES not supported".into(),
+                                    ))
+                                }
                             });
                         }
                         rows.push(row);
@@ -302,13 +306,14 @@ impl Connection {
         }
         let plan = sql::planner::plan_with_params(stmt.ast.clone(), &self.db, params)?;
 
-        let needs_optimize = matches!(plan,
+        let needs_optimize = matches!(
+            plan,
             PhysicalPlan::TableScan { .. }
-            | PhysicalPlan::Filter { .. }
-            | PhysicalPlan::Projection { .. }
-            | PhysicalPlan::HashJoin { .. }
-            | PhysicalPlan::Aggregate { .. }
-            | PhysicalPlan::Limit { .. }
+                | PhysicalPlan::Filter { .. }
+                | PhysicalPlan::Projection { .. }
+                | PhysicalPlan::HashJoin { .. }
+                | PhysicalPlan::Aggregate { .. }
+                | PhysicalPlan::Limit { .. }
         );
         if needs_optimize {
             let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
@@ -323,11 +328,7 @@ impl Connection {
     ///
     /// 一次性传入多行参数，内部批量构造并执行，减少函数调用开销。
     /// params 是一个二维数组，每个子数组对应一行的参数值。
-    pub fn execute_prepared_batch(
-        &mut self,
-        stmt: &PreparedStatement,
-        params_batch: &[Vec<Value>],
-    ) -> Result<u64> {
+    pub fn execute_prepared_batch(&mut self, stmt: &PreparedStatement, params_batch: &[Vec<Value>]) -> Result<u64> {
         use executor::physical_plan::PhysicalPlan;
 
         let mut total = 0u64;
@@ -406,7 +407,9 @@ impl Connection {
         // P0-2：先冲刷攒批，保证行序（缓冲行先入表）
         self.flush_batches()?;
 
-        let engine = self.db.get_engine_table_mut(table_name)
+        let engine = self
+            .db
+            .get_engine_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
         let num_cols = engine.def().columns.len();
@@ -418,10 +421,11 @@ impl Connection {
 
         // 验证列数匹配
         if columns.len() != num_cols {
-            return Err(EngramDbError::Internal(
-                format!("import_columns: column count mismatch (expected {}, got {})",
-                    num_cols, columns.len())
-            ));
+            return Err(EngramDbError::Internal(format!(
+                "import_columns: column count mismatch (expected {}, got {})",
+                num_cols,
+                columns.len()
+            )));
         }
 
         // 引擎分派（M2：Memory 表走列式批量插入）
@@ -530,7 +534,7 @@ impl Connection {
     /// - `CompactStrategy::full(threshold)` — 全量合并，达到阈值一次性合并
     /// - `CompactStrategy::incremental(threshold, batch_size)` — 增量式，分批合并
     /// - `CompactStrategy::default_adaptive(row_group_size)` — 自适应分桶（默认）
-pub fn set_compact_strategy(&mut self, strategy: crate::common::config::CompactStrategy) {
+    pub fn set_compact_strategy(&mut self, strategy: crate::common::config::CompactStrategy) {
         self.db.set_default_compact_strategy(strategy);
     }
 
@@ -555,7 +559,11 @@ pub fn set_compact_strategy(&mut self, strategy: crate::common::config::CompactS
     }
 
     /// 设置指定表的 Delta 合并策略（运行时动态切换）
-    pub fn set_table_compact_strategy(&mut self, table_name: &str, strategy: crate::common::config::CompactStrategy) -> Result<()> {
+    pub fn set_table_compact_strategy(
+        &mut self,
+        table_name: &str,
+        strategy: crate::common::config::CompactStrategy,
+    ) -> Result<()> {
         self.db.set_table_compact_strategy(table_name, strategy)
     }
 }
@@ -607,7 +615,11 @@ fn count_placeholders(stmt: &sql::ast::Statement) -> usize {
                     count_placeholder_in_expr(expr, &mut max_idx);
                 }
             }
-            if max_idx > 0 { max_idx + 1 } else { 0 }
+            if max_idx > 0 {
+                max_idx + 1
+            } else {
+                0
+            }
         }
         _ => 0,
     }
@@ -1001,10 +1013,8 @@ impl std::fmt::Display for Value {
 }
 
 #[cfg(test)]
-mod value_tests {    use super::*;
-
-
-
+mod value_tests {
+    use super::*;
 
     #[test]
     fn test_value_is_null() {
@@ -1093,8 +1103,10 @@ mod value_tests {    use super::*;
     fn test_json_type_create_and_insert() {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE agent_meta (id INT, data JSON)").unwrap();
-        conn.execute("INSERT INTO agent_meta VALUES (1, '{\"name\":\"agent1\",\"role\":\"analyst\"}')").unwrap();
-        conn.execute("INSERT INTO agent_meta VALUES (2, '{\"name\":\"agent2\",\"role\":\"coder\"}')").unwrap();
+        conn.execute("INSERT INTO agent_meta VALUES (1, '{\"name\":\"agent1\",\"role\":\"analyst\"}')")
+            .unwrap();
+        conn.execute("INSERT INTO agent_meta VALUES (2, '{\"name\":\"agent2\",\"role\":\"coder\"}')")
+            .unwrap();
 
         let result = conn.execute("SELECT id FROM agent_meta ORDER BY id").unwrap();
         assert_eq!(result.rows.len(), 2);
@@ -1106,7 +1118,8 @@ mod value_tests {    use super::*;
     fn test_json_extract_sql() {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE tools (id INT, params JSON)").unwrap();
-        conn.execute("INSERT INTO tools VALUES (1, '{\"tool\":\"search\",\"query\":\"gold price\",\"limit\":10}')").unwrap();
+        conn.execute("INSERT INTO tools VALUES (1, '{\"tool\":\"search\",\"query\":\"gold price\",\"limit\":10}')")
+            .unwrap();
 
         let result = conn.execute("SELECT JSON_EXTRACT(params, '$.tool') FROM tools").unwrap();
         assert_eq!(result.rows.len(), 1);
@@ -1117,9 +1130,12 @@ mod value_tests {    use super::*;
     fn test_json_contains_sql() {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE tags (id INT, meta JSON)").unwrap();
-        conn.execute("INSERT INTO tags VALUES (1, '{\"tags\":[\"rust\",\"db\",\"ai\"]}')").unwrap();
+        conn.execute("INSERT INTO tags VALUES (1, '{\"tags\":[\"rust\",\"db\",\"ai\"]}')")
+            .unwrap();
 
-        let result = conn.execute("SELECT JSON_CONTAINS(meta, '\"ai\"', '$.tags') FROM tags").unwrap();
+        let result = conn
+            .execute("SELECT JSON_CONTAINS(meta, '\"ai\"', '$.tags') FROM tags")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Boolean(true));
     }
@@ -1154,10 +1170,14 @@ mod value_tests {    use super::*;
     #[test]
     fn test_create_index_basic() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE sessions (id INT, session_id VARCHAR, user_id INT, role VARCHAR)").unwrap();
-        conn.execute("INSERT INTO sessions VALUES (1, 'sess_001', 100, 'admin')").unwrap();
-        conn.execute("INSERT INTO sessions VALUES (2, 'sess_002', 200, 'user')").unwrap();
-        conn.execute("INSERT INTO sessions VALUES (3, 'sess_003', 100, 'admin')").unwrap();
+        conn.execute("CREATE TABLE sessions (id INT, session_id VARCHAR, user_id INT, role VARCHAR)")
+            .unwrap();
+        conn.execute("INSERT INTO sessions VALUES (1, 'sess_001', 100, 'admin')")
+            .unwrap();
+        conn.execute("INSERT INTO sessions VALUES (2, 'sess_002', 200, 'user')")
+            .unwrap();
+        conn.execute("INSERT INTO sessions VALUES (3, 'sess_003', 100, 'admin')")
+            .unwrap();
 
         // 创建普通索引
         let result = conn.execute("CREATE INDEX idx_session_id ON sessions (session_id)").unwrap();
@@ -1168,12 +1188,15 @@ mod value_tests {    use super::*;
     #[test]
     fn test_create_index_after_data() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, role VARCHAR, content VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, role VARCHAR, content VARCHAR)")
+            .unwrap();
         for i in 0..50 {
             conn.execute(&format!(
                 "INSERT INTO messages VALUES ({}, 'sess_{}', 'user', 'hello')",
-                i, i % 10
-            )).unwrap();
+                i,
+                i % 10
+            ))
+            .unwrap();
         }
 
         // 有数据后创建索引
@@ -1230,13 +1253,19 @@ mod value_tests {    use super::*;
     fn test_index_only_scan_point_lookup() {
         // WHERE 键列等值 + SELECT 键列 → IndexOnlyScan
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE sessions (id INT, session_id VARCHAR, user_id INT, role VARCHAR)").unwrap();
-        conn.execute("INSERT INTO sessions VALUES (1, 'sess_001', 100, 'admin')").unwrap();
-        conn.execute("INSERT INTO sessions VALUES (2, 'sess_002', 200, 'user')").unwrap();
-        conn.execute("INSERT INTO sessions VALUES (3, 'sess_003', 100, 'admin')").unwrap();
+        conn.execute("CREATE TABLE sessions (id INT, session_id VARCHAR, user_id INT, role VARCHAR)")
+            .unwrap();
+        conn.execute("INSERT INTO sessions VALUES (1, 'sess_001', 100, 'admin')")
+            .unwrap();
+        conn.execute("INSERT INTO sessions VALUES (2, 'sess_002', 200, 'user')")
+            .unwrap();
+        conn.execute("INSERT INTO sessions VALUES (3, 'sess_003', 100, 'admin')")
+            .unwrap();
         conn.execute("CREATE INDEX idx_sess ON sessions (session_id)").unwrap();
 
-        let result = conn.execute("SELECT session_id FROM sessions WHERE session_id = 'sess_002'").unwrap();
+        let result = conn
+            .execute("SELECT session_id FROM sessions WHERE session_id = 'sess_002'")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Varchar("sess_002".to_string()));
     }
@@ -1258,14 +1287,17 @@ mod value_tests {    use super::*;
     fn test_index_only_scan_multiple_matches() {
         // 非唯一索引点查返回所有匹配行
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, content VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, content VARCHAR)")
+            .unwrap();
         conn.execute("INSERT INTO messages VALUES (1, 'sess1', 'hello')").unwrap();
         conn.execute("INSERT INTO messages VALUES (2, 'sess1', 'world')").unwrap();
         conn.execute("INSERT INTO messages VALUES (3, 'sess2', 'foo')").unwrap();
         conn.execute("INSERT INTO messages VALUES (4, 'sess1', '!')").unwrap();
         conn.execute("CREATE INDEX idx_sess ON messages (session_id)").unwrap();
 
-        let result = conn.execute("SELECT session_id FROM messages WHERE session_id = 'sess1'").unwrap();
+        let result = conn
+            .execute("SELECT session_id FROM messages WHERE session_id = 'sess1'")
+            .unwrap();
         assert_eq!(result.rows.len(), 3);
         for row in &result.rows {
             assert_eq!(row[0], Value::Varchar("sess1".to_string()));
@@ -1276,34 +1308,36 @@ mod value_tests {    use super::*;
     fn test_index_scan_non_covering() {
         // P2 回归：非覆盖索引点查（SELECT 列超出索引覆盖范围 → IndexScan 回表）
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, content VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, content VARCHAR)")
+            .unwrap();
         for i in 0..10 {
             conn.execute(&format!(
                 "INSERT INTO messages VALUES ({}, 'sess{}', 'payload_{}')",
-                i, i % 4, i
-            )).unwrap();
+                i,
+                i % 4,
+                i
+            ))
+            .unwrap();
         }
         conn.execute("CREATE INDEX idx_sess ON messages (session_id)").unwrap();
 
         // 索引只覆盖 session_id，content 需要回表 → 走 IndexScan
-        let result = conn.execute(
-            "SELECT session_id, content FROM messages WHERE session_id = 'sess2'"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT session_id, content FROM messages WHERE session_id = 'sess2'")
+            .unwrap();
         assert_eq!(result.rows.len(), 2); // i%4==2 → i=2,6
         for row in &result.rows {
             assert_eq!(row[0], Value::Varchar("sess2".to_string()));
         }
 
         // 无匹配
-        let result = conn.execute(
-            "SELECT session_id, content FROM messages WHERE session_id = 'none'"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT session_id, content FROM messages WHERE session_id = 'none'")
+            .unwrap();
         assert_eq!(result.rows.len(), 0);
 
         // 多列结果 + 回表列裁剪正确性
-        let result = conn.execute(
-            "SELECT content FROM messages WHERE session_id = 'sess0'"
-        ).unwrap();
+        let result = conn.execute("SELECT content FROM messages WHERE session_id = 'sess0'").unwrap();
         assert_eq!(result.rows.len(), 3);
     }
 
@@ -1313,55 +1347,45 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE scores (id INT, score INT, name VARCHAR)").unwrap();
         for i in 0..20 {
-            conn.execute(&format!(
-                "INSERT INTO scores VALUES ({}, {}, 'user{}')",
-                i, i * 5, i
-            )).unwrap();
+            conn.execute(&format!("INSERT INTO scores VALUES ({}, {}, 'user{}')", i, i * 5, i))
+                .unwrap();
         }
         conn.execute("CREATE INDEX idx_score ON scores (score)").unwrap();
 
         // 双边闭区间（BETWEEN 被改写为 score >= a AND score <= b → 合并为闭区间）
-        let result = conn.execute(
-            "SELECT id, name FROM scores WHERE score BETWEEN 30 AND 60"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT id, name FROM scores WHERE score BETWEEN 30 AND 60")
+            .unwrap();
         // score ∈ {30,35,40,45,50,55,60} → id = 6..12
         assert_eq!(result.rows.len(), 7);
         assert_eq!(result.rows[0][0], Value::Int64(6));
         assert_eq!(result.rows[6][0], Value::Int64(12));
 
         // 单边下界（开区间）
-        let result = conn.execute(
-            "SELECT id FROM scores WHERE score > 90"
-        ).unwrap();
+        let result = conn.execute("SELECT id FROM scores WHERE score > 90").unwrap();
         // score ∈ {95} → id = 19
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Int64(19));
 
         // 单边上界（闭区间）
-        let result = conn.execute(
-            "SELECT id FROM scores WHERE score <= 10"
-        ).unwrap();
+        let result = conn.execute("SELECT id FROM scores WHERE score <= 10").unwrap();
         // score ∈ {0,5,10} → id = 0..2
         assert_eq!(result.rows.len(), 3);
 
         // 双边开闭混合：score >= 15 AND score < 25 → {15,20} → id 3,4
-        let result = conn.execute(
-            "SELECT id FROM scores WHERE score >= 15 AND score < 25"
-        ).unwrap();
+        let result = conn.execute("SELECT id FROM scores WHERE score >= 15 AND score < 25").unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::Int64(3));
         assert_eq!(result.rows[1][0], Value::Int64(4));
 
         // 空范围（下界 > 上界）：退回 Filter 全表扫 → 空结果
-        let result = conn.execute(
-            "SELECT id FROM scores WHERE score > 60 AND score < 30"
-        ).unwrap();
+        let result = conn.execute("SELECT id FROM scores WHERE score > 60 AND score < 30").unwrap();
         assert_eq!(result.rows.len(), 0);
 
         // 范围 + 其他条件（无法完全用范围表示 → 全表 Filter，结果仍正确）
-        let result = conn.execute(
-            "SELECT id FROM scores WHERE score > 30 AND name = 'user10'"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT id FROM scores WHERE score > 30 AND name = 'user10'")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Int64(10));
     }
@@ -1372,7 +1396,8 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (a INT, b INT, c INT)").unwrap();
         for i in 0..5 {
-            conn.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i * 10, i * 100)).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i * 10, i * 100))
+                .unwrap();
         }
 
         // 列子集：SELECT b, a（重排）
@@ -1412,9 +1437,8 @@ mod value_tests {    use super::*;
 
         conn.execute("CREATE TABLE scores (id INT, score INT, name VARCHAR)").unwrap();
         // 多行 VALUES → 列式路径
-        conn.execute(
-            "INSERT INTO scores VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')"
-        ).unwrap();
+        conn.execute("INSERT INTO scores VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')")
+            .unwrap();
         conn.execute("CREATE INDEX idx_score ON scores (score)").unwrap();
 
         // 数据正确（全表扫描）
@@ -1459,8 +1483,10 @@ mod value_tests {    use super::*;
         for i in 1..=4 {
             conn.execute(&format!("INSERT INTO users VALUES ({}, 'user{}')", i, i)).unwrap();
         }
-        conn.execute("INSERT INTO orders VALUES (101, 1, 50), (102, 2, 30), (103, 2, 80), (104, 99, 10)").unwrap();
-        conn.execute("INSERT INTO items VALUES (101, 'apple'), (103, 'pear'), (999, 'ghost')").unwrap();
+        conn.execute("INSERT INTO orders VALUES (101, 1, 50), (102, 2, 30), (103, 2, 80), (104, 99, 10)")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (101, 'apple'), (103, 'pear'), (999, 'ghost')")
+            .unwrap();
     }
 
     #[test]
@@ -1507,8 +1533,14 @@ mod value_tests {    use super::*;
         ).unwrap();
         assert_eq!(r.columns, vec!["name".to_string(), "label".to_string()]);
         assert_eq!(r.rows.len(), 2);
-        assert_eq!(r.rows[0], vec![Value::Varchar("user1".into()), Value::Varchar("apple".into())]);
-        assert_eq!(r.rows[1], vec![Value::Varchar("user2".into()), Value::Varchar("pear".into())]);
+        assert_eq!(
+            r.rows[0],
+            vec![Value::Varchar("user1".into()), Value::Varchar("apple".into())]
+        );
+        assert_eq!(
+            r.rows[1],
+            vec![Value::Varchar("user2".into()), Value::Varchar("pear".into())]
+        );
     }
 
     #[test]
@@ -1525,9 +1557,9 @@ mod value_tests {    use super::*;
         assert_eq!(r.rows[1], vec![Value::Varchar("user1".into()), Value::Float64(50.0)]);
 
         // JOIN + COUNT(*)
-        let r = conn.execute(
-            "SELECT COUNT(*) FROM users JOIN orders ON users.id = orders.uid"
-        ).unwrap();
+        let r = conn
+            .execute("SELECT COUNT(*) FROM users JOIN orders ON users.id = orders.uid")
+            .unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(3));
     }
 
@@ -1543,16 +1575,16 @@ mod value_tests {    use super::*;
         assert_eq!(r.rows.len(), 2);
 
         // LEFT JOIN + WHERE（谓词不得下推破坏 NULL 补行语义）
-        let r = conn.execute(
-            "SELECT users.name FROM users LEFT JOIN orders ON users.id = orders.uid WHERE orders.amount > 50"
-        ).unwrap();
+        let r = conn
+            .execute("SELECT users.name FROM users LEFT JOIN orders ON users.id = orders.uid WHERE orders.amount > 50")
+            .unwrap();
         // 只有 user2 的 amount=80 满足
         assert_eq!(r.rows, vec![vec![Value::Varchar("user2".into())]]);
 
         // 无匹配 LEFT JOIN + WHERE：全 NULL 右列行应被过滤
-        let r = conn.execute(
-            "SELECT users.name FROM users LEFT JOIN orders ON users.id = orders.uid WHERE orders.amount < 15"
-        ).unwrap();
+        let r = conn
+            .execute("SELECT users.name FROM users LEFT JOIN orders ON users.id = orders.uid WHERE orders.amount < 15")
+            .unwrap();
         // orders 有 amount=10（uid=99 无匹配左表）→ 无结果
         assert_eq!(r.rows.len(), 0);
     }
@@ -1563,9 +1595,9 @@ mod value_tests {    use super::*;
         setup_join_tables(&mut conn);
 
         // CROSS JOIN + WHERE + 投影（此前 CrossJoin 直接返回、WHERE 被忽略）
-        let r = conn.execute(
-            "SELECT users.name, items.label FROM users CROSS JOIN items WHERE items.iid = 101"
-        ).unwrap();
+        let r = conn
+            .execute("SELECT users.name, items.label FROM users CROSS JOIN items WHERE items.iid = 101")
+            .unwrap();
         assert_eq!(r.rows.len(), 4);
         for row in &r.rows {
             assert_eq!(row[1], Value::Varchar("apple".into()));
@@ -1578,25 +1610,29 @@ mod value_tests {    use super::*;
     fn test_create_covering_index_include_syntax() {
         // CREATE INDEX ... INCLUDE (col1, col2) 语法
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, role VARCHAR, content VARCHAR, ts INT)").unwrap();
+        conn.execute("CREATE TABLE messages (id INT, session_id VARCHAR, role VARCHAR, content VARCHAR, ts INT)")
+            .unwrap();
         for i in 0..20 {
             conn.execute(&format!(
                 "INSERT INTO messages VALUES ({}, 'sess_{}', 'user', 'hello', {})",
-                i, i % 5, i * 100
-            )).unwrap();
+                i,
+                i % 5,
+                i * 100
+            ))
+            .unwrap();
         }
 
         // 创建覆盖索引：键列 session_id，INCLUDE role 和 ts
-        let result = conn.execute(
-            "CREATE INDEX idx_sess_cover ON messages (session_id) INCLUDE (role, ts)"
-        ).unwrap();
+        let result = conn
+            .execute("CREATE INDEX idx_sess_cover ON messages (session_id) INCLUDE (role, ts)")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert!(matches!(&result.rows[0][0], Value::Varchar(s) if s.contains("idx_sess_cover")));
 
         // 验证：点查 session_id = 'sess_2'，返回 4 行（20/5）
-        let result = conn.execute(
-            "SELECT session_id, role FROM messages WHERE session_id = 'sess_2'"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT session_id, role FROM messages WHERE session_id = 'sess_2'")
+            .unwrap();
         assert_eq!(result.rows.len(), 4);
 
         // 验证两列的值正确（不依赖列顺序）
@@ -1725,8 +1761,10 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT, category VARCHAR, val INT)").unwrap();
         for i in 1..=5 {
-            conn.execute(&format!("INSERT INTO t VALUES ({}, 'a', {})", i, 100 - i * 10)).unwrap();
-            conn.execute(&format!("INSERT INTO t VALUES ({}, 'b', {})", i + 10, i * 10)).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({}, 'a', {})", i, 100 - i * 10))
+                .unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({}, 'b', {})", i + 10, i * 10))
+                .unwrap();
         }
 
         let result = conn.execute("SELECT val FROM t WHERE category = 'a' ORDER BY val").unwrap();
@@ -1870,8 +1908,8 @@ mod value_tests {    use super::*;
         let rows = conn.execute("SELECT id, val FROM t ORDER BY id").unwrap();
         assert_eq!(rows.rows.len(), 3);
         assert_eq!(rows.rows[0][1], Value::Int64(10)); // id=1 不变
-        assert_eq!(rows.rows[1][1], Value::Int64(0));  // id=2 被更新
-        assert_eq!(rows.rows[2][1], Value::Int64(0));  // id=3 被更新
+        assert_eq!(rows.rows[1][1], Value::Int64(0)); // id=2 被更新
+        assert_eq!(rows.rows[2][1], Value::Int64(0)); // id=3 被更新
     }
 
     #[test]
@@ -1973,7 +2011,11 @@ mod value_tests {    use super::*;
         // INSERT with NULL in NOT NULL column should fail
         let err = conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap_err();
         let err_str = err.to_string();
-        assert!(err_str.contains("NOT NULL"), "expected NOT NULL error, got: {}", err_str);
+        assert!(
+            err_str.contains("NOT NULL"),
+            "expected NOT NULL error, got: {}",
+            err_str
+        );
     }
 
     #[test]
@@ -2071,7 +2113,8 @@ mod value_tests {    use super::*;
     #[test]
     fn test_auto_increment_basic() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)")
+            .unwrap();
 
         // 不提供 id 值 → 自动从 1 开始
         conn.execute("INSERT INTO t (name) VALUES ('a')").unwrap();
@@ -2091,7 +2134,8 @@ mod value_tests {    use super::*;
     #[test]
     fn test_auto_increment_explicit_value() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)").unwrap();
+        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR)")
+            .unwrap();
 
         conn.execute("INSERT INTO t (name) VALUES ('a')").unwrap();
         // 显式指定 id=100
@@ -2154,7 +2198,8 @@ mod value_tests {    use super::*;
     fn test_unique_column_with_pk() {
         let mut conn = Connection::open(":memory:").unwrap();
         // PRIMARY KEY + UNIQUE 不冲突
-        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR UNIQUE)").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR UNIQUE)")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
         conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
         // 重复 name 应该报错
@@ -2165,22 +2210,29 @@ mod value_tests {    use super::*;
     #[test]
     fn test_insert_returning() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR, score INT)").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR, score INT)")
+            .unwrap();
 
         // INSERT...RETURNING 单列
-        let result = conn.execute("INSERT INTO t (name, score) VALUES ('alice', 100) RETURNING id").unwrap();
+        let result = conn
+            .execute("INSERT INTO t (name, score) VALUES ('alice', 100) RETURNING id")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Int64(1));
 
         // INSERT...RETURNING 多列
-        let result = conn.execute("INSERT INTO t (name, score) VALUES ('bob', 200) RETURNING id, name, score").unwrap();
+        let result = conn
+            .execute("INSERT INTO t (name, score) VALUES ('bob', 200) RETURNING id, name, score")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Int64(2));
         assert_eq!(result.rows[0][1], Value::Varchar("bob".into()));
         assert_eq!(result.rows[0][2], Value::Int64(200));
 
         // INSERT...RETURNING *
-        let result = conn.execute("INSERT INTO t (name, score) VALUES ('carol', 300) RETURNING *").unwrap();
+        let result = conn
+            .execute("INSERT INTO t (name, score) VALUES ('carol', 300) RETURNING *")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].len(), 3); // id, name, score
 
@@ -2192,7 +2244,8 @@ mod value_tests {    use super::*;
     #[test]
     fn test_upsert_do_update() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR, score INT)").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR, score INT)")
+            .unwrap();
 
         // 首次插入
         conn.execute("INSERT INTO t VALUES (1, 'alice', 100)").unwrap();
@@ -2219,7 +2272,8 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
 
         // UPSERT：冲突时不做任何事
-        conn.execute("INSERT INTO t VALUES (1, 'bob') ON CONFLICT (id) DO NOTHING").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'bob') ON CONFLICT (id) DO NOTHING")
+            .unwrap();
 
         // 验证原始值未变
         let result = conn.execute("SELECT name FROM t WHERE id = 1").unwrap();
@@ -2232,8 +2286,8 @@ mod value_tests {    use super::*;
 
     #[test]
     fn test_hybrid_search() {
+        use crate::common::types::{ColumnDef, DataType, TableDef};
         use crate::storage::vector_index::DistanceMetric;
-        use crate::common::types::{TableDef, ColumnDef, DataType};
 
         // 通过 API 直接创建表（避免 SQL 解析器 VECTOR 维度问题）
         let mut conn = Connection::open(":memory:").unwrap();
@@ -2249,16 +2303,29 @@ mod value_tests {    use super::*;
         db.create_table(table_def).unwrap();
 
         // 写入数据
-        let ids = vec![Value::Int64(1), Value::Int64(2), Value::Int64(3), Value::Int64(4), Value::Int64(5), Value::Int64(6)];
+        let ids = vec![
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(5),
+            Value::Int64(6),
+        ];
         let names = vec![
-            Value::Varchar("item1".into()), Value::Varchar("item2".into()),
-            Value::Varchar("item3".into()), Value::Varchar("item4".into()),
-            Value::Varchar("item5".into()), Value::Varchar("item6".into()),
+            Value::Varchar("item1".into()),
+            Value::Varchar("item2".into()),
+            Value::Varchar("item3".into()),
+            Value::Varchar("item4".into()),
+            Value::Varchar("item5".into()),
+            Value::Varchar("item6".into()),
         ];
         let categories = vec![
-            Value::Varchar("A".into()), Value::Varchar("A".into()),
-            Value::Varchar("B".into()), Value::Varchar("B".into()),
-            Value::Varchar("C".into()), Value::Varchar("C".into()),
+            Value::Varchar("A".into()),
+            Value::Varchar("A".into()),
+            Value::Varchar("B".into()),
+            Value::Varchar("B".into()),
+            Value::Varchar("C".into()),
+            Value::Varchar("C".into()),
         ];
         let vectors = vec![
             Value::Vector(vec![0.1, 0.2, 0.3, 0.4]),
@@ -2269,14 +2336,22 @@ mod value_tests {    use super::*;
             Value::Vector(vec![0.4, 0.4, 0.4, 0.4]),
         ];
         // 使用 table.insert 直接写入行数据
-        let rows: Vec<Vec<Value>> = (0..6).map(|i| {
-            vec![ids[i].clone(), names[i].clone(), categories[i].clone(), vectors[i].clone()]
-        }).collect();
+        let rows: Vec<Vec<Value>> = (0..6)
+            .map(|i| {
+                vec![
+                    ids[i].clone(),
+                    names[i].clone(),
+                    categories[i].clone(),
+                    vectors[i].clone(),
+                ]
+            })
+            .collect();
         let table = db.get_table_mut("items").unwrap();
         table.insert(rows).unwrap();
 
         // 创建 HNSW 向量索引
-        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50).unwrap();
+        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50)
+            .unwrap();
 
         // 查询向量：接近类别 A 的向量
         let query = vec![0.15, 0.25, 0.35, 0.45];
@@ -2286,52 +2361,49 @@ mod value_tests {    use super::*;
         assert_eq!(results.len(), 3);
 
         // 混合搜索：只保留类别 A 的结果
-        let results = db.hybrid_search(
-            "items", "idx_vec", &query, 3, 3, &[0, 1, 2],
-            &|row: &[Value]| {
+        let results = db
+            .hybrid_search("items", "idx_vec", &query, 3, 3, &[0, 1, 2], &|row: &[Value]| {
                 if let Value::Varchar(cat) = &row[2] {
                     cat == "A"
                 } else {
                     false
                 }
-            },
-        ).unwrap();
+            })
+            .unwrap();
         assert_eq!(results.len(), 2, "应该只返回类别 A 的 2 个结果");
         for r in &results {
             assert_eq!(r.row.len(), 3, "应该返回 id, name, category 三列");
         }
 
         // 混合搜索：保留类别 B 的结果
-        let results = db.hybrid_search(
-            "items", "idx_vec", &query, 3, 3, &[0, 1, 2],
-            &|row: &[Value]| {
+        let results = db
+            .hybrid_search("items", "idx_vec", &query, 3, 3, &[0, 1, 2], &|row: &[Value]| {
                 if let Value::Varchar(cat) = &row[2] {
                     cat == "B"
                 } else {
                     false
                 }
-            },
-        ).unwrap();
+            })
+            .unwrap();
         assert_eq!(results.len(), 2, "应该只返回类别 B 的 2 个结果");
 
         // 混合搜索：无匹配类别
-        let results = db.hybrid_search(
-            "items", "idx_vec", &query, 3, 3, &[0, 1, 2],
-            &|row: &[Value]| {
+        let results = db
+            .hybrid_search("items", "idx_vec", &query, 3, 3, &[0, 1, 2], &|row: &[Value]| {
                 if let Value::Varchar(cat) = &row[2] {
                     cat == "Z"
                 } else {
                     false
                 }
-            },
-        ).unwrap();
+            })
+            .unwrap();
         assert_eq!(results.len(), 0, "没有类别 Z 的数据");
     }
 
     #[test]
     fn test_search_trace() {
+        use crate::common::types::{ColumnDef, DataType, TableDef};
         use crate::storage::vector_index::DistanceMetric;
-        use crate::common::types::{TableDef, ColumnDef, DataType};
 
         let mut conn = Connection::open(":memory:").unwrap();
 
@@ -2344,15 +2416,18 @@ mod value_tests {    use super::*;
         db.create_table(table_def).unwrap();
 
         // 插入 10 个向量
-        let rows: Vec<Vec<Value>> = (0..10).map(|i| {
-            let v = vec![i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1];
-            vec![Value::Int64(i as i64), Value::Vector(v)]
-        }).collect();
+        let rows: Vec<Vec<Value>> = (0..10)
+            .map(|i| {
+                let v = vec![i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1];
+                vec![Value::Int64(i as i64), Value::Vector(v)]
+            })
+            .collect();
         let table = db.get_table_mut("items").unwrap();
         table.insert(rows).unwrap();
 
         // 创建 HNSW 索引
-        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50).unwrap();
+        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50)
+            .unwrap();
 
         // 带 trace 的搜索
         let query = vec![0.5, 0.5, 0.5, 0.5];
@@ -2384,8 +2459,8 @@ mod value_tests {    use super::*;
 
     #[test]
     fn test_search_trace_with_quantization() {
+        use crate::common::types::{ColumnDef, DataType, TableDef};
         use crate::storage::vector_index::DistanceMetric;
-        use crate::common::types::{TableDef, ColumnDef, DataType};
 
         let mut conn = Connection::open(":memory:").unwrap();
 
@@ -2398,15 +2473,18 @@ mod value_tests {    use super::*;
         db.create_table(table_def).unwrap();
 
         // 插入 20 个向量
-        let rows: Vec<Vec<Value>> = (0..20).map(|i| {
-            let v: Vec<i8> = (0..4).map(|j| ((i + j) as f32 * 10.0) as i8).collect();
-            vec![Value::Int64(i as i64), Value::VectorInt8(v)]
-        }).collect();
+        let rows: Vec<Vec<Value>> = (0..20)
+            .map(|i| {
+                let v: Vec<i8> = (0..4).map(|j| ((i + j) as f32 * 10.0) as i8).collect();
+                vec![Value::Int64(i as i64), Value::VectorInt8(v)]
+            })
+            .collect();
         let table = db.get_table_mut("items").unwrap();
         table.insert(rows).unwrap();
 
         // 创建量化 HNSW 索引
-        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50).unwrap();
+        db.create_vector_index("items", "idx_vec", "vec", DistanceMetric::L2, 8, 50)
+            .unwrap();
 
         // 带 trace 的搜索（query 需要是 f32，向量内部会自动转换）
         let query = vec![0.5, 0.5, 0.5, 0.5];
@@ -2495,11 +2573,10 @@ mod value_tests {    use super::*;
         conn.execute("COMMIT").unwrap();
 
         let ids = row_ids(&mut conn, "t", "id");
-        assert_eq!(ids, vec![
-            crate::Value::Int64(1),
-            crate::Value::Int64(2),
-            crate::Value::Int64(3),
-        ]);
+        assert_eq!(
+            ids,
+            vec![crate::Value::Int64(1), crate::Value::Int64(2), crate::Value::Int64(3),]
+        );
     }
 
     #[test]
@@ -2575,10 +2652,7 @@ mod value_tests {    use super::*;
 
         // 2、3 被撤销，1（savepoint 前）与 4（回滚后）保留
         let ids = row_ids(&mut conn, "t", "id");
-        assert_eq!(ids, vec![
-            crate::Value::Int64(1),
-            crate::Value::Int64(4),
-        ]);
+        assert_eq!(ids, vec![crate::Value::Int64(1), crate::Value::Int64(4),]);
     }
 
     #[test]
@@ -2609,8 +2683,10 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
         // 冲突：攒批路径下会延迟到 flush；约束门控下语句时即报错
         let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "expected ConstraintViolation at statement time, got {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "expected ConstraintViolation at statement time, got {err:?}"
+        );
         conn.execute("COMMIT").unwrap();
 
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
@@ -2667,8 +2743,10 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
         // 攒批路径 + 入批即校验：第二条冲突语句即时报错
         let err = conn.execute("INSERT INTO t VALUES (1)").unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "expected ConstraintViolation at statement, got {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "expected ConstraintViolation at statement, got {err:?}"
+        );
         // 失败零副作用：行数不变
         conn.execute("COMMIT").unwrap();
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
@@ -2699,7 +2777,7 @@ mod value_tests {    use super::*;
 
     #[test]
     fn test_ttl_expiration() {
-        use crate::common::types::{TableDef, ColumnDef, DataType};
+        use crate::common::types::{ColumnDef, DataType, TableDef};
 
         let mut conn = Connection::open(":memory:").unwrap();
 
@@ -2711,20 +2789,18 @@ mod value_tests {    use super::*;
         ];
         let mut table_def = TableDef::new(0, "ttl_test", columns);
         table_def.ttl_seconds = Some(60); // 60 秒过期
-        table_def.ttl_column = Some(2);   // created_at 列是 TTL 参考列
+        table_def.ttl_column = Some(2); // created_at 列是 TTL 参考列
 
         let db = conn.database_mut();
         db.create_table(table_def).unwrap();
 
         // 插入数据（TTL 会自动填充 created_at 为当前时间）
-        let rows = vec![
-            vec![Value::Int64(1), Value::Varchar("alive".into()), Value::Null],
-        ];
+        let rows = vec![vec![Value::Int64(1), Value::Varchar("alive".into()), Value::Null]];
         let table = db.get_table_mut("ttl_test").unwrap();
         table.insert(rows).unwrap();
 
         // 验证刚插入的数据可以被查询到（未过期）
-        let row = table.get_row_by_id(0).unwrap();  // delta store 使用 0-based row_id
+        let row = table.get_row_by_id(0).unwrap(); // delta store 使用 0-based row_id
         assert!(row.is_some(), "刚插入的数据应该可查询");
 
         // 验证 scan 也能查到
@@ -2735,7 +2811,8 @@ mod value_tests {    use super::*;
         let past = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as i64 - 120_000;
+            .as_millis() as i64
+            - 120_000;
         let table = db.get_table_mut("ttl_test").unwrap();
         // 直接修改 Delta 层的数据（row_id=0）
         let old_row = table.delta_store().get(0).unwrap();
@@ -2754,9 +2831,7 @@ mod value_tests {    use super::*;
         // 验证 compaction 后物理删除
         table.compact_delta().unwrap();
         // 重新插入一条新数据验证 compaction 后索引正常
-        let rows = vec![
-            vec![Value::Int64(2), Value::Varchar("new".into()), Value::Null],
-        ];
+        let rows = vec![vec![Value::Int64(2), Value::Varchar("new".into()), Value::Null]];
         table.insert(rows).unwrap();
         let all = table.scan(&[0, 1]).unwrap();
         assert_eq!(all.len(), 1, "compaction 后只有新数据");
@@ -2771,15 +2846,17 @@ mod value_tests {    use super::*;
         // 默认 Adaptive 策略 min_threshold = 10,000：
         // 单批 10,000 行写入 Delta 层（< direct_threshold 30,720）
         // 会触发 maybe_compact → compact_delta_partial，此前此处会重复累加 row_count
-        let rows: Vec<String> = (0..10_000)
-            .map(|i| format!("({}, 'v{}')", i, i))
-            .collect();
+        let rows: Vec<String> = (0..10_000).map(|i| format!("({}, 'v{}')", i, i)).collect();
         let sql = format!("INSERT INTO t VALUES {}", rows.join(", "));
         conn.execute(&sql).unwrap();
 
         // COUNT(*) fast-path（元数据）与实际行数必须一致
         let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
-        assert_eq!(result.rows[0][0], Value::Int64(10_000), "COUNT(*) 应等于 10000，不应翻倍");
+        assert_eq!(
+            result.rows[0][0],
+            Value::Int64(10_000),
+            "COUNT(*) 应等于 10000，不应翻倍"
+        );
 
         // SELECT * 全量扫描验证实际行数
         let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
@@ -2816,7 +2893,11 @@ mod value_tests {    use super::*;
         conn.import_columns("t", vec![ids, vals]).unwrap();
 
         let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
-        assert_eq!(result.rows[0][0], Value::Int64(100), "import_columns 小批量 COUNT 应为 100");
+        assert_eq!(
+            result.rows[0][0],
+            Value::Int64(100),
+            "import_columns 小批量 COUNT 应为 100"
+        );
 
         // compact 后计数不变
         conn.compact_all().unwrap();
@@ -2829,7 +2910,8 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
 
         // 创建表
-        conn.execute("CREATE TABLE sales (id INT64, product VARCHAR, amount INT64)").unwrap();
+        conn.execute("CREATE TABLE sales (id INT64, product VARCHAR, amount INT64)")
+            .unwrap();
         conn.execute("INSERT INTO sales VALUES (1, 'A', 100)").unwrap();
         conn.execute("INSERT INTO sales VALUES (2, 'A', 200)").unwrap();
         conn.execute("INSERT INTO sales VALUES (3, 'B', 150)").unwrap();
@@ -2841,11 +2923,15 @@ mod value_tests {    use super::*;
         assert_eq!(result.rows.len(), 3, "应有 3 个分组");
 
         // HAVING SUM(amount) > 250: A=300, B=200, C=300 → A 和 C 通过
-        let result = conn.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 250").unwrap();
+        let result = conn
+            .execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 250")
+            .unwrap();
         assert_eq!(result.rows.len(), 2, "A(total=300) 和 C(total=300) 应被选中");
 
         // HAVING SUM(amount) < 250: A=300, B=200, C=300 → B 通过
-        let result = conn.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) < 250").unwrap();
+        let result = conn
+            .execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) < 250")
+            .unwrap();
         assert_eq!(result.rows.len(), 1, "B(total=200) 应被选中");
     }
 
@@ -2853,7 +2939,8 @@ mod value_tests {    use super::*;
     fn test_having_with_count() {
         let mut conn = Connection::open(":memory:").unwrap();
 
-        conn.execute("CREATE TABLE orders (id INT64, customer VARCHAR, amount INT64)").unwrap();
+        conn.execute("CREATE TABLE orders (id INT64, customer VARCHAR, amount INT64)")
+            .unwrap();
         conn.execute("INSERT INTO orders VALUES (1, 'Alice', 100)").unwrap();
         conn.execute("INSERT INTO orders VALUES (2, 'Bob', 200)").unwrap();
         conn.execute("INSERT INTO orders VALUES (3, 'Alice', 150)").unwrap();
@@ -2862,7 +2949,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO orders VALUES (6, 'Alice', 200)").unwrap();
 
         // HAVING COUNT(*) > 1: Alice=3, Bob=2, Charlie=1 → Alice 和 Bob 通过
-        let result = conn.execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) > 1").unwrap();
+        let result = conn
+            .execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) > 1")
+            .unwrap();
         assert_eq!(result.rows.len(), 2, "Alice(3) 和 Bob(2) 应有多个订单");
     }
 
@@ -2877,7 +2966,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO scores VALUES (4, 55)").unwrap();
 
         // CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END
-        let result = conn.execute("SELECT id, CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END FROM scores").unwrap();
+        let result = conn
+            .execute("SELECT id, CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END FROM scores")
+            .unwrap();
         assert_eq!(result.rows.len(), 4);
         assert_eq!(result.rows[0][1], Value::Varchar("A".to_string())); // 95 -> A
         assert_eq!(result.rows[1][1], Value::Varchar("B".to_string())); // 85 -> B
@@ -2927,7 +3018,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t2 VALUES (3, 'c'), (4, 'd'), (5, 'e')").unwrap();
 
         // UNION ALL：不去重，6 行
-        let result = conn.execute("SELECT id, name FROM t1 UNION ALL SELECT id, name FROM t2").unwrap();
+        let result = conn
+            .execute("SELECT id, name FROM t1 UNION ALL SELECT id, name FROM t2")
+            .unwrap();
         assert_eq!(result.rows.len(), 6, "UNION ALL 应返回 6 行（不去重）");
     }
 
@@ -2972,7 +3065,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t2 VALUES (3, 30), (4, 40), (5, 50)").unwrap();
 
         // 带 WHERE 过滤的 UNION
-        let result = conn.execute("SELECT id FROM t1 WHERE val > 15 UNION ALL SELECT id FROM t2 WHERE val > 35").unwrap();
+        let result = conn
+            .execute("SELECT id FROM t1 WHERE val > 15 UNION ALL SELECT id FROM t2 WHERE val > 35")
+            .unwrap();
         assert_eq!(result.rows.len(), 4, "t1(val>15): 2 行, t2(val>35): 2 行");
     }
 
@@ -2988,7 +3083,14 @@ mod value_tests {    use super::*;
         // INTERSECT：返回交集 {3, 4}
         let result = conn.execute("SELECT id FROM t1 INTERSECT SELECT id FROM t2").unwrap();
         assert_eq!(result.rows.len(), 2, "INTERSECT 应返回 2 行");
-        let ids: Vec<i64> = result.rows.iter().map(|r| match r[0] { Value::Int64(v) => v, _ => 0 }).collect();
+        let ids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int64(v) => v,
+                _ => 0,
+            })
+            .collect();
         assert!(ids.contains(&3));
         assert!(ids.contains(&4));
     }
@@ -3005,7 +3107,14 @@ mod value_tests {    use super::*;
         // EXCEPT：t1 - t2 = {1, 2}
         let result = conn.execute("SELECT id FROM t1 EXCEPT SELECT id FROM t2").unwrap();
         assert_eq!(result.rows.len(), 2, "EXCEPT 应返回 2 行");
-        let ids: Vec<i64> = result.rows.iter().map(|r| match r[0] { Value::Int64(v) => v, _ => 0 }).collect();
+        let ids: Vec<i64> = result
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int64(v) => v,
+                _ => 0,
+            })
+            .collect();
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
     }
@@ -3020,7 +3129,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t2 VALUES (10), (20)").unwrap();
 
         // CROSS JOIN：笛卡尔积，2 × 2 = 4 行
-        let result = conn.execute("SELECT t1.id, t1.name, t2.val FROM t1 CROSS JOIN t2 ORDER BY t1.id, t2.val").unwrap();
+        let result = conn
+            .execute("SELECT t1.id, t1.name, t2.val FROM t1 CROSS JOIN t2 ORDER BY t1.id, t2.val")
+            .unwrap();
         assert_eq!(result.rows.len(), 4, "CROSS JOIN 应返回 4 行");
         // 验证第一行: id=1, name='a', val=10
         assert_eq!(result.rows[0].len(), 3);
@@ -3054,12 +3165,14 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
 
         conn.execute("CREATE TABLE products (id INT64, price INT64)").unwrap();
-        conn.execute("INSERT INTO products VALUES (1, 50), (2, 150), (3, 500), (4, 1000)").unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 50), (2, 150), (3, 500), (4, 1000)")
+            .unwrap();
 
         conn.execute("CREATE TABLE cheap_products (id INT64, price INT64)").unwrap();
 
         // INSERT ... SELECT ... WHERE — 只插入价格 < 200 的
-        conn.execute("INSERT INTO cheap_products SELECT id, price FROM products WHERE price < 200").unwrap();
+        conn.execute("INSERT INTO cheap_products SELECT id, price FROM products WHERE price < 200")
+            .unwrap();
 
         let result = conn.execute("SELECT COUNT(*) FROM cheap_products").unwrap();
         assert_eq!(result.rows[0][0], Value::Int64(2), "price < 200 的产品有 2 个");
@@ -3111,14 +3224,19 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
 
         conn.execute("CREATE TABLE products (id INT64, name VARCHAR)").unwrap();
-        conn.execute("INSERT INTO products VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'date')").unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'date')")
+            .unwrap();
 
         // IN 列表基本查询
-        let result = conn.execute("SELECT id FROM products WHERE name IN ('apple', 'cherry')").unwrap();
+        let result = conn
+            .execute("SELECT id FROM products WHERE name IN ('apple', 'cherry')")
+            .unwrap();
         assert_eq!(result.rows.len(), 2, "应返回 apple 和 cherry");
 
         // NOT IN
-        let result = conn.execute("SELECT id FROM products WHERE name NOT IN ('apple', 'cherry')").unwrap();
+        let result = conn
+            .execute("SELECT id FROM products WHERE name NOT IN ('apple', 'cherry')")
+            .unwrap();
         assert_eq!(result.rows.len(), 2, "应返回 banana 和 date");
     }
 
@@ -3127,7 +3245,8 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
 
         conn.execute("CREATE TABLE t (id INT64, val INT64)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+            .unwrap();
 
         // 数值 IN 列表
         let result = conn.execute("SELECT id FROM t WHERE val IN (10, 30, 50)").unwrap();
@@ -3140,10 +3259,12 @@ mod value_tests {    use super::*;
 
         // 源表
         conn.execute("CREATE TABLE src (id INT64, name VARCHAR, score INT64)").unwrap();
-        conn.execute("INSERT INTO src VALUES (1, 'alice', 90), (2, 'bob', 85), (3, 'charlie', 95)").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alice', 90), (2, 'bob', 85), (3, 'charlie', 95)")
+            .unwrap();
 
         // CREATE TABLE AS SELECT：创建高分学生表
-        conn.execute("CREATE TABLE high_scores AS SELECT id, name, score FROM src WHERE score >= 90").unwrap();
+        conn.execute("CREATE TABLE high_scores AS SELECT id, name, score FROM src WHERE score >= 90")
+            .unwrap();
 
         let result = conn.execute("SELECT id FROM high_scores ORDER BY id").unwrap();
         assert_eq!(result.rows.len(), 2, "高分学生应有 2 人（alice 和 charlie）");
@@ -3157,7 +3278,8 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO src VALUES (1, 10), (2, 20)").unwrap();
 
         // CREATE TABLE col1 TYPE, col2 TYPE AS SELECT ... — 显式列定义
-        conn.execute("CREATE TABLE dst (x INT64, y VARCHAR) AS SELECT a, 'tag' FROM src").unwrap();
+        conn.execute("CREATE TABLE dst (x INT64, y VARCHAR) AS SELECT a, 'tag' FROM src")
+            .unwrap();
 
         let result = conn.execute("SELECT x FROM dst").unwrap();
         assert_eq!(result.rows.len(), 2);
@@ -3195,18 +3317,31 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')").unwrap();
 
         // INSERT OR REPLACE：替换重复的 id=1，插入新的 id=3
-        conn.execute("INSERT OR REPLACE INTO t VALUES (1, 'replaced'), (3, 'new')").unwrap();
+        conn.execute("INSERT OR REPLACE INTO t VALUES (1, 'replaced'), (3, 'new')")
+            .unwrap();
 
         let result = conn.execute("SELECT COUNT(*) FROM t").unwrap();
-        assert_eq!(result.rows[0][0], Value::Int64(3), "应保留 3 行（1 替换 + 1 新增 + 1 不变）");
+        assert_eq!(
+            result.rows[0][0],
+            Value::Int64(3),
+            "应保留 3 行（1 替换 + 1 新增 + 1 不变）"
+        );
 
         // 验证 id=1 的 val 被替换
         let result = conn.execute("SELECT val FROM t WHERE id = 1").unwrap();
-        assert_eq!(result.rows[0][0], Value::Varchar("replaced".into()), "id=1 的 val 应被替换");
+        assert_eq!(
+            result.rows[0][0],
+            Value::Varchar("replaced".into()),
+            "id=1 的 val 应被替换"
+        );
 
         // 验证 id=2 的 val 不变
         let result = conn.execute("SELECT val FROM t WHERE id = 2").unwrap();
-        assert_eq!(result.rows[0][0], Value::Varchar("world".into()), "id=2 的 val 应保持不变");
+        assert_eq!(
+            result.rows[0][0],
+            Value::Varchar("world".into()),
+            "id=2 的 val 应保持不变"
+        );
     }
 
     #[test]
@@ -3237,7 +3372,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t2 VALUES (1), (3)").unwrap();
 
         // IN (SELECT ...) — 子查询
-        let result = conn.execute("SELECT val FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id").unwrap();
+        let result = conn
+            .execute("SELECT val FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id")
+            .unwrap();
         assert_eq!(result.rows.len(), 2, "IN 子查询应返回 2 行");
         assert_eq!(result.rows[0][0], Value::Varchar("a".into()));
         assert_eq!(result.rows[1][0], Value::Varchar("c".into()));
@@ -3253,7 +3390,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t2 VALUES (1), (3)").unwrap();
 
         // EXISTS (SELECT ...) — 子查询（非关联）
-        let result = conn.execute("SELECT val FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = 1)").unwrap();
+        let result = conn
+            .execute("SELECT val FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = 1)")
+            .unwrap();
         assert_eq!(result.rows.len(), 3, "EXISTS 为真时应返回所有行");
     }
 
@@ -3267,7 +3406,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t2 VALUES (1)").unwrap();
 
         // NOT EXISTS (SELECT ...) — 子查询（非关联）
-        let result = conn.execute("SELECT val FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = 999)").unwrap();
+        let result = conn
+            .execute("SELECT val FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = 999)")
+            .unwrap();
         assert_eq!(result.rows.len(), 3, "NOT EXISTS 为真（子查询无结果）时应返回所有行");
     }
 
@@ -3279,7 +3420,9 @@ mod value_tests {    use super::*;
         conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
 
         // 标量子查询 (SELECT ...) 作为表达式
-        let result = conn.execute("SELECT val, (SELECT COUNT(*) FROM t) AS cnt FROM t WHERE id = 1").unwrap();
+        let result = conn
+            .execute("SELECT val, (SELECT COUNT(*) FROM t) AS cnt FROM t WHERE id = 1")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Varchar("a".into()));
         assert_eq!(result.rows[0][1], Value::Int64(2), "标量子查询应返回 COUNT");
@@ -3290,7 +3433,8 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
 
         conn.execute("CREATE TABLE t (id INT64, val INT64)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+            .unwrap();
 
         // BETWEEN 范围查询
         let result = conn.execute("SELECT id FROM t WHERE val BETWEEN 20 AND 40").unwrap();
@@ -3302,7 +3446,8 @@ mod value_tests {    use super::*;
 
         // BETWEEN with strings
         conn.execute("CREATE TABLE words (w VARCHAR)").unwrap();
-        conn.execute("INSERT INTO words VALUES ('apple'), ('banana'), ('cherry'), ('date')").unwrap();
+        conn.execute("INSERT INTO words VALUES ('apple'), ('banana'), ('cherry'), ('date')")
+            .unwrap();
         let result = conn.execute("SELECT w FROM words WHERE w BETWEEN 'banana' AND 'date'").unwrap();
         assert_eq!(result.rows.len(), 3, "banana-date 范围内应有 banana, cherry, date");
     }
@@ -3337,7 +3482,8 @@ mod value_tests {    use super::*;
     fn test_trim() {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (s VARCHAR)").unwrap();
-        conn.execute("INSERT INTO t VALUES ('  hello  '), ('xxxhelloxxx'), ('  world')").unwrap();
+        conn.execute("INSERT INTO t VALUES ('  hello  '), ('xxxhelloxxx'), ('  world')")
+            .unwrap();
 
         // TRIM 默认去除两端空白
         let result = conn.execute("SELECT TRIM(s) FROM t").unwrap();
@@ -3369,13 +3515,16 @@ mod value_tests {    use super::*;
     fn test_split_part() {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (s VARCHAR)").unwrap();
-        conn.execute("INSERT INTO t VALUES ('a,b,c'), ('hello.world.test'), ('single')").unwrap();
+        conn.execute("INSERT INTO t VALUES ('a,b,c'), ('hello.world.test'), ('single')")
+            .unwrap();
 
         // SPLIT_PART(str, delimiter, part): 1-based
         let result = conn.execute("SELECT SPLIT_PART(s, ',', 2) FROM t WHERE s = 'a,b,c'").unwrap();
         assert_eq!(result.rows[0][0], Value::Varchar("b".into()));
 
-        let result = conn.execute("SELECT SPLIT_PART(s, '.', 3) FROM t WHERE s = 'hello.world.test'").unwrap();
+        let result = conn
+            .execute("SELECT SPLIT_PART(s, '.', 3) FROM t WHERE s = 'hello.world.test'")
+            .unwrap();
         assert_eq!(result.rows[0][0], Value::Varchar("test".into()));
 
         // out of range returns empty string
@@ -3411,7 +3560,9 @@ mod value_tests {    use super::*;
         conn.execute("CREATE TABLE _dummy (x INT64)").unwrap();
         conn.execute("INSERT INTO _dummy VALUES (1)").unwrap();
         // JSON_OBJECT('name', 'alice', 'age', 30) → {"name":"alice","age":30}
-        let result = conn.execute("SELECT JSON_OBJECT('name', 'alice', 'age', 30) FROM _dummy").unwrap();
+        let result = conn
+            .execute("SELECT JSON_OBJECT('name', 'alice', 'age', 30) FROM _dummy")
+            .unwrap();
         let json = match &result.rows[0][0] {
             Value::Json(s) => s.clone(),
             _ => panic!("Expected JSON value"),
@@ -3448,7 +3599,9 @@ mod value_tests {    use super::*;
         assert_eq!(result.rows[0][0], Value::Int64(5));
 
         // 嵌套路径
-        let result = conn.execute("SELECT JSON_ARRAY_LENGTH('{\"a\":[1,2,3]}', '$.a') FROM _dummy").unwrap();
+        let result = conn
+            .execute("SELECT JSON_ARRAY_LENGTH('{\"a\":[1,2,3]}', '$.a') FROM _dummy")
+            .unwrap();
         assert_eq!(result.rows[0][0], Value::Int64(3));
 
         // 非数组应返回 NULL
@@ -3541,7 +3694,8 @@ mod value_tests {    use super::*;
         let mut conn = Connection::open(":memory:").unwrap();
 
         conn.execute("CREATE TABLE t (name VARCHAR, age INT64)").unwrap();
-        conn.execute("INSERT INTO t VALUES ('alice', 30), (NULL, 25), ('bob', NULL)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('alice', 30), (NULL, 25), ('bob', NULL)")
+            .unwrap();
 
         // VARCHAR IS NOT NULL
         let result = conn.execute("SELECT name FROM t WHERE name IS NOT NULL").unwrap();
@@ -3550,14 +3704,17 @@ mod value_tests {    use super::*;
         assert_eq!(result.rows[1][0], Value::Varchar("bob".to_string()));
 
         // IS NOT NULL 对两种列
-        let result = conn.execute("SELECT name FROM t WHERE age IS NOT NULL AND name IS NOT NULL").unwrap();
+        let result = conn
+            .execute("SELECT name FROM t WHERE age IS NOT NULL AND name IS NOT NULL")
+            .unwrap();
         assert_eq!(result.rows.len(), 1, "age AND name IS NOT NULL 应有 1 行 (alice)");
     }
 
     #[test]
     fn test_pragma_index_info() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, name VARCHAR, age INT64)").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, name VARCHAR, age INT64)")
+            .unwrap();
         conn.execute("CREATE INDEX idx_name ON t (name)").unwrap();
         conn.execute("CREATE INDEX idx_age ON t (age)").unwrap();
 
@@ -3580,9 +3737,10 @@ mod value_tests {    use super::*;
         let result = conn.execute("PRAGMA index_list('t')").unwrap();
         assert!(result.rows.len() >= 1, "index_list should have at least 1 row");
         // 验证有索引名列
-        let has_name_idx = result.rows.iter().any(|r| {
-            matches!(&r[1], Value::Varchar(n) if n == "idx_name")
-        });
+        let has_name_idx = result
+            .rows
+            .iter()
+            .any(|r| matches!(&r[1], Value::Varchar(n) if n == "idx_name"));
         assert!(has_name_idx, "index_list should contain idx_name");
     }
 
@@ -3639,29 +3797,42 @@ mod value_tests {    use super::*;
     #[test]
     fn test_create_vector_index() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, embedding VECTOR(4))").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, embedding VECTOR(4))")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, '[1.0, 0.0, 0.0, 0.0]'), (2, '[0.0, 1.0, 0.0, 0.0]'), (3, '[0.0, 0.0, 1.0, 0.0]')").unwrap();
 
         // 创建向量索引（使用 CREATE VECTOR INDEX 语法）
-        let result = conn.execute("CREATE VECTOR INDEX idx_emb ON t (embedding) WITH (metric = cosine, m = 8, ef_construction = 50)").unwrap();
+        let result = conn
+            .execute("CREATE VECTOR INDEX idx_emb ON t (embedding) WITH (metric = cosine, m = 8, ef_construction = 50)")
+            .unwrap();
         assert!(result.rows[0][0].to_string().contains("Vector index"));
 
         // 使用标准 CREATE INDEX ... USING hnsw 语法
-        let result = conn.execute("CREATE INDEX idx_emb2 ON t (embedding) USING hnsw WITH (metric = l2, m = 8, ef_construction = 50)").unwrap();
+        let result = conn
+            .execute(
+                "CREATE INDEX idx_emb2 ON t (embedding) USING hnsw WITH (metric = l2, m = 8, ef_construction = 50)",
+            )
+            .unwrap();
         assert!(result.rows[0][0].to_string().contains("Vector index"));
     }
 
     #[test]
     fn test_vector_search() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, embedding VECTOR(4))").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, embedding VECTOR(4))")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, '[1.0, 0.0, 0.0, 0.0]'), (2, '[0.0, 1.0, 0.0, 0.0]'), (3, '[0.0, 0.0, 1.0, 0.0]')").unwrap();
 
         // 创建向量索引
-        conn.execute("CREATE VECTOR INDEX idx_emb ON t (embedding) WITH (metric = cosine, m = 8, ef_construction = 50)").unwrap();
+        conn.execute(
+            "CREATE VECTOR INDEX idx_emb ON t (embedding) WITH (metric = cosine, m = 8, ef_construction = 50)",
+        )
+        .unwrap();
 
         // 使用 vector_search 表值函数
-        let result = conn.execute("SELECT * FROM vector_search('t', 'idx_emb', '[1.0, 0.0, 0.0, 0.0]', 3)").unwrap();
+        let result = conn
+            .execute("SELECT * FROM vector_search('t', 'idx_emb', '[1.0, 0.0, 0.0, 0.0]', 3)")
+            .unwrap();
         assert_eq!(result.rows.len(), 3, "vector_search should return 3 neighbors");
         // 第一行应是 id=1（自己，距离最近）
         assert_eq!(result.rows[0][0], Value::Int64(1));
@@ -3693,7 +3864,9 @@ mod value_tests {    use super::*;
             let mut sql = String::with_capacity((end - chunk_start) * 40);
             sql.push_str("INSERT INTO t VALUES ");
             for i in chunk_start..end {
-                if i > chunk_start { sql.push_str(", "); }
+                if i > chunk_start {
+                    sql.push_str(", ");
+                }
                 let val = val_fn(i);
                 sql.push_str(&format!("({}, {}, 'name_{}')", i, val, i));
             }
@@ -3706,7 +3879,11 @@ mod value_tests {    use super::*;
     fn test_prewhere_selectivity_1pct() {
         // 1% 选择性：val = 100 的只有 1 行
         let mut conn = setup_where_table(1000, 100, |i| {
-            if i == 500 { 100 } else { (i as i64) % 50 + 1 }  // 1 row matches val=100
+            if i == 500 {
+                100
+            } else {
+                (i as i64) % 50 + 1
+            } // 1 row matches val=100
         });
         // val=100 实际只有 1 行（i=500），其他都是 [1,50] 范围
         let result = conn.execute("SELECT id FROM t WHERE val = 100").unwrap();
@@ -3804,8 +3981,10 @@ mod value_tests {    use super::*;
 
         let mut sql = String::from("INSERT INTO t VALUES ");
         for i in 0..200 {
-            if i > 0 { sql.push_str(", "); }
-            let v = (i as f64) / 200.0;  // [0.0, 0.995]
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let v = (i as f64) / 200.0; // [0.0, 0.995]
             sql.push_str(&format!("({}, {})", i, v));
         }
         conn.execute(&sql).unwrap();
@@ -3824,7 +4003,10 @@ mod value_tests {    use super::*;
         assert_eq!(result.rows.len(), 40); // val ∈ [6, 9]
         for row in &result.rows {
             // 0=id, 1=val, 2=name
-            let val = match &row[1] { Value::Int64(v) => *v, _ => panic!("expected Int64") };
+            let val = match &row[1] {
+                Value::Int64(v) => *v,
+                _ => panic!("expected Int64"),
+            };
             assert!(val > 5, "val should be > 5, got {}", val);
         }
     }
@@ -3872,7 +4054,6 @@ mod multi_engine_tests {
     include!("p5_tests.rs");
     include!("layered_index_tests.rs");
 
-
     #[test]
     fn test_engine_clause_parse() {
         // ENGINE = Memory 子句剥离
@@ -3908,10 +4089,7 @@ mod multi_engine_tests {
     fn test_engine_clause_planner() {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT) ENGINE = Memory").unwrap();
-        let engine = conn
-            .database_mut()
-            .get_engine_table("t")
-            .map(|et| et.engine_type());
+        let engine = conn.database_mut().get_engine_table("t").map(|et| et.engine_type());
         assert_eq!(engine, Some(common::types::EngineType::Memory));
 
         // 非法引擎名报错
@@ -3920,10 +4098,7 @@ mod multi_engine_tests {
 
         // 默认 Columnar
         conn.execute("CREATE TABLE c (id INT)").unwrap();
-        let engine = conn
-            .database_mut()
-            .get_engine_table("c")
-            .map(|et| et.engine_type());
+        let engine = conn.database_mut().get_engine_table("c").map(|et| et.engine_type());
         assert_eq!(engine, Some(common::types::EngineType::Columnar));
     }
 
@@ -3991,10 +4166,7 @@ mod multi_engine_tests {
         }
         {
             let mut conn = Connection::open(&path).unwrap();
-            let engine = conn
-                .database_mut()
-                .get_engine_table("t")
-                .map(|et| et.engine_type());
+            let engine = conn.database_mut().get_engine_table("t").map(|et| et.engine_type());
             assert_eq!(engine, Some(common::types::EngineType::Memory));
             conn.close().unwrap();
         }
@@ -4050,7 +4222,8 @@ mod multi_engine_tests {
     #[test]
     fn test_decimal_type() {
         let mut conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, price DECIMAL(10, 2))").unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY, price DECIMAL(10, 2))")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 19)").unwrap();
         conn.execute("INSERT INTO t VALUES (2, 42)").unwrap();
 
@@ -4068,14 +4241,16 @@ mod multi_engine_tests {
     fn test_correlated_scalar_subquery() {
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)").unwrap();
-        conn.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, value TEXT)").unwrap();
+        conn.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, value TEXT)")
+            .unwrap();
         conn.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
-        conn.execute("INSERT INTO t2 VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 1, 'z')").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 1, 'z')")
+            .unwrap();
 
         // 关联标量子查询：每个 t1 行获取对应的 t2 值
-        let result = conn.execute(
-            "SELECT name, (SELECT value FROM t2 WHERE t2.t1_id = t1.id LIMIT 1) FROM t1 ORDER BY id"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT name, (SELECT value FROM t2 WHERE t2.t1_id = t1.id LIMIT 1) FROM t1 ORDER BY id")
+            .unwrap();
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.rows[0][1], Value::Varchar("x".to_string()));
         assert_eq!(result.rows[1][1], Value::Varchar("y".to_string()));
@@ -4092,9 +4267,9 @@ mod multi_engine_tests {
         conn.execute("INSERT INTO t2 VALUES (1, 1), (2, 2)").unwrap();
 
         // 关联 EXISTS 子查询：只返回在 t2 中有匹配的 t1 行
-        let result = conn.execute(
-            "SELECT name FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id) ORDER BY id"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT name FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id) ORDER BY id")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::Varchar("a".to_string()));
         assert_eq!(result.rows[1][0], Value::Varchar("b".to_string()));
@@ -4109,9 +4284,9 @@ mod multi_engine_tests {
         conn.execute("INSERT INTO t2 VALUES (1, 1), (2, 1)").unwrap();
 
         // 关联 IN 子查询：返回在 t2 中有匹配的 t1 行
-        let result = conn.execute(
-            "SELECT name FROM t1 WHERE t1.id IN (SELECT t1_id FROM t2) ORDER BY id"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT name FROM t1 WHERE t1.id IN (SELECT t1_id FROM t2) ORDER BY id")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Varchar("a".to_string()));
     }
@@ -4129,17 +4304,17 @@ mod multi_engine_tests {
         assert_eq!(result.rows[0][0], Value::Int64(2));
 
         // 非关联 EXISTS（外层带 FROM；引擎不支持无 FROM SELECT）
-        let result = conn.execute(
-            "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.val > t1.val) ORDER BY id"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.val > t1.val) ORDER BY id")
+            .unwrap();
         // val=10 < 15 匹配；val=20、30 无匹配
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Int64(1));
 
         // 非关联 IN
-        let result = conn.execute(
-            "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id"
-        ).unwrap();
+        let result = conn
+            .execute("SELECT id FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
     }
 }

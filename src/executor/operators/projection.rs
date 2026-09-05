@@ -6,8 +6,8 @@
 use crate::common::error::Result;
 use crate::sql::ast::Expression;
 
+use super::super::expression::{contains_subquery, eval_vectorized, eval_vectorized_with_db};
 use super::super::vector::{DataChunk, Vector};
-use super::super::expression::{eval_vectorized, eval_vectorized_with_db, contains_subquery};
 
 /// 执行投影（支持表达式计算）
 ///
@@ -42,8 +42,7 @@ pub fn execute_with_db(
     column_names: &[String],
     db: &mut crate::storage::Database,
 ) -> Result<Vec<DataChunk>> {
-    let per_row = input.iter().any(|c| c.count > 0)
-        && expressions.iter().any(contains_subquery);
+    let per_row = input.iter().any(|c| c.count > 0) && expressions.iter().any(contains_subquery);
 
     let mut result = Vec::new();
 
@@ -54,7 +53,10 @@ pub fn execute_with_db(
             for expr in expressions {
                 columns.push(eval_vectorized_with_db(expr, chunk, input_columns, Some(db), None)?);
             }
-            result.push(DataChunk { count: chunk.count, columns });
+            result.push(DataChunk {
+                count: chunk.count,
+                columns,
+            });
         }
         let _ = column_names;
         return Ok(result);
@@ -65,7 +67,8 @@ pub fn execute_with_db(
         let n_out = expressions.len();
         let mut out_cols: Vec<Vec<crate::Value>> = vec![Vec::with_capacity(chunk.count); n_out];
         for i in 0..chunk.count {
-            let outer_row: Vec<(String, crate::Value)> = input_columns.iter()
+            let outer_row: Vec<(String, crate::Value)> = input_columns
+                .iter()
                 .zip(chunk.columns.iter())
                 .map(|(name, col)| (name.clone(), col.get(i)))
                 .collect();
@@ -79,18 +82,17 @@ pub fn execute_with_db(
             }
         }
         let columns: Vec<Vector> = out_cols.into_iter().map(Vector::Flat).collect();
-        result.push(DataChunk { count: chunk.count, columns });
+        result.push(DataChunk {
+            count: chunk.count,
+            columns,
+        });
     }
     let _ = column_names;
     Ok(result)
 }
 
 /// 对单个 DataChunk 做投影计算
-fn project_chunk(
-    chunk: &DataChunk,
-    expressions: &[Expression],
-    input_columns: &[String],
-) -> Result<DataChunk> {
+fn project_chunk(chunk: &DataChunk, expressions: &[Expression], input_columns: &[String]) -> Result<DataChunk> {
     let mut columns = Vec::with_capacity(expressions.len());
 
     for expr in expressions {
@@ -111,18 +113,24 @@ fn project_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::ast::{Expression, BinaryOperator};
+    use crate::executor::vector::{DataChunk, Vector};
+    use crate::sql::ast::{BinaryOperator, Expression};
     use crate::Value;
-    use crate::executor::vector::{Vector, DataChunk};
 
     fn make_test_chunk() -> DataChunk {
         let a = Vector::Flat(vec![
-            Value::Int64(10), Value::Int64(20), Value::Int64(30),
-            Value::Int64(40), Value::Int64(50),
+            Value::Int64(10),
+            Value::Int64(20),
+            Value::Int64(30),
+            Value::Int64(40),
+            Value::Int64(50),
         ]);
         let b = Vector::Flat(vec![
-            Value::Int64(1), Value::Int64(2), Value::Int64(3),
-            Value::Int64(4), Value::Int64(5),
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(5),
         ]);
         DataChunk {
             columns: vec![a, b],
@@ -134,9 +142,10 @@ mod tests {
     fn test_project_columns() {
         let chunk = make_test_chunk();
         // 只选第一列
-        let exprs = vec![
-            Expression::ColumnRef { table: None, column: "a".to_string() },
-        ];
+        let exprs = vec![Expression::ColumnRef {
+            table: None,
+            column: "a".to_string(),
+        }];
         let result = project_chunk(&chunk, &exprs, &["a".to_string(), "b".to_string()]).unwrap();
         assert_eq!(result.num_columns(), 1);
         assert_eq!(result.count, 5);
@@ -146,13 +155,17 @@ mod tests {
     fn test_project_arithmetic() {
         let chunk = make_test_chunk();
         // a + b
-        let exprs = vec![
-            Expression::BinaryOp {
-                left: Box::new(Expression::ColumnRef { table: None, column: "a".to_string() }),
-                op: BinaryOperator::Plus,
-                right: Box::new(Expression::ColumnRef { table: None, column: "b".to_string() }),
-            },
-        ];
+        let exprs = vec![Expression::BinaryOp {
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "a".to_string(),
+            }),
+            op: BinaryOperator::Plus,
+            right: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "b".to_string(),
+            }),
+        }];
         let result = project_chunk(&chunk, &exprs, &["a".to_string(), "b".to_string()]).unwrap();
         assert_eq!(result.count, 5);
         let rows = result.to_rows();
@@ -166,9 +179,15 @@ mod tests {
         let chunk = make_test_chunk();
         // 混合：列引用 + 计算 + 常量
         let exprs = vec![
-            Expression::ColumnRef { table: None, column: "a".to_string() },
+            Expression::ColumnRef {
+                table: None,
+                column: "a".to_string(),
+            },
             Expression::BinaryOp {
-                left: Box::new(Expression::ColumnRef { table: None, column: "a".to_string() }),
+                left: Box::new(Expression::ColumnRef {
+                    table: None,
+                    column: "a".to_string(),
+                }),
                 op: BinaryOperator::Multiply,
                 right: Box::new(Expression::Literal(Value::Int64(2))),
             },
@@ -186,9 +205,10 @@ mod tests {
     #[test]
     fn test_project_empty() {
         let chunk = DataChunk::new(2);
-        let exprs = vec![
-            Expression::ColumnRef { table: None, column: "a".to_string() },
-        ];
+        let exprs = vec![Expression::ColumnRef {
+            table: None,
+            column: "a".to_string(),
+        }];
         let result = project_chunk(&chunk, &exprs, &["a".to_string(), "b".to_string()]).unwrap();
         assert_eq!(result.count, 0);
     }

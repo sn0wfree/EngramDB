@@ -6,8 +6,8 @@
 //! - 批量写入 > 50 万行/秒（对比列存 ~5 万行/秒）
 //! - 时间范围扫描 1.5-2x（MinMax 块级跳读 vs 列存行级筛选）
 
-use std::time::{Duration, Instant};
 use engramdb::{Connection, Value};
+use std::time::{Duration, Instant};
 
 const ITERS: usize = 5;
 const N: usize = 1_000_000;
@@ -41,18 +41,14 @@ fn main() {
     std::fs::remove_file("/tmp/m3_log.hdb-wal").ok();
 
     let mut conn = Connection::open("/tmp/m3_log.hdb").unwrap();
-    conn.execute("CREATE TABLE log_t (ts INT64, event VARCHAR) ENGINE = Log").unwrap();
+    conn.execute("CREATE TABLE log_t (ts INT64, event VARCHAR) ENGINE = Log")
+        .unwrap();
     conn.execute("CREATE TABLE col_t (ts INT64, event VARCHAR)").unwrap();
 
     // 预生成 N 行（ts 递增时间戳，event 固定宽度字符串）
     // 与 M2 验收同方法论：巨型 INSERT 单语句批量写入（一次事务/一次 apply）
     let batch: Vec<Vec<Value>> = (0..N)
-        .map(|i| {
-            vec![
-                Value::Int64(i as i64),
-                Value::Varchar(format!("evt_{}", i % 10000)),
-            ]
-        })
+        .map(|i| vec![Value::Int64(i as i64), Value::Varchar(format!("evt_{}", i % 10000))])
         .collect();
 
     // ---- 写入吞吐 ----
@@ -60,7 +56,9 @@ fn main() {
     for _ in 0..ITERS {
         let mut sql = String::from("INSERT INTO log_t VALUES ");
         for (i, row) in batch.iter().enumerate() {
-            if i > 0 { sql.push(','); }
+            if i > 0 {
+                sql.push(',');
+            }
             match &row[1] {
                 Value::Varchar(s) => sql.push_str(&format!("({}, '{}')", row[0].as_i64().unwrap(), s)),
                 _ => unreachable!(),
@@ -77,7 +75,9 @@ fn main() {
     for _ in 0..ITERS {
         let mut sql = String::from("INSERT INTO col_t VALUES ");
         for (i, row) in batch.iter().enumerate() {
-            if i > 0 { sql.push(','); }
+            if i > 0 {
+                sql.push(',');
+            }
             match &row[1] {
                 Value::Varchar(s) => sql.push_str(&format!("({}, '{}')", row[0].as_i64().unwrap(), s)),
                 _ => unreachable!(),
@@ -111,10 +111,7 @@ fn main() {
 
     println!("Log   时间范围扫描 ts>=900000 (10% 命中): {}", fmt(log_scan));
     println!("Columnar 时间范围扫描 ts>=900000 (10% 命中): {}", fmt(col_scan));
-    println!(
-        "扫描加速: {:.2}x",
-        col_scan.as_secs_f64() / log_scan.as_secs_f64()
-    );
+    println!("扫描加速: {:.2}x", col_scan.as_secs_f64() / log_scan.as_secs_f64());
 
     // ---- 小时间窗（命中 1%，最不利块级跳读）----
     let mut samples = Vec::new();
@@ -135,8 +132,5 @@ fn main() {
     let col_narrow = median(samples);
     println!("Log   时间范围扫描 ts>=990000 (1% 命中): {}", fmt(log_narrow));
     println!("Columnar 时间范围扫描 ts>=990000 (1% 命中): {}", fmt(col_narrow));
-    println!(
-        "扫描加速: {:.2}x",
-        col_narrow.as_secs_f64() / log_narrow.as_secs_f64()
-    );
+    println!("扫描加速: {:.2}x", col_narrow.as_secs_f64() / log_narrow.as_secs_f64());
 }

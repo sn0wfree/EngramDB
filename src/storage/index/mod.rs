@@ -10,14 +10,14 @@
 //!
 //! 定位：专用分析型嵌入 AI Agent 数据引擎
 
-pub mod skiplist;
 pub mod bitmap;
 pub mod bloom;
 pub mod inverted_index;
+pub mod skiplist;
 
-pub use skiplist::SkipListIndex;
 pub use bitmap::BitmapIndex;
 pub use bloom::BloomFilter;
+pub use skiplist::SkipListIndex;
 
 use crate::Value;
 

@@ -9,8 +9,8 @@
 
 use std::time::{Duration, Instant};
 
+use engramdb::{Config, Connection};
 use std::io::Write;
-use engramdb::{Connection, Config};
 
 const ITERS: usize = 5;
 const HDB_PATH: &str = "/tmp/select_star.hdb";
@@ -28,14 +28,23 @@ fn open_hdb() -> Connection {
 fn median(mut samples: Vec<Duration>) -> Duration {
     samples.sort();
     let n = samples.len();
-    if n == 0 { return Duration::ZERO; }
-    if n % 2 == 1 { samples[n / 2] } else { (samples[n / 2 - 1] + samples[n / 2]) / 2 }
+    if n == 0 {
+        return Duration::ZERO;
+    }
+    if n % 2 == 1 {
+        samples[n / 2]
+    } else {
+        (samples[n / 2 - 1] + samples[n / 2]) / 2
+    }
 }
 
 fn fmt_ms(d: Duration) -> String {
     let us = d.as_micros();
-    if us < 1000 { format!("{} µs", us) }
-    else { format!("{:.2} ms", us as f64 / 1000.0) }
+    if us < 1000 {
+        format!("{} µs", us)
+    } else {
+        format!("{:.2} ms", us as f64 / 1000.0)
+    }
 }
 
 fn cleanup_files() {
@@ -49,7 +58,8 @@ fn cleanup_files() {
 fn setup_engramdb() {
     cleanup_files();
     let mut conn = open_hdb();
-    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)").unwrap();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, val DOUBLE, name VARCHAR)")
+        .unwrap();
 
     const BATCH: usize = 50_000;
     for chunk_start in (0..N).step_by(BATCH) {
@@ -78,15 +88,19 @@ fn setup_sqlite() {
          PRAGMA synchronous = NORMAL;
          PRAGMA cache_size = -20000;
          PRAGMA temp_store = MEMORY;",
-    ).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)", []).unwrap();
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT)", [])
+        .unwrap();
     const BATCH: usize = 50_000;
     let tx = conn.unchecked_transaction().unwrap();
     for chunk_start in (0..N).step_by(BATCH) {
         let end = (chunk_start + BATCH).min(N);
         let mut sql = String::with_capacity(end - chunk_start);
         for i in chunk_start..end {
-            if i > chunk_start { sql.push_str(", "); }
+            if i > chunk_start {
+                sql.push_str(", ");
+            }
             sql.push_str(&format!("({}, {}, 'row_{}')", i, i as f64 * 1.5, i));
         }
         tx.execute(&format!("INSERT INTO t VALUES {}", sql), []).unwrap();
@@ -112,7 +126,9 @@ fn sqlite_star() -> Duration {
     let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
     let mut rows = stmt.query([]).unwrap();
     let mut count = 0;
-    while let Some(_) = rows.next().unwrap() { count += 1; }
+    while let Some(_) = rows.next().unwrap() {
+        count += 1;
+    }
     let dur = start.elapsed();
     assert_eq!(count, N, "expected {} rows, got {}", N, count);
     drop(rows);
@@ -138,7 +154,9 @@ fn sqlite_narrow() -> Duration {
     let mut stmt = conn.prepare("SELECT id, val FROM t").unwrap();
     let mut rows = stmt.query([]).unwrap();
     let mut count = 0;
-    while let Some(_) = rows.next().unwrap() { count += 1; }
+    while let Some(_) = rows.next().unwrap() {
+        count += 1;
+    }
     let dur = start.elapsed();
     assert_eq!(count, N);
     drop(rows);
@@ -152,14 +170,26 @@ fn run(name: &str, mut e: impl FnMut() -> Duration, mut s: impl FnMut() -> Durat
     let mut eh = Vec::with_capacity(ITERS);
     let mut sh = Vec::with_capacity(ITERS);
     for i in 1..=ITERS {
-        let h = e(); let st = s();
-        println!("  第{}轮  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x",
-            i, fmt_ms(h), fmt_ms(st), h.as_secs_f64() / st.as_secs_f64());
-        eh.push(h); sh.push(st);
+        let h = e();
+        let st = s();
+        println!(
+            "  第{}轮  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x",
+            i,
+            fmt_ms(h),
+            fmt_ms(st),
+            h.as_secs_f64() / st.as_secs_f64()
+        );
+        eh.push(h);
+        sh.push(st);
     }
-    let hm = median(eh); let sm = median(sh);
-    println!("  中位数  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x",
-        fmt_ms(hm), fmt_ms(sm), hm.as_secs_f64() / sm.as_secs_f64());
+    let hm = median(eh);
+    let sm = median(sh);
+    println!(
+        "  中位数  EngramDB: {:>12}  SQLite: {:>12}  比值: {:>5.2}x",
+        fmt_ms(hm),
+        fmt_ms(sm),
+        hm.as_secs_f64() / sm.as_secs_f64()
+    );
 }
 
 fn main() {

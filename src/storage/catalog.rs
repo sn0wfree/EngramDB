@@ -53,10 +53,7 @@ pub struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     /// 从数据库实例收集 catalog 快照
-    pub fn collect(
-        next_table_id: u32,
-        tables: &HashMap<u32, crate::storage::engine::EngineTable>,
-    ) -> Self {
+    pub fn collect(next_table_id: u32, tables: &HashMap<u32, crate::storage::engine::EngineTable>) -> Self {
         let mut snapshot_tables = Vec::with_capacity(tables.len());
         for (&table_id, table) in tables {
             snapshot_tables.push((table_id, table.def().clone()));
@@ -125,10 +122,7 @@ impl CatalogSnapshot {
             tables.push((table_id, table_def));
         }
 
-        Ok(Self {
-            next_table_id,
-            tables,
-        })
+        Ok(Self { next_table_id, tables })
     }
 }
 
@@ -200,10 +194,7 @@ mod tests {
     fn test_catalog_corrupt_def_rejected() {
         let snapshot = CatalogSnapshot {
             next_table_id: 1,
-            tables: vec![(
-                1,
-                TableDef::new(1, "t", vec![ColumnDef::new("id", DataType::Int64)]),
-            )],
+            tables: vec![(1, TableDef::new(1, "t", vec![ColumnDef::new("id", DataType::Int64)]))],
         };
         let mut bytes = snapshot.to_bytes().unwrap();
         // 破坏 def 字节

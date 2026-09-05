@@ -15,8 +15,8 @@
 use crate::common::error::Result;
 use crate::Value;
 
-use super::super::vector::{DataChunk, Vector, VECTOR_SIZE};
 use super::super::physical_plan::JoinType;
+use super::super::vector::{DataChunk, Vector, VECTOR_SIZE};
 
 use fxhash::FxHashMap;
 
@@ -45,18 +45,11 @@ pub fn execute(
             let probe_rows: usize = left_chunks.iter().map(|c| c.count).sum();
 
             if build_rows <= probe_rows {
-                hash_join_inner(
-                    left_chunks, right_chunks,
-                    left_keys, right_keys,
-                    left_cols, right_cols,
-                )
+                hash_join_inner(left_chunks, right_chunks, left_keys, right_keys, left_cols, right_cols)
             } else {
                 // 左右交换，然后交换结果列顺序
-                let mut result = hash_join_inner(
-                    right_chunks, left_chunks,
-                    right_keys, left_keys,
-                    right_cols, left_cols,
-                )?;
+                let mut result =
+                    hash_join_inner(right_chunks, left_chunks, right_keys, left_keys, right_cols, left_cols)?;
                 // 交换列顺序：右表列在前，左表列在后 → 交换回来
                 for chunk in &mut result {
                     swap_join_columns(chunk, right_cols);
@@ -64,46 +57,18 @@ pub fn execute(
                 Ok(result)
             }
         }
-        JoinType::Left => {
-            hash_join_left(
-                left_chunks, right_chunks,
-                left_keys, right_keys,
-                left_cols, right_cols,
-            )
-        }
+        JoinType::Left => hash_join_left(left_chunks, right_chunks, left_keys, right_keys, left_cols, right_cols),
         JoinType::Right => {
             // RIGHT JOIN = 左右交换的 LEFT JOIN，然后交换列顺序
-            let mut result = hash_join_left(
-                right_chunks, left_chunks,
-                right_keys, left_keys,
-                right_cols, left_cols,
-            )?;
+            let mut result = hash_join_left(right_chunks, left_chunks, right_keys, left_keys, right_cols, left_cols)?;
             for chunk in &mut result {
                 swap_join_columns(chunk, right_cols);
             }
             Ok(result)
         }
-        JoinType::Full => {
-            hash_join_full(
-                left_chunks, right_chunks,
-                left_keys, right_keys,
-                left_cols, right_cols,
-            )
-        }
-        JoinType::Semi => {
-            hash_join_semi(
-                left_chunks, right_chunks,
-                left_keys, right_keys,
-                left_cols,
-            )
-        }
-        JoinType::Anti => {
-            hash_join_anti(
-                left_chunks, right_chunks,
-                left_keys, right_keys,
-                left_cols,
-            )
-        }
+        JoinType::Full => hash_join_full(left_chunks, right_chunks, left_keys, right_keys, left_cols, right_cols),
+        JoinType::Semi => hash_join_semi(left_chunks, right_chunks, left_keys, right_keys, left_cols),
+        JoinType::Anti => hash_join_anti(left_chunks, right_chunks, left_keys, right_keys, left_cols),
     }
 }
 
@@ -115,10 +80,7 @@ pub fn execute(
 ///
 /// HashMap<键值组合, Vec<(chunk_idx, row_idx)>>
 /// 键值组合用 Vec<Value> 表示多列连接键
-fn build_hash_table(
-    chunks: &[DataChunk],
-    key_cols: &[usize],
-) -> FxHashMap<Vec<Value>, Vec<(usize, usize)>> {
+fn build_hash_table(chunks: &[DataChunk], key_cols: &[usize]) -> FxHashMap<Vec<Value>, Vec<(usize, usize)>> {
     let mut map: FxHashMap<Vec<Value>, Vec<(usize, usize)>> = FxHashMap::default();
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
@@ -140,7 +102,8 @@ fn build_hash_table(
 
 /// 从行中提取连接键值
 fn extract_key(chunk: &DataChunk, row_idx: usize, key_cols: &[usize]) -> Vec<Value> {
-    key_cols.iter()
+    key_cols
+        .iter()
         .map(|&col| {
             if col < chunk.columns.len() {
                 chunk.columns[col].get(row_idx)
@@ -156,8 +119,8 @@ fn extract_key(chunk: &DataChunk, row_idx: usize, key_cols: &[usize]) -> Vec<Val
 // ============================================================================
 
 fn hash_join_inner(
-    probe_chunks: &[DataChunk],  // 左表（探测端）
-    build_chunks: &[DataChunk],  // 右表（构建端）
+    probe_chunks: &[DataChunk], // 左表（探测端）
+    build_chunks: &[DataChunk], // 右表（构建端）
     probe_keys: &[usize],
     build_keys: &[usize],
     probe_cols: usize,
@@ -166,7 +129,12 @@ fn hash_join_inner(
     // S2-M3：单列整数键 → FxHashMap<i64>（8B key 直连，替代 Vec<Value>）
     if probe_keys.len() == 1 && build_keys.len() == 1 {
         if let Some(result) = hash_join_inner_int(
-            probe_chunks, build_chunks, probe_keys[0], build_keys[0], probe_cols, build_cols,
+            probe_chunks,
+            build_chunks,
+            probe_keys[0],
+            build_keys[0],
+            probe_cols,
+            build_cols,
         ) {
             return Ok(result);
         }
@@ -263,8 +231,8 @@ fn hash_join_inner_int(
         }
         for row_idx in 0..chunk.count {
             match col_key(&chunk.columns[build_key], row_idx) {
-                None => return None,           // 列不支持 → 回退
-                Some(None) => continue,        // NULL 键跳过
+                None => return None,    // 列不支持 → 回退
+                Some(None) => continue, // NULL 键跳过
                 Some(Some(k)) => {
                     hash_table.entry(k).or_default().push((chunk_idx, row_idx));
                 }
@@ -317,8 +285,8 @@ fn hash_join_inner_int(
 // ============================================================================
 
 fn hash_join_left(
-    probe_chunks: &[DataChunk],  // 左表（保留所有行）
-    build_chunks: &[DataChunk],  // 右表
+    probe_chunks: &[DataChunk], // 左表（保留所有行）
+    build_chunks: &[DataChunk], // 右表
     probe_keys: &[usize],
     build_keys: &[usize],
     probe_cols: usize,
@@ -334,11 +302,7 @@ fn hash_join_left(
             let key = extract_key(probe_chunk, probe_row, probe_keys);
             let has_null_key = key.iter().any(|v| v.is_null());
 
-            let matches = if has_null_key {
-                None
-            } else {
-                hash_table.get(&key)
-            };
+            let matches = if has_null_key { None } else { hash_table.get(&key) };
 
             match matches {
                 Some(rows) => {
@@ -402,11 +366,7 @@ fn hash_join_full(
     right_cols: usize,
 ) -> Result<Vec<DataChunk>> {
     // 先做 LEFT JOIN（包含所有左表行）
-    let mut result = hash_join_left(
-        left_chunks, right_chunks,
-        left_keys, right_keys,
-        left_cols, right_cols,
-    )?;
+    let mut result = hash_join_left(left_chunks, right_chunks, left_keys, right_keys, left_cols, right_cols)?;
 
     // 再追加右表中未匹配的行（右表独有）
     let hash_table_left = build_hash_table(left_chunks, left_keys);
@@ -551,11 +511,7 @@ fn rows_to_chunks(rows: &[Vec<Value>], num_cols: usize) -> Vec<DataChunk> {
 // ============================================================================
 
 /// 处理空输入的情况
-fn handle_empty_input(
-    left: &[DataChunk],
-    right: &[DataChunk],
-    join_type: JoinType,
-) -> Result<Vec<DataChunk>> {
+fn handle_empty_input(left: &[DataChunk], right: &[DataChunk], join_type: JoinType) -> Result<Vec<DataChunk>> {
     match join_type {
         JoinType::Inner => Ok(vec![]),
         JoinType::Left => {
@@ -564,12 +520,18 @@ fn handle_empty_input(
                 return Ok(vec![]);
             }
             let left_cols = left[0].num_columns();
-            let result: Vec<DataChunk> = left.iter().map(|chunk| {
-                let mut columns = chunk.columns.clone();
-                // 追加 NULL 列
-                columns.push(Vector::Constant(Value::Null, chunk.count));
-                DataChunk { columns, count: chunk.count }
-            }).collect();
+            let result: Vec<DataChunk> = left
+                .iter()
+                .map(|chunk| {
+                    let mut columns = chunk.columns.clone();
+                    // 追加 NULL 列
+                    columns.push(Vector::Constant(Value::Null, chunk.count));
+                    DataChunk {
+                        columns,
+                        count: chunk.count,
+                    }
+                })
+                .collect();
             Ok(result)
         }
         JoinType::Right => {
@@ -577,11 +539,17 @@ fn handle_empty_input(
                 return Ok(vec![]);
             }
             let right_cols = right[0].num_columns();
-            let result: Vec<DataChunk> = right.iter().map(|chunk| {
-                let mut columns = vec![Vector::Constant(Value::Null, chunk.count)];
-                columns.extend(chunk.columns.clone());
-                DataChunk { columns, count: chunk.count }
-            }).collect();
+            let result: Vec<DataChunk> = right
+                .iter()
+                .map(|chunk| {
+                    let mut columns = vec![Vector::Constant(Value::Null, chunk.count)];
+                    columns.extend(chunk.columns.clone());
+                    DataChunk {
+                        columns,
+                        count: chunk.count,
+                    }
+                })
+                .collect();
             Ok(result)
         }
         JoinType::Full => {
@@ -632,12 +600,15 @@ fn swap_join_columns(chunk: &mut DataChunk, first_part_cols: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::vector::{Vector, DataChunk};
+    use crate::executor::vector::{DataChunk, Vector};
 
     fn make_left_chunk() -> DataChunk {
         let ids = Vector::Flat(vec![
-            Value::Int64(1), Value::Int64(2), Value::Int64(3),
-            Value::Int64(4), Value::Int64(5),
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(5),
         ]);
         let names = Vector::Flat(vec![
             Value::Varchar("alice".into()),
@@ -646,13 +617,19 @@ mod tests {
             Value::Varchar("dave".into()),
             Value::Varchar("eve".into()),
         ]);
-        DataChunk { columns: vec![ids, names], count: 5 }
+        DataChunk {
+            columns: vec![ids, names],
+            count: 5,
+        }
     }
 
     fn make_right_chunk() -> DataChunk {
         let user_ids = Vector::Flat(vec![
-            Value::Int64(1), Value::Int64(2), Value::Int64(2),
-            Value::Int64(3), Value::Int64(6),
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(6),
         ]);
         let orders = Vector::Flat(vec![
             Value::Varchar("order_a".into()),
@@ -661,7 +638,10 @@ mod tests {
             Value::Varchar("order_c".into()),
             Value::Varchar("order_f".into()),
         ]);
-        DataChunk { columns: vec![user_ids, orders], count: 5 }
+        DataChunk {
+            columns: vec![user_ids, orders],
+            count: 5,
+        }
     }
 
     /// S2-M3：Typed 整数键 join 与 Flat 等价性（含 NULL 键）
@@ -670,28 +650,66 @@ mod tests {
         use crate::common::column_data::ColumnData;
         // 左表：id（含 NULL）+ 值
         let left_data = ColumnData::try_from_values(&vec![
-            Value::Int64(1), Value::Null, Value::Int64(2), Value::Int64(3), Value::Int64(4),
-        ]).unwrap();
+            Value::Int64(1),
+            Value::Null,
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+        ])
+        .unwrap();
         let left_vals = left_data.to_values();
         let left_typed = DataChunk {
-            columns: vec![Vector::Typed(left_data), Vector::Flat(vec![Value::Int64(10), Value::Int64(20), Value::Int64(30), Value::Int64(40), Value::Int64(50)])],
+            columns: vec![
+                Vector::Typed(left_data),
+                Vector::Flat(vec![
+                    Value::Int64(10),
+                    Value::Int64(20),
+                    Value::Int64(30),
+                    Value::Int64(40),
+                    Value::Int64(50),
+                ]),
+            ],
             count: 5,
         };
         let left_flat = DataChunk {
-            columns: vec![Vector::Flat(left_vals), Vector::Flat(vec![Value::Int64(10), Value::Int64(20), Value::Int64(30), Value::Int64(40), Value::Int64(50)])],
+            columns: vec![
+                Vector::Flat(left_vals),
+                Vector::Flat(vec![
+                    Value::Int64(10),
+                    Value::Int64(20),
+                    Value::Int64(30),
+                    Value::Int64(40),
+                    Value::Int64(50),
+                ]),
+            ],
             count: 5,
         };
         // 右表：id + 值（NULL 键不参与连接）
-        let right_data = ColumnData::try_from_values(&vec![
-            Value::Int64(2), Value::Null, Value::Int64(1), Value::Int64(3),
-        ]).unwrap();
+        let right_data =
+            ColumnData::try_from_values(&vec![Value::Int64(2), Value::Null, Value::Int64(1), Value::Int64(3)]).unwrap();
         let right_vals = right_data.to_values();
         let right_typed = DataChunk {
-            columns: vec![Vector::Typed(right_data), Vector::Flat(vec![Value::Int64(100), Value::Int64(200), Value::Int64(300), Value::Int64(400)])],
+            columns: vec![
+                Vector::Typed(right_data),
+                Vector::Flat(vec![
+                    Value::Int64(100),
+                    Value::Int64(200),
+                    Value::Int64(300),
+                    Value::Int64(400),
+                ]),
+            ],
             count: 4,
         };
         let right_flat = DataChunk {
-            columns: vec![Vector::Flat(right_vals), Vector::Flat(vec![Value::Int64(100), Value::Int64(200), Value::Int64(300), Value::Int64(400)])],
+            columns: vec![
+                Vector::Flat(right_vals),
+                Vector::Flat(vec![
+                    Value::Int64(100),
+                    Value::Int64(200),
+                    Value::Int64(300),
+                    Value::Int64(400),
+                ]),
+            ],
             count: 4,
         };
 
@@ -787,21 +805,15 @@ mod tests {
     #[test]
     fn test_null_key_no_match() {
         let left = DataChunk {
-            columns: vec![Vector::Flat(vec![
-                Value::Int64(1), Value::Null, Value::Int64(3),
-            ])],
+            columns: vec![Vector::Flat(vec![Value::Int64(1), Value::Null, Value::Int64(3)])],
             count: 3,
         };
         let right = DataChunk {
-            columns: vec![Vector::Flat(vec![
-                Value::Int64(1), Value::Int64(2), Value::Int64(3),
-            ])],
+            columns: vec![Vector::Flat(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)])],
             count: 3,
         };
 
-        let result = execute(
-            &[left], &[right], &[0], &[0], JoinType::Inner
-        ).unwrap();
+        let result = execute(&[left], &[right], &[0], &[0], JoinType::Inner).unwrap();
         let total_rows: usize = result.iter().map(|c| c.count).sum();
         // NULL 键不匹配，只有 1 和 3 匹配 → 2 行
         assert_eq!(total_rows, 2);
@@ -829,9 +841,7 @@ mod tests {
             count: 3,
         };
 
-        let result = execute(
-            &[left], &[right], &[0, 1], &[0, 1], JoinType::Inner
-        ).unwrap();
+        let result = execute(&[left], &[right], &[0, 1], &[0, 1], JoinType::Inner).unwrap();
         let total_rows: usize = result.iter().map(|c| c.count).sum();
         // 两列都匹配的：(1,10) 和 (2,10) → 2 行
         assert_eq!(total_rows, 2);

@@ -13,8 +13,8 @@
 //! - Varchar/Json 第一版用 Vec<String> 简化，offset+data 双数组后续优化
 //! - Vector/VectorInt8/Blob 每行一个 Vec
 
-use crate::Value;
 use crate::common::types::DataType;
+use crate::Value;
 
 /// 1 bit/row 的 NULL 位图（自实现，避免引入依赖）
 #[derive(Debug, Clone, Default)]
@@ -230,18 +230,19 @@ impl ColumnData {
                         rany = true;
                     }
                 }
-                (
-                    if any { Some(o) } else { None },
-                    if rany { Some(r) } else { None },
-                )
+                (if any { Some(o) } else { None }, if rany { Some(r) } else { None })
             }
         };
         self.nulls = rest_nulls;
-        ColumnData { values: out_values, nulls: out_nulls }
+        ColumnData {
+            values: out_values,
+            nulls: out_nulls,
+        }
     }
 
     /// 按索引收集子列（S2-M2：SelectionVector 应用，类型数组直接 gather）
-    pub fn gather(&self, indices: &[usize]) -> ColumnData {        let out = match &self.values {
+    pub fn gather(&self, indices: &[usize]) -> ColumnData {
+        let out = match &self.values {
             ColumnValue::Boolean(v) => ColumnValue::Boolean(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Int16(v) => ColumnValue::Int16(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Int32(v) => ColumnValue::Int32(indices.iter().map(|&i| v[i]).collect()),
@@ -273,7 +274,11 @@ impl ColumnData {
                         any = true;
                     }
                 }
-                if any { Some(nb) } else { None }
+                if any {
+                    Some(nb)
+                } else {
+                    None
+                }
             }
         };
         ColumnData { values: out, nulls }
@@ -317,14 +322,22 @@ impl ColumnData {
                         any = true;
                     }
                 }
-                if any { Some(nb) } else { None }
+                if any {
+                    Some(nb)
+                } else {
+                    None
+                }
             }
         };
-        ColumnData { values: out_values, nulls }
+        ColumnData {
+            values: out_values,
+            nulls,
+        }
     }
 
     /// 追加另一列数据到尾部（两列类型必须一致）
-    pub fn append(&mut self, other: &ColumnData) {        match (&mut self.values, &other.values) {
+    pub fn append(&mut self, other: &ColumnData) {
+        match (&mut self.values, &other.values) {
             (ColumnValue::Boolean(a), ColumnValue::Boolean(b)) => a.extend_from_slice(b),
             (ColumnValue::Int16(a), ColumnValue::Int16(b)) => a.extend_from_slice(b),
             (ColumnValue::Int32(a), ColumnValue::Int32(b)) => a.extend_from_slice(b),
@@ -420,10 +433,7 @@ impl ColumnData {
             push_null_placeholder(&mut arr);
         }
 
-        ColumnData {
-            values: arr,
-            nulls,
-        }
+        ColumnData { values: arr, nulls }
     }
 
     /// 序列化为磁盘字节（与 `serialize_values` 字节格式完全一致）
@@ -648,7 +658,11 @@ impl ColumnData {
             None => return None, // 全 NULL 列：无类型信息，交调用方处理
         };
 
-        let mut bitvec = if has_null { Some(BitVec::new(values.len())) } else { None };
+        let mut bitvec = if has_null {
+            Some(BitVec::new(values.len()))
+        } else {
+            None
+        };
         let mut values_vec: ColumnValue = match t {
             ValueType::Boolean => ColumnValue::Boolean(Vec::with_capacity(values.len())),
             ValueType::Int16 => ColumnValue::Int16(Vec::with_capacity(values.len())),
@@ -1034,7 +1048,13 @@ fn push_null_placeholder(arr: &mut ColumnValue) {
 fn write_typed(buf: &mut Vec<u8>, values: &ColumnValue, i: usize, data_type: &DataType, is_null: bool) {
     match (data_type, values) {
         (DataType::Boolean, ColumnValue::Boolean(a)) => {
-            buf.push(if is_null { 2 } else if a[i] { 1 } else { 0 });
+            buf.push(if is_null {
+                2
+            } else if a[i] {
+                1
+            } else {
+                0
+            });
         }
         (DataType::Int16, ColumnValue::Int16(a)) => {
             buf.extend_from_slice(&(if is_null { 0i16 } else { a[i] }).to_le_bytes());
@@ -1191,7 +1211,10 @@ mod tests {
     #[test]
     fn test_int64_roundtrip() {
         roundtrip(vec![
-            Value::Int64(1), Value::Int64(-5), Value::Null, Value::Int64(i64::MAX),
+            Value::Int64(1),
+            Value::Int64(-5),
+            Value::Null,
+            Value::Int64(i64::MAX),
         ]);
         roundtrip((0..300).map(|i| Value::Int64(i as i64)).collect());
     }
@@ -1219,7 +1242,11 @@ mod tests {
 
     #[test]
     fn test_json_blob_roundtrip() {
-        roundtrip(vec![Value::Json("{\"a\":1}".into()), Value::Null, Value::Json("{}".into())]);
+        roundtrip(vec![
+            Value::Json("{\"a\":1}".into()),
+            Value::Null,
+            Value::Json("{}".into()),
+        ]);
         roundtrip(vec![Value::Blob(vec![1, 2, 3]), Value::Null, Value::Blob(vec![])]);
     }
 
@@ -1285,7 +1312,7 @@ mod tests {
     #[test]
     fn test_from_values_typed_int64() {
         let values = vec![
-            Value::Int32(5),  // 兼容转换
+            Value::Int32(5), // 兼容转换
             Value::Null,
             Value::Int64(7),
         ];
@@ -1334,12 +1361,15 @@ mod tests {
     #[test]
     fn test_typed_serialize_matches_value_format() {
         // 交叉验证：ColumnData 序列化与 serialize_values 字节一致（磁盘格式兼容）
-        use crate::storage::column_store::{serialize_values, deserialize_values};
+        use crate::storage::column_store::{deserialize_values, serialize_values};
         let cases: Vec<(Vec<Value>, DataType)> = vec![
             (vec![Value::Int64(1), Value::Null, Value::Int64(-3)], DataType::Int64),
             (vec![Value::Int32(1), Value::Null], DataType::Int32),
             (vec![Value::Float64(1.5), Value::Null], DataType::Float64),
-            (vec![Value::Boolean(true), Value::Null, Value::Boolean(false)], DataType::Boolean),
+            (
+                vec![Value::Boolean(true), Value::Null, Value::Boolean(false)],
+                DataType::Boolean,
+            ),
             (vec![Value::Varchar("hi".into()), Value::Null], DataType::Varchar),
             (vec![Value::Timestamp(123), Value::Null], DataType::Timestamp),
             (vec![Value::Blob(vec![1, 2]), Value::Null], DataType::Blob),
@@ -1409,10 +1439,7 @@ mod tests {
 
     #[test]
     fn test_typed_iter_values() {
-        let col = ColumnData::from_values_typed(
-            &[Value::Int64(1), Value::Null, Value::Int64(3)],
-            &DataType::Int64,
-        );
+        let col = ColumnData::from_values_typed(&[Value::Int64(1), Value::Null, Value::Int64(3)], &DataType::Int64);
         let vals: Vec<Value> = col.iter_values().collect();
         assert_eq!(vals, vec![Value::Int64(1), Value::Null, Value::Int64(3)]);
     }

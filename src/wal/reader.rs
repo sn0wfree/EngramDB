@@ -148,12 +148,13 @@ impl WalReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::{WalWriter, WalRecordType};
+    use crate::wal::{WalRecordType, WalWriter};
 
     fn tmp(name: &str) -> String {
         let mut p = std::env::temp_dir();
         let tid = format!("{:?}", std::thread::current().id())
-            .replace('(', "_").replace(')', "")
+            .replace('(', "_")
+            .replace(')', "")
             .replace([':', ' '], "_");
         p.push(format!("engramdb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
         p.to_string_lossy().to_string()
@@ -167,9 +168,33 @@ mod tests {
         // 写入
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[10, 20, 30]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[10, 20, 30],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -205,9 +230,33 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1, 2]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[1, 2],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -245,8 +294,24 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -272,7 +337,15 @@ mod tests {
         {
             use std::io::Write;
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -302,7 +375,15 @@ mod tests {
             let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 0..n {
                 let payload = vec![i as u8; 20];
-                writer.write_record(WalRecordType::Insert, i, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
+                writer
+                    .write_record(
+                        WalRecordType::Insert,
+                        i,
+                        1,
+                        crate::common::types::EngineType::Columnar,
+                        &payload,
+                    )
+                    .unwrap();
             }
             writer.sync().unwrap();
         }

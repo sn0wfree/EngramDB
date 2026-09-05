@@ -4,10 +4,10 @@
 //!
 //! 运行：`cargo bench --bench compression_compare_bench`
 
-use std::time::{Duration, Instant};
-use engramdb::storage::compression::{compress, decompress};
 use engramdb::common::config::CompressionType;
 use engramdb::common::types::DataType;
+use engramdb::storage::compression::{compress, decompress};
+use std::time::{Duration, Instant};
 
 const ITERS: usize = 10;
 
@@ -17,11 +17,19 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 }
 
 fn fmt_rate(d: Duration, n: usize) -> String {
-    format!("{:.0} 次/秒 ({:.1} ms)", n as f64 / d.as_secs_f64(), d.as_secs_f64() * 1000.0)
+    format!(
+        "{:.0} 次/秒 ({:.1} ms)",
+        n as f64 / d.as_secs_f64(),
+        d.as_secs_f64() * 1000.0
+    )
 }
 
 fn fmt_ratio(compressed: usize, original: usize) -> String {
-    format!("{:.2}x ({:.1}%)", original as f64 / compressed as f64, compressed as f64 / original as f64 * 100.0)
+    format!(
+        "{:.2}x ({:.1}%)",
+        original as f64 / compressed as f64,
+        compressed as f64 / original as f64 * 100.0
+    )
 }
 
 fn main() {
@@ -49,7 +57,12 @@ fn main() {
         }
         let m = median(times);
         let avg_comp = compressed_sizes.iter().sum::<usize>() / compressed_sizes.len();
-        println!("  Best codec: 压缩后 {} bytes ({}), {}", avg_comp, fmt_ratio(avg_comp, int_bytes.len()), fmt_rate(m, 1));
+        println!(
+            "  Best codec: 压缩后 {} bytes ({}), {}",
+            avg_comp,
+            fmt_ratio(avg_comp, int_bytes.len()),
+            fmt_rate(m, 1)
+        );
     }
 
     // RLE
@@ -65,7 +78,12 @@ fn main() {
         }
         let m = median(times);
         let avg_comp = compressed_sizes.iter().sum::<usize>() / compressed_sizes.len();
-        println!("  RLE:    压缩后 {} bytes ({}), {}", avg_comp, fmt_ratio(avg_comp, int_bytes.len()), fmt_rate(m, 1));
+        println!(
+            "  RLE:    压缩后 {} bytes ({}), {}",
+            avg_comp,
+            fmt_ratio(avg_comp, int_bytes.len()),
+            fmt_rate(m, 1)
+        );
     }
 
     // Gorilla
@@ -80,7 +98,12 @@ fn main() {
         }
         let m = median(times);
         let avg_comp = compressed_sizes.iter().sum::<usize>() / compressed_sizes.len();
-        println!("  Gorilla: 压缩后 {} bytes ({}), {}", avg_comp, fmt_ratio(avg_comp, int_bytes.len()), fmt_rate(m, 1));
+        println!(
+            "  Gorilla: 压缩后 {} bytes ({}), {}",
+            avg_comp,
+            fmt_ratio(avg_comp, int_bytes.len()),
+            fmt_rate(m, 1)
+        );
     }
 
     // Zstd
@@ -95,7 +118,12 @@ fn main() {
         }
         let m = median(times);
         let avg_comp = compressed_sizes.iter().sum::<usize>() / compressed_sizes.len();
-        println!("  Zstd:   压缩后 {} bytes ({}), {}", avg_comp, fmt_ratio(avg_comp, int_bytes.len()), fmt_rate(m, 1));
+        println!(
+            "  Zstd:   压缩后 {} bytes ({}), {}",
+            avg_comp,
+            fmt_ratio(avg_comp, int_bytes.len()),
+            fmt_rate(m, 1)
+        );
     }
 
     println!();
@@ -119,7 +147,13 @@ fn main() {
         }
         let m = median(times);
         let avg_comp = compressed_sizes.iter().sum::<usize>() / compressed_sizes.len();
-        println!("  {}: 压缩后 {} bytes ({}), {}", name, avg_comp, fmt_ratio(avg_comp, float_bytes.len()), fmt_rate(m, 1));
+        println!(
+            "  {}: 压缩后 {} bytes ({}), {}",
+            name,
+            avg_comp,
+            fmt_ratio(avg_comp, float_bytes.len()),
+            fmt_rate(m, 1)
+        );
     }
 
     println!();
@@ -142,7 +176,12 @@ fn main() {
     }
     let m = median(times);
     let avg_comp = compressed_sizes.iter().sum::<usize>() / compressed_sizes.len();
-    println!("  Timestamp: 压缩后 {} bytes ({}), {}", avg_comp, fmt_ratio(avg_comp, ts_bytes.len()), fmt_rate(m, 1));
+    println!(
+        "  Timestamp: 压缩后 {} bytes ({}), {}",
+        avg_comp,
+        fmt_ratio(avg_comp, ts_bytes.len()),
+        fmt_rate(m, 1)
+    );
 
     println!();
 
@@ -169,7 +208,12 @@ fn main() {
     }
     let m = median(times);
     let avg_comp = compressed_sizes.iter().sum::<usize>() / compressed_sizes.len();
-    println!("  Varchar: 压缩后 {} bytes ({}), {}", avg_comp, fmt_ratio(avg_comp, varchar_bytes.len()), fmt_rate(m, 1));
+    println!(
+        "  Varchar: 压缩后 {} bytes ({}), {}",
+        avg_comp,
+        fmt_ratio(avg_comp, varchar_bytes.len()),
+        fmt_rate(m, 1)
+    );
 
     println!();
 
@@ -209,8 +253,8 @@ fn main() {
             for _ in 0..ITERS {
                 let t0 = Instant::now();
                 match decompress(&result_ts.1, result_ts.0, &DataType::Timestamp) {
-                    Ok(_) => {},
-                    Err(_) => {},
+                    Ok(_) => {}
+                    Err(_) => {}
                 }
                 times.push(t0.elapsed());
             }

@@ -102,7 +102,10 @@ mod tests {
         assert_eq!(loaded.version, VOCAB_VERSION);
         assert_eq!(loaded.seeds, vec!["银行".to_string()]);
         assert_eq!(loaded.merges, vec![("银".to_string(), "行".to_string())]);
-        assert_eq!(loaded.vocab, vec!["银".to_string(), "行".to_string(), "银行".to_string()]);
+        assert_eq!(
+            loaded.vocab,
+            vec!["银".to_string(), "行".to_string(), "银行".to_string()]
+        );
     }
 
     #[test]

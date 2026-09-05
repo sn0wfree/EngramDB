@@ -9,8 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::{reader::WalReader, WalRecord, WalRecordType};
 use crate::common::error::Result;
-use super::{WalRecord, WalRecordType, reader::WalReader};
 
 /// 恢复结果
 #[derive(Debug, Default, Clone)]
@@ -85,15 +85,18 @@ pub fn recover(wal_path: &str) -> Result<RecoveryResult> {
     }
 
     // 统计
-    let committed: HashSet<u32> = txn_states.iter()
+    let committed: HashSet<u32> = txn_states
+        .iter()
         .filter(|(_, s)| **s == TxnRecoveryState::Committed)
         .map(|(id, _)| *id)
         .collect();
-    let rolled_back: HashSet<u32> = txn_states.iter()
+    let rolled_back: HashSet<u32> = txn_states
+        .iter()
         .filter(|(_, s)| **s == TxnRecoveryState::RolledBack)
         .map(|(id, _)| *id)
         .collect();
-    let active: HashSet<u32> = txn_states.iter()
+    let active: HashSet<u32> = txn_states
+        .iter()
         .filter(|(_, s)| **s == TxnRecoveryState::Active)
         .map(|(id, _)| *id)
         .collect();
@@ -175,7 +178,9 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
         };
         match rec.record_type {
             WalRecordType::Insert => {
-                let Some((rowid, row)) = parse_insert_payload(&rec.payload) else { continue };
+                let Some((rowid, row)) = parse_insert_payload(&rec.payload) else {
+                    continue;
+                };
                 let rid = rowid as u32;
                 if replayed.insert((rec.table_id, rid)) {
                     // 首次见到：表中可能已存在（部分落盘）→ O(1) HashSet 探测
@@ -186,7 +191,9 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
                 result.records_redone += 1;
             }
             WalRecordType::InsertBatch => {
-                let Some((base, rows)) = parse_insert_batch_payload(&rec.payload) else { continue };
+                let Some((base, rows)) = parse_insert_batch_payload(&rec.payload) else {
+                    continue;
+                };
                 for (i, row) in rows.iter().enumerate() {
                     let rid = (base + i as u64) as u32;
                     if replayed.insert((rec.table_id, rid)) {
@@ -198,7 +205,9 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
                 result.records_redone += 1;
             }
             WalRecordType::Update => {
-                let Some((rowid, _, new_row)) = parse_update_payload(&rec.payload) else { continue };
+                let Some((rowid, _, new_row)) = parse_update_payload(&rec.payload) else {
+                    continue;
+                };
                 // v0.22.2：行不存在时跳过而非报错——redo 语义下 update 目标行
                 // 由同事务更早的 insert redo 保证；行缺失说明该 insert 从未
                 // 持久化（部分 flush），后续操作应为无操作。良性不一致不再
@@ -209,7 +218,9 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
                 result.records_redone += 1;
             }
             WalRecordType::Delete => {
-                let Some((rowid, _)) = parse_delete_payload(&rec.payload) else { continue };
+                let Some((rowid, _)) = parse_delete_payload(&rec.payload) else {
+                    continue;
+                };
                 // v0.22.2：同 Update——行缺失时删除为无操作
                 if table.get_row_by_id(rowid as u32)?.is_some() {
                     table.delete_row(rowid as u32)?;
@@ -257,10 +268,13 @@ pub fn get_redo_records(wal_path: &str) -> Result<Vec<WalRecord>> {
     }
 
     let start_idx = last_ckpt_idx.map(|i| i + 1).unwrap_or(0);
-    let redo: Vec<WalRecord> = records[start_idx..].iter()
+    let redo: Vec<WalRecord> = records[start_idx..]
+        .iter()
         .filter(|r| {
-            matches!(r.record_type, WalRecordType::Insert | WalRecordType::InsertBatch | WalRecordType::Update | WalRecordType::Delete)
-                && committed.contains(&r.txn_id)
+            matches!(
+                r.record_type,
+                WalRecordType::Insert | WalRecordType::InsertBatch | WalRecordType::Update | WalRecordType::Delete
+            ) && committed.contains(&r.txn_id)
         })
         .cloned()
         .collect();
@@ -271,13 +285,14 @@ pub fn get_redo_records(wal_path: &str) -> Result<Vec<WalRecord>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::{WalWriter, WalRecordType, make_insert_payload, make_insert_batch_payload};
+    use crate::wal::{make_insert_batch_payload, make_insert_payload, WalRecordType, WalWriter};
     use crate::Value;
 
     fn tmp(name: &str) -> String {
         let mut p = std::env::temp_dir();
         let tid = format!("{:?}", std::thread::current().id())
-            .replace('(', "_").replace(')', "")
+            .replace('(', "_")
+            .replace(')', "")
             .replace([':', ' '], "_");
         p.push(format!("engramdb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
         p.to_string_lossy().to_string()
@@ -298,10 +313,34 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             let payload = make_insert_payload(1, &[Value::Int64(42)]);
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &payload,
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -322,9 +361,25 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             let payload = make_insert_payload(1, &[Value::Int64(42)]);
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &payload,
+                )
+                .unwrap();
             // 没有 Commit — 模拟崩溃
             writer.flush().unwrap();
         }
@@ -333,7 +388,7 @@ mod tests {
         assert_eq!(result.transactions_committed, 0);
         assert_eq!(result.transactions_rolled_back, 1);
         assert_eq!(result.records_redone, 1); // Redo 阶段重做了
-        assert_eq!(result.records_undone, 1);  // Undo 阶段回滚了
+        assert_eq!(result.records_undone, 1); // Undo 阶段回滚了
         assert!(result.success);
 
         let _ = std::fs::remove_file(&tmp);
@@ -347,14 +402,41 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            let payload = make_insert_batch_payload(0, &[
-                vec![Value::Int64(1), Value::Varchar("a".into())],
-                vec![Value::Int64(2), Value::Varchar("b".into())],
-                vec![Value::Int64(3), Value::Varchar("c".into())],
-            ]);
-            writer.write_record(WalRecordType::InsertBatch, 1, 1, crate::common::types::EngineType::Columnar, &payload).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            let payload = make_insert_batch_payload(
+                0,
+                &[
+                    vec![Value::Int64(1), Value::Varchar("a".into())],
+                    vec![Value::Int64(2), Value::Varchar("b".into())],
+                    vec![Value::Int64(3), Value::Varchar("c".into())],
+                ],
+            );
+            writer
+                .write_record(
+                    WalRecordType::InsertBatch,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &payload,
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -381,13 +463,61 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             // Txn 1: 已提交
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[1],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             // Txn 2: 未提交（崩溃）
-            writer.write_record(WalRecordType::Begin, 2, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 2, 1, crate::common::types::EngineType::Columnar, &[2]).unwrap();
-            writer.write_record(WalRecordType::Insert, 2, 1, crate::common::types::EngineType::Columnar, &[3]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    2,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    2,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[2],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    2,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[3],
+                )
+                .unwrap();
             // 没有 Commit
             writer.flush().unwrap();
         }
@@ -396,7 +526,7 @@ mod tests {
         assert_eq!(result.transactions_committed, 1);
         assert_eq!(result.transactions_rolled_back, 1);
         assert_eq!(result.records_redone, 3); // 1 (txn1) + 2 (txn2)
-        assert_eq!(result.records_undone, 2);  // txn2 的 2 条
+        assert_eq!(result.records_undone, 2); // txn2 的 2 条
         assert!(result.success);
 
         let _ = std::fs::remove_file(&tmp);
@@ -410,9 +540,33 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 1..=5 {
-                writer.write_record(WalRecordType::Begin, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-                writer.write_record(WalRecordType::Insert, i, 1, crate::common::types::EngineType::Columnar, &[i as u8]).unwrap();
-                writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+                writer
+                    .write_record(
+                        WalRecordType::Begin,
+                        i,
+                        0,
+                        crate::common::types::EngineType::Columnar,
+                        &[],
+                    )
+                    .unwrap();
+                writer
+                    .write_record(
+                        WalRecordType::Insert,
+                        i,
+                        1,
+                        crate::common::types::EngineType::Columnar,
+                        &[i as u8],
+                    )
+                    .unwrap();
+                writer
+                    .write_record(
+                        WalRecordType::Commit,
+                        i,
+                        0,
+                        crate::common::types::EngineType::Columnar,
+                        &[],
+                    )
+                    .unwrap();
             }
             writer.sync().unwrap();
         }
@@ -435,8 +589,24 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             for i in 1..=3 {
-                writer.write_record(WalRecordType::Begin, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-                writer.write_record(WalRecordType::Insert, i, 1, crate::common::types::EngineType::Columnar, &[i as u8]).unwrap();
+                writer
+                    .write_record(
+                        WalRecordType::Begin,
+                        i,
+                        0,
+                        crate::common::types::EngineType::Columnar,
+                        &[],
+                    )
+                    .unwrap();
+                writer
+                    .write_record(
+                        WalRecordType::Insert,
+                        i,
+                        1,
+                        crate::common::types::EngineType::Columnar,
+                        &[i as u8],
+                    )
+                    .unwrap();
                 // 没有 Commit
             }
             writer.flush().unwrap();
@@ -459,9 +629,33 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1, 2, 3]).unwrap();
-            writer.write_record(WalRecordType::Rollback, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[1, 2, 3],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Rollback,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -480,10 +674,42 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[10]).unwrap();
-            writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[20]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[10],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[20],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 

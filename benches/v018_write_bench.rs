@@ -7,9 +7,9 @@
 //! - 逐行 autocommit INSERT：Batcher 攒批（P0-2）vs 关闭 Batcher
 //! - 组提交时间窗（P0-3）：低流量延迟有界（Sync 模式下持久化窗口）
 
-use std::time::{Duration, Instant};
 use engramdb::common::config::Config;
 use engramdb::{Connection, Value};
+use std::time::{Duration, Instant};
 
 const ITERS: usize = 3;
 
@@ -54,7 +54,12 @@ fn main() {
             conn.import_columns("t", cols).unwrap();
             let d = t0.elapsed();
             times.push(d);
-            println!("  批量 import_columns {} 行: {} ({})", n, fmt_rate(d, n as usize), "P0-1 列式直写");
+            println!(
+                "  批量 import_columns {} 行: {} ({})",
+                n,
+                fmt_rate(d, n as usize),
+                "P0-1 列式直写"
+            );
             conn.close().unwrap();
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(format!("{}-wal", path));
@@ -103,7 +108,10 @@ fn main() {
         conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
         let d = t0.elapsed();
         // 第二条语句的 commit 应因时间窗强制 fsync；持久化窗口 ≈ 15ms 有界
-        println!("  低流量两行间隔写入总耗时: {:.1} ms（时间窗有界，无 16 次等待）", d.as_millis());
+        println!(
+            "  低流量两行间隔写入总耗时: {:.1} ms（时间窗有界，无 16 次等待）",
+            d.as_millis()
+        );
         conn.close().unwrap();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path));
@@ -168,7 +176,8 @@ fn main_plan_cache() {
             let stmt = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
             let t0 = Instant::now();
             for i in 0..n {
-                conn.execute_prepared(&stmt, &[Value::Int64(i as i64), Value::Varchar(format!("e{}", i))]).unwrap();
+                conn.execute_prepared(&stmt, &[Value::Int64(i as i64), Value::Varchar(format!("e{}", i))])
+                    .unwrap();
             }
             conn.sync_wal().unwrap();
             prep_times.push(t0.elapsed());
@@ -181,9 +190,20 @@ fn main_plan_cache() {
     let miss = median(miss_times);
     let hit = median(hit_times);
     let prep = median(prep_times);
-    println!("  [中位数] miss {} / hit {} / prepared {}", fmt_rate(miss, n), fmt_rate(hit, n), fmt_rate(prep, n));
-    println!("  缓存收益: {:.1}x（同 SQL 场景）", miss.as_secs_f64() / hit.as_secs_f64());
-    println!("  prepared（直通）成本: {:.1}% 相对 miss 全解析", (prep.as_secs_f64() / miss.as_secs_f64()) * 100.0);
+    println!(
+        "  [中位数] miss {} / hit {} / prepared {}",
+        fmt_rate(miss, n),
+        fmt_rate(hit, n),
+        fmt_rate(prep, n)
+    );
+    println!(
+        "  缓存收益: {:.1}x（同 SQL 场景）",
+        miss.as_secs_f64() / hit.as_secs_f64()
+    );
+    println!(
+        "  prepared（直通）成本: {:.1}% 相对 miss 全解析",
+        (prep.as_secs_f64() / miss.as_secs_f64()) * 100.0
+    );
 
     // ---- 直通模拟：免 plan 固定开销的 INSERT 全链路 ----
     // 对照 prepared（直通路径）。bench 内直接构造 rows + operators::insert::execute，
@@ -208,6 +228,13 @@ fn main_plan_cache() {
         let _ = std::fs::remove_file(format!("{}-wal", path));
     }
     let direct = median(direct_times);
-    println!("  [中位数] prepared {} / 直通 {}", fmt_rate(prep, n), fmt_rate(direct, n));
-    println!("  直通上界差距: {:.1}%（prepared 相对直通模拟）", (direct.as_secs_f64() / prep.as_secs_f64() - 1.0) * 100.0);
+    println!(
+        "  [中位数] prepared {} / 直通 {}",
+        fmt_rate(prep, n),
+        fmt_rate(direct, n)
+    );
+    println!(
+        "  直通上界差距: {:.1}%（prepared 相对直通模拟）",
+        (direct.as_secs_f64() / prep.as_secs_f64() - 1.0) * 100.0
+    );
 }

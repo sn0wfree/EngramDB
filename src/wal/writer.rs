@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use crate::common::config::{WalFlushMode, WalCompression};
+use crate::common::config::{WalCompression, WalFlushMode};
 use crate::common::error::Result;
 
 use super::{WalRecord, WalRecordType, WAL_MAGIC, WAL_RECORD_HEADER_SIZE};
@@ -60,11 +60,7 @@ impl WalWriter {
         group_commit_max_bytes: usize,
     ) -> Result<Self> {
         let path = PathBuf::from(path);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).read(true).open(&path)?;
 
         let file_size = file.metadata()?.len();
         let buf_cap = buffer_size.max(4096);
@@ -196,15 +192,12 @@ impl WalWriter {
                     self.pending_commits += 1;
 
                     // 检查是否需要 fsync（任一条件满足即触发）
-                    let size_triggered = self.group_commit_size > 0
-                        && self.pending_commits >= self.group_commit_size;
-                    let bytes_triggered = self.group_commit_max_bytes > 0
-                        && self.bytes_since_sync >= self.group_commit_max_bytes;
+                    let size_triggered = self.group_commit_size > 0 && self.pending_commits >= self.group_commit_size;
+                    let bytes_triggered =
+                        self.group_commit_max_bytes > 0 && self.bytes_since_sync >= self.group_commit_max_bytes;
                     // P0-3 时间窗：距上次 fsync 超时则强制 sync（低流量延迟有界）
-                    let timeout_triggered = self
-                        .max_sync_interval
-                        .map(|d| self.last_sync.elapsed() >= d)
-                        .unwrap_or(false);
+                    let timeout_triggered =
+                        self.max_sync_interval.map(|d| self.last_sync.elapsed() >= d).unwrap_or(false);
 
                     if size_triggered || bytes_triggered || timeout_triggered {
                         self.file.sync_data()?;
@@ -293,10 +286,7 @@ impl WalWriter {
         // 一把 `write + create` 的独立句柄执行 set_len。Rust 在 Windows 上
         // 默认带 FILE_SHARE_READ|WRITE，并发打开不会冲突。
         {
-            let resizer = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(&self.path)?;
+            let resizer = OpenOptions::new().write(true).create(true).open(&self.path)?;
             resizer.set_len(lsn)?;
         }
 
@@ -332,7 +322,8 @@ mod tests {
     fn tmp(name: &str) -> String {
         let mut p = std::env::temp_dir();
         let tid = format!("{:?}", std::thread::current().id())
-            .replace('(', "_").replace(')', "")
+            .replace('(', "_")
+            .replace(')', "")
             .replace([':', ' '], "_");
         p.push(format!("engramdb_wal_{}_{}_{}.hdb-wal", name, std::process::id(), tid));
         p.to_string_lossy().to_string()
@@ -345,8 +336,24 @@ mod tests {
 
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
-            let lsn1 = writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            let lsn2 = writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[1, 2, 3]).unwrap();
+            let lsn1 = writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            let lsn2 = writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[1, 2, 3],
+                )
+                .unwrap();
             writer.sync().unwrap();
 
             assert_eq!(lsn1, 0);
@@ -381,7 +388,15 @@ mod tests {
         // 写入多条，验证 LSN 连续
         let mut prev_lsn = 0;
         for i in 0..100 {
-            let lsn = writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &[i as u8]).unwrap();
+            let lsn = writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[i as u8],
+                )
+                .unwrap();
             assert!(lsn >= prev_lsn);
             prev_lsn = lsn;
         }
@@ -398,10 +413,42 @@ mod tests {
         {
             let mut writer = WalWriter::open(&tmp).unwrap();
             // Begin/Commit/Rollback/Checkpoint 都有空 payload
-            writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Rollback, 2, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            let lsn2 = writer.write_record(WalRecordType::Checkpoint, 0, 0, crate::common::types::EngineType::Columnar, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    1,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Rollback,
+                    2,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            let lsn2 = writer
+                .write_record(
+                    WalRecordType::Checkpoint,
+                    0,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[0, 0, 0, 0, 0, 0, 0, 0],
+                )
+                .unwrap();
             writer.sync().unwrap();
         }
 
@@ -421,7 +468,15 @@ mod tests {
         let mut last_lsn = u64::MAX;
 
         for i in 0..50 {
-            let lsn = writer.write_record(WalRecordType::Insert, i, i, crate::common::types::EngineType::Columnar, &[i as u8; 10]).unwrap();
+            let lsn = writer
+                .write_record(
+                    WalRecordType::Insert,
+                    i,
+                    i,
+                    crate::common::types::EngineType::Columnar,
+                    &[i as u8; 10],
+                )
+                .unwrap();
             if last_lsn != u64::MAX {
                 assert!(lsn > last_lsn, "LSN not monotonic: {} <= {}", lsn, last_lsn);
             }
@@ -437,7 +492,15 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let mut writer = WalWriter::open(&tmp).unwrap();
-        let lsn = writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        let lsn = writer
+            .write_record(
+                WalRecordType::Begin,
+                1,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
 
         // sync 前 current_lsn 应该已经是写入后的位置
         assert_eq!(writer.current_lsn(), lsn + 20); // 20 = header + engine + empty payload + crc
@@ -454,7 +517,15 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let mut writer = WalWriter::open(&tmp).unwrap();
-        writer.write_record(WalRecordType::Begin, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        writer
+            .write_record(
+                WalRecordType::Begin,
+                1,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
         writer.flush().unwrap();
 
         // flush 后文件应该有数据
@@ -472,7 +543,15 @@ mod tests {
         let mut writer = WalWriter::open(&tmp).unwrap();
         // 写入一条大于默认 buffer size (64KB) 的记录
         let large_payload = vec![42u8; 100_000];
-        let lsn = writer.write_record(WalRecordType::Insert, 1, 1, crate::common::types::EngineType::Columnar, &large_payload).unwrap();
+        let lsn = writer
+            .write_record(
+                WalRecordType::Insert,
+                1,
+                1,
+                crate::common::types::EngineType::Columnar,
+                &large_payload,
+            )
+            .unwrap();
         writer.sync().unwrap();
 
         let file_size = std::fs::metadata(&tmp).unwrap().len();
@@ -491,22 +570,55 @@ mod tests {
             &tmp,
             WalFlushMode::Sync,
             65536,
-            4,  // group_commit_size = 4
-            0,  // 不按字节触发
-        ).unwrap();
+            4, // group_commit_size = 4
+            0, // 不按字节触发
+        )
+        .unwrap();
 
         // 前 3 次 commit 不应触发 fsync
         for i in 0..3 {
-            writer.write_record(WalRecordType::Begin, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Begin,
+                    i,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    i,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.commit_flush().unwrap();
         }
         assert_eq!(writer.pending_commits(), 3);
         assert!(writer.bytes_since_sync() > 0);
 
         // 第 4 次 commit 应触发 fsync
-        writer.write_record(WalRecordType::Begin, 3, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
-        writer.write_record(WalRecordType::Commit, 3, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        writer
+            .write_record(
+                WalRecordType::Begin,
+                3,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
+        writer
+            .write_record(
+                WalRecordType::Commit,
+                3,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
         writer.commit_flush().unwrap();
         assert_eq!(writer.pending_commits(), 0);
         assert_eq!(writer.bytes_since_sync(), 0);
@@ -527,12 +639,21 @@ mod tests {
             65536,
             0,   // 不按次数触发
             100, // group_commit_max_bytes = 100
-        ).unwrap();
+        )
+        .unwrap();
 
         // 写入小记录，累计字节数直到触发
         let mut count = 0;
         loop {
-            writer.write_record(WalRecordType::Insert, count, 1, crate::common::types::EngineType::Columnar, &[count as u8; 10]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    count,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[count as u8; 10],
+                )
+                .unwrap();
             writer.commit_flush().unwrap();
             count += 1;
             if writer.pending_commits() == 0 && count > 1 {
@@ -557,11 +678,20 @@ mod tests {
             65536,
             100, // 大的 group size，不会自动触发
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         // 写入 5 次 commit，都在组内
         for i in 0..5 {
-            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    i,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.commit_flush().unwrap();
         }
         assert_eq!(writer.pending_commits(), 5);
@@ -586,11 +716,20 @@ mod tests {
             65536,
             0, // 禁用
             0, // 禁用
-        ).unwrap();
+        )
+        .unwrap();
 
         // 每次 commit 都应 fsync（pending 始终为 0）
         for i in 0..5 {
-            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    i,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.commit_flush().unwrap();
             assert_eq!(writer.pending_commits(), 0);
         }
@@ -610,14 +749,31 @@ mod tests {
             65536,
             1000, // 不按次数触发
             0,
-        ).unwrap();
+        )
+        .unwrap();
         writer.set_max_sync_interval_ms(1);
-        writer.write_record(WalRecordType::Commit, 0, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        writer
+            .write_record(
+                WalRecordType::Commit,
+                0,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
         writer.commit_flush().unwrap();
         assert_eq!(writer.pending_commits(), 1, "时间未到不应触发");
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        writer.write_record(WalRecordType::Commit, 1, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+        writer
+            .write_record(
+                WalRecordType::Commit,
+                1,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
         writer.commit_flush().unwrap();
         assert_eq!(writer.pending_commits(), 0, "时间窗到期应强制 fsync");
         assert_eq!(writer.bytes_since_sync(), 0);
@@ -631,17 +787,19 @@ mod tests {
         let tmp = tmp("writer_timeout_disabled");
         let _ = std::fs::remove_file(&tmp);
 
-        let mut writer = WalWriter::with_config(
-            &tmp,
-            WalFlushMode::Sync,
-            65536,
-            1000,
-            0,
-        ).unwrap();
+        let mut writer = WalWriter::with_config(&tmp, WalFlushMode::Sync, 65536, 1000, 0).unwrap();
         // 默认禁用（None）；显式设 0 = 禁用
         writer.set_max_sync_interval_ms(0);
         for i in 0..3 {
-            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    i,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.commit_flush().unwrap();
         }
         assert_eq!(writer.pending_commits(), 3, "禁用时间窗时不应触发");
@@ -656,16 +814,18 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         // 时间窗未到期时，size 阈值仍正常工作
-        let mut writer = WalWriter::with_config(
-            &tmp,
-            WalFlushMode::Sync,
-            65536,
-            3,
-            0,
-        ).unwrap();
+        let mut writer = WalWriter::with_config(&tmp, WalFlushMode::Sync, 65536, 3, 0).unwrap();
         writer.set_max_sync_interval_ms(10_000);
         for i in 0..3 {
-            writer.write_record(WalRecordType::Commit, i, 0, crate::common::types::EngineType::Columnar, &[]).unwrap();
+            writer
+                .write_record(
+                    WalRecordType::Commit,
+                    i,
+                    0,
+                    crate::common::types::EngineType::Columnar,
+                    &[],
+                )
+                .unwrap();
             writer.commit_flush().unwrap();
         }
         assert_eq!(writer.pending_commits(), 0, "size 阈值 3 应触发 fsync");

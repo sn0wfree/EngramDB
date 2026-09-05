@@ -22,8 +22,8 @@ use crate::common::types::{EngineType, TableDef};
 use crate::Value;
 
 use super::engine::EngineTable;
-use super::memory_engine::MemoryTable;
 use super::log_engine::LogTable;
+use super::memory_engine::MemoryTable;
 
 /// Phase 3 P0：迁移错误类型
 #[derive(Debug)]
@@ -108,7 +108,7 @@ fn insert_all_rows(new_table: &mut EngineTable, rows: Vec<Vec<Value>>) -> Result
         // Columnar 插入需要 columnar::Table 类型（暂通过 insert_columns 路径）
         // 这里只支持 Memory/Log 的批量插入；Columnar 走专用路径
         EngineTable::Columnar(_) => Err(EngramDbError::Parse(
-            "use insert_columns_to_columnar for Columnar target".into()
+            "use insert_columns_to_columnar for Columnar target".into(),
         )),
     }
 }
@@ -135,10 +135,11 @@ pub fn migrate_table_data(
     }
 
     // Step 1: 读取所有行
-    let rows = extract_all_rows(table).map_err(|e| MigrationError::DataLost(
-        format!("extract rows failed: {}", e)
-    ))?;
-    let bytes_read: u64 = rows.iter().map(|r| r.iter().map(|v| estimate_value_size(v)).sum::<usize>() as u64).sum();
+    let rows = extract_all_rows(table).map_err(|e| MigrationError::DataLost(format!("extract rows failed: {}", e)))?;
+    let bytes_read: u64 = rows
+        .iter()
+        .map(|r| r.iter().map(|v| estimate_value_size(v)).sum::<usize>() as u64)
+        .sum();
     let row_count = rows.len() as u64;
 
     // Step 2: 准备新 def（更新 engine 字段，row_count 由 insert 维护）
@@ -151,18 +152,16 @@ pub fn migrate_table_data(
         EngineType::Memory => {
             let mut t = MemoryTable::new(new_def.clone());
             if row_count > 0 {
-                t.insert(rows.clone()).map_err(|e| MigrationError::DataLost(
-                    format!("memory insert failed: {}", e)
-                ))?;
+                t.insert(rows.clone())
+                    .map_err(|e| MigrationError::DataLost(format!("memory insert failed: {}", e)))?;
             }
             EngineTable::Memory(t)
         }
         EngineType::Log => {
             let mut t = LogTable::with_block_rows(new_def.clone(), 8192);
             if row_count > 0 {
-                t.insert(rows.clone()).map_err(|e| MigrationError::DataLost(
-                    format!("log insert failed: {}", e)
-                ))?;
+                t.insert(rows.clone())
+                    .map_err(|e| MigrationError::DataLost(format!("log insert failed: {}", e)))?;
             }
             EngineTable::Log(t)
         }
@@ -170,17 +169,19 @@ pub fn migrate_table_data(
             // Columnar 需要特殊处理：先创建空 Table，再 append_columns
             // 但 append_columns 接受 Vec<Vec<Value>>（按列），需要转置
             use super::table::Table;
-            let mut t = Table::new(new_def.clone(), crate::common::config::CompactStrategy::Adaptive {
-                min_threshold: 10_000,
-                max_threshold: 122_880,
-                pct_of_table: 0.10,
-                batch_size: 122_880,
-            });
+            let mut t = Table::new(
+                new_def.clone(),
+                crate::common::config::CompactStrategy::Adaptive {
+                    min_threshold: 10_000,
+                    max_threshold: 122_880,
+                    pct_of_table: 0.10,
+                    batch_size: 122_880,
+                },
+            );
             t.set_index_config(true, false, 8192);
             if row_count > 0 {
-                t.insert(rows.clone()).map_err(|e| MigrationError::DataLost(
-                    format!("columnar insert failed: {}", e)
-                ))?;
+                t.insert(rows.clone())
+                    .map_err(|e| MigrationError::DataLost(format!("columnar insert failed: {}", e)))?;
             }
             EngineTable::Columnar(t)
         }
@@ -190,7 +191,10 @@ pub fn migrate_table_data(
     };
 
     // Step 4: 计算写入字节（估算）
-    let bytes_written: u64 = rows.iter().map(|r| r.iter().map(|v| estimate_value_size(v)).sum::<usize>() as u64).sum();
+    let bytes_written: u64 = rows
+        .iter()
+        .map(|r| r.iter().map(|v| estimate_value_size(v)).sum::<usize>() as u64)
+        .sum();
 
     // Step 5: 替换原表
     let _ = std::mem::replace(table, new_table);
@@ -283,9 +287,13 @@ mod tests {
     }
 
     fn make_columnar_table(rows: u64) -> EngineTable {
-        let mut t = Table::new(make_def("t", EngineType::Columnar), CompactStrategy::default_adaptive(122880));
+        let mut t = Table::new(
+            make_def("t", EngineType::Columnar),
+            CompactStrategy::default_adaptive(122880),
+        );
         for i in 0..rows {
-            t.insert(vec![vec![Value::Int64(i as i64), Value::Varchar(format!("r{}", i))]]).unwrap();
+            t.insert(vec![vec![Value::Int64(i as i64), Value::Varchar(format!("r{}", i))]])
+                .unwrap();
         }
         EngineTable::Columnar(t)
     }

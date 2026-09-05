@@ -13,14 +13,26 @@ use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let path = args.windows(2).find(|w| w[0] == "--path")
-        .map(|w| w[1].clone()).expect("--path required");
-    let scenario = args.windows(2).find(|w| w[0] == "--scenario")
-        .map(|w| w[1].clone()).expect("--scenario required");
-    let n_txns: usize = args.windows(2).find(|w| w[0] == "--n-txns")
-        .map(|w| w[1].parse().unwrap()).expect("--n-txns required");
-    let kill_at: usize = args.windows(2).find(|w| w[0] == "--kill-at")
-        .map(|w| w[1].parse().unwrap()).expect("--kill-at required");
+    let path = args
+        .windows(2)
+        .find(|w| w[0] == "--path")
+        .map(|w| w[1].clone())
+        .expect("--path required");
+    let scenario = args
+        .windows(2)
+        .find(|w| w[0] == "--scenario")
+        .map(|w| w[1].clone())
+        .expect("--scenario required");
+    let n_txns: usize = args
+        .windows(2)
+        .find(|w| w[0] == "--n-txns")
+        .map(|w| w[1].parse().unwrap())
+        .expect("--n-txns required");
+    let kill_at: usize = args
+        .windows(2)
+        .find(|w| w[0] == "--kill-at")
+        .map(|w| w[1].parse().unwrap())
+        .expect("--kill-at required");
 
     let mut conn = engramdb::Connection::open(&path).unwrap();
     conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT)").unwrap();

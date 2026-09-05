@@ -50,9 +50,8 @@ pub fn parse(sql: &str) -> Result<Statement> {
     // sqlparser 0.47 不原生支持 INCLUDE 子句，需要预处理
     if let Some((base_sql, included_cols)) = extract_include_clause(&sql_for_parse) {
         let dialect = GenericDialect {};
-        let stmts = Parser::parse_sql(&dialect, &base_sql).map_err(|e| {
-            EngramDbError::Parse(format!("SQL parse error: {}", e))
-        })?;
+        let stmts = Parser::parse_sql(&dialect, &base_sql)
+            .map_err(|e| EngramDbError::Parse(format!("SQL parse error: {}", e)))?;
         if stmts.is_empty() {
             return Err(EngramDbError::Parse("Empty SQL statement".into()));
         }
@@ -70,9 +69,8 @@ pub fn parse(sql: &str) -> Result<Statement> {
     }
 
     let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, &sql_for_parse).map_err(|e| {
-        EngramDbError::Parse(format!("SQL parse error: {}", e))
-    })?;
+    let stmts = Parser::parse_sql(&dialect, &sql_for_parse)
+        .map_err(|e| EngramDbError::Parse(format!("SQL parse error: {}", e)))?;
 
     if stmts.is_empty() {
         return Err(EngramDbError::Parse("Empty SQL statement".into()));
@@ -168,7 +166,9 @@ fn renumber_expr(expr: &mut Expression, counter: &mut usize) {
             renumber_expr(expr, counter);
             renumber_expr(pattern, counter);
         }
-        Expression::Case { when_then, else_expr, .. } => {
+        Expression::Case {
+            when_then, else_expr, ..
+        } => {
             for (w, t) in when_then.iter_mut() {
                 renumber_expr(w, counter);
                 renumber_expr(t, counter);
@@ -252,29 +252,41 @@ fn normalize_insert_or(sql: &str) -> String {
     let upper = sql.to_uppercase();
 
     // INSERT OR REPLACE：转换为 ON CONFLICT DO UPDATE（替换所有列）
-    if upper.starts_with("INSERT OR REPLACE ") || upper.starts_with("INSERT OR REPLACE\t")
-        || upper.starts_with("INSERT OR REPLACE\n") || upper.starts_with("INSERT OR REPLACE\r")
+    if upper.starts_with("INSERT OR REPLACE ")
+        || upper.starts_with("INSERT OR REPLACE\t")
+        || upper.starts_with("INSERT OR REPLACE\n")
+        || upper.starts_with("INSERT OR REPLACE\r")
     {
         let after = &sql["INSERT OR REPLACE".len()..];
         let stripped = after.trim_start();
         if !upper.contains("ON CONFLICT") {
-            return format!("INSERT {} ON CONFLICT DO UPDATE SET __replace_all__ = __replace_all__", stripped);
+            return format!(
+                "INSERT {} ON CONFLICT DO UPDATE SET __replace_all__ = __replace_all__",
+                stripped
+            );
         }
     }
 
     // REPLACE INTO：等价于 INSERT OR REPLACE
-    if upper.starts_with("REPLACE INTO ") || upper.starts_with("REPLACE INTO\t")
-        || upper.starts_with("REPLACE INTO\n") || upper.starts_with("REPLACE INTO\r")
+    if upper.starts_with("REPLACE INTO ")
+        || upper.starts_with("REPLACE INTO\t")
+        || upper.starts_with("REPLACE INTO\n")
+        || upper.starts_with("REPLACE INTO\r")
     {
         let after = &sql["REPLACE INTO".len()..];
         let stripped = after.trim_start();
         if !upper.contains("ON CONFLICT") {
-            return format!("INSERT {} ON CONFLICT DO UPDATE SET __replace_all__ = __replace_all__", stripped);
+            return format!(
+                "INSERT {} ON CONFLICT DO UPDATE SET __replace_all__ = __replace_all__",
+                stripped
+            );
         }
     }
 
-    if upper.starts_with("INSERT OR IGNORE ") || upper.starts_with("INSERT OR IGNORE\t")
-        || upper.starts_with("INSERT OR IGNORE\n") || upper.starts_with("INSERT OR IGNORE\r")
+    if upper.starts_with("INSERT OR IGNORE ")
+        || upper.starts_with("INSERT OR IGNORE\t")
+        || upper.starts_with("INSERT OR IGNORE\n")
+        || upper.starts_with("INSERT OR IGNORE\r")
     {
         // 去掉 "INSERT OR IGNORE" 前缀
         let after = &sql["INSERT OR IGNORE".len()..];
@@ -468,7 +480,9 @@ fn strip_using_hnsw(sql: &str) -> String {
 /// sqlparser AST → EngramDB 内部 AST
 fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
     match stmt {
-        sqlast::Statement::CreateTable { name, columns, query, .. } => {
+        sqlast::Statement::CreateTable {
+            name, columns, query, ..
+        } => {
             let table_name = name.to_string();
             let mut cols = Vec::new();
             for col_def in columns {
@@ -479,13 +493,15 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                         .options
                         .iter()
                         .any(|o| matches!(o.option, sqlast::ColumnOption::NotNull));
-                    let primary_key = col_def.options.iter().any(|o| {
-                        matches!(o.option, sqlast::ColumnOption::Unique { is_primary: true, .. })
-                    });
+                    let primary_key = col_def
+                        .options
+                        .iter()
+                        .any(|o| matches!(o.option, sqlast::ColumnOption::Unique { is_primary: true, .. }));
                     // 列级 UNIQUE 约束（非 PRIMARY KEY 的 UNIQUE 列）
-                    let unique = col_def.options.iter().any(|o| {
-                        matches!(o.option, sqlast::ColumnOption::Unique { is_primary: false, .. })
-                    });
+                    let unique = col_def
+                        .options
+                        .iter()
+                        .any(|o| matches!(o.option, sqlast::ColumnOption::Unique { is_primary: false, .. }));
                     // 检测 AUTO_INCREMENT 关键字
                     // sqlparser 把它解析为 ColumnOption::DialectSpecific([Token::AUTO_INCREMENT])
                     let auto_increment = col_def.options.iter().any(|o| {
@@ -560,9 +576,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                     }
                 }
             } else {
-                return Err(EngramDbError::Parse(
-                    "INSERT without source not supported".into(),
-                ));
+                return Err(EngramDbError::Parse("INSERT without source not supported".into()));
             };
 
             // 解析 RETURNING 子句
@@ -596,9 +610,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                         // 提取冲突目标列
                         let conflict_columns = if let Some(target) = &on_conflict.conflict_target {
                             match target {
-                                sqlast::ConflictTarget::Columns(cols) => {
-                                    cols.iter().map(|c| c.value.clone()).collect()
-                                }
+                                sqlast::ConflictTarget::Columns(cols) => cols.iter().map(|c| c.value.clone()).collect(),
                                 _ => vec![],
                             }
                         } else {
@@ -607,9 +619,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
 
                         // 提取冲突动作
                         let action = match &on_conflict.action {
-                            sqlast::OnConflictAction::DoNothing => {
-                                OnConflictAction::DoNothing
-                            }
+                            sqlast::OnConflictAction::DoNothing => OnConflictAction::DoNothing,
                             sqlast::OnConflictAction::DoUpdate(do_update) => {
                                 // 检测 INSERT OR REPLACE / REPLACE INTO 标记
                                 if do_update.assignments.len() == 1
@@ -693,18 +703,13 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                 sqlast::Value::Boolean(b) => b.to_string(),
                 _ => v.to_string(),
             });
-            Ok(Statement::Pragma(PragmaStmt {
-                name: pragma_name,
-                arg,
-            }))
+            Ok(Statement::Pragma(PragmaStmt { name: pragma_name, arg }))
         }
 
         // TRUNCATE TABLE（v0.15.0 新增）
-        sqlast::Statement::Truncate { table_name, .. } => {
-            Ok(Statement::TruncateTable {
-                table_name: table_name.to_string(),
-            })
-        }
+        sqlast::Statement::Truncate { table_name, .. } => Ok(Statement::TruncateTable {
+            table_name: table_name.to_string(),
+        }),
 
         // ANALYZE：收集统计信息
         sqlast::Statement::Analyze { table_name, .. } => {
@@ -783,13 +788,12 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
             using,
             ..
         } => {
-            let index_name = name.as_ref()
+            let index_name = name
+                .as_ref()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| format!("idx_{}", table_name.to_string().replace('.', "_")));
             let tbl_name = table_name.to_string();
-            let key_cols: Vec<String> = columns.iter()
-                .map(|c| c.expr.to_string())
-                .collect();
+            let key_cols: Vec<String> = columns.iter().map(|c| c.expr.to_string()).collect();
 
             // INCLUDE 子句：sqlparser 0.47 的 CreateIndex 不原生支持 INCLUDE
             // 从原始 SQL 中手动解析 INCLUDE (col1, col2, ...)
@@ -831,7 +835,12 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
         }
 
         // UPDATE（v0.12.0 新增）
-        sqlast::Statement::Update { table, assignments, selection, .. } => {
+        sqlast::Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => {
             let tbl_name = match &table.relation {
                 sqlast::TableFactor::Table { name, .. } => name.to_string(),
                 _ => return Err(EngramDbError::Parse("Unsupported UPDATE table type".into())),
@@ -857,18 +866,21 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
         sqlast::Statement::AlterTable { name, operations, .. } => {
             let table_name = name.to_string();
             // 只处理第一个操作（sqlparser 支持多个，我们一次一个）
-            let op = operations.first().ok_or_else(|| {
-                EngramDbError::Parse("ALTER TABLE requires at least one operation".into())
-            })?;
+            let op = operations
+                .first()
+                .ok_or_else(|| EngramDbError::Parse("ALTER TABLE requires at least one operation".into()))?;
             let operation = match op {
                 sqlast::AlterTableOperation::AddColumn { column_def, .. } => {
                     let col_name = column_def.name.value.clone();
                     let dt = convert_data_type(&column_def.data_type)?;
-                    let nullable = !column_def.options.iter()
+                    let nullable = !column_def
+                        .options
+                        .iter()
                         .any(|o| matches!(o.option, sqlast::ColumnOption::NotNull));
-                    let primary_key = column_def.options.iter().any(|o| {
-                        matches!(o.option, sqlast::ColumnOption::Unique { is_primary: true, .. })
-                    });
+                    let primary_key = column_def
+                        .options
+                        .iter()
+                        .any(|o| matches!(o.option, sqlast::ColumnOption::Unique { is_primary: true, .. }));
                     let auto_increment = column_def.options.iter().any(|o| {
                         if let sqlast::ColumnOption::DialectSpecific(tokens) = &o.option {
                             tokens.iter().any(|t| {
@@ -887,35 +899,35 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                             primary_key,
                             auto_increment,
                             unique: false,
-                    check_expr: None,
+                            check_expr: None,
                         },
                         position: None,
                     }
                 }
-                sqlast::AlterTableOperation::DropColumn { column_name, .. } => {
-                    AlterTableOp::DropColumn {
-                        column_name: column_name.value.clone(),
-                    }
+                sqlast::AlterTableOperation::DropColumn { column_name, .. } => AlterTableOp::DropColumn {
+                    column_name: column_name.value.clone(),
+                },
+                sqlast::AlterTableOperation::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                    ..
+                } => AlterTableOp::RenameColumn {
+                    old_name: old_column_name.value.clone(),
+                    new_name: new_column_name.value.clone(),
+                },
+                sqlast::AlterTableOperation::RenameTable {
+                    table_name: new_name, ..
+                } => AlterTableOp::RenameTable {
+                    new_name: new_name.to_string(),
+                },
+                _ => {
+                    return Err(EngramDbError::Parse(format!(
+                        "Unsupported ALTER TABLE operation: {:?}",
+                        op
+                    )))
                 }
-                sqlast::AlterTableOperation::RenameColumn { old_column_name, new_column_name, .. } => {
-                    AlterTableOp::RenameColumn {
-                        old_name: old_column_name.value.clone(),
-                        new_name: new_column_name.value.clone(),
-                    }
-                }
-                sqlast::AlterTableOperation::RenameTable { table_name: new_name, .. } => {
-                    AlterTableOp::RenameTable {
-                        new_name: new_name.to_string(),
-                    }
-                }
-                _ => return Err(EngramDbError::Parse(format!(
-                    "Unsupported ALTER TABLE operation: {:?}", op
-                ))),
             };
-            Ok(Statement::AlterTable(AlterTableStmt {
-                table_name,
-                operation,
-            }))
+            Ok(Statement::AlterTable(AlterTableStmt { table_name, operation }))
         }
 
         // 暂不支持的语句
@@ -991,7 +1003,12 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
 
             (items, from, where_clause, group_by, having, None)
         }
-        sqlast::SetExpr::SetOperation { op, set_quantifier, left, right } => {
+        sqlast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
             // UNION / UNION ALL / INTERSECT / EXCEPT
             let set_op_type = match (op, set_quantifier) {
                 (sqlast::SetOperator::Union, sqlast::SetQuantifier::All) => SetOpType::UnionAll,
@@ -1036,22 +1053,23 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
 
             // 使用左侧的 select_list、from 等，set_op 指向右侧
             let (l_items, l_from, l_where, l_group_by, l_having) = match left_select {
-                s if s.set_op.is_none() => (
-                    s.select_list, s.from, s.where_clause, s.group_by, s.having,
-                ),
+                s if s.set_op.is_none() => (s.select_list, s.from, s.where_clause, s.group_by, s.having),
                 _ => {
-                    return Err(EngramDbError::Parse(
-                        "Nested set operations not supported".into(),
-                    ));
+                    return Err(EngramDbError::Parse("Nested set operations not supported".into()));
                 }
             };
 
-            (l_items, l_from, l_where, l_group_by, l_having, Some((set_op_type, Box::new(right_select))))
+            (
+                l_items,
+                l_from,
+                l_where,
+                l_group_by,
+                l_having,
+                Some((set_op_type, Box::new(right_select))),
+            )
         }
         _ => {
-            return Err(EngramDbError::Parse(
-                "Only SELECT queries are supported".into(),
-            ));
+            return Err(EngramDbError::Parse("Only SELECT queries are supported".into()));
         }
     };
 
@@ -1062,10 +1080,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
             sqlast::OrderByExpr { expr, asc, .. } => {
                 let e = convert_expression(expr)?;
                 let ascending = asc.unwrap_or(true);
-                order_by.push(OrderByItem {
-                    expr: e,
-                    ascending,
-                });
+                order_by.push(OrderByItem { expr: e, ascending });
             }
         }
     }
@@ -1075,13 +1090,12 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
     let limit = match &query.limit {
         Some(expr) => {
             if let sqlast::Expr::Value(sqlast::Value::Number(n, _)) = expr {
-                Some(n.parse::<usize>().map_err(|_| {
-                    EngramDbError::Parse("Invalid LIMIT value".into())
-                })?)
+                Some(
+                    n.parse::<usize>()
+                        .map_err(|_| EngramDbError::Parse("Invalid LIMIT value".into()))?,
+                )
             } else {
-                return Err(EngramDbError::Parse(
-                    "LIMIT must be a literal integer".into(),
-                ));
+                return Err(EngramDbError::Parse("LIMIT must be a literal integer".into()));
             }
         }
         None => None,
@@ -1089,13 +1103,12 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
     let offset = match &query.offset {
         Some(off) => {
             if let sqlast::Expr::Value(sqlast::Value::Number(n, _)) = &off.value {
-                Some(n.parse::<usize>().map_err(|_| {
-                    EngramDbError::Parse("Invalid OFFSET value".into())
-                })?)
+                Some(
+                    n.parse::<usize>()
+                        .map_err(|_| EngramDbError::Parse("Invalid OFFSET value".into()))?,
+                )
             } else {
-                return Err(EngramDbError::Parse(
-                    "OFFSET must be a literal integer".into(),
-                ));
+                return Err(EngramDbError::Parse("OFFSET must be a literal integer".into()));
             }
         }
         None => None,
@@ -1169,22 +1182,14 @@ fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>>
                         | sqlast::JoinOperator::FullOuter(constraint) => {
                             // ②：INNER / LEFT / RIGHT / FULL JOIN
                             let join_type = match &join.join_operator {
-                                sqlast::JoinOperator::LeftOuter(_) => {
-                                    crate::executor::physical_plan::JoinType::Left
-                                }
-                                sqlast::JoinOperator::RightOuter(_) => {
-                                    crate::executor::physical_plan::JoinType::Right
-                                }
-                                sqlast::JoinOperator::FullOuter(_) => {
-                                    crate::executor::physical_plan::JoinType::Full
-                                }
+                                sqlast::JoinOperator::LeftOuter(_) => crate::executor::physical_plan::JoinType::Left,
+                                sqlast::JoinOperator::RightOuter(_) => crate::executor::physical_plan::JoinType::Right,
+                                sqlast::JoinOperator::FullOuter(_) => crate::executor::physical_plan::JoinType::Full,
                                 _ => crate::executor::physical_plan::JoinType::Inner,
                             };
                             // ON 条件（None = 无 ON，等价 CROSS JOIN）
                             let on = match constraint {
-                                sqlast::JoinConstraint::On(expr) => {
-                                    Some(convert_expression(expr)?)
-                                }
+                                sqlast::JoinConstraint::On(expr) => Some(convert_expression(expr)?),
                                 _ => None,
                             };
                             result = TableRef::Join {
@@ -1203,9 +1208,7 @@ fn convert_table_ref(table: &sqlast::TableWithJoins) -> Result<Option<TableRef>>
                     }
                 }
                 _ => {
-                    return Err(EngramDbError::Parse(
-                        "Only simple table joins are supported".into()
-                    ));
+                    return Err(EngramDbError::Parse("Only simple table joins are supported".into()));
                 }
             }
         }
@@ -1225,11 +1228,10 @@ fn convert_table_factor(factor: &sqlast::TableFactor) -> Result<Option<TableRef>
             // 否则按普通表处理。
             if let Some(arg_list) = args {
                 let name_str = name.to_string();
-                let converted_args: Vec<Expression> = arg_list.iter()
+                let converted_args: Vec<Expression> = arg_list
+                    .iter()
                     .filter_map(|arg| match arg {
-                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                            convert_expression(e).ok()
-                        }
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => convert_expression(e).ok(),
                         _ => None,
                     })
                     .collect();
@@ -1239,7 +1241,10 @@ fn convert_table_factor(factor: &sqlast::TableFactor) -> Result<Option<TableRef>
                     alias,
                 }));
             }
-            Ok(Some(TableRef::Table { table_name: name.to_string(), alias }))
+            Ok(Some(TableRef::Table {
+                table_name: name.to_string(),
+                alias,
+            }))
         }
         sqlast::TableFactor::Derived { subquery, alias, .. } => {
             if let sqlast::SetExpr::Select(_) = subquery.body.as_ref() {
@@ -1256,15 +1261,17 @@ fn convert_table_factor(factor: &sqlast::TableFactor) -> Result<Option<TableRef>
             let (name, args) = if let sqlast::Expr::Function(func) = &expr {
                 let name = func.name.to_string();
                 let args = match &func.args {
-                    sqlast::FunctionArguments::List(arg_list) => {
-                        arg_list.args.iter().filter_map(|arg| {
+                    sqlast::FunctionArguments::List(arg_list) => arg_list
+                        .args
+                        .iter()
+                        .filter_map(|arg| {
                             if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) = arg {
                                 convert_expression(e).ok()
                             } else {
                                 None
                             }
-                        }).collect()
-                    }
+                        })
+                        .collect(),
                     _ => Vec::new(),
                 };
                 (name, args)
@@ -1341,10 +1348,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
                     expr: Box::new(inner),
                 }),
                 sqlast::UnaryOperator::Plus => Ok(inner),
-                _ => Err(EngramDbError::Parse(format!(
-                    "Unsupported unary operator: {:?}",
-                    op
-                ))),
+                _ => Err(EngramDbError::Parse(format!("Unsupported unary operator: {:?}", op))),
             }
         }
 
@@ -1355,22 +1359,16 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             let (args, distinct) = match &func.args {
                 sqlast::FunctionArguments::None => (Vec::new(), false),
                 sqlast::FunctionArguments::Subquery(_) => {
-                    return Err(EngramDbError::Parse(
-                        "Subquery function arguments not supported".into(),
-                    ));
+                    return Err(EngramDbError::Parse("Subquery function arguments not supported".into()));
                 }
                 sqlast::FunctionArguments::List(arg_list) => {
                     let mut args = Vec::new();
                     for arg in &arg_list.args {
-                        if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) = arg
-                        {
+                        if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) = arg {
                             args.push(convert_expression(e)?);
                         }
                     }
-                    let distinct = matches!(
-                        arg_list.duplicate_treatment,
-                        Some(sqlast::DuplicateTreatment::Distinct)
-                    );
+                    let distinct = matches!(arg_list.duplicate_treatment, Some(sqlast::DuplicateTreatment::Distinct));
                     (args, distinct)
                 }
             };
@@ -1406,7 +1404,12 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
         sqlast::Expr::IsNull(expr) => Ok(Expression::IsNull(Box::new(convert_expression(expr)?))),
 
         // TRIM(expr [, chars]) / LTRIM / RTRIM：转换为函数调用（v0.15.0 S05）
-        sqlast::Expr::Trim { expr, trim_where, trim_what, .. } => {
+        sqlast::Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            ..
+        } => {
             let inner = convert_expression(expr)?;
             // trim_what 是要去除的字符（仅第一个元素）
             let what = if let Some(what_box) = trim_what {
@@ -1433,9 +1436,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             })
         }
 
-        sqlast::Expr::IsNotNull(expr) => {
-            Ok(Expression::IsNotNull(Box::new(convert_expression(expr)?)))
-        }
+        sqlast::Expr::IsNotNull(expr) => Ok(Expression::IsNotNull(Box::new(convert_expression(expr)?))),
 
         // CEIL/FLOOR 表达式：转换为函数调用（v0.15.0 N03-N04）
         sqlast::Expr::Ceil { expr, .. } => {
@@ -1479,7 +1480,12 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             }
         }
 
-        sqlast::Expr::Between { expr, negated, low, high } => {
+        sqlast::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
             let inner = convert_expression(expr)?;
             let low_expr = convert_expression(low)?;
             let high_expr = convert_expression(high)?;
@@ -1508,10 +1514,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
         }
 
         sqlast::Expr::Like {
-            expr,
-            pattern,
-            negated,
-            ..
+            expr, pattern, negated, ..
         } => {
             let inner = convert_expression(expr)?;
             let pat = convert_expression(pattern)?;
@@ -1557,15 +1560,10 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
                 Some(e) => Some(Box::new(convert_expression(e)?)),
                 None => None,
             };
-            Ok(Expression::Case {
-                when_then,
-                else_expr,
-            })
+            Ok(Expression::Case { when_then, else_expr })
         }
 
-        sqlast::Expr::Cast {
-            expr, data_type, ..
-        } => {
+        sqlast::Expr::Cast { expr, data_type, .. } => {
             let inner = convert_expression(expr)?;
             let target_type = convert_data_type(data_type)?;
             Ok(Expression::Cast {
@@ -1578,7 +1576,6 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
         // sqlparser 0.47 has Expr::JsonAccess { value: Box<Expr>, path: JsonPath }
         // where JsonPath is a struct, not an Expr, so we skip it and fall through
         // to the unsupported expression error below.
-
         sqlast::Expr::Subquery(subquery) => {
             let inner = convert_query(subquery)?;
             Ok(Expression::Subquery(Box::new(inner)))
@@ -1592,7 +1589,11 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             })
         }
 
-        sqlast::Expr::InSubquery { expr, subquery, negated } => {
+        sqlast::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
             let inner_expr = convert_expression(expr)?;
             let inner_sub = convert_query(subquery)?;
             Ok(Expression::InSubquery {
@@ -1602,10 +1603,7 @@ fn convert_expression(expr: &sqlast::Expr) -> Result<Expression> {
             })
         }
 
-        _ => Err(EngramDbError::Parse(format!(
-            "Unsupported expression: {}",
-            expr
-        ))),
+        _ => Err(EngramDbError::Parse(format!("Unsupported expression: {}", expr))),
     }
 }
 
@@ -1631,15 +1629,17 @@ fn convert_value(v: &sqlast::Value) -> Result<Value> {
 
 /// 转换窗口规范
 fn convert_window_spec(ws: &sqlast::WindowSpec) -> WindowSpec {
-    let partition_by: Result<Vec<Expression>> = ws.partition_by.iter()
-        .map(|e| convert_expression(e))
-        .collect();
+    let partition_by: Result<Vec<Expression>> = ws.partition_by.iter().map(|e| convert_expression(e)).collect();
     let partition_by = partition_by.unwrap_or_default();
-    let order_by: Vec<OrderByItem> = ws.order_by.iter().map(|item| {
-        let expr = convert_expression(&item.expr).unwrap_or(Expression::Literal(Value::Null));
-        let ascending = item.asc.unwrap_or(true);
-        OrderByItem { expr, ascending }
-    }).collect();
+    let order_by: Vec<OrderByItem> = ws
+        .order_by
+        .iter()
+        .map(|item| {
+            let expr = convert_expression(&item.expr).unwrap_or(Expression::Literal(Value::Null));
+            let ascending = item.asc.unwrap_or(true);
+            OrderByItem { expr, ascending }
+        })
+        .collect();
     let window_frame = ws.window_frame.as_ref().map(|wf| WindowFrame {
         units: match wf.units {
             sqlast::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
@@ -1669,7 +1669,11 @@ fn convert_window_spec(ws: &sqlast::WindowSpec) -> WindowSpec {
             sqlast::WindowFrameBound::Following(None) => WindowFrameBound::UnboundedFollowing,
         }),
     });
-    WindowSpec { partition_by, order_by, window_frame }
+    WindowSpec {
+        partition_by,
+        order_by,
+        window_frame,
+    }
 }
 
 fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
@@ -1682,12 +1686,8 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         sqlast::DataType::SmallInt(_) => Ok(DataType::Int16),
         sqlast::DataType::TinyInt(_) => Ok(DataType::Int32),
         sqlast::DataType::Float4 => Ok(DataType::Float32),
-        sqlast::DataType::Float(_) | sqlast::DataType::Double | sqlast::DataType::Float64 => {
-            Ok(DataType::Float64)
-        }
-        sqlast::DataType::Numeric(precision) => {
-            Ok(DataType::Decimal { scale: 0 })
-        }
+        sqlast::DataType::Float(_) | sqlast::DataType::Double | sqlast::DataType::Float64 => Ok(DataType::Float64),
+        sqlast::DataType::Numeric(precision) => Ok(DataType::Decimal { scale: 0 }),
         sqlast::DataType::Decimal(info) => {
             match info {
                 sqlast::ExactNumberInfo::None => Ok(DataType::Decimal { scale: 0 }),
@@ -1698,7 +1698,8 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
                     // 溢出 i128 panic。
                     if *s > 38 {
                         return Err(EngramDbError::Parse(format!(
-                            "DECIMAL scale {} out of range (max 38)", s
+                            "DECIMAL scale {} out of range (max 38)",
+                            s
                         )));
                     }
                     Ok(DataType::Decimal { scale: *s as u8 })
@@ -1716,10 +1717,12 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
         // JSON 类型（v0.12.0 新增）
         // sqlparser 0.47 有原生 JSON 变体，同时保留 Custom 兜底
         sqlast::DataType::JSON => Ok(DataType::Json),
-        sqlast::DataType::Custom(name, _) if name.0.len() == 1 && {
-            let n = name.0[0].value.to_uppercase();
-            n == "JSON" || n == "JSONB"
-        } => {
+        sqlast::DataType::Custom(name, _)
+            if name.0.len() == 1 && {
+                let n = name.0[0].value.to_uppercase();
+                n == "JSON" || n == "JSONB"
+            } =>
+        {
             let n = name.0[0].value.to_uppercase();
             if n == "JSONB" {
                 Ok(DataType::Jsonb)
@@ -1728,13 +1731,17 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
             }
         }
         // 向量类型 VECTOR(dim)（v0.12.0 新增）
-        sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR" => {
+        sqlast::DataType::Custom(name, modifiers)
+            if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR" =>
+        {
             // 从 modifiers 中解析维度，如 VECTOR(4) → dim=4
             let dim = parse_dim_from_modifiers(modifiers).unwrap_or(0);
             Ok(DataType::Vector { dim })
         }
         // INT8 量化向量类型 VECTOR_INT8(dim)（v0.15.0 新增）
-        sqlast::DataType::Custom(name, modifiers) if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR_INT8" => {
+        sqlast::DataType::Custom(name, modifiers)
+            if name.0.len() == 1 && name.0[0].value.to_uppercase() == "VECTOR_INT8" =>
+        {
             let dim = parse_dim_from_modifiers(modifiers).unwrap_or(0);
             Ok(DataType::VectorInt8 { dim })
         }
@@ -1759,10 +1766,7 @@ fn convert_data_type(dt: &sqlast::DataType) -> Result<DataType> {
             let values = modifiers.iter().map(|s| s.clone()).collect();
             Ok(DataType::Enum { values })
         }
-        _ => Err(EngramDbError::Parse(format!(
-            "Unsupported data type: {:?}",
-            dt
-        ))),
+        _ => Err(EngramDbError::Parse(format!("Unsupported data type: {:?}", dt))),
     }
 }
 
@@ -1788,10 +1792,7 @@ fn convert_binary_op(op: &sqlast::BinaryOperator) -> Result<BinaryOperator> {
         sqlast::BinaryOperator::And => Ok(BinaryOperator::And),
         sqlast::BinaryOperator::Or => Ok(BinaryOperator::Or),
         sqlast::BinaryOperator::StringConcat => Ok(BinaryOperator::Concat),
-        _ => Err(EngramDbError::Parse(format!(
-            "Unsupported binary operator: {:?}",
-            op
-        ))),
+        _ => Err(EngramDbError::Parse(format!("Unsupported binary operator: {:?}", op))),
     }
 }
 
@@ -1893,15 +1894,13 @@ mod tests {
         let sql = "SELECT COUNT(*) FROM users";
         let stmt = parse(sql).unwrap();
         match stmt {
-            Statement::Select(s) => {
-                match &s.select_list[0] {
-                    SelectItem::Expression(Expression::Function { name, count_star, .. }, _) => {
-                        assert_eq!(name, "COUNT");
-                        assert!(*count_star);
-                    }
-                    _ => panic!("Expected COUNT(*) function"),
+            Statement::Select(s) => match &s.select_list[0] {
+                SelectItem::Expression(Expression::Function { name, count_star, .. }, _) => {
+                    assert_eq!(name, "COUNT");
+                    assert!(*count_star);
                 }
-            }
+                _ => panic!("Expected COUNT(*) function"),
+            },
             _ => panic!("Expected Select"),
         }
     }
@@ -1924,7 +1923,10 @@ mod tests {
         assert!(matches!(parse("BEGIN").unwrap(), Statement::BeginTransaction));
         assert!(matches!(parse("COMMIT").unwrap(), Statement::Commit));
         assert!(matches!(parse("ROLLBACK").unwrap(), Statement::Rollback));
-        assert!(matches!(parse("START TRANSACTION").unwrap(), Statement::BeginTransaction));
+        assert!(matches!(
+            parse("START TRANSACTION").unwrap(),
+            Statement::BeginTransaction
+        ));
     }
 
     #[test]

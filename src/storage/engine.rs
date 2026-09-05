@@ -7,7 +7,7 @@
 //! 当前仅有 Columnar 引擎（原 Table 列存）。M2 起加入 Memory/Log 变体，
 //! 新增引擎只需实现 [`StorageEngine`] 并加入枚举。
 
-use crate::common::error::{Result, EngramDbError};
+use crate::common::error::{EngramDbError, Result};
 use crate::common::types::{EngineType, TableDef};
 use crate::executor::vector::{DataChunk, Vector};
 use crate::storage::column_store::PredicateOp;
@@ -186,9 +186,7 @@ impl EngineTable {
         skip_pred: Option<(usize, PredicateOp, Value)>,
     ) -> Result<Vec<Vec<Value>>> {
         match self {
-            EngineTable::Columnar(t) => {
-                t.scan_to_rows_direct_with_skip(column_indices, skip_pred)
-            }
+            EngineTable::Columnar(t) => t.scan_to_rows_direct_with_skip(column_indices, skip_pred),
             EngineTable::Memory(t) => t.scan_to_rows_direct(column_indices, skip_pred),
             EngineTable::Log(t) => t.scan_to_rows_direct(column_indices, skip_pred),
         }
@@ -205,11 +203,7 @@ impl EngineTable {
 
     /// 按行号取行（引擎分派入口）
     /// 按 row_id + 列裁剪取行（单行，按 col_indices 顺序；不存在返回空）
-    pub fn get_row_by_id_columns(
-        &mut self,
-        row_id: u32,
-        col_indices: &[usize],
-    ) -> Result<Vec<Vec<Value>>> {
+    pub fn get_row_by_id_columns(&mut self, row_id: u32, col_indices: &[usize]) -> Result<Vec<Vec<Value>>> {
         match self {
             EngineTable::Columnar(t) => t.get_row_by_id_columns(row_id, col_indices),
             EngineTable::Memory(t) => Ok(t
@@ -243,9 +237,7 @@ impl EngineTable {
     /// 唯一索引键存在性检查（v0.20 攒批入批预检用；仅 Columnar 有二级索引）
     pub fn unique_index_contains(&self, index_name: &str, key: &Value) -> bool {
         match self {
-            EngineTable::Columnar(t) => t
-                .get_index(index_name)
-                .is_some_and(|idx| idx.get_entries(key).is_some()),
+            EngineTable::Columnar(t) => t.get_index(index_name).is_some_and(|idx| idx.get_entries(key).is_some()),
             EngineTable::Memory(_) | EngineTable::Log(_) => false,
         }
     }
@@ -330,11 +322,7 @@ impl EngineTable {
     }
 
     /// 列式批量插入（跳过 PK 复检；仅事务 apply 路径在预检后传入 true）
-    pub fn insert_columns_with_check(
-        &mut self,
-        columns: Vec<Vec<Value>>,
-        skip_pk_check: bool,
-    ) -> Result<u64> {
+    pub fn insert_columns_with_check(&mut self, columns: Vec<Vec<Value>>, skip_pk_check: bool) -> Result<u64> {
         if skip_pk_check {
             // 仅 Columnar 有 PK 复检语义；Memory/Log 无冗余复检，直接走原路径
             if let EngineTable::Columnar(t) = self {
@@ -354,12 +342,7 @@ impl EngineTable {
     }
 
     /// 单行插入（跳过事务中预检已覆盖的 PK 复检）
-    pub fn insert_row_with_check(
-        &mut self,
-        row_id: u32,
-        row: &[Value],
-        skip_pk_check: bool,
-    ) -> Result<()> {
+    pub fn insert_row_with_check(&mut self, row_id: u32, row: &[Value], skip_pk_check: bool) -> Result<()> {
         if skip_pk_check {
             if let EngineTable::Columnar(t) = self {
                 return t.insert_row_with_check(row_id, row, true);

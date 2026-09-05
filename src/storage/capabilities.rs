@@ -164,7 +164,10 @@ mod tests {
         let err = cap.ensure("UPDATE", false, "events").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Log"), "错误应包含引擎名: {msg}");
-        assert!(msg.contains("UPDATE") && msg.contains("events"), "错误应包含能力与表名: {msg}");
+        assert!(
+            msg.contains("UPDATE") && msg.contains("events"),
+            "错误应包含能力与表名: {msg}"
+        );
     }
 
     #[test]

@@ -62,13 +62,9 @@ fn main() {
         match a.as_str() {
             "--input" => input = PathBuf::from(args.next().expect("--input path")),
             "--output" => output = PathBuf::from(args.next().expect("--output path")),
-            "--vocab-size" => {
-                vocab_size = args.next().expect("--vocab-size n").parse().expect("usize")
-            }
+            "--vocab-size" => vocab_size = args.next().expect("--vocab-size n").parse().expect("usize"),
             "--seeds" => seeds_path = Some(PathBuf::from(args.next().expect("--seeds path"))),
-            "--min-frequency" => {
-                min_frequency = args.next().expect("--min-frequency n").parse().expect("u64")
-            }
+            "--min-frequency" => min_frequency = args.next().expect("--min-frequency n").parse().expect("u64"),
             other => panic!("unknown arg: {other}"),
         }
     }
@@ -121,8 +117,7 @@ fn main() {
 
     // 导出 VocabFile：token 按 id 升序（rank 序）；merges 按训练顺序
     let vocab_ids = model.get_vocab();
-    let mut token_ranks: Vec<(String, u32)> =
-        vocab_ids.into_iter().map(|(t, id)| (t, id)).collect();
+    let mut token_ranks: Vec<(String, u32)> = vocab_ids.into_iter().map(|(t, id)| (t, id)).collect();
     token_ranks.sort_by_key(|(_, id)| *id);
     let vocab: Vec<String> = token_ranks.iter().map(|(t, _)| t.clone()).collect();
 
@@ -131,8 +126,7 @@ fn main() {
     println!("building static code-lengths from corpus ...");
     let mut vf = engramdb::common::vocab_file::VocabFile::new(seeds, merges, vocab);
     {
-        let tok = engramdb::common::tokenizer::Tokenizer::from_vocab_file(vf.clone())
-            .expect("load tokenizer");
+        let tok = engramdb::common::tokenizer::Tokenizer::from_vocab_file(vf.clone()).expect("load tokenizer");
         let mut freqs: fxhash::FxHashMap<u32, u64> = fxhash::FxHashMap::default();
         for text in &texts {
             for t in tok.tokenize(text) {

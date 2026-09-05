@@ -97,10 +97,7 @@ fn main() {
     let vocab_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "data/vocab/engram_vocab_v1.bin".into());
-    let rows_n: usize = std::env::args()
-        .nth(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
+    let rows_n: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(30_000);
     let corpus = load_corpus(&corpus_path);
     assert!(!corpus.is_empty(), "empty corpus");
     let texts: Vec<String> = corpus.into_iter().take(rows_n).collect();

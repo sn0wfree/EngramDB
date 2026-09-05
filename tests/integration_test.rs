@@ -17,15 +17,15 @@ mod tests {
         let (mut conn, _dir) = setup_db();
 
         // 创建表
-        let result = conn.execute(
-            "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT)"
-        ).unwrap();
+        let result = conn
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR, age INT)")
+            .unwrap();
         assert!(result.rows_affected == 0);
 
         // 插入数据
-        let result = conn.execute(
-            "INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35)"
-        ).unwrap();
+        let result = conn
+            .execute("INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35)")
+            .unwrap();
         assert_eq!(result.rows_affected, 3);
 
         // 查询

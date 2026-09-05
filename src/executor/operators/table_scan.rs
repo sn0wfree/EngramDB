@@ -6,23 +6,20 @@
 //! - 稀疏索引定位：通过稀疏索引快速定位 granule 范围
 
 use crate::common::error::Result;
+use crate::sql::ast::{BinaryOperator, Expression};
 use crate::storage::Database;
-use crate::sql::ast::{Expression, BinaryOperator};
 use crate::Value;
 
 use super::super::vector::DataChunk;
 
 /// 执行全表扫描（带跳过索引优化）
-pub fn execute(
-    db: &mut Database,
-    table_name: &str,
-    column_indices: &[usize],
-) -> Result<Vec<DataChunk>> {
+pub fn execute(db: &mut Database, table_name: &str, column_indices: &[usize]) -> Result<Vec<DataChunk>> {
     // Phase 2.5 P1：HeatTracker record_access（每张表每次访问一次）
     db.record_access_by_name(table_name);
 
     // 引擎分派（M2：Memory 表走同一扫描接口）
-    let table = db.get_engine_table_mut(table_name)
+    let table = db
+        .get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
     // 性能优化：直接走 scan_to_chunks，跳过 row→chunk 转置（每次转置都做 cell 级 clone）
@@ -57,7 +54,8 @@ pub fn execute_with_filter_pushdown(
     // 4. 返回物化结果
 
     // MVP 回退：全量扫描（引擎分派）
-    let engine = db.get_engine_table_mut(table_name)
+    let engine = db
+        .get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
     let rows = match engine {
         crate::storage::engine::EngineTable::Columnar(t) => t.scan(column_indices)?,
@@ -76,16 +74,11 @@ pub fn execute_with_filter_pushdown(
 }
 
 /// 从过滤表达式中提取可用于跳过索引的信息
-fn extract_filter_info(
-    expr: &Expression,
-    column_names: &[String],
-) -> Option<(usize, BinaryOperator, Value)> {
+fn extract_filter_info(expr: &Expression, column_names: &[String]) -> Option<(usize, BinaryOperator, Value)> {
     match expr {
         Expression::BinaryOp { left, op, right } => {
             // 左列右常量
-            if let (Expression::ColumnRef { column, .. }, Expression::Literal(val)) =
-                (left.as_ref(), right.as_ref())
-            {
+            if let (Expression::ColumnRef { column, .. }, Expression::Literal(val)) = (left.as_ref(), right.as_ref()) {
                 let idx = column_names.iter().position(|c| c == column)?;
                 return Some((idx, *op, val.clone()));
             }
@@ -159,10 +152,13 @@ mod tests {
         let db = conn.database_mut();
         crate::executor::operators::insert::flush_all_batched(db).unwrap();
         let chunks = execute_with_filter_pushdown(
-            db, "t", &[0, 1],
+            db,
+            "t",
+            &[0, 1],
             &Expression::Literal(Value::Int64(1)),
             &["id".into(), "v".into()],
-        ).unwrap();
+        )
+        .unwrap();
         let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
         assert_eq!(rows.len(), 3);
     }
@@ -170,11 +166,19 @@ mod tests {
     #[test]
     fn test_scan_pushdown_memory_engine() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory").unwrap();
+        conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory")
+            .unwrap();
         conn.execute("INSERT INTO mem VALUES (1, 10)").unwrap();
         let db = conn.database_mut();
         crate::executor::operators::insert::flush_all_batched(db).unwrap();
-        let chunks = execute_with_filter_pushdown(db, "mem", &[0, 1], &Expression::Literal(Value::Int64(1)), &["id".into(), "v".into()]).unwrap();
+        let chunks = execute_with_filter_pushdown(
+            db,
+            "mem",
+            &[0, 1],
+            &Expression::Literal(Value::Int64(1)),
+            &["id".into(), "v".into()],
+        )
+        .unwrap();
         let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
         assert_eq!(rows.len(), 1);
     }
@@ -186,7 +190,14 @@ mod tests {
         conn.execute("INSERT INTO lg VALUES (1, 10)").unwrap();
         let db = conn.database_mut();
         crate::executor::operators::insert::flush_all_batched(db).unwrap();
-        let chunks = execute_with_filter_pushdown(db, "lg", &[0, 1], &Expression::Literal(Value::Int64(1)), &["ts".into(), "v".into()]).unwrap();
+        let chunks = execute_with_filter_pushdown(
+            db,
+            "lg",
+            &[0, 1],
+            &Expression::Literal(Value::Int64(1)),
+            &["ts".into(), "v".into()],
+        )
+        .unwrap();
         let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
         assert_eq!(rows.len(), 1);
     }
@@ -196,7 +207,10 @@ mod tests {
         let names = vec!["id".to_string(), "v".to_string()];
         // 左列右常量
         let expr = Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "id".into(),
+            }),
             op: crate::sql::ast::BinaryOperator::Gt,
             right: Box::new(Expression::Literal(Value::Int64(5))),
         };
@@ -206,16 +220,25 @@ mod tests {
         assert_eq!(info.2, Value::Int64(5));
         // 列不在列表中
         let expr2 = Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "zzz".into() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "zzz".into(),
+            }),
             op: crate::sql::ast::BinaryOperator::Eq,
             right: Box::new(Expression::Literal(Value::Int64(1))),
         };
         assert!(extract_filter_info(&expr2, &names).is_none());
         // 右值非字面量
         let expr3 = Expression::BinaryOp {
-            left: Box::new(Expression::ColumnRef { table: None, column: "id".into() }),
+            left: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "id".into(),
+            }),
             op: crate::sql::ast::BinaryOperator::Eq,
-            right: Box::new(Expression::ColumnRef { table: None, column: "v".into() }),
+            right: Box::new(Expression::ColumnRef {
+                table: None,
+                column: "v".into(),
+            }),
         };
         assert!(extract_filter_info(&expr3, &names).is_none());
         // 非 BinaryOp

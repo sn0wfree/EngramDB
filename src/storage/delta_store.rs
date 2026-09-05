@@ -3,10 +3,10 @@
 //! 吸收随机写入，定期合并到列存主存储。
 //! P4 优化：内部采用列式存储，合并到列存时无需行→列转置，compact 速度提升约 2x。
 
-use std::collections::HashMap;
 use crate::common::error::Result;
 use crate::common::types::TableDef;
 use crate::Value;
+use std::collections::HashMap;
 
 /// 连续 rowid 区间（S1.4）
 ///
@@ -53,7 +53,11 @@ impl DeltaStore {
             row_id_to_idx: HashMap::new(),
             sparse_runs: Vec::new(),
             deleted_ids: std::collections::HashSet::new(),
-            pk_index: if has_pk { Some(std::collections::BTreeMap::new()) } else { None },
+            pk_index: if has_pk {
+                Some(std::collections::BTreeMap::new())
+            } else {
+                None
+            },
         }
     }
 
@@ -95,12 +99,12 @@ impl DeltaStore {
         let idx = self.pk_index.as_ref()?;
         use crate::Value::*;
         match key {
-            Int32(v) => idx.get(&Int64(*v as i64)).copied()
+            Int32(v) => idx
+                .get(&Int64(*v as i64))
+                .copied()
                 .or_else(|| idx.get(&Timestamp(*v as i64)).copied()),
-            Int64(v) => idx.get(&Int32(*v as i32)).copied()
-                .or_else(|| idx.get(&Timestamp(*v)).copied()),
-            Timestamp(v) => idx.get(&Int64(*v)).copied()
-                .or_else(|| idx.get(&Int32(*v as i32)).copied()),
+            Int64(v) => idx.get(&Int32(*v as i32)).copied().or_else(|| idx.get(&Timestamp(*v)).copied()),
+            Timestamp(v) => idx.get(&Int64(*v)).copied().or_else(|| idx.get(&Int32(*v as i32)).copied()),
             _ => None,
         }
     }
@@ -129,8 +133,7 @@ impl DeltaStore {
     fn expand_run(&mut self, run_idx: usize) {
         let run = self.sparse_runs.remove(run_idx);
         for i in 0..run.count as usize {
-            self.row_id_to_idx
-                .insert(run.base_rowid + i as u64, run.base_idx + i);
+            self.row_id_to_idx.insert(run.base_rowid + i as u64, run.base_idx + i);
         }
     }
 
@@ -194,7 +197,7 @@ impl DeltaStore {
         self.row_count += 1;
         Ok(rowid)
     }
-    
+
     /// 插入一行（指定 rowid，用于事务提交后应用）
     ///
     /// 与 `insert()` 不同，此方法允许指定 rowid：
@@ -238,13 +241,13 @@ impl DeltaStore {
         }
         // 维护 row_id -> idx 映射
         self.row_id_to_idx.insert(rowid as u64, idx);
-        
+
         // 更新 next_rowid（如果需要）
         self.next_rowid = self.next_rowid.max(rowid as u64 + 1);
         self.row_count += 1;
         Ok(())
     }
-    
+
     /// 基于 row_id 删除单行（tombstone 标记，实际物理删除在 compact 时）
     ///
     /// 用于事务路径提交后的应用阶段
@@ -265,35 +268,32 @@ impl DeltaStore {
         self.row_id_to_idx.remove(&rowid_64);
         Ok(())
     }
-    
+
     /// 基于 row_id 更新单行
     ///
     /// 用于事务路径提交后的应用阶段
     pub fn update_row_by_id(&mut self, rowid: u32, new_row: Vec<Value>) -> Result<()> {
         let rowid_64 = rowid as u64;
-        
+
         // 检查是否已删除
         if self.deleted_ids.contains(&rowid_64) {
-            return Err(crate::common::error::EngramDbError::InvalidFormat(
-                format!("row {} has been deleted", rowid)
-            ));
+            return Err(crate::common::error::EngramDbError::InvalidFormat(format!(
+                "row {} has been deleted",
+                rowid
+            )));
         }
-        
+
         // 获取位置索引（区间二分 / HashMap）
         let idx = self.idx_lookup(rowid_64).ok_or_else(|| {
-            crate::common::error::EngramDbError::InvalidFormat(
-                format!("row {} not found in delta store", rowid)
-            )
+            crate::common::error::EngramDbError::InvalidFormat(format!("row {} not found in delta store", rowid))
         })?;
-        
+
         let num_table_cols = self.table_def.columns.len();
         let row_len = new_row.len();
 
         // 分层索引：记录旧主键值（更新后可能变化）
         let old_pk = match self.pk_col_idx() {
-            Some(pk_idx) if idx < self.columns[pk_idx].len() => {
-                Some(self.columns[pk_idx][idx].clone())
-            }
+            Some(pk_idx) if idx < self.columns[pk_idx].len() => Some(self.columns[pk_idx][idx].clone()),
             _ => None,
         };
 
@@ -303,7 +303,7 @@ impl DeltaStore {
                 self.columns[col_idx][idx] = val;
             }
         }
-        
+
         // 如果行的列数少于表列数，补 NULL
         for col_idx in row_len..num_table_cols {
             if col_idx < self.columns.len() && idx < self.columns[col_idx].len() {
@@ -321,7 +321,7 @@ impl DeltaStore {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -402,7 +402,7 @@ impl DeltaStore {
         for col in &columns {
             if col.len() != num_rows {
                 return Err(crate::common::error::EngramDbError::Internal(
-                    "insert_columns: all columns must have the same length".into()
+                    "insert_columns: all columns must have the same length".into(),
                 ));
             }
         }
@@ -421,7 +421,8 @@ impl DeltaStore {
         // 分层索引：主键列整列逐行维护稠密主键索引（columns 消费前）
         if self.pk_index.is_some() {
             if let Some(pk_idx) = self.pk_col_idx() {
-                let pk_col: Vec<Value> = columns.get(pk_idx)
+                let pk_col: Vec<Value> = columns
+                    .get(pk_idx)
                     .map(|c| c.clone())
                     .unwrap_or_else(|| vec![Value::Null; num_rows]);
                 if let Some(m) = self.pk_index.as_mut() {
@@ -471,9 +472,7 @@ impl DeltaStore {
         let idx = self.idx_lookup(rowid)?;
 
         if idx < self.row_count {
-            let row: Vec<Value> = self.columns.iter()
-                .map(|col| col[idx].clone())
-                .collect();
+            let row: Vec<Value> = self.columns.iter().map(|col| col[idx].clone()).collect();
             Some(row)
         } else {
             None
@@ -522,9 +521,7 @@ impl DeltaStore {
         entries
             .into_iter()
             .map(|(rowid, idx)| {
-                let row: Vec<Value> = self.columns.iter()
-                    .map(|col| col[idx].clone())
-                    .collect();
+                let row: Vec<Value> = self.columns.iter().map(|col| col[idx].clone()).collect();
                 (rowid, row)
             })
             .collect()
@@ -534,7 +531,7 @@ impl DeltaStore {
     pub fn len(&self) -> usize {
         self.row_count
     }
-    
+
     /// 有效行数（不包括已删除的行）
     pub fn active_len(&self) -> usize {
         self.row_count - self.deleted_ids.len()
@@ -692,7 +689,8 @@ impl DeltaStore {
 
         // 同步散行映射：被取走位置删除，剩余位置前移
         if !self.row_id_to_idx.is_empty() {
-            self.row_id_to_idx = self.row_id_to_idx
+            self.row_id_to_idx = self
+                .row_id_to_idx
                 .drain()
                 .filter(|(_, idx)| *idx >= n)
                 .map(|(rid, idx)| (rid, idx - n))
@@ -740,9 +738,7 @@ impl DeltaStore {
         // 先收集被删除的行（按原始顺序）
         for &idx in indices {
             if idx < self.row_count {
-                let row: Vec<Value> = self.columns.iter()
-                    .map(|col| col[idx].clone())
-                    .collect();
+                let row: Vec<Value> = self.columns.iter().map(|col| col[idx].clone()).collect();
                 deleted_rows.push(row);
             }
         }
@@ -781,9 +777,7 @@ impl DeltaStore {
         }
 
         // 收集旧行
-        let old_row: Vec<Value> = self.columns.iter()
-            .map(|col| col[idx].clone())
-            .collect();
+        let old_row: Vec<Value> = self.columns.iter().map(|col| col[idx].clone()).collect();
 
         // 应用更新
         for &(col_idx, ref new_val) in new_values {
@@ -937,14 +931,14 @@ mod tests {
         }
         ds.insert_batch(batch).unwrap();
         ds.insert_row(200, row(200, "scattered")).unwrap(); // next_rowid → 201
-        ds.insert(row(50, "after")).unwrap();               // rowid = 201
+        ds.insert(row(50, "after")).unwrap(); // rowid = 201
 
         let all = ds.all_rows();
         assert_eq!(all.len(), 52);
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
         assert_eq!(all[0].1[1], Value::Varchar("r0".into()));
         assert_eq!(all[50].1[1], Value::Varchar("scattered".into())); // rowid 200
-        assert_eq!(all[51].1[1], Value::Varchar("after".into()));    // rowid 201
+        assert_eq!(all[51].1[1], Value::Varchar("after".into())); // rowid 201
     }
 
     #[test]
@@ -1010,7 +1004,10 @@ mod tests {
         ];
         ds2.insert_columns(cols3).unwrap();
         assert_eq!(ds2.num_columns(), 3);
-        assert_eq!(ds2.get(0).unwrap(), vec![Value::Int64(1), Value::Varchar("a".into()), Value::Float64(1.5)]);
+        assert_eq!(
+            ds2.get(0).unwrap(),
+            vec![Value::Int64(1), Value::Varchar("a".into()), Value::Float64(1.5)]
+        );
     }
 
     #[test]

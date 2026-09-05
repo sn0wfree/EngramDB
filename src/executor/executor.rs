@@ -3,14 +3,14 @@
 //! 遍历物理计划树，执行每个算子。
 //! 向量化执行：算子间以 DataChunk 为单位传递数据，整批计算。
 
-use crate::common::error::{Result, EngramDbError};
+use crate::common::error::{EngramDbError, Result};
 use crate::storage::Database;
 use crate::QueryResult;
 use crate::Value;
 
-use super::physical_plan::{PhysicalPlan, JoinType, SetUnionOp};
-use super::vector::{DataChunk, Vector};
 use super::operators;
+use super::physical_plan::{JoinType, PhysicalPlan, SetUnionOp};
+use super::vector::{DataChunk, Vector};
 use crate::sql::ast::Expression;
 use fxhash::FxHashSet;
 
@@ -19,25 +19,22 @@ use fxhash::FxHashSet;
 /// M1-3：跳过「行→列→行」双重转置。表扫描直接产出 Typed chunks，
 /// 过滤/投影/排序/聚合在列式管道内完成，最终结果只物化一次。
 /// 不支持的节点返回 Ok(None)，调用方回退行式路径（行为与改造前一致）。
-fn try_execute_chunks(
-    plan: &PhysicalPlan,
-    db: &mut Database,
-) -> Result<Option<(Vec<String>, Vec<DataChunk>)>> {
+fn try_execute_chunks(plan: &PhysicalPlan, db: &mut Database) -> Result<Option<(Vec<String>, Vec<DataChunk>)>> {
     use crate::common::column_data::ColumnData;
     use crate::executor::vector::VECTOR_SIZE;
 
     match plan {
-        PhysicalPlan::TableScan { table_name, column_indices } => {
+        PhysicalPlan::TableScan {
+            table_name,
+            column_indices,
+        } => {
             // Phase 2.5 P1：HeatTracker record_access（每张表每次访问一次）
             db.record_access_by_name(table_name);
 
             let table = db
                 .get_engine_table_mut(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
-            let columns: Vec<String> = column_indices
-                .iter()
-                .map(|&i| table.def().columns[i].name.clone())
-                .collect();
+            let columns: Vec<String> = column_indices.iter().map(|&i| table.def().columns[i].name.clone()).collect();
             let chunks = table.scan_to_chunks(column_indices, None)?;
             Ok(Some((columns, chunks)))
         }
@@ -47,10 +44,7 @@ fn try_execute_chunks(
             column_names,
         } => {
             // 仅支持纯列引用投影（列子集 / 重排），其余表达式回退行式路径
-            if !expressions
-                .iter()
-                .all(|e| matches!(e, Expression::ColumnRef { .. }))
-            {
+            if !expressions.iter().all(|e| matches!(e, Expression::ColumnRef { .. })) {
                 return Ok(None);
             }
             let (cols, chunks) = match try_execute_chunks(input, db)? {
@@ -63,23 +57,17 @@ fn try_execute_chunks(
                 let Expression::ColumnRef { table, column } = e else {
                     return Ok(None);
                 };
-                let prefixed = table
-                    .as_ref()
-                    .map(|t| format!("{}.{}", t, column))
-                    .unwrap_or_default();
+                let prefixed = table.as_ref().map(|t| format!("{}.{}", t, column)).unwrap_or_default();
                 let pos = cols
                     .iter()
                     .position(|c| c == column || c == &prefixed)
-                    .ok_or_else(|| {
-                        EngramDbError::Parse(format!("unknown column: {}", column))
-                    })?;
+                    .ok_or_else(|| EngramDbError::Parse(format!("unknown column: {}", column)))?;
                 indices.push(pos);
             }
             let out_chunks = chunks
                 .iter()
                 .map(|ch| {
-                    let columns: Vec<Vector> =
-                        indices.iter().map(|&i| ch.columns[i].clone()).collect();
+                    let columns: Vec<Vector> = indices.iter().map(|&i| ch.columns[i].clone()).collect();
                     DataChunk {
                         columns,
                         count: ch.count,
@@ -91,20 +79,21 @@ fn try_execute_chunks(
         PhysicalPlan::Filter { input, condition } => {
             // PREWHERE（M1-6）：TableScan + 简单谓词 → 列式跳读扫描
             // （row group MinMax 跳过 + batch 内 Typed 谓词直扫，只物化幸存行）
-            if let PhysicalPlan::TableScan { table_name, column_indices } = input.as_ref() {
+            if let PhysicalPlan::TableScan {
+                table_name,
+                column_indices,
+            } = input.as_ref()
+            {
                 if let Some((pred_col, pred_op, pred_val)) = extract_skip_predicate(condition) {
                     let (names, chunks, filtered) = {
                         let table = db
                             .get_engine_table_mut(table_name)
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
-                        let names: Vec<String> = column_indices
-                            .iter()
-                            .map(|&i| table.def().columns[i].name.clone())
-                            .collect();
+                        let names: Vec<String> =
+                            column_indices.iter().map(|&i| table.def().columns[i].name.clone()).collect();
                         let pred_col_idx = table.def().column_index(&pred_col);
                         // 谓词列是否在输出列：在 → 扫描已精确筛选；不在 → 需 filter 兜底
-                        let pred_pos = pred_col_idx
-                            .and_then(|ci| column_indices.iter().position(|&c| c == ci));
+                        let pred_pos = pred_col_idx.and_then(|ci| column_indices.iter().position(|&c| c == ci));
                         let skip = pred_col_idx.map(|ci| (ci, pred_op, pred_val.clone()));
                         let chunks = table.scan_to_chunks(column_indices, skip)?;
                         (names, chunks, pred_pos.is_some())
@@ -168,20 +157,15 @@ fn try_execute_chunks(
                                 let mut d = d.clone();
                                 Vector::Typed(d.take_front(take))
                             }
-                            Vector::Flat(rows) => {
-                                Vector::Flat(rows.iter().take(take).cloned().collect())
-                            }
+                            Vector::Flat(rows) => Vector::Flat(rows.iter().take(take).cloned().collect()),
                         })
                         .collect();
-                    out.push(DataChunk {
-                    columns,
-                    count: take,
-                });
-                remaining -= take;
+                    out.push(DataChunk { columns, count: take });
+                    remaining -= take;
+                }
+                return Ok(Some((cols, out)));
             }
-                Ok(Some((cols, out)))
-            }
-            // offset > 0：回落到 try_execute_chunks 的调用方物化路径（在下方 execute 分支处理 skip）
+            // offset > 0：返回 None 回落到物化路径（下方 execute 分支处理 skip）
             Ok(None)
         }
         PhysicalPlan::Aggregate {
@@ -193,15 +177,11 @@ fn try_execute_chunks(
                 Some(x) => x,
                 None => return Ok(None),
             };
-            let agg_funcs: Vec<_> = aggregates
-                .iter()
-                .map(|a| (a.func, a.input, a.distinct))
-                .collect();
+            let agg_funcs: Vec<_> = aggregates.iter().map(|a| (a.func, a.input, a.distinct)).collect();
             let result = if group_by.is_empty() {
                 operators::aggregate::execute(&chunks, &agg_funcs)?
             } else {
                 operators::aggregate::execute_grouped(&chunks, group_by, &agg_funcs)?
-                
             };
             let mut columns: Vec<String> = group_by
                 .iter()
@@ -213,10 +193,7 @@ fn try_execute_chunks(
                     }
                 })
                 .collect();
-            let agg_names: Vec<String> = aggregates
-                .iter()
-                .map(|a| format!("{:?}({})", a.func, a.input))
-                .collect();
+            let agg_names: Vec<String> = aggregates.iter().map(|a| format!("{:?}({})", a.func, a.input)).collect();
             columns.extend(agg_names);
             Ok(Some((columns, result)))
         }
@@ -265,9 +242,7 @@ fn try_execute_chunks(
                 Some(x) => x,
                 None => return Ok(None),
             };
-            let joined = operators::hash_join::execute(
-                &lchunks, &rchunks, left_keys, right_keys, *join_type,
-            )?;
+            let joined = operators::hash_join::execute(&lchunks, &rchunks, left_keys, right_keys, *join_type)?;
             let mut columns = lcols;
             columns.extend(rcols);
             Ok(Some((columns, joined)))
@@ -325,10 +300,7 @@ fn truncate_chunk(chunk: &DataChunk, n: usize) -> DataChunk {
             Vector::Flat(rows) => Vector::Flat(rows.iter().take(n).cloned().collect()),
         })
         .collect();
-    DataChunk {
-        columns,
-        count: n,
-    }
+    DataChunk { columns, count: n }
 }
 
 /// 列式笛卡尔积：左 chunks × 右 chunks
@@ -384,7 +356,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             // 2. 执行 SELECT 子查询，将结果插入新表
             let source_result = execute(*source, db)?;
             let num_cols = source_result.rows.first().map(|r| r.len()).unwrap_or(0);
-            let rows: Vec<Vec<crate::Value>> = source_result.rows.iter()
+            let rows: Vec<Vec<crate::Value>> = source_result
+                .rows
+                .iter()
                 .map(|r| {
                     let mut row = r.clone();
                     row.resize(num_cols.max(0), crate::Value::Null);
@@ -396,13 +370,22 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
                 rows: vec![vec![crate::Value::Varchar(format!(
-                    "Table '{}' created with {} rows", name, count
+                    "Table '{}' created with {} rows",
+                    name, count
                 ))]],
                 rows_affected: count,
             })
         }
 
-        PhysicalPlan::CreateIndex { table_name, index_name, key_columns, included_columns, unique, using, with_options } => {
+        PhysicalPlan::CreateIndex {
+            table_name,
+            index_name,
+            key_columns,
+            included_columns,
+            unique,
+            using,
+            with_options,
+        } => {
             if let Some(using_type) = using {
                 if using_type.to_lowercase() == "hnsw" {
                     // 向量索引：解析 WITH 选项
@@ -414,8 +397,12 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                             "metric" => {
                                 metric = match val.to_lowercase().as_str() {
                                     "l2" | "l2_distance" => crate::storage::vector_index::DistanceMetric::L2,
-                                    "cosine" | "cosine_similarity" => crate::storage::vector_index::DistanceMetric::Cosine,
-                                    "ip" | "inner_product" => crate::storage::vector_index::DistanceMetric::InnerProduct,
+                                    "cosine" | "cosine_similarity" => {
+                                        crate::storage::vector_index::DistanceMetric::Cosine
+                                    }
+                                    "ip" | "inner_product" => {
+                                        crate::storage::vector_index::DistanceMetric::InnerProduct
+                                    }
                                     _ => return Err(EngramDbError::Parse(format!("unknown metric: {}", val))),
                                 };
                             }
@@ -423,13 +410,16 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                                 m = val.parse().map_err(|_| EngramDbError::Parse(format!("invalid m: {}", val)))?;
                             }
                             "ef_construction" => {
-                                ef_construction = val.parse().map_err(|_| EngramDbError::Parse(format!("invalid ef_construction: {}", val)))?;
+                                ef_construction = val
+                                    .parse()
+                                    .map_err(|_| EngramDbError::Parse(format!("invalid ef_construction: {}", val)))?;
                             }
                             _ => { /* ignore unknown options */ }
                         }
                     }
                     let col_name_str = {
-                        let table = db.get_table(table_name.as_str())
+                        let table = db
+                            .get_table(table_name.as_str())
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
                         table.def.columns[key_columns[0]].name.clone()
                     };
@@ -451,7 +441,10 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                     columns: vec!["status".to_string()],
                     rows: vec![vec![crate::Value::Varchar(format!(
                         "Index '{}' created on '{}' ({} key, {} included)",
-                        index_name, table_name, key_columns.len(), included_columns.len()
+                        index_name,
+                        table_name,
+                        key_columns.len(),
+                        included_columns.len()
                     ))]],
                     rows_affected: 0,
                 })
@@ -467,7 +460,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Update { table_name, assignments, condition } => {
+        PhysicalPlan::Update {
+            table_name,
+            assignments,
+            condition,
+        } => {
             let count = operators::update::execute(db, &table_name, &assignments, condition)?;
             Ok(QueryResult {
                 columns: vec!["rows_updated".to_string()],
@@ -476,7 +473,12 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Insert { table_name, rows, returning, on_conflict } => {
+        PhysicalPlan::Insert {
+            table_name,
+            rows,
+            returning,
+            on_conflict,
+        } => {
             // UPSERT 路径：INSERT...ON CONFLICT DO UPDATE/NOTHING
             if let Some(conflict_clause) = on_conflict {
                 return execute_upsert(db, &table_name, rows, conflict_clause, returning);
@@ -484,7 +486,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
             // 记录插入前的 row_count，用于 RETURNING 读取实际行
             let base_row_id = if returning.is_some() {
-                let t = db.get_engine_table(&table_name)
+                let t = db
+                    .get_engine_table(&table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
                 t.def().row_count as u32
             } else {
@@ -496,15 +499,15 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
             // INSERT...RETURNING: 从表中读取实际插入的行（含 AUTO_INCREMENT 值）
             if let Some(returning_items) = returning {
-                let table = db.get_engine_table_mut(&table_name)
+                let table = db
+                    .get_engine_table_mut(&table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
 
                 let mut result_rows = Vec::with_capacity(num_rows);
                 for rid in base_row_id..base_row_id + num_rows as u32 {
-                    let row = table.get_row_by_id(rid)?
-                        .ok_or_else(|| EngramDbError::Internal(
-                            format!("RETURNING: row_id {} not found after insert", rid)
-                        ))?;
+                    let row = table.get_row_by_id(rid)?.ok_or_else(|| {
+                        EngramDbError::Internal(format!("RETURNING: row_id {} not found after insert", rid))
+                    })?;
                     let mut result_row = Vec::with_capacity(returning_items.len());
                     for item in &returning_items {
                         match item {
@@ -521,14 +524,16 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 }
 
                 // 构造列名
-                let columns: Vec<String> = returning_items.iter().enumerate().map(|(i, item)| {
-                    match item {
+                let columns: Vec<String> = returning_items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| match item {
                         crate::sql::ast::SelectItem::Wildcard => format!("*"),
                         crate::sql::ast::SelectItem::Expression(_expr, alias) => {
                             alias.clone().unwrap_or_else(|| format!("col_{}", i))
                         }
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 return Ok(QueryResult {
                     columns,
@@ -553,21 +558,25 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::InsertSelect { table_name, columns, source } => {
+        PhysicalPlan::InsertSelect {
+            table_name,
+            columns,
+            source,
+        } => {
             // INSERT ... SELECT：先执行 source 计划，将结果行插入目标表
             let source_result = execute(*source, db)?;
 
             // 验证表存在
-            let table = db.get_table(&table_name)
+            let table = db
+                .get_table(&table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?
-                .def.clone();
+                .def
+                .clone();
             let num_cols = table.columns.len();
 
             // 计算列索引映射
             let col_map: Vec<usize> = if let Some(col_names) = columns {
-                col_names.iter()
-                    .filter_map(|name| table.column_index(name))
-                    .collect()
+                col_names.iter().filter_map(|name| table.column_index(name)).collect()
             } else {
                 // 无列名时，按源结果的列顺序填入
                 (0..source_result.rows.first().map(|r| r.len()).unwrap_or(num_cols)).collect()
@@ -596,7 +605,10 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::TableScan { table_name, column_indices } => {
+        PhysicalPlan::TableScan {
+            table_name,
+            column_indices,
+        } => {
             // Phase 2.5 P1：HeatTracker record_access
             db.record_access_by_name(&table_name);
 
@@ -604,11 +616,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             // 跳过 DataChunk 中间层，直接产出行 Vec，避免 chunks_to_rows 的二次克隆
             // 引擎分派（M2：Memory 表走同语义扫描）
             let (columns, rows) = {
-                let table = db.get_engine_table_mut(&table_name)
+                let table = db
+                    .get_engine_table_mut(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
-                let columns: Vec<String> = column_indices.iter()
-                    .map(|&i| table.def().columns[i].name.clone())
-                    .collect();
+                let columns: Vec<String> =
+                    column_indices.iter().map(|&i| table.def().columns[i].name.clone()).collect();
                 let rows = table.scan_to_rows_direct(&column_indices, None)?;
                 (columns, rows)
             };
@@ -619,15 +631,21 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::IndexOnlyScan { table_name, index_name, key_value, output_column_indices, output_col_map } => {
-            let table = db.get_table(&table_name)
+        PhysicalPlan::IndexOnlyScan {
+            table_name,
+            index_name,
+            key_value,
+            output_column_indices,
+            output_col_map,
+        } => {
+            let table = db
+                .get_table(&table_name)
                 .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
 
             // 从索引中查找
-            let index = table.get_index(&index_name)
-                .ok_or_else(|| crate::common::error::EngramDbError::Parse(
-                    format!("Index '{}' not found during execution", index_name)
-                ))?;
+            let index = table.get_index(&index_name).ok_or_else(|| {
+                crate::common::error::EngramDbError::Parse(format!("Index '{}' not found during execution", index_name))
+            })?;
 
             let entries = index.get_entries(&key_value);
 
@@ -651,7 +669,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             }
 
             // 列名
-            let column_names: Vec<String> = output_column_indices.iter()
+            let column_names: Vec<String> = output_column_indices
+                .iter()
                 .map(|&i| table.def.columns[i].name.clone())
                 .collect();
 
@@ -662,24 +681,34 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::IndexScan { table_name, index_name, key_value, output_column_indices } => {
+        PhysicalPlan::IndexScan {
+            table_name,
+            index_name,
+            key_value,
+            output_column_indices,
+        } => {
             // P2：非覆盖索引点查 —— 索引拿 row_id，回表读列
             let (row_ids, columns): (Vec<u32>, Vec<String>) = {
-                let table = db.get_table(&table_name)
+                let table = db
+                    .get_table(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
-                let cols: Vec<String> = output_column_indices.iter()
+                let cols: Vec<String> = output_column_indices
+                    .iter()
                     .map(|&i| table.def.columns[i].name.clone())
                     .collect();
-                let index = table.get_index(&index_name)
-                    .ok_or_else(|| crate::common::error::EngramDbError::Parse(
-                        format!("Index '{}' not found during execution", index_name)
-                    ))?;
+                let index = table.get_index(&index_name).ok_or_else(|| {
+                    crate::common::error::EngramDbError::Parse(format!(
+                        "Index '{}' not found during execution",
+                        index_name
+                    ))
+                })?;
                 (index.get(&key_value).unwrap_or_default(), cols)
             };
 
             let mut rows: Vec<Vec<crate::Value>> = Vec::with_capacity(row_ids.len());
             {
-                let table = db.get_table_mut(&table_name)
+                let table = db
+                    .get_table_mut(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 for row_id in row_ids {
                     // 回表读取（列裁剪）
@@ -695,31 +724,37 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         PhysicalPlan::IndexRangeScan {
-            table_name, index_name,
-            low, low_inclusive, high, high_inclusive,
+            table_name,
+            index_name,
+            low,
+            low_inclusive,
+            high,
+            high_inclusive,
             output_column_indices,
         } => {
             // ①：索引范围扫描 —— 跳表有序段取 row_id，回表读列
             let (row_ids, columns): (Vec<u32>, Vec<String>) = {
-                let table = db.get_table(&table_name)
+                let table = db
+                    .get_table(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
-                let cols: Vec<String> = output_column_indices.iter()
+                let cols: Vec<String> = output_column_indices
+                    .iter()
                     .map(|&i| table.def.columns[i].name.clone())
                     .collect();
-                let index = table.get_index(&index_name)
-                    .ok_or_else(|| crate::common::error::EngramDbError::Parse(
-                        format!("Index '{}' not found during execution", index_name)
-                    ))?;
-                let entries = index.range_bounded(
-                    low.as_ref(), low_inclusive,
-                    high.as_ref(), high_inclusive,
-                );
+                let index = table.get_index(&index_name).ok_or_else(|| {
+                    crate::common::error::EngramDbError::Parse(format!(
+                        "Index '{}' not found during execution",
+                        index_name
+                    ))
+                })?;
+                let entries = index.range_bounded(low.as_ref(), low_inclusive, high.as_ref(), high_inclusive);
                 (entries.into_iter().map(|e| e.row_id).collect(), cols)
             };
 
             let mut rows: Vec<Vec<crate::Value>> = Vec::with_capacity(row_ids.len());
             {
-                let table = db.get_table_mut(&table_name)
+                let table = db
+                    .get_table_mut(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 for row_id in row_ids {
                     // 回表读取（列裁剪）
@@ -738,18 +773,22 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             // P2.4/P3.2：若输入是 TableScan 且条件为简单比较谓词（col OP literal），
             // 用 MinMax 跳过索引扫描 + 逐行求值，跳过 DataChunk 中间层
             // （省去 rows→chunks→filter→rows 的整列克隆链）
-            if let PhysicalPlan::TableScan { table_name, column_indices } = input.as_ref() {
+            if let PhysicalPlan::TableScan {
+                table_name,
+                column_indices,
+            } = input.as_ref()
+            {
                 if let Some((pred_col, pred_op, pred_val)) = extract_skip_predicate(&condition) {
                     let (column_names, rows) = {
-                        let table = db.get_engine_table_mut(table_name)
+                        let table = db
+                            .get_engine_table_mut(table_name)
                             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                         // 谓词列在表定义中的索引（MinMax 按表列索引判断）
                         let pred_col_idx = table.def().column_index(&pred_col);
                         // 谓词列在扫描输出中的位置（column_indices 顺序即输出顺序）
                         let pred_pos = pred_col_idx.and_then(|ci| column_indices.iter().position(|&c| c == ci));
-                        let names: Vec<String> = column_indices.iter()
-                            .map(|&i| table.def().columns[i].name.clone())
-                            .collect();
+                        let names: Vec<String> =
+                            column_indices.iter().map(|&i| table.def().columns[i].name.clone()).collect();
                         let skip = pred_col_idx.map(|ci| (ci, pred_op, pred_val.clone()));
                         let scanned = table.scan_to_rows_direct(column_indices, skip)?;
 
@@ -758,15 +797,26 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                             Some(pos) => {
                                 // PredicateOp → BinaryOperator（eval_binary_value 的输入）
                                 let bin_op = match pred_op {
-                                    crate::storage::column_store::PredicateOp::Eq => crate::sql::ast::BinaryOperator::Eq,
-                                    crate::storage::column_store::PredicateOp::Lt => crate::sql::ast::BinaryOperator::Lt,
-                                    crate::storage::column_store::PredicateOp::LtEq => crate::sql::ast::BinaryOperator::LtEq,
-                                    crate::storage::column_store::PredicateOp::Gt => crate::sql::ast::BinaryOperator::Gt,
-                                    crate::storage::column_store::PredicateOp::GtEq => crate::sql::ast::BinaryOperator::GtEq,
+                                    crate::storage::column_store::PredicateOp::Eq => {
+                                        crate::sql::ast::BinaryOperator::Eq
+                                    }
+                                    crate::storage::column_store::PredicateOp::Lt => {
+                                        crate::sql::ast::BinaryOperator::Lt
+                                    }
+                                    crate::storage::column_store::PredicateOp::LtEq => {
+                                        crate::sql::ast::BinaryOperator::LtEq
+                                    }
+                                    crate::storage::column_store::PredicateOp::Gt => {
+                                        crate::sql::ast::BinaryOperator::Gt
+                                    }
+                                    crate::storage::column_store::PredicateOp::GtEq => {
+                                        crate::sql::ast::BinaryOperator::GtEq
+                                    }
                                 };
                                 let mut out = Vec::with_capacity(scanned.len());
                                 for row in scanned {
-                                    let keep = match super::expression::eval_binary_value(&row[pos], bin_op, &pred_val) {
+                                    let keep = match super::expression::eval_binary_value(&row[pos], bin_op, &pred_val)
+                                    {
                                         Ok(Value::Boolean(true)) => true,
                                         _ => false,
                                     };
@@ -808,27 +858,36 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Projection { input, expressions, column_names } => {
+        PhysicalPlan::Projection {
+            input,
+            expressions,
+            column_names,
+        } => {
             let input_result = execute(*input, db)?;
 
             // ④：纯列引用投影 → rows 直排（跳过 DataChunk 往返 + 向量化求值）
             // 覆盖 SELECT a, b / SELECT b, a（列子集 + 重排，非恒等投影）等常见场景
             if !input_result.rows.is_empty()
-                && expressions.iter().all(|e| matches!(e, crate::sql::ast::Expression::ColumnRef { .. }))
+                && expressions
+                    .iter()
+                    .all(|e| matches!(e, crate::sql::ast::Expression::ColumnRef { .. }))
             {
-                let col_indices: Vec<Option<usize>> = expressions.iter().map(|e| match e {
-                    crate::sql::ast::Expression::ColumnRef { column, .. } => {
-                        input_result.columns.iter().position(|c| c == column)
-                    }
-                    _ => None,
-                }).collect();
+                let col_indices: Vec<Option<usize>> = expressions
+                    .iter()
+                    .map(|e| match e {
+                        crate::sql::ast::Expression::ColumnRef { column, .. } => {
+                            input_result.columns.iter().position(|c| c == column)
+                        }
+                        _ => None,
+                    })
+                    .collect();
 
                 if col_indices.iter().all(|i| i.is_some()) {
-                    let rows: Vec<Vec<crate::Value>> = input_result.rows.iter().map(|row| {
-                        col_indices.iter()
-                            .map(|&i| row[i.expect("checked above")].clone())
-                            .collect()
-                    }).collect();
+                    let rows: Vec<Vec<crate::Value>> = input_result
+                        .rows
+                        .iter()
+                        .map(|row| col_indices.iter().map(|&i| row[i.expect("checked above")].clone()).collect())
+                        .collect();
 
                     return Ok(QueryResult {
                         columns: column_names,
@@ -842,13 +901,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_columns = input_result.columns.clone();
 
             let projected = if expressions.iter().any(super::expression::contains_subquery) {
-                operators::projection::execute_with_db(
-                    &input_chunks, &expressions, &input_columns, &column_names, db
-                )?
+                operators::projection::execute_with_db(&input_chunks, &expressions, &input_columns, &column_names, db)?
             } else {
-                operators::projection::execute(
-                    &input_chunks, &expressions, &input_columns, &column_names
-                )?
+                operators::projection::execute(&input_chunks, &expressions, &input_columns, &column_names)?
             };
             let rows = chunks_to_rows(&projected);
 
@@ -859,7 +914,13 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::HashJoin { left, right, join_type, left_keys, right_keys } => {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            join_type,
+            left_keys,
+            right_keys,
+        } => {
             // 列式优先：两侧分别 try_execute_chunks 直接给 chunks，省 rows↔chunks 转换
             let (lcols, lchunks) = match try_execute_chunks(left.as_ref(), db)? {
                 Some(x) => x,
@@ -879,9 +940,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                     (columns, chunks)
                 }
             };
-            let joined = operators::hash_join::execute(
-                &lchunks, &rchunks, &left_keys[..], &right_keys[..], join_type,
-            )?;
+            let joined = operators::hash_join::execute(&lchunks, &rchunks, &left_keys[..], &right_keys[..], join_type)?;
             let rows = chunks_to_rows(&joined);
             let mut columns = lcols;
             columns.extend(rcols);
@@ -923,12 +982,14 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Aggregate { input, group_by, aggregates } => {
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             // M1-3：列式路径（子计划列式执行 + 聚合），失败回退行式
             if let Some((sub_cols, chunks)) = try_execute_chunks(&input, db)? {
-                let agg_funcs: Vec<_> = aggregates.iter()
-                    .map(|a| (a.func, a.input, a.distinct))
-                    .collect();
+                let agg_funcs: Vec<_> = aggregates.iter().map(|a| (a.func, a.input, a.distinct)).collect();
 
                 let result = if group_by.is_empty() {
                     operators::aggregate::execute(&chunks, &agg_funcs)?
@@ -936,7 +997,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                     operators::aggregate::execute_grouped(&chunks, &group_by, &agg_funcs)?
                 };
                 // 列名：分组列 + 聚合列
-                let mut columns: Vec<String> = group_by.iter()
+                let mut columns: Vec<String> = group_by
+                    .iter()
                     .map(|&i| {
                         if i < sub_cols.len() {
                             sub_cols[i].clone()
@@ -945,9 +1007,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                         }
                     })
                     .collect();
-                let agg_names: Vec<String> = aggregates.iter()
-                    .map(|a| format!("{:?}({})", a.func, a.input))
-                    .collect();
+                let agg_names: Vec<String> = aggregates.iter().map(|a| format!("{:?}({})", a.func, a.input)).collect();
                 columns.extend(agg_names);
                 let rows = chunks_to_rows(&result);
                 return Ok(QueryResult {
@@ -959,9 +1019,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_result = execute(*input, db)?;
             let input_chunks = rows_to_chunks(&input_result.rows);
 
-            let agg_funcs: Vec<_> = aggregates.iter()
-                .map(|a| (a.func, a.input, a.distinct))
-                .collect();
+            let agg_funcs: Vec<_> = aggregates.iter().map(|a| (a.func, a.input, a.distinct)).collect();
 
             let result = if group_by.is_empty() {
                 // 无 GROUP BY：简单聚合
@@ -974,7 +1032,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let rows = chunks_to_rows(&result);
 
             // 列名：分组列 + 聚合列
-            let mut columns: Vec<String> = group_by.iter()
+            let mut columns: Vec<String> = group_by
+                .iter()
                 .map(|&i| {
                     if i < input_result.columns.len() {
                         input_result.columns[i].clone()
@@ -984,9 +1043,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 })
                 .collect();
 
-            let agg_names: Vec<String> = aggregates.iter()
-                .map(|a| format!("{:?}({})", a.func, a.input))
-                .collect();
+            let agg_names: Vec<String> = aggregates.iter().map(|a| format!("{:?}({})", a.func, a.input)).collect();
             columns.extend(agg_names);
 
             Ok(QueryResult {
@@ -996,7 +1053,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Sort { input, sort_keys, limit } => {
+        PhysicalPlan::Sort {
+            input,
+            sort_keys,
+            limit,
+        } => {
             // M1-3：列式路径（跳过行→列→行双重转置），失败回退行式
             if let Some((columns, chunks)) = try_execute_chunks(&input, db)? {
                 let sorted = operators::sort::execute(&chunks, &sort_keys, limit)?;
@@ -1022,8 +1083,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
         PhysicalPlan::Limit { input, limit, offset } => {
             // 列式优先：上游 chunks 直接取前 N 行，无需全表物化
-            // v0.22.1：带 OFFSET 时走物化路径先 skip 再 take
-            if *offset == 0 {
+            // v0.22.1：带 OFFSET 时走物化路径先 skip 再 take（此分支按值匹配，
+            // limit/offset 为 usize，无需解引用）
+            if offset == 0 {
                 if let Some((columns, in_chunks)) = try_execute_chunks(input.as_ref(), db)? {
                     let mut remaining = limit;
                     let mut out: Vec<DataChunk> = Vec::new();
@@ -1032,30 +1094,34 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                             break;
                         }
                         let take = ch.count.min(remaining);
-                        let cols: Vec<Vector> = ch.columns.iter().map(|c| match c {
-                            Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
-                            Vector::Typed(d) => {
-                                let mut d = d.clone();
-                                Vector::Typed(d.take_front(take))
-                            }
-                            Vector::Flat(rows) => {
-                                Vector::Flat(rows.iter().take(take).cloned().collect())
-                            }
-                        }).collect();
-                        out.push(DataChunk { columns: cols, count: take });
+                        let cols: Vec<Vector> = ch
+                            .columns
+                            .iter()
+                            .map(|c| match c {
+                                Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
+                                Vector::Typed(d) => {
+                                    let mut d = d.clone();
+                                    Vector::Typed(d.take_front(take))
+                                }
+                                Vector::Flat(rows) => Vector::Flat(rows.iter().take(take).cloned().collect()),
+                            })
+                            .collect();
+                        out.push(DataChunk {
+                            columns: cols,
+                            count: take,
+                        });
                         remaining -= take;
                     }
                     let rows = chunks_to_rows(&out);
-                    return Ok(QueryResult { columns, rows, rows_affected: 0 });
+                    return Ok(QueryResult {
+                        columns,
+                        rows,
+                        rows_affected: 0,
+                    });
                 }
             }
             let input_result = execute(*input, db)?;
-            let limited_rows: Vec<_> = input_result
-                .rows
-                .into_iter()
-                .skip(*offset)
-                .take(*limit)
-                .collect();
+            let limited_rows: Vec<_> = input_result.rows.into_iter().skip(offset).take(limit).collect();
 
             Ok(QueryResult {
                 columns: input_result.columns,
@@ -1092,15 +1158,13 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 }
                 SetUnionOp::Intersect => {
                     // INTERSECT：返回两个结果集的交集（去重）
-                    let right_set: std::collections::HashSet<Vec<Value>> =
-                        right_result.rows.into_iter().collect();
+                    let right_set: std::collections::HashSet<Vec<Value>> = right_result.rows.into_iter().collect();
                     rows.retain(|r| right_set.contains(r));
                     rows.dedup();
                 }
                 SetUnionOp::Except => {
                     // EXCEPT：返回左结果集减去右结果集（去重）
-                    let right_set: std::collections::HashSet<Vec<Value>> =
-                        right_result.rows.into_iter().collect();
+                    let right_set: std::collections::HashSet<Vec<Value>> = right_result.rows.into_iter().collect();
                     rows.retain(|r| !right_set.contains(r));
                     rows.dedup();
                 }
@@ -1114,7 +1178,12 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         // 递归 CTE 执行（v0.22.0 新增）
-        PhysicalPlan::RecursiveCte { cte_name, anchor, recursive, max_iterations } => {
+        PhysicalPlan::RecursiveCte {
+            cte_name,
+            anchor,
+            recursive,
+            max_iterations,
+        } => {
             // 1. 执行 anchor（非递归部分）获取初始结果
             let mut working_result = execute(*anchor, db)?;
             let initial_row_count = working_result.rows.len();
@@ -1157,12 +1226,10 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
 
             // 检查是否达到最大迭代次数（可能是无限循环）
             if iteration >= effective_max && new_rows_added {
-                return Err(crate::common::error::EngramDbError::Internal(
-                    format!(
-                        "Recursive CTE '{}' exceeded maximum iterations ({}), possible infinite loop",
-                        cte_name, effective_max
-                    ),
-                ));
+                return Err(crate::common::error::EngramDbError::Internal(format!(
+                    "Recursive CTE '{}' exceeded maximum iterations ({}), possible infinite loop",
+                    cte_name, effective_max
+                )));
             }
 
             // 如果初始结果就为空，直接返回空结果
@@ -1176,9 +1243,9 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         PhysicalPlan::BeginTransaction => {
             // 实际开启事务（v0.15.0 Txn05 新增）
             // 设置默认隔离级别为 SnapshotIsolation
-            let txn_id = db.txn_manager_mut().begin(
-                crate::common::config::IsolationLevel::SnapshotIsolation
-            )?;
+            let txn_id = db
+                .txn_manager_mut()
+                .begin(crate::common::config::IsolationLevel::SnapshotIsolation)?;
             // P0-2 事务级 Batcher：防御性清空（异常残留时避免跨事务串数据）
             db.discard_txn_buffer();
             db.set_current_txn_id(Some(txn_id));
@@ -1200,7 +1267,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 Ok(r)
             } else {
                 Err(crate::common::error::EngramDbError::Internal(
-                    "No active transaction to COMMIT".into()
+                    "No active transaction to COMMIT".into(),
                 ))
             };
             result.map(|_| QueryResult {
@@ -1220,7 +1287,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 Ok(())
             } else {
                 Err(crate::common::error::EngramDbError::Internal(
-                    "No active transaction to ROLLBACK".into()
+                    "No active transaction to ROLLBACK".into(),
                 ))
             };
             result.map(|_| QueryResult {
@@ -1240,7 +1307,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 Ok(())
             } else {
                 Err(crate::common::error::EngramDbError::Internal(
-                    "No active transaction for SAVEPOINT".into()
+                    "No active transaction for SAVEPOINT".into(),
                 ))
             };
             result.map(|_| QueryResult {
@@ -1257,7 +1324,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 Ok(())
             } else {
                 Err(crate::common::error::EngramDbError::Internal(
-                    "No active transaction for RELEASE SAVEPOINT".into()
+                    "No active transaction for RELEASE SAVEPOINT".into(),
                 ))
             };
             result.map(|_| QueryResult {
@@ -1276,7 +1343,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 Ok(())
             } else {
                 Err(crate::common::error::EngramDbError::Internal(
-                    "No active transaction for ROLLBACK TO SAVEPOINT".into()
+                    "No active transaction for ROLLBACK TO SAVEPOINT".into(),
                 ))
             };
             result.map(|_| QueryResult {
@@ -1287,21 +1354,24 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         // V16: vector_search 表值函数
-        PhysicalPlan::VectorSearch { table_name, index_name, query_vector, k } => {
+        PhysicalPlan::VectorSearch {
+            table_name,
+            index_name,
+            query_vector,
+            k,
+        } => {
             let neighbors = db.vector_search(&table_name, &index_name, query_vector.as_slice(), k)?;
             // 返回 (primary_key_value, distance) 格式
             let mut rows = Vec::with_capacity(neighbors.len());
             for n in &neighbors {
-                let table = db.get_table_mut(&table_name)
+                let table = db
+                    .get_table_mut(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 match table.get_row_by_id(n.id)? {
                     Some(row) => {
                         // 找到 PRIMARY KEY 列（第一列）的值
                         let pk_value = row.first().cloned().unwrap_or(crate::Value::Int32(n.id as i32));
-                        rows.push(vec![
-                            pk_value,
-                            crate::Value::Float64(n.distance as f64),
-                        ]);
+                        rows.push(vec![pk_value, crate::Value::Float64(n.distance as f64)]);
                     }
                     None => {
                         rows.push(vec![
@@ -1319,31 +1389,38 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         }
 
         // Perf01：COUNT(*) 元数据级短路
-        PhysicalPlan::CountStar { output_name, count } => {
-            Ok(QueryResult {
-                columns: vec![output_name],
-                rows: vec![vec![crate::Value::Int64(count)]],
-                rows_affected: 0,
-            })
-        }
+        PhysicalPlan::CountStar { output_name, count } => Ok(QueryResult {
+            columns: vec![output_name],
+            rows: vec![vec![crate::Value::Int64(count)]],
+            rows_affected: 0,
+        }),
 
         // Perf03：主键点查短路（WHERE pk = Literal）
-        PhysicalPlan::PrimaryKeyLookup { table_name, pk_value, output_column_indices } => {
+        PhysicalPlan::PrimaryKeyLookup {
+            table_name,
+            pk_value,
+            output_column_indices,
+        } => {
             // Phase 1：可变借 -> 查主键索引拿 row_id + 列名（引擎分派）
             let (row_id_opt, columns): (Option<u32>, Vec<String>) = {
-                let table = db.get_engine_table_mut(&table_name)
+                let table = db
+                    .get_engine_table_mut(&table_name)
                     .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                 let cols: Vec<String> = if output_column_indices.is_empty() {
                     table.def().columns.iter().map(|c| c.name.clone()).collect()
                 } else {
-                    output_column_indices.iter().map(|&i| table.def().columns[i].name.clone()).collect()
+                    output_column_indices
+                        .iter()
+                        .map(|&i| table.def().columns[i].name.clone())
+                        .collect()
                 };
                 (table.lookup_primary_key(&pk_value), cols)
             };
             // Phase 2：可变借 -> 回表读指定列（避免读无关列）
             let rows: Vec<Vec<crate::Value>> = match row_id_opt {
                 Some(row_id) => {
-                    let table = db.get_engine_table_mut(&table_name)
+                    let table = db
+                        .get_engine_table_mut(&table_name)
                         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.clone()))?;
                     if output_column_indices.is_empty() {
                         match table.get_row_by_id(row_id)? {
@@ -1366,7 +1443,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         // M5：ANALYZE 真实收集统计（引擎分派全表扫描 → 直方图/NDV 缓存）
         PhysicalPlan::Analyze { table_name, .. } => {
             use crate::sql::statistics::TableStatistics;
-            let table = db.get_engine_table_mut(&table_name)
+            let table = db
+                .get_engine_table_mut(&table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
             let engine = table.def().engine;
             let col_names: Vec<String> = table.def().columns.iter().map(|c| c.name.clone()).collect();
@@ -1381,29 +1459,37 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
-        PhysicalPlan::CreateMaterializedView { view_name, .. } => {
-            Ok(QueryResult {
-                columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar(format!("Materialized view '{}' created", view_name))]],
-                rows_affected: 0,
-            })
-        }
-        PhysicalPlan::RefreshMaterializedView { view_name, .. } => {
-            Ok(QueryResult {
-                columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar(format!("Materialized view '{}' refreshed", view_name))]],
-                rows_affected: 0,
-            })
-        }
-        PhysicalPlan::DropMaterializedView { view_name, .. } => {
-            Ok(QueryResult {
-                columns: vec!["status".to_string()],
-                rows: vec![vec![crate::Value::Varchar(format!("Materialized view '{}' dropped", view_name))]],
-                rows_affected: 0,
-            })
-        }
+        PhysicalPlan::CreateMaterializedView { view_name, .. } => Ok(QueryResult {
+            columns: vec!["status".to_string()],
+            rows: vec![vec![crate::Value::Varchar(format!(
+                "Materialized view '{}' created",
+                view_name
+            ))]],
+            rows_affected: 0,
+        }),
+        PhysicalPlan::RefreshMaterializedView { view_name, .. } => Ok(QueryResult {
+            columns: vec!["status".to_string()],
+            rows: vec![vec![crate::Value::Varchar(format!(
+                "Materialized view '{}' refreshed",
+                view_name
+            ))]],
+            rows_affected: 0,
+        }),
+        PhysicalPlan::DropMaterializedView { view_name, .. } => Ok(QueryResult {
+            columns: vec!["status".to_string()],
+            rows: vec![vec![crate::Value::Varchar(format!(
+                "Materialized view '{}' dropped",
+                view_name
+            ))]],
+            rows_affected: 0,
+        }),
         // CREATE VIEW（v0.22.0 新增）
-        PhysicalPlan::CreateView { view_name, column_names, query, or_replace } => {
+        PhysicalPlan::CreateView {
+            view_name,
+            column_names,
+            query,
+            or_replace,
+        } => {
             // 将 view 定义存储到 Database 的 views 映射中
             let view_def = crate::storage::ViewDef {
                 name: view_name.clone(),
@@ -1427,15 +1513,17 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
-        PhysicalPlan::AlterTable(stmt) => {
-            crate::executor::operators::alter_table::execute(db, stmt)
-        }
+        PhysicalPlan::AlterTable(stmt) => crate::executor::operators::alter_table::execute(db, stmt),
         PhysicalPlan::TruncateTable { table_name } => {
             // TRUNCATE TABLE：清空表数据，保留表结构
-            let table_id = db.table_names().get(&table_name).copied()
+            let table_id = db
+                .table_names()
+                .get(&table_name)
+                .copied()
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
             {
-                let table = db.get_engine_table_mut(&table_name)
+                let table = db
+                    .get_engine_table_mut(&table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.clone()))?;
                 table.truncate()?;
             }
@@ -1447,9 +1535,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 rows_affected: 0,
             })
         }
-        PhysicalPlan::Pragma(stmt) => {
-            crate::executor::operators::pragma::execute(db, stmt)
-        }
+        PhysicalPlan::Pragma(stmt) => crate::executor::operators::pragma::execute(db, stmt),
         PhysicalPlan::Distinct { input } => {
             let input_result = execute(*input, db)?;
             let mut seen = FxHashSet::default();
@@ -1472,7 +1558,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 execute_explain(*plan, db)
             }
         }
-        PhysicalPlan::Window { input, window_functions, column_names } => {
+        PhysicalPlan::Window {
+            input,
+            window_functions,
+            column_names,
+        } => {
             // 列式优先：上游 chunks 直接传给 window operator
             let (cols, chunks) = match try_execute_chunks(input.as_ref(), db)? {
                 Some(x) => x,
@@ -1508,13 +1598,11 @@ fn collect_result(
     table_name: &str,
     column_indices: &[usize],
 ) -> Result<(Vec<String>, Vec<Vec<crate::Value>>)> {
-    let table = db.get_table(table_name)
+    let table = db
+        .get_table(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
-    let column_names: Vec<String> = column_indices
-        .iter()
-        .map(|&i| table.def.columns[i].name.clone())
-        .collect();
+    let column_names: Vec<String> = column_indices.iter().map(|&i| table.def.columns[i].name.clone()).collect();
 
     let rows = chunks_to_rows(chunks);
 
@@ -1578,14 +1666,19 @@ fn format_plan_tree(plan: &PhysicalPlan, indent: usize) -> String {
     let prefix = "  ".repeat(indent);
     let name = plan_node_name(plan);
     let detail = match plan {
-        PhysicalPlan::TableScan { table_name, column_indices } => {
+        PhysicalPlan::TableScan {
+            table_name,
+            column_indices,
+        } => {
             format!(" [{}.{} cols]", table_name, column_indices.len())
         }
         PhysicalPlan::Filter { .. } => String::new(),
         PhysicalPlan::Projection { column_names, .. } => {
             format!(" [{}]", column_names.join(", "))
         }
-        PhysicalPlan::Aggregate { group_by, aggregates, .. } => {
+        PhysicalPlan::Aggregate {
+            group_by, aggregates, ..
+        } => {
             let gb: Vec<String> = group_by.iter().map(|i| format!("col{}", i)).collect();
             let agg: Vec<String> = aggregates.iter().map(|a| format!("{:?}", a.func)).collect();
             format!(" [group_by: {}, agg: {}]", gb.join(","), agg.join(","))
@@ -1742,7 +1835,6 @@ fn extract_skip_predicate(
     Some((col_name.clone(), pred_op, val.clone()))
 }
 
-
 /// 评估 INSERT...RETURNING 表达式
 fn evaluate_returning_expr(
     expr: &crate::sql::ast::Expression,
@@ -1752,16 +1844,16 @@ fn evaluate_returning_expr(
     use crate::sql::ast::Expression;
     match expr {
         Expression::ColumnRef { column, .. } => {
-            let idx = table_def.column_index(column)
-                .ok_or_else(|| EngramDbError::Internal(
-                    format!("RETURNING column '{}' not found", column)
-                ))?;
+            let idx = table_def
+                .column_index(column)
+                .ok_or_else(|| EngramDbError::Internal(format!("RETURNING column '{}' not found", column)))?;
             Ok(row[idx].clone())
         }
         Expression::Literal(v) => Ok(v.clone()),
-        _ => Err(EngramDbError::Parse(
-            format!("Unsupported RETURNING expression: {:?}", expr)
-        )),
+        _ => Err(EngramDbError::Parse(format!(
+            "Unsupported RETURNING expression: {:?}",
+            expr
+        ))),
     }
 }
 
@@ -1784,11 +1876,14 @@ fn execute_upsert(
         }
     }
 
-    let table = db.get_table(table_name)
+    let table = db
+        .get_table(table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
     let table_def = table.def.clone();
 
-    let mut conflict_col_indices: Vec<usize> = conflict_clause.conflict_columns.iter()
+    let mut conflict_col_indices: Vec<usize> = conflict_clause
+        .conflict_columns
+        .iter()
         .filter_map(|col_name| table_def.column_index(col_name))
         .collect();
 
@@ -1806,12 +1901,11 @@ fn execute_upsert(
         let mut conflicting_row_id: Option<u32> = None;
 
         if !conflict_col_indices.is_empty() {
-            let table = db.get_table_mut(table_name)
+            let table = db
+                .get_table_mut(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
 
-            conflicting_row_id = find_conflicting_row(
-                table, &table_def, &conflict_col_indices, row,
-            )?;
+            conflicting_row_id = find_conflicting_row(table, &table_def, &conflict_col_indices, row)?;
         }
 
         match conflicting_row_id {
@@ -1820,24 +1914,27 @@ fn execute_upsert(
                     OnConflictAction::DoNothing => {}
                     OnConflictAction::Replace => {
                         // INSERT OR REPLACE / REPLACE INTO：替换所有列
-                        let table = db.get_table_mut(table_name)
+                        let table = db
+                            .get_table_mut(table_name)
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
                         table.update_row(rid, row.as_slice())?;
                         rows_affected += 1;
                     }
                     OnConflictAction::DoUpdate { assignments } => {
-                        let table = db.get_table_mut(table_name)
+                        let table = db
+                            .get_table_mut(table_name)
                             .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
-                        let mut existing_row = table.get_row_by_id(rid)?
-                            .ok_or_else(|| EngramDbError::Internal(
-                                format!("Row {} not found during UPSERT update", rid)
-                            ))?;
+                        let mut existing_row = table.get_row_by_id(rid)?.ok_or_else(|| {
+                            EngramDbError::Internal(format!("Row {} not found during UPSERT update", rid))
+                        })?;
 
                         for (col_name, expr) in assignments {
-                            let col_idx = table_def.column_index(col_name)
-                                .ok_or_else(|| EngramDbError::Internal(
-                                    format!("Column '{}' not found in UPDATE assignments", col_name)
-                                ))?;
+                            let col_idx = table_def.column_index(col_name).ok_or_else(|| {
+                                EngramDbError::Internal(format!(
+                                    "Column '{}' not found in UPDATE assignments",
+                                    col_name
+                                ))
+                            })?;
                             if col_idx < existing_row.len() {
                                 existing_row[col_idx] = evaluate_returning_expr(expr, &row, &table_def)?;
                             }
@@ -1849,7 +1946,8 @@ fn execute_upsert(
                 }
             }
             None => {
-                let table = db.get_table_mut(table_name)
+                let table = db
+                    .get_table_mut(table_name)
                     .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
                 table.insert(vec![row.clone()])?;
                 rows_affected += 1;
@@ -1857,13 +1955,13 @@ fn execute_upsert(
         }
 
         if let Some(ref returning_items) = returning {
-            let table = db.get_table_mut(table_name)
+            let table = db
+                .get_table_mut(table_name)
                 .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
             let rid = conflicting_row_id.unwrap_or(table.def.row_count as u32 - 1);
-            let actual_row = table.get_row_by_id(rid)?
-                .ok_or_else(|| EngramDbError::Internal(
-                    format!("Row {} not found for RETURNING", rid)
-                ))?;
+            let actual_row = table
+                .get_row_by_id(rid)?
+                .ok_or_else(|| EngramDbError::Internal(format!("Row {} not found for RETURNING", rid)))?;
             let mut result_row = Vec::new();
             for item in returning_items {
                 match item {
@@ -1882,14 +1980,16 @@ fn execute_upsert(
 
     if returning.is_some() {
         let returning_items = returning.unwrap();
-        let columns: Vec<String> = returning_items.iter().enumerate().map(|(i, item)| {
-            match item {
+        let columns: Vec<String> = returning_items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| match item {
                 crate::sql::ast::SelectItem::Wildcard => format!("*"),
                 crate::sql::ast::SelectItem::Expression(_expr, alias) => {
                     alias.clone().unwrap_or_else(|| format!("col_{}", i))
                 }
-            }
-        }).collect();
+            })
+            .collect();
         Ok(QueryResult {
             columns,
             rows: result_rows,
@@ -1992,7 +2092,11 @@ fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<P
                 condition,
             })
         }
-        PhysicalPlan::Projection { input, expressions, column_names } => {
+        PhysicalPlan::Projection {
+            input,
+            expressions,
+            column_names,
+        } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
             let scope = collect_outer_scope(&input, db);
             let mut resolved = Vec::with_capacity(expressions.len());
@@ -2005,21 +2109,49 @@ fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<P
                 column_names,
             })
         }
-        PhysicalPlan::Aggregate { input, group_by, aggregates } => {
+        PhysicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
-            Ok(PhysicalPlan::Aggregate { input: Box::new(input), group_by, aggregates })
+            Ok(PhysicalPlan::Aggregate {
+                input: Box::new(input),
+                group_by,
+                aggregates,
+            })
         }
-        PhysicalPlan::Sort { input, sort_keys, limit } => {
+        PhysicalPlan::Sort {
+            input,
+            sort_keys,
+            limit,
+        } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
-            Ok(PhysicalPlan::Sort { input: Box::new(input), sort_keys, limit })
+            Ok(PhysicalPlan::Sort {
+                input: Box::new(input),
+                sort_keys,
+                limit,
+            })
         }
         PhysicalPlan::Limit { input, limit, offset } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
-            Ok(PhysicalPlan::Limit { input: Box::new(input), limit, offset })
+            Ok(PhysicalPlan::Limit {
+                input: Box::new(input),
+                limit,
+                offset,
+            })
         }
-        PhysicalPlan::Window { input, window_functions, column_names } => {
+        PhysicalPlan::Window {
+            input,
+            window_functions,
+            column_names,
+        } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
-            Ok(PhysicalPlan::Window { input: Box::new(input), window_functions, column_names })
+            Ok(PhysicalPlan::Window {
+                input: Box::new(input),
+                window_functions,
+                column_names,
+            })
         }
         PhysicalPlan::SubqueryScan { plan } => {
             let inner = resolve_subqueries_in_plan(*plan, db)?;
@@ -2028,17 +2160,36 @@ fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<P
         PhysicalPlan::SetUnion { op, left, right } => {
             let left = resolve_subqueries_in_plan(*left, db)?;
             let right = resolve_subqueries_in_plan(*right, db)?;
-            Ok(PhysicalPlan::SetUnion { op, left: Box::new(left), right: Box::new(right) })
+            Ok(PhysicalPlan::SetUnion {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
         }
-        PhysicalPlan::HashJoin { join_type, left, right, left_keys, right_keys } => {
+        PhysicalPlan::HashJoin {
+            join_type,
+            left,
+            right,
+            left_keys,
+            right_keys,
+        } => {
             let left = resolve_subqueries_in_plan(*left, db)?;
             let right = resolve_subqueries_in_plan(*right, db)?;
-            Ok(PhysicalPlan::HashJoin { join_type, left: Box::new(left), right: Box::new(right), left_keys, right_keys })
+            Ok(PhysicalPlan::HashJoin {
+                join_type,
+                left: Box::new(left),
+                right: Box::new(right),
+                left_keys,
+                right_keys,
+            })
         }
         PhysicalPlan::CrossJoin { left, right } => {
             let left = resolve_subqueries_in_plan(*left, db)?;
             let right = resolve_subqueries_in_plan(*right, db)?;
-            Ok(PhysicalPlan::CrossJoin { left: Box::new(left), right: Box::new(right) })
+            Ok(PhysicalPlan::CrossJoin {
+                left: Box::new(left),
+                right: Box::new(right),
+            })
         }
         other => Ok(other),
     }
@@ -2054,7 +2205,10 @@ fn collect_outer_scope(plan: &PhysicalPlan, db: &Database) -> super::expression:
 
     fn walk(plan: &PhysicalPlan, db: &Database, s: &mut OuterScope) {
         match plan {
-            PhysicalPlan::TableScan { table_name, column_indices } => {
+            PhysicalPlan::TableScan {
+                table_name,
+                column_indices,
+            } => {
                 if !s.tables.iter().any(|t| t == table_name) {
                     s.tables.push(table_name.clone());
                 }
@@ -2069,7 +2223,9 @@ fn collect_outer_scope(plan: &PhysicalPlan, db: &Database) -> super::expression:
                     }
                 }
             }
-            PhysicalPlan::Projection { input, column_names, .. } => {
+            PhysicalPlan::Projection {
+                input, column_names, ..
+            } => {
                 walk(input, db, s);
                 for n in column_names {
                     if !s.cols.contains(n) {
@@ -2077,7 +2233,9 @@ fn collect_outer_scope(plan: &PhysicalPlan, db: &Database) -> super::expression:
                     }
                 }
             }
-            PhysicalPlan::Window { input, column_names, .. } => {
+            PhysicalPlan::Window {
+                input, column_names, ..
+            } => {
                 walk(input, db, s);
                 for n in column_names {
                     if !s.cols.contains(n) {
@@ -2125,13 +2283,9 @@ fn resolve_subqueries_in_expr(
                 Ok(Expression::Subquery(probe))
             } else {
                 // 非关联：静态解析为字面量
-                let plan = crate::sql::planner::plan(
-                    crate::sql::ast::Statement::Select(*subquery), db
-                )?;
+                let plan = crate::sql::planner::plan(crate::sql::ast::Statement::Select(*subquery), db)?;
                 let result = crate::executor::execute(plan, db)?;
-                let val = result.rows.first()
-                    .and_then(|r| r.first().cloned())
-                    .unwrap_or(Value::Null);
+                let val = result.rows.first().and_then(|r| r.first().cloned()).unwrap_or(Value::Null);
                 Ok(Expression::Literal(val))
             }
         }
@@ -2139,18 +2293,23 @@ fn resolve_subqueries_in_expr(
             let mut probe = subquery.clone();
             let normalized = normalize_outer_refs(&mut probe, outer, db);
             if normalized {
-                Ok(Expression::Exists { subquery: probe, negated })
+                Ok(Expression::Exists {
+                    subquery: probe,
+                    negated,
+                })
             } else {
-                let plan = crate::sql::planner::plan(
-                    crate::sql::ast::Statement::Select(*subquery), db
-                )?;
+                let plan = crate::sql::planner::plan(crate::sql::ast::Statement::Select(*subquery), db)?;
                 let result = crate::executor::execute(plan, db)?;
                 let exists = !result.rows.is_empty();
                 let val = if negated { !exists } else { exists };
                 Ok(Expression::Literal(Value::Boolean(val)))
             }
         }
-        Expression::InSubquery { expr, subquery, negated } => {
+        Expression::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
             let mut probe = subquery.clone();
             if normalize_outer_refs(&mut probe, outer, db) {
                 Ok(Expression::InSubquery {
@@ -2159,18 +2318,15 @@ fn resolve_subqueries_in_expr(
                     negated,
                 })
             } else {
-                let plan = crate::sql::planner::plan(
-                    crate::sql::ast::Statement::Select(*subquery), db
-                )?;
+                let plan = crate::sql::planner::plan(crate::sql::ast::Statement::Select(*subquery), db)?;
                 let result = crate::executor::execute(plan, db)?;
-                let values: Vec<Expression> = result.rows.iter()
+                let values: Vec<Expression> = result
+                    .rows
+                    .iter()
                     .filter_map(|r| r.first().cloned())
                     .map(Expression::Literal)
                     .collect();
-                let list = Expression::InList {
-                    expr,
-                    list: values,
-                };
+                let list = Expression::InList { expr, list: values };
                 if negated {
                     Ok(Expression::UnaryOp {
                         op: crate::sql::ast::UnaryOperator::Not,
@@ -2190,12 +2346,24 @@ fn resolve_subqueries_in_expr(
             op,
             expr: Box::new(resolve_subqueries_in_expr(*inner, db, outer)?),
         }),
-        Expression::Function { name, args, distinct, count_star, over } => {
+        Expression::Function {
+            name,
+            args,
+            distinct,
+            count_star,
+            over,
+        } => {
             let mut resolved = Vec::with_capacity(args.len());
             for arg in args {
                 resolved.push(resolve_subqueries_in_expr(arg, db, outer)?);
             }
-            Ok(Expression::Function { name, args: resolved, distinct, count_star, over })
+            Ok(Expression::Function {
+                name,
+                args: resolved,
+                distinct,
+                count_star,
+                over,
+            })
         }
         Expression::Like { expr, pattern } => Ok(Expression::Like {
             expr: Box::new(resolve_subqueries_in_expr(*expr, db, outer)?),
@@ -2204,26 +2372,39 @@ fn resolve_subqueries_in_expr(
         Expression::Case { when_then, else_expr } => {
             let mut resolved = Vec::with_capacity(when_then.len());
             for (w, t) in when_then {
-                resolved.push((resolve_subqueries_in_expr(w, db, outer)?, resolve_subqueries_in_expr(t, db, outer)?));
+                resolved.push((
+                    resolve_subqueries_in_expr(w, db, outer)?,
+                    resolve_subqueries_in_expr(t, db, outer)?,
+                ));
             }
             let resolved_else = match else_expr {
                 Some(e) => Some(Box::new(resolve_subqueries_in_expr(*e, db, outer)?)),
                 None => None,
             };
-            Ok(Expression::Case { when_then: resolved, else_expr: resolved_else })
+            Ok(Expression::Case {
+                when_then: resolved,
+                else_expr: resolved_else,
+            })
         }
         Expression::Cast { expr, data_type } => Ok(Expression::Cast {
             expr: Box::new(resolve_subqueries_in_expr(*expr, db, outer)?),
             data_type,
         }),
-        Expression::IsNull(inner) => Ok(Expression::IsNull(Box::new(resolve_subqueries_in_expr(*inner, db, outer)?))),
-        Expression::IsNotNull(inner) => Ok(Expression::IsNotNull(Box::new(resolve_subqueries_in_expr(*inner, db, outer)?))),
+        Expression::IsNull(inner) => Ok(Expression::IsNull(Box::new(resolve_subqueries_in_expr(
+            *inner, db, outer,
+        )?))),
+        Expression::IsNotNull(inner) => Ok(Expression::IsNotNull(Box::new(resolve_subqueries_in_expr(
+            *inner, db, outer,
+        )?))),
         Expression::InList { expr, list } => {
             let mut resolved = Vec::with_capacity(list.len());
             for item in list {
                 resolved.push(resolve_subqueries_in_expr(item, db, outer)?);
             }
-            Ok(Expression::InList { expr: Box::new(resolve_subqueries_in_expr(*expr, db, outer)?), list: resolved })
+            Ok(Expression::InList {
+                expr: Box::new(resolve_subqueries_in_expr(*expr, db, outer)?),
+                list: resolved,
+            })
         }
         other => Ok(other),
     }
@@ -2250,7 +2431,10 @@ mod tests {
     use crate::Value;
 
     fn col(name: &str) -> Expression {
-        Expression::ColumnRef { table: None, column: name.into() }
+        Expression::ColumnRef {
+            table: None,
+            column: name.into(),
+        }
     }
 
     fn lit(v: Value) -> Expression {
@@ -2258,7 +2442,10 @@ mod tests {
     }
 
     fn plan_scan() -> PhysicalPlan {
-        PhysicalPlan::TableScan { table_name: "t".into(), column_indices: vec![0, 1] }
+        PhysicalPlan::TableScan {
+            table_name: "t".into(),
+            column_indices: vec![0, 1],
+        }
     }
 
     fn plan_filter() -> PhysicalPlan {
@@ -2279,12 +2466,36 @@ mod tests {
         assert_eq!(plan_node_name(&PhysicalPlan::BeginTransaction), "BeginTransaction");
         assert_eq!(plan_node_name(&PhysicalPlan::Commit), "Commit");
         assert_eq!(plan_node_name(&PhysicalPlan::Rollback), "Rollback");
-        assert_eq!(plan_node_name(&PhysicalPlan::Distinct { input: Box::new(plan_scan()) }), "Distinct");
-        assert_eq!(plan_node_name(&PhysicalPlan::Window { input: Box::new(plan_scan()), window_functions: vec![], column_names: vec![] }), "Window");
-        assert_eq!(plan_node_name(&PhysicalPlan::TruncateTable { table_name: "t".into() }), "TruncateTable");
-        assert_eq!(plan_node_name(&PhysicalPlan::Savepoint { name: "sp".into() }), "Savepoint");
-        assert_eq!(plan_node_name(&PhysicalPlan::ReleaseSavepoint { name: "sp".into() }), "ReleaseSavepoint");
-        assert_eq!(plan_node_name(&PhysicalPlan::RollbackToSavepoint { name: "sp".into() }), "RollbackToSavepoint");
+        assert_eq!(
+            plan_node_name(&PhysicalPlan::Distinct {
+                input: Box::new(plan_scan())
+            }),
+            "Distinct"
+        );
+        assert_eq!(
+            plan_node_name(&PhysicalPlan::Window {
+                input: Box::new(plan_scan()),
+                window_functions: vec![],
+                column_names: vec![]
+            }),
+            "Window"
+        );
+        assert_eq!(
+            plan_node_name(&PhysicalPlan::TruncateTable { table_name: "t".into() }),
+            "TruncateTable"
+        );
+        assert_eq!(
+            plan_node_name(&PhysicalPlan::Savepoint { name: "sp".into() }),
+            "Savepoint"
+        );
+        assert_eq!(
+            plan_node_name(&PhysicalPlan::ReleaseSavepoint { name: "sp".into() }),
+            "ReleaseSavepoint"
+        );
+        assert_eq!(
+            plan_node_name(&PhysicalPlan::RollbackToSavepoint { name: "sp".into() }),
+            "RollbackToSavepoint"
+        );
     }
 
     #[test]
@@ -2305,14 +2516,43 @@ mod tests {
     #[test]
     fn test_format_plan_tree_detail_variants() {
         let cases: Vec<PhysicalPlan> = vec![
-            PhysicalPlan::Insert { table_name: "t".into(), rows: vec![], returning: None, on_conflict: None },
-            PhysicalPlan::InsertColumns { table_name: "t".into(), columns: vec![] },
-            PhysicalPlan::Delete { table_name: "t".into(), condition: None },
-            PhysicalPlan::Update { table_name: "t".into(), assignments: vec![], condition: None },
-            PhysicalPlan::PrimaryKeyLookup { table_name: "t".into(), pk_value: Value::Int64(1), output_column_indices: vec![0] },
-            PhysicalPlan::CountStar { output_name: "count(*)".into(), count: 42 },
-            PhysicalPlan::Limit { input: Box::new(plan_scan()), limit: 5, offset: 0 },
-            PhysicalPlan::Pragma(crate::sql::ast::PragmaStmt { name: "table_info".into(), arg: Some("t".into()) }),
+            PhysicalPlan::Insert {
+                table_name: "t".into(),
+                rows: vec![],
+                returning: None,
+                on_conflict: None,
+            },
+            PhysicalPlan::InsertColumns {
+                table_name: "t".into(),
+                columns: vec![],
+            },
+            PhysicalPlan::Delete {
+                table_name: "t".into(),
+                condition: None,
+            },
+            PhysicalPlan::Update {
+                table_name: "t".into(),
+                assignments: vec![],
+                condition: None,
+            },
+            PhysicalPlan::PrimaryKeyLookup {
+                table_name: "t".into(),
+                pk_value: Value::Int64(1),
+                output_column_indices: vec![0],
+            },
+            PhysicalPlan::CountStar {
+                output_name: "count(*)".into(),
+                count: 42,
+            },
+            PhysicalPlan::Limit {
+                input: Box::new(plan_scan()),
+                limit: 5,
+                offset: 0,
+            },
+            PhysicalPlan::Pragma(crate::sql::ast::PragmaStmt {
+                name: "table_info".into(),
+                arg: Some("t".into()),
+            }),
             PhysicalPlan::AlterTable(crate::sql::ast::AlterTableStmt {
                 table_name: "t".into(),
                 operation: crate::sql::ast::AlterTableOp::RenameTable { new_name: "t2".into() },
@@ -2386,28 +2626,38 @@ mod tests {
     fn test_extract_skip_predicate() {
         use crate::storage::column_store::PredicateOp;
         let e = Expression::BinaryOp {
-            left: Box::new(col("v")), op: BinaryOperator::Gt, right: Box::new(lit(Value::Int64(5))),
+            left: Box::new(col("v")),
+            op: BinaryOperator::Gt,
+            right: Box::new(lit(Value::Int64(5))),
         };
         let (name, op, val) = extract_skip_predicate(&e).unwrap();
         assert_eq!(name, "v");
         assert_eq!(op, PredicateOp::Gt);
         assert_eq!(val, Value::Int64(5));
         let e = Expression::BinaryOp {
-            left: Box::new(lit(Value::Int64(5))), op: BinaryOperator::Lt, right: Box::new(col("v")),
+            left: Box::new(lit(Value::Int64(5))),
+            op: BinaryOperator::Lt,
+            right: Box::new(col("v")),
         };
         let (name, op, _) = extract_skip_predicate(&e).unwrap();
         assert_eq!(name, "v");
         assert_eq!(op, PredicateOp::Lt);
         let e = Expression::BinaryOp {
-            left: Box::new(col("id")), op: BinaryOperator::Eq, right: Box::new(lit(Value::Int64(1))),
+            left: Box::new(col("id")),
+            op: BinaryOperator::Eq,
+            right: Box::new(lit(Value::Int64(1))),
         };
         assert_eq!(extract_skip_predicate(&e).unwrap().1, PredicateOp::Eq);
         let e = Expression::BinaryOp {
-            left: Box::new(col("v")), op: BinaryOperator::Plus, right: Box::new(lit(Value::Int64(1))),
+            left: Box::new(col("v")),
+            op: BinaryOperator::Plus,
+            right: Box::new(lit(Value::Int64(1))),
         };
         assert!(extract_skip_predicate(&e).is_none());
         let e = Expression::BinaryOp {
-            left: Box::new(col("a")), op: BinaryOperator::Eq, right: Box::new(col("b")),
+            left: Box::new(col("a")),
+            op: BinaryOperator::Eq,
+            right: Box::new(col("b")),
         };
         assert!(extract_skip_predicate(&e).is_none());
         assert!(extract_skip_predicate(&lit(Value::Int64(1))).is_none());
@@ -2420,7 +2670,10 @@ mod tests {
         let db = conn.database_mut();
         let r = execute_explain(plan_filter(), db).unwrap();
         assert_eq!(r.rows.len(), 1);
-        let text = match &r.rows[0][0] { Value::Varchar(s) => s.clone(), other => panic!("{other:?}") };
+        let text = match &r.rows[0][0] {
+            Value::Varchar(s) => s.clone(),
+            other => panic!("{other:?}"),
+        };
         assert!(text.contains("Filter"), "{text}");
         assert!(text.contains("TableScan"), "{text}");
     }
@@ -2433,19 +2686,31 @@ mod tests {
             id: 0,
             name: "newt".into(),
             columns: vec![crate::common::types::ColumnDef {
-                name: "id".into(), data_type: crate::common::types::DataType::Int64,
-                nullable: false, is_primary_key: true, default_value: None, auto_increment: false,
+                name: "id".into(),
+                data_type: crate::common::types::DataType::Int64,
+                nullable: false,
+                is_primary_key: true,
+                default_value: None,
+                auto_increment: false,
                 check_expr: None,
             }],
-            row_count: 0, indexes: vec![], cluster_key: None, foreign_keys: vec![],
+            row_count: 0,
+            indexes: vec![],
+            cluster_key: None,
+            foreign_keys: vec![],
             engine: crate::common::types::EngineType::Columnar,
-            next_auto_increment_id: 0, ttl_seconds: None, ttl_column: None,
+            next_auto_increment_id: 0,
+            ttl_seconds: None,
+            ttl_column: None,
         };
         let r = execute(PhysicalPlan::CreateTable { table_def: def.clone() }, db).unwrap();
         assert!(r.rows[0][0] == Value::Varchar("Table 'newt' created".into()));
         assert!(db.get_table("newt").is_some());
         let err = execute(PhysicalPlan::CreateTable { table_def: def }, db).unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        assert!(matches!(
+            err,
+            crate::common::error::EngramDbError::ConstraintViolation(_)
+        ));
     }
 
     #[test]
@@ -2453,22 +2718,43 @@ mod tests {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         let db = conn.database_mut();
-        let r = execute(PhysicalPlan::Insert {
-            table_name: "t".into(),
-            rows: vec![vec![Value::Int64(1), Value::Int64(10)], vec![Value::Int64(2), Value::Int64(20)]],
-            returning: None,
-            on_conflict: None,
-        }, db).unwrap();
+        let r = execute(
+            PhysicalPlan::Insert {
+                table_name: "t".into(),
+                rows: vec![
+                    vec![Value::Int64(1), Value::Int64(10)],
+                    vec![Value::Int64(2), Value::Int64(20)],
+                ],
+                returning: None,
+                on_conflict: None,
+            },
+            db,
+        )
+        .unwrap();
         assert_eq!(r.rows_affected, 2);
-        let r = execute(PhysicalPlan::CountStar { output_name: "count(*)".into(), count: 2 }, db).unwrap();
+        let r = execute(
+            PhysicalPlan::CountStar {
+                output_name: "count(*)".into(),
+                count: 2,
+            },
+            db,
+        )
+        .unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(2));
-        let err = execute(PhysicalPlan::Insert {
-            table_name: "t".into(),
-            rows: vec![vec![Value::Int64(1), Value::Int64(99)]],
-            returning: None,
-            on_conflict: None,
-        }, db).unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)));
+        let err = execute(
+            PhysicalPlan::Insert {
+                table_name: "t".into(),
+                rows: vec![vec![Value::Int64(1), Value::Int64(99)]],
+                returning: None,
+                on_conflict: None,
+            },
+            db,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::common::error::EngramDbError::ConstraintViolation(_)
+        ));
     }
 
     #[test]
@@ -2479,9 +2765,24 @@ mod tests {
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
         crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
         let db = conn.database_mut();
-        let r = execute(PhysicalPlan::Update { table_name: "t".into(), assignments: vec![], condition: None }, db).unwrap();
+        let r = execute(
+            PhysicalPlan::Update {
+                table_name: "t".into(),
+                assignments: vec![],
+                condition: None,
+            },
+            db,
+        )
+        .unwrap();
         assert_eq!(r.rows_affected, 0);
-        let r = execute(PhysicalPlan::Delete { table_name: "t".into(), condition: None }, db).unwrap();
+        let r = execute(
+            PhysicalPlan::Delete {
+                table_name: "t".into(),
+                condition: None,
+            },
+            db,
+        )
+        .unwrap();
         assert_eq!(r.rows_affected, 3);
         let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
         assert!(rows.is_empty());
@@ -2505,7 +2806,13 @@ mod tests {
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
         crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
         let db = conn.database_mut();
-        let r = execute(PhysicalPlan::SubqueryScan { plan: Box::new(plan_scan()) }, db).unwrap();
+        let r = execute(
+            PhysicalPlan::SubqueryScan {
+                plan: Box::new(plan_scan()),
+            },
+            db,
+        )
+        .unwrap();
         assert_eq!(r.rows.len(), 2);
     }
 
@@ -2517,19 +2824,24 @@ mod tests {
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
         crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
         let db = conn.database_mut();
-        let r = execute(PhysicalPlan::Insert {
-            table_name: "t".into(),
-            rows: vec![vec![Value::Int64(1), Value::Int64(99)], vec![Value::Int64(2), Value::Int64(20)]],
-            returning: None,
-            on_conflict: Some(OnConflictClause {
-                conflict_columns: vec![],
-                action: crate::sql::ast::OnConflictAction::DoNothing,
-            }),
-        }, db).unwrap();
+        let r = execute(
+            PhysicalPlan::Insert {
+                table_name: "t".into(),
+                rows: vec![
+                    vec![Value::Int64(1), Value::Int64(99)],
+                    vec![Value::Int64(2), Value::Int64(20)],
+                ],
+                returning: None,
+                on_conflict: Some(OnConflictClause {
+                    conflict_columns: vec![],
+                    action: crate::sql::ast::OnConflictAction::DoNothing,
+                }),
+            },
+            db,
+        )
+        .unwrap();
         let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1], Value::Int64(10));
     }
 }
-
-

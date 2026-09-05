@@ -16,11 +16,17 @@ pub enum Statement {
     Commit,
     Rollback,
     /// SAVEPOINT name（v0.15.0 Txn05 新增）
-    Savepoint { name: String },
+    Savepoint {
+        name: String,
+    },
     /// RELEASE SAVEPOINT name（v0.15.0 Txn05 新增）
-    ReleaseSavepoint { name: String },
+    ReleaseSavepoint {
+        name: String,
+    },
     /// ROLLBACK TO SAVEPOINT name（v0.15.0 Txn05 新增）
-    RollbackToSavepoint { name: String },
+    RollbackToSavepoint {
+        name: String,
+    },
     Analyze(AnalyzeStmt),
     CreateMaterializedView(CreateMaterializedViewStmt),
     RefreshMaterializedView(RefreshMaterializedViewStmt),
@@ -52,10 +58,20 @@ pub struct AlterTableStmt {
 
 #[derive(Debug, Clone)]
 pub enum AlterTableOp {
-    AddColumn { column_def: ColumnDef, position: Option<String> },
-    DropColumn { column_name: String },
-    RenameColumn { old_name: String, new_name: String },
-    RenameTable { new_name: String },
+    AddColumn {
+        column_def: ColumnDef,
+        position: Option<String>,
+    },
+    DropColumn {
+        column_name: String,
+    },
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    RenameTable {
+        new_name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +145,9 @@ pub struct OnConflictClause {
 #[derive(Debug, Clone)]
 pub enum OnConflictAction {
     DoNothing,
-    DoUpdate { assignments: Vec<(String, Expression)> },
+    DoUpdate {
+        assignments: Vec<(String, Expression)>,
+    },
     /// INSERT OR REPLACE / REPLACE INTO：替换所有列（v0.15.0 M05 新增）
     Replace,
 }
@@ -249,7 +267,11 @@ pub enum TableRef {
     /// 派生表（子查询）
     Derived { query: Box<SelectStmt>, alias: String },
     /// 表值函数（v0.15.0 V16 新增，如 vector_search(...)）
-    TableFunction { name: String, args: Vec<Expression>, alias: Option<String> },
+    TableFunction {
+        name: String,
+        args: Vec<Expression>,
+        alias: Option<String>,
+    },
     /// 交叉连接（CROSS JOIN）
     CrossJoin { left: Box<TableRef>, right: Box<TableRef> },
     /// 连接（②：INNER / LEFT / RIGHT / FULL JOIN）

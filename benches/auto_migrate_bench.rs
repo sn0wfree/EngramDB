@@ -4,9 +4,9 @@
 //!
 //! 运行：`cargo bench --bench auto_migrate_bench`
 
-use std::time::{Duration, Instant};
 use engramdb::common::types::EngineType;
 use engramdb::Connection;
+use std::time::{Duration, Instant};
 
 const ITERS: usize = 5;
 const N_ROWS: usize = 10_000;
@@ -17,7 +17,11 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 }
 
 fn fmt_rate(d: Duration, n: usize) -> String {
-    format!("{:.0} 行/秒 ({:.1} ms)", n as f64 / d.as_secs_f64(), d.as_secs_f64() * 1000.0)
+    format!(
+        "{:.0} 行/秒 ({:.1} ms)",
+        n as f64 / d.as_secs_f64(),
+        d.as_secs_f64() * 1000.0
+    )
 }
 
 fn main() {
@@ -35,7 +39,8 @@ fn main() {
         let _ = std::fs::remove_file(format!("{}-wal", path));
 
         let mut conn = Connection::open(path).unwrap();
-        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto")
+            .unwrap();
 
         // 写入数据
         for i in 0..N_ROWS {
@@ -72,7 +77,8 @@ fn main() {
         let _ = std::fs::remove_file(format!("{}-wal", path));
 
         let mut conn = Connection::open(path).unwrap();
-        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto")
+            .unwrap();
 
         // 写入数据
         for i in 0..N_ROWS {
@@ -107,7 +113,8 @@ fn main() {
     let _ = std::fs::remove_file(format!("{}-wal", path));
     {
         let mut conn = Connection::open(path).unwrap();
-        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT) ENGINE = Columnar").unwrap();
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT) ENGINE = Columnar")
+            .unwrap();
         for i in 0..N_ROWS {
             conn.execute(&format!("INSERT INTO t VALUES ({}, 'row-{}')", i, i)).unwrap();
         }
@@ -120,7 +127,12 @@ fn main() {
             let mut conn = Connection::open(path).unwrap();
             let t0 = Instant::now();
             for _ in 0..1000 {
-                let _r = conn.execute(&format!("SELECT * FROM t WHERE id = {}", rand::random::<usize>() % N_ROWS)).unwrap();
+                let _r = conn
+                    .execute(&format!(
+                        "SELECT * FROM t WHERE id = {}",
+                        rand::random::<usize>() % N_ROWS
+                    ))
+                    .unwrap();
             }
             times.push(t0.elapsed());
         }
@@ -147,7 +159,12 @@ fn main() {
             let mut conn = Connection::open(path).unwrap();
             let t0 = Instant::now();
             for _ in 0..1000 {
-                let _r = conn.execute(&format!("SELECT * FROM t WHERE id = {}", rand::random::<usize>() % N_ROWS)).unwrap();
+                let _r = conn
+                    .execute(&format!(
+                        "SELECT * FROM t WHERE id = {}",
+                        rand::random::<usize>() % N_ROWS
+                    ))
+                    .unwrap();
             }
             times.push(t0.elapsed());
         }
@@ -169,9 +186,14 @@ fn main() {
 
         // 创建多个 Auto 表
         for i in 0..5 {
-            conn.execute(&format!("CREATE TABLE t{} (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto", i)).unwrap();
+            conn.execute(&format!(
+                "CREATE TABLE t{} (id INT64 PRIMARY KEY, v TEXT) ENGINE = Auto",
+                i
+            ))
+            .unwrap();
             for j in 0..N_ROWS {
-                conn.execute(&format!("INSERT INTO t{} VALUES ({}, 'row-{}')", i, j, j)).unwrap();
+                conn.execute(&format!("INSERT INTO t{} VALUES ({}, 'row-{}')", i, j, j))
+                    .unwrap();
             }
         }
 

@@ -1,51 +1,51 @@
 //! 存储引擎模块
 
-pub mod file_format;
 pub mod buffer_pool;
-pub mod column_store;
-pub mod delta_store;
-pub mod compression;
-pub mod table;
-pub mod sparse_index;
-pub mod vector_index;
 pub mod cache;
-pub mod rate_limiter;
-pub mod index;
 pub mod catalog;
+pub mod column_store;
+pub mod compression;
+pub mod delta_store;
 pub mod engine;
+pub mod file_format;
+pub mod index;
+pub mod rate_limiter;
+pub mod sparse_index;
+pub mod table;
+pub mod vector_index;
 
 #[cfg(feature = "mmap-read")]
 pub mod mmap_reader;
 
-pub mod heat_tracker;
+pub mod async_compress;
+pub mod bloom;
 pub mod bloom_filter;
-pub mod tier_migration;
+pub mod capabilities;
+#[cfg(feature = "mmap-read")]
+pub mod compact_mmap;
+pub mod heat_tracker;
+pub mod insert_batcher;
+mod log_engine;
+pub mod manifest;
+mod memory_engine;
 pub mod migration;
 pub mod mmap_integration;
 #[cfg(feature = "mmap-read")]
 pub mod mmap_writer;
-#[cfg(feature = "mmap-read")]
-pub mod compact_mmap;
-pub mod async_compress;
-pub mod bloom;
 pub mod segment;
-pub mod manifest;
-pub mod capabilities;
-pub mod insert_batcher;
-mod log_engine;
-mod memory_engine;
+pub mod tier_migration;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::common::error::{Result, EngramDbError};
-use crate::common::types::TableDef;
-use engine::EngineTable;
 use crate::common::config::Config;
+use crate::common::error::{EngramDbError, Result};
+use crate::common::types::TableDef;
 use crate::txn::TransactionManager;
+use crate::Value;
+use engine::EngineTable;
 use file_format::FileHeader;
 use table::Table;
-use crate::Value;
 
 /// 视图定义（v0.22.0 新增）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -131,7 +131,9 @@ impl Database {
         let path = if is_memory {
             let mut p = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             p.push(format!("engramdb_mem_{}_{}.hdb", std::process::id(), nanos));
             p.to_string_lossy().to_string()
         } else {
@@ -153,7 +155,9 @@ impl Database {
         let path = if is_memory {
             let mut p = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             p.push(format!("engramdb_mem_{}_{}.hdb", std::process::id(), nanos));
             p.to_string_lossy().to_string()
         } else {
@@ -185,8 +189,11 @@ impl Database {
         // 初始化事务管理器
         let path_str = path.to_string_lossy().to_string();
         let txn_manager = TransactionManager::new(&path_str, &config)?;
-        let (ib_rows, ib_bytes, ib_timeout) =
-            (config.insert_batch_rows, config.insert_batch_bytes, config.insert_batch_timeout_ms);
+        let (ib_rows, ib_bytes, ib_timeout) = (
+            config.insert_batch_rows,
+            config.insert_batch_bytes,
+            config.insert_batch_timeout_ms,
+        );
 
         // Step 2 LSM：创建段文件目录
         let segments_dir = path.with_extension("").join("segments");
@@ -227,10 +234,7 @@ impl Database {
         // v0.21：注册全局 Tokenizer（TokenDelta 压缩分派依赖）
         crate::storage::compression::init_tokenizer_from_config(&config)?;
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
 
         // 读取文件头（v0.22.1：读完整页以获取页内副本；按文件实际大小截取，
         // 截断损坏文件走 InvalidFormat 报错而非 IO UnexpectedEof）
@@ -245,8 +249,11 @@ impl Database {
         // 初始化事务管理器（会自动打开 WAL 并执行恢复）
         let path_str = path.to_string_lossy().to_string();
         let txn_manager = TransactionManager::new(&path_str, &config)?;
-        let (ib_rows, ib_bytes, ib_timeout) =
-            (config.insert_batch_rows, config.insert_batch_bytes, config.insert_batch_timeout_ms);
+        let (ib_rows, ib_bytes, ib_timeout) = (
+            config.insert_batch_rows,
+            config.insert_batch_bytes,
+            config.insert_batch_timeout_ms,
+        );
 
         let mut db = Self {
             path: path.to_path_buf(),
@@ -300,9 +307,10 @@ impl Database {
     /// 创建表
     pub fn create_table(&mut self, table_def: TableDef) -> Result<()> {
         if self.table_names.contains_key(&table_def.name) {
-            return Err(crate::common::error::EngramDbError::ConstraintViolation(
-                format!("Table '{}' already exists", table_def.name)
-            ));
+            return Err(crate::common::error::EngramDbError::ConstraintViolation(format!(
+                "Table '{}' already exists",
+                table_def.name
+            )));
         }
 
         let table_id = self.next_table_id;
@@ -321,11 +329,10 @@ impl Database {
             crate::common::types::EngineType::Memory => {
                 EngineTable::Memory(memory_engine::MemoryTable::new(table_def.clone()))
             }
-            crate::common::types::EngineType::Log => {
-                EngineTable::Log(log_engine::LogTable::with_block_rows(
-                    table_def.clone(), self.config.log_block_rows,
-                ))
-            }
+            crate::common::types::EngineType::Log => EngineTable::Log(log_engine::LogTable::with_block_rows(
+                table_def.clone(),
+                self.config.log_block_rows,
+            )),
             // Phase 2 P0-B：Auto 引擎——根据初始 heat 与表大小调度到具体引擎。
             // 当前策略：小表（< 1000 行）→ Memory，否则 → Columnar。
             // 后续由 HeatTracker 在运行时迁移。
@@ -354,10 +361,18 @@ impl Database {
         self.table_names.insert(table_def.name.clone(), table_id);
 
         // v0.14.0: 为表上的 Unique 索引自动构建（来自列级 UNIQUE 约束）
-        let unique_index_specs: Vec<(String, Vec<usize>, Vec<usize>, bool)> = table_def.indexes
+        let unique_index_specs: Vec<(String, Vec<usize>, Vec<usize>, bool)> = table_def
+            .indexes
             .iter()
             .filter(|idx| idx.unique)
-            .map(|idx| (idx.name.clone(), idx.key_columns.clone(), idx.included_columns.clone(), idx.unique))
+            .map(|idx| {
+                (
+                    idx.name.clone(),
+                    idx.key_columns.clone(),
+                    idx.included_columns.clone(),
+                    idx.unique,
+                )
+            })
             .collect();
         if let Some(EngineTable::Columnar(table_mut)) = self.tables.get_mut(&table_id) {
             for (idx_name, key_cols, included_cols, unique) in &unique_index_specs {
@@ -373,7 +388,7 @@ impl Database {
 
     /// 获取表（Columnar 引擎解包；非 Columnar 引擎返回 None）
     ///
-    /// 引擎感知的调用方应使用 [`Database::get_engine_table`] / 
+    /// 引擎感知的调用方应使用 [`Database::get_engine_table`] /
     /// [`Database::get_engine_table_mut`] 获取引擎句柄。
     pub fn get_table(&self, name: &str) -> Option<&Table> {
         self.table_names
@@ -504,10 +519,7 @@ impl Database {
                     Ok(result) => {
                         // Phase 3.5：迁移后同步更新 txn_manager 状态
                         // 1. 更新 table_engines（影响 WAL 记录头）
-                        self.txn_manager.register_table_engine(
-                            table_id,
-                            result.new_engine,
-                        );
+                        self.txn_manager.register_table_engine(table_id, result.new_engine);
                         // 2. 更新 non_persistent_tables（影响 WAL fsync 行为）
                         // Memory → 不持久化（不写 WAL COMMIT）
                         // Log/Columnar → 持久化（写 WAL COMMIT）
@@ -532,22 +544,32 @@ impl Database {
     }
 
     /// 创建覆盖索引（v0.12.0 新增）
-    pub fn create_index(&mut self, table_name: &str, index_name: &str,
-                        key_cols: &[usize], included_cols: &[usize], unique: bool) -> Result<()> {
-        let table = self.get_table_mut(table_name)
+    pub fn create_index(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        key_cols: &[usize],
+        included_cols: &[usize],
+        unique: bool,
+    ) -> Result<()> {
+        let table = self
+            .get_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.to_string()))?;
         table.create_index(index_name, key_cols, included_cols, unique)
     }
 
     /// 重命名表：同步表定义与 `table_names` 名称映射
     pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
-        let table_id = self.table_names.get(old_name)
+        let table_id = self
+            .table_names
+            .get(old_name)
             .copied()
             .ok_or_else(|| EngramDbError::TableNotFound(old_name.to_string()))?;
         if self.table_names.contains_key(new_name) {
-            return Err(EngramDbError::ConstraintViolation(
-                format!("Table '{}' already exists", new_name)
-            ));
+            return Err(EngramDbError::ConstraintViolation(format!(
+                "Table '{}' already exists",
+                new_name
+            )));
         }
         self.table_names.remove(old_name);
         self.table_names.insert(new_name.to_string(), table_id);
@@ -560,9 +582,10 @@ impl Database {
     /// 创建视图（v0.22.0 新增）
     pub fn create_view(&mut self, view_def: ViewDef, or_replace: bool) -> Result<()> {
         if !or_replace && self.views.contains_key(&view_def.name) {
-            return Err(EngramDbError::ConstraintViolation(
-                format!("View '{}' already exists", view_def.name)
-            ));
+            return Err(EngramDbError::ConstraintViolation(format!(
+                "View '{}' already exists",
+                view_def.name
+            )));
         }
         self.views.insert(view_def.name.clone(), view_def);
         Ok(())
@@ -594,7 +617,7 @@ impl Database {
     pub fn table_names(&self) -> &HashMap<String, u32> {
         &self.table_names
     }
-    
+
     /// 获取所有引擎表的可变引用（用于事务提交后应用）
     pub fn tables_mut(&mut self) -> &mut HashMap<u32, EngineTable> {
         &mut self.tables
@@ -676,11 +699,7 @@ impl Database {
     /// v0.20：入批预检（已提交状态部分）——主键点查 + 唯一索引点查 + NOT NULL
     ///
     /// 仅约束表需要；无主键/唯一索引/NOT NULL 的表零开销直接通过。
-    pub(crate) fn validate_rows_against_committed(
-        &mut self,
-        table_name: &str,
-        rows: &[Vec<Value>],
-    ) -> Result<()> {
+    pub(crate) fn validate_rows_against_committed(&mut self, table_name: &str, rows: &[Vec<Value>]) -> Result<()> {
         use crate::common::error::EngramDbError;
         // 表不存在：无约束可查（生产调用方已先做存在性校验；直接调用方
         // 的错误在 flush 的 execute_with_txn 暴露）
@@ -691,7 +710,9 @@ impl Database {
         drop(table);
         // 无约束快速路径：无主键、无唯一索引、全列可空 → 零检查
         let pk = def.primary_key_index();
-        let unique: Vec<(String, usize)> = def.indexes.iter()
+        let unique: Vec<(String, usize)> = def
+            .indexes
+            .iter()
             .filter(|i| i.unique)
             .map(|i| (i.name.clone(), i.key_columns[0]))
             .collect();
@@ -708,7 +729,8 @@ impl Database {
                     }
                     if !col.nullable && row.get(ci).is_none_or(|v| v.is_null()) {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "NOT NULL constraint failed: column '{}'", col.name
+                            "NOT NULL constraint failed: column '{}'",
+                            col.name
                         )));
                     }
                 }
@@ -717,7 +739,8 @@ impl Database {
             if let Some(pk_idx) = pk {
                 if let Some(cell) = row.get(pk_idx) {
                     if !cell.is_null()
-                        && self.get_engine_table_mut(table_name)
+                        && self
+                            .get_engine_table_mut(table_name)
                             .and_then(|t| t.lookup_primary_key(cell))
                             .is_some()
                     {
@@ -731,11 +754,13 @@ impl Database {
             // 唯一索引冲突（已提交）
             for (idx_name, key_col) in &unique {
                 if let Some(cell) = row.get(*key_col) {
-                    if self.get_engine_table(table_name)
+                    if self
+                        .get_engine_table(table_name)
                         .is_some_and(|t| t.unique_index_contains(idx_name, cell))
                     {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: index '{}'", idx_name
+                            "UNIQUE constraint failed: index '{}'",
+                            idx_name
                         )));
                     }
                 }
@@ -747,11 +772,7 @@ impl Database {
     /// v0.20：入批预检（事务 buffer 批内自重复部分）
     ///
     /// 主键 / 唯一索引键与已攒入 txn_buffer 的行判重（O(1) seen-set）。
-    fn validate_rows_against_txn_buffer(
-        &mut self,
-        table_name: &str,
-        rows: &[Vec<Value>],
-    ) -> Result<()> {
+    fn validate_rows_against_txn_buffer(&mut self, table_name: &str, rows: &[Vec<Value>]) -> Result<()> {
         use crate::common::error::EngramDbError;
         let Some(table) = self.get_engine_table(table_name) else {
             return Ok(());
@@ -759,7 +780,9 @@ impl Database {
         let def = table.def().clone();
         drop(table);
         let pk = def.primary_key_index();
-        let unique: Vec<(String, usize)> = def.indexes.iter()
+        let unique: Vec<(String, usize)> = def
+            .indexes
+            .iter()
             .filter(|i| i.unique)
             .map(|i| (i.name.clone(), i.key_columns[0]))
             .collect();
@@ -771,9 +794,7 @@ impl Database {
         for row in rows {
             if let Some(pk_idx) = pk {
                 if let Some(cell) = row.get(pk_idx) {
-                    if !cell.is_null()
-                        && (pk_seen.contains(cell) || !local_pk.insert(cell.clone()))
-                    {
+                    if !cell.is_null() && (pk_seen.contains(cell) || !local_pk.insert(cell.clone())) {
                         return Err(EngramDbError::ConstraintViolation(format!(
                             "UNIQUE constraint failed: {}={:?}",
                             def.columns[pk_idx].name, cell
@@ -793,7 +814,8 @@ impl Database {
                     let local_seen = local_unique.entry(idx_name.clone()).or_default();
                     if entry_seen || !local_seen.insert(cell.clone()) {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: index '{}'", idx_name
+                            "UNIQUE constraint failed: index '{}'",
+                            idx_name
                         )));
                     }
                 }
@@ -835,9 +857,7 @@ impl Database {
         if self.txn_buffer.is_empty() {
             return Ok(());
         }
-        let pending: Vec<(String, Vec<Vec<Value>>)> = std::mem::take(&mut self.txn_buffer)
-            .into_iter()
-            .collect();
+        let pending: Vec<(String, Vec<Vec<Value>>)> = std::mem::take(&mut self.txn_buffer).into_iter().collect();
         self.txn_buffer_rows = 0;
         self.txn_buffer_pk_seen.clear();
         self.txn_buffer_unique_seen.clear();
@@ -896,7 +916,8 @@ impl Database {
     /// 设置后，compact 时会按该列的值分组写入列存，
     /// 相同 key 的行物理上连续，可大幅提升按该列的范围查询性能。
     pub fn set_cluster_key(&mut self, table_name: &str, column_name: &str) -> Result<()> {
-        let table = self.get_table_mut(table_name)
+        let table = self
+            .get_table_mut(table_name)
             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         table.set_cluster_key(column_name)
     }
@@ -909,11 +930,23 @@ impl Database {
     ///
     /// 对指定表的向量列构建 HNSW 近似最近邻索引。
     /// 列必须是 Vector 类型。
-    pub fn create_vector_index(&mut self, table_name: &str, index_name: &str, column_name: &str, metric: crate::storage::vector_index::DistanceMetric, m: usize, ef_construction: usize) -> Result<()> {
-        let table = self.get_table_mut(table_name)
+    pub fn create_vector_index(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        column_name: &str,
+        metric: crate::storage::vector_index::DistanceMetric,
+        m: usize,
+        ef_construction: usize,
+    ) -> Result<()> {
+        let table = self
+            .get_table_mut(table_name)
             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
-        let col_idx = table.def().columns.iter()
+        let col_idx = table
+            .def()
+            .columns
+            .iter()
             .position(|c| c.name == column_name)
             .ok_or_else(|| crate::common::error::EngramDbError::ColumnNotFound(column_name.into()))?;
 
@@ -923,8 +956,15 @@ impl Database {
     /// 向量相似度搜索
     ///
     /// 返回 top-k 最近邻的行 ID 和距离。
-    pub fn vector_search(&self, table_name: &str, index_name: &str, query: &[f32], k: usize) -> Result<Vec<crate::storage::vector_index::Neighbor>> {
-        let table = self.get_table(table_name)
+    pub fn vector_search(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<crate::storage::vector_index::Neighbor>> {
+        let table = self
+            .get_table(table_name)
             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         table.vector_search(index_name, query, k)
     }
@@ -939,8 +979,12 @@ impl Database {
         index_name: &str,
         query: &[f32],
         k: usize,
-    ) -> Result<(Vec<crate::storage::vector_index::Neighbor>, crate::storage::vector_index::SearchTrace)> {
-        let table = self.get_table(table_name)
+    ) -> Result<(
+        Vec<crate::storage::vector_index::Neighbor>,
+        crate::storage::vector_index::SearchTrace,
+    )> {
+        let table = self
+            .get_table(table_name)
             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         table.vector_search_with_trace(index_name, query, k)
     }
@@ -964,11 +1008,13 @@ impl Database {
         column_indices: &[usize],
         filter_fn: &dyn Fn(&[crate::Value]) -> bool,
     ) -> Result<Vec<crate::HybridSearchResult>> {
-        let table = self.get_table_mut(table_name)
+        let table = self
+            .get_table_mut(table_name)
             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
         // 1. 获取 HNSW 索引，读取 id_mapping 和 ef_search 配置
-        let (hnsw_index, id_mapping) = table.vector_indexes()
+        let (hnsw_index, id_mapping) = table
+            .vector_indexes()
             .get(index_name)
             .ok_or_else(|| crate::common::error::EngramDbError::IndexNotFound(index_name.into()))?;
 
@@ -978,7 +1024,8 @@ impl Database {
         let neighbors = hnsw_index.search(query, candidate_k);
 
         // 3. 构建 row_id -> distance 映射（释放对 table 的不可变借用）
-        let mut candidates: Vec<(u32, f32)> = neighbors.iter()
+        let mut candidates: Vec<(u32, f32)> = neighbors
+            .iter()
             .map(|n| {
                 let row_id = if n.id < id_mapping.len() as u32 {
                     id_mapping[n.id as usize]
@@ -994,16 +1041,22 @@ impl Database {
         drop(id_mapping);
 
         // 5. 遍历候选集，读取行数据并应用标量过滤
-        let table = self.get_table_mut(table_name)
+        let table = self
+            .get_table_mut(table_name)
             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
 
         let mut results = Vec::with_capacity(candidates.len());
         for (row_id, distance) in &candidates {
             if let Some(row) = table.get_row_by_id(*row_id)? {
                 if filter_fn(&row) {
-                    let projected: Vec<crate::Value> = column_indices.iter()
+                    let projected: Vec<crate::Value> = column_indices
+                        .iter()
                         .map(|&ci| {
-                            if ci < row.len() { row[ci].clone() } else { crate::Value::Null }
+                            if ci < row.len() {
+                                row[ci].clone()
+                            } else {
+                                crate::Value::Null
+                            }
                         })
                         .collect();
                     results.push(crate::HybridSearchResult {
@@ -1027,8 +1080,13 @@ impl Database {
     }
 
     /// 设置指定表的合并策略（运行时动态切换）
-    pub fn set_table_compact_strategy(&mut self, table_name: &str, strategy: crate::common::config::CompactStrategy) -> Result<()> {
-        let table = self.get_table_mut(table_name)
+    pub fn set_table_compact_strategy(
+        &mut self,
+        table_name: &str,
+        strategy: crate::common::config::CompactStrategy,
+    ) -> Result<()> {
+        let table = self
+            .get_table_mut(table_name)
             .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
         table.set_compact_strategy(strategy);
         Ok(())
@@ -1093,7 +1151,9 @@ impl Database {
         let compress = self.config.compress_on_persist;
         let section_buf = {
             let engine = self.get_engine_table_mut(table_name).unwrap();
-            let EngineTable::Columnar(table) = engine else { unreachable!() };
+            let EngineTable::Columnar(table) = engine else {
+                unreachable!()
+            };
             table.column_store_mut().data_to_bytes(compress)?
         };
 
@@ -1101,7 +1161,10 @@ impl Database {
         let size_bytes = section_buf.len() as u64;
 
         // 更新 Manifest
-        let row_range = (self.manifest.table_row_count(table_id), self.manifest.table_row_count(table_id) + total_rows);
+        let row_range = (
+            self.manifest.table_row_count(table_id),
+            self.manifest.table_row_count(table_id) + total_rows,
+        );
         self.manifest.add_segment(manifest::ManifestSegment {
             path: seg_name,
             table_id,
@@ -1130,7 +1193,10 @@ impl Database {
         // （Connection::drop 的 best-effort checkpoint 保持不变，Drop 无法传播。）
         let ckpt_result = self.checkpoint();
         if let Err(ref e) = ckpt_result {
-            log::error!("checkpoint failed during close: {} (data may not be fully persisted)", e);
+            log::error!(
+                "checkpoint failed during close: {} (data may not be fully persisted)",
+                e
+            );
         }
 
         self.file.flush()?;
@@ -1158,10 +1224,7 @@ impl Database {
     }
 
     /// 获取缓存的查询计划（Perf02 / v0.18 P0-1 计划缓存接线）
-    pub fn get_plan_cache(
-        &self,
-        sql: &str,
-    ) -> Option<&(crate::executor::physical_plan::PhysicalPlan, bool)> {
+    pub fn get_plan_cache(&self, sql: &str) -> Option<&(crate::executor::physical_plan::PhysicalPlan, bool)> {
         self.plan_cache.get(sql)
     }
 
@@ -1194,7 +1257,9 @@ impl Database {
         &self.statistics_cache
     }
 
-    pub fn statistics_cache_mut(&mut self) -> &mut std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
+    pub fn statistics_cache_mut(
+        &mut self,
+    ) -> &mut std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
         &mut self.statistics_cache
     }
 
@@ -1273,13 +1338,13 @@ impl Database {
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated table id".into()));
             }
-            let table_id = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
+            let table_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
 
             if offset + 4 > data.len() {
                 return Err(EngramDbError::InvalidFormat("truncated table index size".into()));
             }
-            let index_data_len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            let index_data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
             if offset + index_data_len > data.len() {
@@ -1290,7 +1355,7 @@ impl Database {
             if let Some(EngineTable::Columnar(table)) = self.tables.get_mut(&table_id) {
                 let before_skip = table.indexes().len();
                 let before_vec = table.vector_indexes().len();
-                table.indexes_from_bytes(&data[offset..offset+index_data_len])?;
+                table.indexes_from_bytes(&data[offset..offset + index_data_len])?;
                 total_indexes += table.indexes().len() - before_skip;
                 total_indexes += table.vector_indexes().len() - before_vec;
             }
@@ -1323,15 +1388,16 @@ impl Database {
                     table.rebuild_primary_index()?;
                     rebuilt += 1;
                 }
-            } else if table.column_store().sparse_granule_count() == 0
-                && table.column_store().total_rows() > 0
-            {
+            } else if table.column_store().sparse_granule_count() == 0 && table.column_store().total_rows() > 0 {
                 table.column_store_mut().rebuild_sparse()?;
                 rebuilt += 1;
             }
         }
         if rebuilt > 0 {
-            log::trace!("Mark Index: rebuilt primary index for {} tables (no persisted mark segment)", rebuilt);
+            log::trace!(
+                "Mark Index: rebuilt primary index for {} tables (no persisted mark segment)",
+                rebuilt
+            );
         }
         Ok(())
     }
@@ -1348,10 +1414,7 @@ impl Database {
     pub fn save_catalog(&mut self) -> Result<u64> {
         use std::io::{Seek, Write};
 
-        let snapshot = catalog::CatalogSnapshot::collect(
-            self.next_table_id,
-            &self.tables,
-        );
+        let snapshot = catalog::CatalogSnapshot::collect(self.next_table_id, &self.tables);
         let section_buf = snapshot.to_bytes()?;
 
         // 页对齐写入
@@ -1418,11 +1481,10 @@ impl Database {
                     mem_def.row_count = 0;
                     EngineTable::Memory(memory_engine::MemoryTable::new(mem_def))
                 }
-                crate::common::types::EngineType::Log => {
-                    EngineTable::Log(log_engine::LogTable::with_block_rows(
-                        table_def.clone(), self.config.log_block_rows,
-                    ))
-                }
+                crate::common::types::EngineType::Log => EngineTable::Log(log_engine::LogTable::with_block_rows(
+                    table_def.clone(),
+                    self.config.log_block_rows,
+                )),
                 // Phase 2 P0-B：Auto 引擎恢复时按 Columnar 路径（同创建路径）
                 crate::common::types::EngineType::Auto => {
                     let mut t = Table::new(table_def.clone(), self.config.compact_strategy);
@@ -1518,11 +1580,9 @@ impl Database {
         self.file.flush()?;
         self.file.sync_data()?;
 
-        // 更新文件头（v0.22.1：索引段先 fsync 落盘，头再指向它 + 原子化头部）
-        self.header.index_root = index_root;
-        self.header.index_size = section_buf.len() as u32;
-        self.file.flush()?;
-        self.file.sync_data()?;
+        // 更新文件头（v0.22.1：数据段已先行 sync_data，头再指向它 + 原子化头部）
+        self.header.data_root = data_root;
+        self.header.data_size = section_buf.len() as u32;
         self.persist_header()?;
 
         Ok(section_buf.len() as u64)
@@ -1666,8 +1726,7 @@ impl Database {
         if reader.len() < 4 {
             return Ok(0);
         }
-        let table_count =
-            u32::from_le_bytes(reader.slice(0, 4).try_into().unwrap()) as usize;
+        let table_count = u32::from_le_bytes(reader.slice(0, 4).try_into().unwrap()) as usize;
         let mut offset: u64 = 4;
         let mut loaded = 0;
 
@@ -1675,11 +1734,9 @@ impl Database {
             if offset + 8 > reader.len() {
                 return Err(EngramDbError::InvalidFormat("truncated mmap data header".into()));
             }
-            let table_id =
-                u32::from_le_bytes(reader.slice(offset, 4).try_into().unwrap());
+            let table_id = u32::from_le_bytes(reader.slice(offset, 4).try_into().unwrap());
             offset += 4;
-            let data_len =
-                u32::from_le_bytes(reader.slice(offset, 4).try_into().unwrap()) as usize;
+            let data_len = u32::from_le_bytes(reader.slice(offset, 4).try_into().unwrap()) as usize;
             offset += 4;
 
             if offset + data_len as u64 > reader.len() {
@@ -1758,22 +1815,27 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{TableDef, ColumnDef, DataType};
+    use crate::common::types::{ColumnDef, DataType, TableDef};
     use crate::Value;
 
     fn make_test_table() -> Table {
-        let def = TableDef::new(1, "test", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("name", DataType::Varchar),
-            ColumnDef::new("score", DataType::Float64),
-        ]);
+        let def = TableDef::new(
+            1,
+            "test",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("name", DataType::Varchar),
+                ColumnDef::new("score", DataType::Float64),
+            ],
+        );
         Table::new(def, crate::common::config::CompactStrategy::Manual)
     }
 
     fn temp_db_path(suffix: &str) -> String {
         let mut p = std::env::temp_dir();
         let tid = format!("{:?}", std::thread::current().id())
-            .replace('(', "_").replace(')', "")
+            .replace('(', "_")
+            .replace(')', "")
             .replace([':', ' '], "_");
         // 追加 ThreadId：同进程并发跑多个测试线程时，用 PID 区分跨进程，
         // 用 tid 区分跨线程（Rust 默认 --test-threads > 1 多线程跑）
@@ -1858,19 +1920,25 @@ mod tests {
             let mut db = Database::open(&path).unwrap();
 
             // 创建表
-            let def = TableDef::new(1, "users", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("name", DataType::Varchar),
-            ]);
+            let def = TableDef::new(
+                1,
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("name", DataType::Varchar),
+                ],
+            );
             db.create_table(def).unwrap();
 
             // 插入数据
             let table = db.get_table_mut("users").unwrap();
-            table.insert(vec![
-                vec![Value::Int64(1), Value::Varchar("alice".into())],
-                vec![Value::Int64(2), Value::Varchar("bob".into())],
-                vec![Value::Int64(3), Value::Varchar("charlie".into())],
-            ]).unwrap();
+            table
+                .insert(vec![
+                    vec![Value::Int64(1), Value::Varchar("alice".into())],
+                    vec![Value::Int64(2), Value::Varchar("bob".into())],
+                    vec![Value::Int64(3), Value::Varchar("charlie".into())],
+                ])
+                .unwrap();
 
             // 创建索引
             table.create_index("idx_name", &[1], &[], false).unwrap();
@@ -1894,10 +1962,14 @@ mod tests {
             // v0.12.1：catalog 已在 open_existing 中自动加载
             // 若表不存在（旧文件未存 catalog），则手动创建同 ID 表兼容旧格式
             if db.get_table("users").is_none() {
-                let def = TableDef::new(1, "users", vec![
-                    ColumnDef::new("id", DataType::Int64),
-                    ColumnDef::new("name", DataType::Varchar),
-                ]);
+                let def = TableDef::new(
+                    1,
+                    "users",
+                    vec![
+                        ColumnDef::new("id", DataType::Int64),
+                        ColumnDef::new("name", DataType::Varchar),
+                    ],
+                );
                 db.create_table(def).unwrap();
             }
 
@@ -1957,20 +2029,21 @@ mod tests {
         let mut db = Database::open(&path).unwrap();
 
         // 创建带向量列的表（16 维，更贴近实际 embedding 场景）
-        let def = TableDef::new(1, "embeddings", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
-        ]);
+        let def = TableDef::new(
+            1,
+            "embeddings",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+            ],
+        );
         db.create_table(def).unwrap();
 
         // 插入 200 条向量数据
         let n = 200;
-        let rows: Vec<Vec<Value>> = (0..n).map(|i| {
-            vec![
-                Value::Int64(i as i64),
-                Value::Vector(random_vector(16, i)),
-            ]
-        }).collect();
+        let rows: Vec<Vec<Value>> = (0..n)
+            .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(16, i))])
+            .collect();
         {
             let table = db.get_table_mut("embeddings").unwrap();
             table.insert(rows).unwrap();
@@ -1984,7 +2057,8 @@ mod tests {
             crate::storage::vector_index::DistanceMetric::L2,
             16,
             200,
-        ).unwrap();
+        )
+        .unwrap();
 
         // 验证索引存在
         {
@@ -2004,8 +2078,11 @@ mod tests {
         // 自己和自己的距离应接近 0
         let self_match = results.iter().find(|r| r.id == 100);
         assert!(self_match.is_some());
-        assert!(self_match.unwrap().distance < 0.001,
-            "自己和自己距离应接近 0，实际: {}", self_match.unwrap().distance);
+        assert!(
+            self_match.unwrap().distance < 0.001,
+            "自己和自己距离应接近 0，实际: {}",
+            self_match.unwrap().distance
+        );
 
         db.close().unwrap();
         cleanup_db(&path);
@@ -2018,35 +2095,40 @@ mod tests {
 
         let mut db = Database::open(&path).unwrap();
 
-        let def = TableDef::new(1, "items", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("vec", DataType::Vector { dim: 4 }),
-        ]);
+        let def = TableDef::new(
+            1,
+            "items",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("vec", DataType::Vector { dim: 4 }),
+            ],
+        );
         db.create_table(def).unwrap();
 
         // 先插入 20 条
-        let rows1: Vec<Vec<Value>> = (0..20).map(|i| {
-            vec![
-                Value::Int64(i as i64),
-                Value::Vector(random_vector(4, i)),
-            ]
-        }).collect();
+        let rows1: Vec<Vec<Value>> = (0..20)
+            .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(4, i))])
+            .collect();
         {
             let table = db.get_table_mut("items").unwrap();
             table.insert(rows1).unwrap();
         }
 
         // 创建索引
-        db.create_vector_index("items", "idx_vec", "vec",
-            crate::storage::vector_index::DistanceMetric::L2, 8, 50).unwrap();
+        db.create_vector_index(
+            "items",
+            "idx_vec",
+            "vec",
+            crate::storage::vector_index::DistanceMetric::L2,
+            8,
+            50,
+        )
+        .unwrap();
 
         // 再插入 20 条（增量更新）
-        let rows2: Vec<Vec<Value>> = (20..40).map(|i| {
-            vec![
-                Value::Int64(i as i64),
-                Value::Vector(random_vector(4, i)),
-            ]
-        }).collect();
+        let rows2: Vec<Vec<Value>> = (20..40)
+            .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(4, i))])
+            .collect();
         {
             let table = db.get_table_mut("items").unwrap();
             table.insert(rows2).unwrap();
@@ -2077,15 +2159,26 @@ mod tests {
 
         let mut db = Database::open(&path).unwrap();
 
-        let def = TableDef::new(1, "empty_vec", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
-        ]);
+        let def = TableDef::new(
+            1,
+            "empty_vec",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+            ],
+        );
         db.create_table(def).unwrap();
 
         // 空表创建索引
-        db.create_vector_index("empty_vec", "idx_emb", "embedding",
-            crate::storage::vector_index::DistanceMetric::Cosine, 8, 50).unwrap();
+        db.create_vector_index(
+            "empty_vec",
+            "idx_emb",
+            "embedding",
+            crate::storage::vector_index::DistanceMetric::Cosine,
+            8,
+            50,
+        )
+        .unwrap();
 
         // 空索引搜索应返回空
         let query = random_vector(16, 999);
@@ -2103,18 +2196,24 @@ mod tests {
 
         let mut db = Database::open(&path).unwrap();
 
-        let def = TableDef::new(1, "t1", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("v", DataType::Vector { dim: 4 }),
-        ]);
+        let def = TableDef::new(
+            1,
+            "t1",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("v", DataType::Vector { dim: 4 }),
+            ],
+        );
         db.create_table(def).unwrap();
 
         // 搜索不存在的索引
         let query = vec![0.0; 4];
         let result = db.vector_search("t1", "no_such_index", &query, 5);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(),
-            crate::common::error::EngramDbError::IndexNotFound(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::common::error::EngramDbError::IndexNotFound(_)
+        ));
 
         cleanup_db(&path);
     }
@@ -2128,27 +2227,35 @@ mod tests {
         {
             let mut db = Database::open(&path).unwrap();
 
-            let def = TableDef::new(1, "docs", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
-            ]);
+            let def = TableDef::new(
+                1,
+                "docs",
+                vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+                ],
+            );
             db.create_table(def).unwrap();
 
             // 插入 100 条向量
-            let rows: Vec<Vec<Value>> = (0..100).map(|i| {
-                vec![
-                    Value::Int64(i as i64),
-                    Value::Vector(random_vector(16, i)),
-                ]
-            }).collect();
+            let rows: Vec<Vec<Value>> = (0..100)
+                .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(16, i))])
+                .collect();
             {
                 let table = db.get_table_mut("docs").unwrap();
                 table.insert(rows).unwrap();
             }
 
             // 创建 HNSW 索引
-            db.create_vector_index("docs", "idx_emb", "embedding",
-                crate::storage::vector_index::DistanceMetric::L2, 16, 200).unwrap();
+            db.create_vector_index(
+                "docs",
+                "idx_emb",
+                "embedding",
+                crate::storage::vector_index::DistanceMetric::L2,
+                16,
+                200,
+            )
+            .unwrap();
 
             // 验证索引存在
             {
@@ -2171,10 +2278,14 @@ mod tests {
             // v0.12.1：catalog 已在 open_existing 中自动加载
             // 若表不存在（旧文件未存 catalog），则手动创建同 ID 表兼容旧格式
             if db.get_table("docs").is_none() {
-                let def = TableDef::new(1, "docs", vec![
-                    ColumnDef::new("id", DataType::Int64),
-                    ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
-                ]);
+                let def = TableDef::new(
+                    1,
+                    "docs",
+                    vec![
+                        ColumnDef::new("id", DataType::Int64),
+                        ColumnDef::new("embedding", DataType::Vector { dim: 16 }),
+                    ],
+                );
                 db.create_table(def).unwrap();
             }
 
@@ -2211,20 +2322,26 @@ mod tests {
         {
             let mut db = Database::open(&path).unwrap();
 
-            let def = TableDef::new(1, "items", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("name", DataType::Varchar),
-                ColumnDef::new("vec", DataType::Vector { dim: 8 }),
-            ]);
+            let def = TableDef::new(
+                1,
+                "items",
+                vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("name", DataType::Varchar),
+                    ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+                ],
+            );
             db.create_table(def).unwrap();
 
-            let rows: Vec<Vec<Value>> = (0..30).map(|i| {
-                vec![
-                    Value::Int64(i as i64),
-                    Value::Varchar(format!("item_{}", i)),
-                    Value::Vector(random_vector(8, i)),
-                ]
-            }).collect();
+            let rows: Vec<Vec<Value>> = (0..30)
+                .map(|i| {
+                    vec![
+                        Value::Int64(i as i64),
+                        Value::Varchar(format!("item_{}", i)),
+                        Value::Vector(random_vector(8, i)),
+                    ]
+                })
+                .collect();
             {
                 let table = db.get_table_mut("items").unwrap();
                 table.insert(rows).unwrap();
@@ -2233,10 +2350,17 @@ mod tests {
             // 同时创建 SkipList 索引和向量索引
             {
                 let table = db.get_table_mut("items").unwrap();
-table.create_index("idx_name", &[1], &[], false).unwrap();
+                table.create_index("idx_name", &[1], &[], false).unwrap();
             }
-            db.create_vector_index("items", "idx_vec", "vec",
-                crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+            db.create_vector_index(
+                "items",
+                "idx_vec",
+                "vec",
+                crate::storage::vector_index::DistanceMetric::L2,
+                8,
+                100,
+            )
+            .unwrap();
 
             // 验证
             {
@@ -2254,11 +2378,15 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
             let mut db = Database::open(&path).unwrap();
 
             if db.get_table("items").is_none() {
-                let def = TableDef::new(1, "items", vec![
-                    ColumnDef::new("id", DataType::Int64),
-                    ColumnDef::new("name", DataType::Varchar),
-                    ColumnDef::new("vec", DataType::Vector { dim: 8 }),
-                ]);
+                let def = TableDef::new(
+                    1,
+                    "items",
+                    vec![
+                        ColumnDef::new("id", DataType::Int64),
+                        ColumnDef::new("name", DataType::Varchar),
+                        ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+                    ],
+                );
                 db.create_table(def).unwrap();
             }
 
@@ -2296,28 +2424,36 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
 
         let mut db = Database::open(&path).unwrap();
 
-        let def = TableDef::new(1, "embeddings", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("vec", DataType::Vector { dim: 8 }),
-        ]);
+        let def = TableDef::new(
+            1,
+            "embeddings",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+            ],
+        );
         db.create_table(def).unwrap();
 
         // 插入 50 条（小批量，走 Delta 层，便于 delete_delta_rows 测试）
         let n = 50;
-        let rows: Vec<Vec<Value>> = (0..n).map(|i| {
-            vec![
-                Value::Int64(i as i64),
-                Value::Vector(random_vector(8, i)),
-            ]
-        }).collect();
+        let rows: Vec<Vec<Value>> = (0..n)
+            .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(8, i))])
+            .collect();
         {
             let table = db.get_table_mut("embeddings").unwrap();
             table.insert(rows).unwrap();
         }
 
         // 创建向量索引
-        db.create_vector_index("embeddings", "idx_vec", "vec",
-            crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+        db.create_vector_index(
+            "embeddings",
+            "idx_vec",
+            "vec",
+            crate::storage::vector_index::DistanceMetric::L2,
+            8,
+            100,
+        )
+        .unwrap();
 
         // 验证初始状态
         {
@@ -2340,9 +2476,9 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         {
             let table = db.get_table("embeddings").unwrap();
             let (hnsw, _) = table.vector_indexes().get("idx_vec").unwrap();
-            assert_eq!(hnsw.len(), 50);         // 物理节点数不变
+            assert_eq!(hnsw.len(), 50); // 物理节点数不变
             assert_eq!(hnsw.deleted_count(), 10); // 10 个 tombstone
-            assert_eq!(hnsw.active_len(), 40);   // 40 个有效
+            assert_eq!(hnsw.active_len(), 40); // 40 个有效
         }
 
         // 搜索已删除的向量（id=15），结果中不应出现
@@ -2350,15 +2486,13 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         let results = db.vector_search("embeddings", "idx_vec", &query, 10).unwrap();
         for r in &results {
             // 行 id 10-19 已被删除，不应出现在结果中
-            assert!(r.id < 10 || r.id >= 20,
-                "结果中包含已删除行 id={}", r.id);
+            assert!(r.id < 10 || r.id >= 20, "结果中包含已删除行 id={}", r.id);
         }
 
         // 搜索未删除的向量（id=42），应该能找到
         let query2 = random_vector(8, 42);
         let results2 = db.vector_search("embeddings", "idx_vec", &query2, 5).unwrap();
-        assert!(results2.iter().any(|r| r.id == 42),
-            "未删除的 id=42 应能被搜索到");
+        assert!(results2.iter().any(|r| r.id == 42), "未删除的 id=42 应能被搜索到");
 
         db.close().unwrap();
         cleanup_db(&path);
@@ -2372,28 +2506,36 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
 
         let mut db = Database::open(&path).unwrap();
 
-        let def = TableDef::new(1, "items", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("vec", DataType::Vector { dim: 8 }),
-        ]);
+        let def = TableDef::new(
+            1,
+            "items",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("vec", DataType::Vector { dim: 8 }),
+            ],
+        );
         db.create_table(def).unwrap();
 
         // 插入 30 条（走 Delta 层）
         let n = 30;
-        let rows: Vec<Vec<Value>> = (0..n).map(|i| {
-            vec![
-                Value::Int64(i as i64),
-                Value::Vector(random_vector(8, i)),
-            ]
-        }).collect();
+        let rows: Vec<Vec<Value>> = (0..n)
+            .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(8, i))])
+            .collect();
         {
             let table = db.get_table_mut("items").unwrap();
             table.insert(rows).unwrap();
         }
 
         // 创建向量索引
-        db.create_vector_index("items", "idx_vec", "vec",
-            crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+        db.create_vector_index(
+            "items",
+            "idx_vec",
+            "vec",
+            crate::storage::vector_index::DistanceMetric::L2,
+            8,
+            100,
+        )
+        .unwrap();
 
         // 验证初始状态
         {
@@ -2407,9 +2549,7 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         let new_vec = random_vector(8, 9999); // 用一个新的 seed 生成不同的向量
         {
             let table = db.get_table_mut("items").unwrap();
-            let updates = vec![
-                (5, vec![(1, Value::Vector(new_vec.clone()))]),
-            ];
+            let updates = vec![(5, vec![(1, Value::Vector(new_vec.clone()))])];
             let updated = table.update_delta_rows(&updates).unwrap();
             assert_eq!(updated, 1);
         }
@@ -2418,9 +2558,9 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         {
             let table = db.get_table("items").unwrap();
             let (hnsw, _) = table.vector_indexes().get("idx_vec").unwrap();
-            assert_eq!(hnsw.len(), 31);         // 旧节点 + 新节点
+            assert_eq!(hnsw.len(), 31); // 旧节点 + 新节点
             assert_eq!(hnsw.deleted_count(), 1); // 旧向量 tombstone
-            assert_eq!(hnsw.active_len(), 30);   // 有效向量数不变
+            assert_eq!(hnsw.active_len(), 30); // 有效向量数不变
         }
 
         // 搜索旧向量（id=5 的原始向量 seed=5），不应再找到 row_id=5
@@ -2439,13 +2579,14 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         // 搜索新向量（seed=9999），应该能找到 row_id=5
         let new_query = random_vector(8, 9999);
         let results_new = db.vector_search("items", "idx_vec", &new_query, 5).unwrap();
-        assert!(results_new.iter().any(|r| r.id == 5),
-            "更新后的新向量应能通过 row_id=5 被搜索到");
+        assert!(
+            results_new.iter().any(|r| r.id == 5),
+            "更新后的新向量应能通过 row_id=5 被搜索到"
+        );
         // 距离自己应接近 0
         let self_match = results_new.iter().find(|r| r.id == 5);
         assert!(self_match.is_some(), "应找到更新后的向量");
-        assert!(self_match.unwrap().distance < 0.001,
-            "自己和自己距离应接近 0");
+        assert!(self_match.unwrap().distance < 0.001, "自己和自己距离应接近 0");
 
         db.close().unwrap();
         cleanup_db(&path);
@@ -2460,27 +2601,35 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         {
             let mut db = Database::open(&path).unwrap();
 
-            let def = TableDef::new(1, "docs", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
-            ]);
+            let def = TableDef::new(
+                1,
+                "docs",
+                vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
+                ],
+            );
             db.create_table(def).unwrap();
 
             // 插入 40 条
-            let rows: Vec<Vec<Value>> = (0..40).map(|i| {
-                vec![
-                    Value::Int64(i as i64),
-                    Value::Vector(random_vector(8, i)),
-                ]
-            }).collect();
+            let rows: Vec<Vec<Value>> = (0..40)
+                .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(8, i))])
+                .collect();
             {
                 let table = db.get_table_mut("docs").unwrap();
                 table.insert(rows).unwrap();
             }
 
             // 创建向量索引
-            db.create_vector_index("docs", "idx_emb", "embedding",
-                crate::storage::vector_index::DistanceMetric::L2, 8, 100).unwrap();
+            db.create_vector_index(
+                "docs",
+                "idx_emb",
+                "embedding",
+                crate::storage::vector_index::DistanceMetric::L2,
+                8,
+                100,
+            )
+            .unwrap();
 
             // 删除 10 行
             {
@@ -2507,10 +2656,14 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
             let mut db = Database::open(&path).unwrap();
 
             if db.get_table("docs").is_none() {
-                let def = TableDef::new(1, "docs", vec![
-                    ColumnDef::new("id", DataType::Int64),
-                    ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
-                ]);
+                let def = TableDef::new(
+                    1,
+                    "docs",
+                    vec![
+                        ColumnDef::new("id", DataType::Int64),
+                        ColumnDef::new("embedding", DataType::Vector { dim: 8 }),
+                    ],
+                );
                 db.create_table(def).unwrap();
             }
 
@@ -2527,8 +2680,7 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
             let results = table.vector_search("idx_emb", &query, 10).unwrap();
             for r in &results {
                 // row_id 5-14 已删除
-                assert!(r.id < 5 || r.id >= 15,
-                    "结果中包含已删除行 id={}", r.id);
+                assert!(r.id < 5 || r.id >= 15, "结果中包含已删除行 id={}", r.id);
             }
 
             db.close().unwrap();
@@ -2545,26 +2697,34 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
 
         let mut db = Database::open(&path).unwrap();
 
-        let def = TableDef::new(1, "small", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("vec", DataType::Vector { dim: 4 }),
-        ]);
+        let def = TableDef::new(
+            1,
+            "small",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("vec", DataType::Vector { dim: 4 }),
+            ],
+        );
         db.create_table(def).unwrap();
 
         // 插入 5 条
-        let rows: Vec<Vec<Value>> = (0..5).map(|i| {
-            vec![
-                Value::Int64(i as i64),
-                Value::Vector(random_vector(4, i)),
-            ]
-        }).collect();
+        let rows: Vec<Vec<Value>> = (0..5)
+            .map(|i| vec![Value::Int64(i as i64), Value::Vector(random_vector(4, i))])
+            .collect();
         {
             let table = db.get_table_mut("small").unwrap();
             table.insert(rows).unwrap();
         }
 
-        db.create_vector_index("small", "idx_vec", "vec",
-            crate::storage::vector_index::DistanceMetric::L2, 4, 20).unwrap();
+        db.create_vector_index(
+            "small",
+            "idx_vec",
+            "vec",
+            crate::storage::vector_index::DistanceMetric::L2,
+            4,
+            20,
+        )
+        .unwrap();
 
         // 删除全部 5 行
         {
@@ -2605,24 +2765,30 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         {
             let mut db = Database::open(&path).unwrap();
 
-            let def = TableDef::new(1, "mixed", vec![
-                ColumnDef::new("id", DataType::Int32),       // Delta/FOR 压缩
-                ColumnDef::new("name", DataType::Varchar),    // Dictionary 压缩
-                ColumnDef::new("score", DataType::Float64),   // Gorilla 压缩
-                ColumnDef::new("active", DataType::Boolean),  // BooleanPack 压缩
-            ]);
+            let def = TableDef::new(
+                1,
+                "mixed",
+                vec![
+                    ColumnDef::new("id", DataType::Int32),       // Delta/FOR 压缩
+                    ColumnDef::new("name", DataType::Varchar),   // Dictionary 压缩
+                    ColumnDef::new("score", DataType::Float64),  // Gorilla 压缩
+                    ColumnDef::new("active", DataType::Boolean), // BooleanPack 压缩
+                ],
+            );
             db.create_table(def).unwrap();
 
             let table = db.get_table_mut("mixed").unwrap();
             let names = ["alice", "bob", "charlie"];
-            let rows: Vec<Vec<Value>> = (0..300u32).map(|i| {
-                vec![
-                    Value::Int32(i as i32),
-                    Value::Varchar(names[(i % 3) as usize].into()),
-                    Value::Float64(i as f64 * 0.1),
-                    Value::Boolean(i % 2 == 0),
-                ]
-            }).collect();
+            let rows: Vec<Vec<Value>> = (0..300u32)
+                .map(|i| {
+                    vec![
+                        Value::Int32(i as i32),
+                        Value::Varchar(names[(i % 3) as usize].into()),
+                        Value::Float64(i as f64 * 0.1),
+                        Value::Boolean(i % 2 == 0),
+                    ]
+                })
+                .collect();
             table.insert(rows).unwrap();
 
             db.checkpoint().unwrap();
@@ -2671,19 +2837,25 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         {
             let mut db = Database::open(&path).unwrap();
 
-            let def = TableDef::new(1, "events", vec![
-                ColumnDef::new("id", DataType::Int64),
-                ColumnDef::new("label", DataType::Varchar),
-            ]);
+            let def = TableDef::new(
+                1,
+                "events",
+                vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("label", DataType::Varchar),
+                ],
+            );
             db.create_table(def).unwrap();
 
             let table = db.get_table_mut("events").unwrap();
-            let rows: Vec<Vec<Value>> = (0..200i64).map(|i| {
-                vec![
-                    Value::Int64(i),
-                    Value::Varchar(if i % 2 == 0 { "even" } else { "odd" }.into()),
-                ]
-            }).collect();
+            let rows: Vec<Vec<Value>> = (0..200i64)
+                .map(|i| {
+                    vec![
+                        Value::Int64(i),
+                        Value::Varchar(if i % 2 == 0 { "even" } else { "odd" }.into()),
+                    ]
+                })
+                .collect();
             table.insert(rows).unwrap();
 
             db.checkpoint().unwrap();
@@ -2696,12 +2868,14 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
 
             // 追加新数据（触发 ensure_rg_decompressed）
             let table = db.get_table_mut("events").unwrap();
-            let new_rows: Vec<Vec<Value>> = (200..250i64).map(|i| {
-                vec![
-                    Value::Int64(i),
-                    Value::Varchar(if i % 2 == 0 { "even" } else { "odd" }.into()),
-                ]
-            }).collect();
+            let new_rows: Vec<Vec<Value>> = (200..250i64)
+                .map(|i| {
+                    vec![
+                        Value::Int64(i),
+                        Value::Varchar(if i % 2 == 0 { "even" } else { "odd" }.into()),
+                    ]
+                })
+                .collect();
             table.insert(new_rows).unwrap();
 
             // compact 把新 Delta 合并到列存
@@ -2738,19 +2912,20 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
             config.compress_on_persist = false;
             let mut db = Database::open_with_config(&path, config).unwrap();
 
-            let def = TableDef::new(1, "raw", vec![
-                ColumnDef::new("id", DataType::Int32),
-                ColumnDef::new("tag", DataType::Varchar),
-            ]);
+            let def = TableDef::new(
+                1,
+                "raw",
+                vec![
+                    ColumnDef::new("id", DataType::Int32),
+                    ColumnDef::new("tag", DataType::Varchar),
+                ],
+            );
             db.create_table(def).unwrap();
 
             let table = db.get_table_mut("raw").unwrap();
-            let rows: Vec<Vec<Value>> = (0..100u32).map(|i| {
-                vec![
-                    Value::Int32(i as i32),
-                    Value::Varchar(format!("item_{}", i % 5)),
-                ]
-            }).collect();
+            let rows: Vec<Vec<Value>> = (0..100u32)
+                .map(|i| vec![Value::Int32(i as i32), Value::Varchar(format!("item_{}", i % 5))])
+                .collect();
             table.insert(rows).unwrap();
 
             db.checkpoint().unwrap();
@@ -2822,10 +2997,17 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
     #[test]
     fn test_txn_buffer_flush_persists() {
         let mut db = Database::open(":memory:").unwrap();
-        db.create_table(TableDef::new(0, "t", vec![
-            crate::common::types::ColumnDef::new("id", crate::common::types::DataType::Int64),
-        ])).unwrap();
-        db.txn_buffer_push("t", vec![vec![crate::Value::Int64(1)], vec![crate::Value::Int64(2)]]).unwrap();
+        db.create_table(TableDef::new(
+            0,
+            "t",
+            vec![crate::common::types::ColumnDef::new(
+                "id",
+                crate::common::types::DataType::Int64,
+            )],
+        ))
+        .unwrap();
+        db.txn_buffer_push("t", vec![vec![crate::Value::Int64(1)], vec![crate::Value::Int64(2)]])
+            .unwrap();
         db.flush_txn_buffer().unwrap();
         assert!(db.txn_buffer_is_empty());
         // 数据已落 Delta（读己之写）
@@ -2838,12 +3020,24 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
     #[test]
     fn test_txn_buffer_flush_multi_table() {
         let mut db = Database::open(":memory:").unwrap();
-        db.create_table(TableDef::new(0, "a", vec![
-            crate::common::types::ColumnDef::new("id", crate::common::types::DataType::Int64),
-        ])).unwrap();
-        db.create_table(TableDef::new(1, "b", vec![
-            crate::common::types::ColumnDef::new("id", crate::common::types::DataType::Int64),
-        ])).unwrap();
+        db.create_table(TableDef::new(
+            0,
+            "a",
+            vec![crate::common::types::ColumnDef::new(
+                "id",
+                crate::common::types::DataType::Int64,
+            )],
+        ))
+        .unwrap();
+        db.create_table(TableDef::new(
+            1,
+            "b",
+            vec![crate::common::types::ColumnDef::new(
+                "id",
+                crate::common::types::DataType::Int64,
+            )],
+        ))
+        .unwrap();
         db.txn_buffer_push("a", vec![vec![crate::Value::Int64(1)]]).unwrap();
         db.txn_buffer_push("b", vec![vec![crate::Value::Int64(2)]]).unwrap();
         db.flush_txn_buffer().unwrap();
@@ -2863,9 +3057,8 @@ table.create_index("idx_name", &[1], &[], false).unwrap();
         let _ = std::fs::remove_file(format!("{}-wal", path));
         {
             let mut db = Database::open(&path).unwrap();
-            db.create_table(TableDef::new(0, "t", vec![
-                ColumnDef::new("id", DataType::Int64),
-            ])).unwrap();
+            db.create_table(TableDef::new(0, "t", vec![ColumnDef::new("id", DataType::Int64)]))
+                .unwrap();
             // 插入数据（走 delta）
             let ids: Vec<Value> = (0..2000i64).map(Value::Int64).collect();
             db.get_engine_table_mut("t").unwrap().insert_columns(vec![ids]).unwrap();

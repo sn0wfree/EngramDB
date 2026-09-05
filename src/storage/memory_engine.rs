@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::common::column_data::ColumnData;
-use crate::common::error::{Result, EngramDbError};
+use crate::common::error::{EngramDbError, Result};
 use crate::common::types::{EngineType, TableDef};
 use crate::executor::vector::{DataChunk, Vector};
 use crate::storage::column_store::{matches_predicate, PredicateOp};
@@ -196,9 +196,7 @@ impl MemoryTable {
             _ => return Ok(None),
         };
         Ok(Some(
-            cols.iter()
-                .map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null))
-                .collect(),
+            cols.iter().map(|&ci| row.get(ci).cloned().unwrap_or(Value::Null)).collect(),
         ))
     }
 
@@ -209,11 +207,20 @@ impl MemoryTable {
         }
         use Value::*;
         match key {
-            Int32(v) => self.primary.get(&Int64(*v as i64)).copied()
+            Int32(v) => self
+                .primary
+                .get(&Int64(*v as i64))
+                .copied()
                 .or_else(|| self.primary.get(&Timestamp(*v as i64)).copied()),
-            Int64(v) => self.primary.get(&Int32(*v as i32)).copied()
+            Int64(v) => self
+                .primary
+                .get(&Int32(*v as i32))
+                .copied()
                 .or_else(|| self.primary.get(&Timestamp(*v)).copied()),
-            Timestamp(v) => self.primary.get(&Int64(*v)).copied()
+            Timestamp(v) => self
+                .primary
+                .get(&Int64(*v))
+                .copied()
                 .or_else(|| self.primary.get(&Int32(*v as i32)).copied()),
             _ => None,
         }
@@ -257,10 +264,7 @@ impl MemoryTable {
                     None => columns.push(Vector::Flat(slice)),
                 }
             }
-            chunks.push(DataChunk {
-                columns,
-                count: len,
-            });
+            chunks.push(DataChunk { columns, count: len });
             start += len;
         }
         Ok(chunks)
@@ -387,7 +391,10 @@ mod tests {
         t.insert(vec![row(1, "a"), row(2, "b")]).unwrap();
         assert_eq!(t.row_count(), 2);
         assert_eq!(t.get_row_by_id(0).unwrap().unwrap(), row(1, "a"));
-        assert_eq!(t.get_row_by_id_columns(1, &[1]).unwrap().unwrap(), vec![Value::Varchar("b".into())]);
+        assert_eq!(
+            t.get_row_by_id_columns(1, &[1]).unwrap().unwrap(),
+            vec![Value::Varchar("b".into())]
+        );
         assert!(t.get_row_by_id(9).unwrap().is_none());
     }
 
@@ -476,7 +483,11 @@ mod tests {
         assert!(t.is_empty());
         assert_eq!(t.lookup_primary_key(&Value::Int64(1)), None);
         t.insert(vec![row(9, "z")]).unwrap();
-        assert_eq!(t.get_row_by_id(0).unwrap().unwrap()[0], Value::Int64(9), "truncate 后 row_id 重置");
+        assert_eq!(
+            t.get_row_by_id(0).unwrap().unwrap()[0],
+            Value::Int64(9),
+            "truncate 后 row_id 重置"
+        );
     }
 
     #[test]
@@ -488,8 +499,17 @@ mod tests {
         }
         t.insert(rows).unwrap();
         t.delete_row(3).unwrap(); // tombstone 跳过
-        let out = t.scan_to_rows_direct(&[1], Some((0, PredicateOp::GtEq, Value::Int64(7)))).unwrap();
-        assert_eq!(out, vec![vec![Value::Varchar("r7".into())], vec![Value::Varchar("r8".into())], vec![Value::Varchar("r9".into())]]);
+        let out = t
+            .scan_to_rows_direct(&[1], Some((0, PredicateOp::GtEq, Value::Int64(7))))
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                vec![Value::Varchar("r7".into())],
+                vec![Value::Varchar("r8".into())],
+                vec![Value::Varchar("r9".into())]
+            ]
+        );
         // 全列 + 谓词命中 tombstone 区域
         let out2 = t.scan_to_rows_direct(&[0, 1], None).unwrap();
         assert_eq!(out2.len(), 9, "tombstone 行不计入");

@@ -56,7 +56,11 @@ fn build_rows(corpus: &[String]) -> Vec<String> {
             rows.push(end);
         }
     }
-    for t in corpus.iter().step_by(corpus.len() / INDEPENDENT_MSGS.max(1)).take(INDEPENDENT_MSGS) {
+    for t in corpus
+        .iter()
+        .step_by(corpus.len() / INDEPENDENT_MSGS.max(1))
+        .take(INDEPENDENT_MSGS)
+    {
         rows.push(t.clone());
     }
     rows
@@ -133,7 +137,12 @@ fn main() {
     for i in 0..5 {
         queries.push(format!("{} {}", zh[i], en[i]));
     }
-    println!("query 集：{} 条（中文 {} + 英文 {} + 混合 5）", queries.len(), zh.len(), en.len());
+    println!(
+        "query 集：{} 条（中文 {} + 英文 {} + 混合 5）",
+        queries.len(),
+        zh.len(),
+        en.len()
+    );
 
     // ---- 3. 查询耗时（真实检索层 API）----
     let mut t_fts = 0u128;
@@ -197,7 +206,10 @@ fn main() {
         let def = TableDef::new(
             1,
             "t",
-            vec![ColumnDef::new("id", DataType::Int64), ColumnDef::new("content", DataType::Varchar)],
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("content", DataType::Varchar),
+            ],
         );
         db.create_table(def).unwrap();
         if with_fts {

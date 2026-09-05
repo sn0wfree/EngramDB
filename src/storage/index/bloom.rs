@@ -10,8 +10,8 @@
 //! - 内存占用极小：100 万元素、1% 误报率仅需 ~1.13 MB
 
 use crate::Value;
-use std::hash::{Hash, Hasher};
 use fxhash::FxHasher64;
+use std::hash::{Hash, Hasher};
 
 /// 布隆过滤器
 #[derive(Debug, Clone)]

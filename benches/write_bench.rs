@@ -48,7 +48,11 @@ fn bench_single_insert(count: usize) {
     for i in 0..count {
         let sql = format!(
             "INSERT INTO bench VALUES ({}, 'user_{}', {}, {:.1}, {})",
-            i, i, 20 + (i % 40), (i % 100) as f64, i % 2 == 0
+            i,
+            i,
+            20 + (i % 40),
+            (i % 100) as f64,
+            i % 2 == 0
         );
         conn.execute(&sql).unwrap();
     }
@@ -64,7 +68,10 @@ fn bench_single_insert(count: usize) {
 }
 
 fn bench_batch_sql(total: usize, batch_size: usize) {
-    println!("【测试 2】批量 INSERT SQL（共 {} 行，{} 行/批，P2+P3 优化）", total, batch_size);
+    println!(
+        "【测试 2】批量 INSERT SQL（共 {} 行，{} 行/批，P2+P3 优化）",
+        total, batch_size
+    );
     let path = format!("/tmp/bench_batch_{}_{}.db", total, batch_size);
     let _ = std::fs::remove_file(&path);
 
@@ -82,7 +89,11 @@ fn bench_batch_sql(total: usize, batch_size: usize) {
             }
             sql.push_str(&format!(
                 "({}, 'user_{}', {}, {:.1}, {})",
-                i, i, 20 + (i % 40), (i % 100) as f64, i % 2 == 0
+                i,
+                i,
+                20 + (i % 40),
+                (i % 100) as f64,
+                i % 2 == 0
             ));
         }
         conn.execute(&sql).unwrap();
@@ -92,7 +103,11 @@ fn bench_batch_sql(total: usize, batch_size: usize) {
 
     let rows_per_sec = total as f64 / elapsed.as_secs_f64();
     println!("  耗时: {:.3}s", elapsed.as_secs_f64());
-    println!("  速度: {:.1} 行/秒 ({:.1} 万行/秒)", rows_per_sec, rows_per_sec / 10000.0);
+    println!(
+        "  速度: {:.1} 行/秒 ({:.1} 万行/秒)",
+        rows_per_sec,
+        rows_per_sec / 10000.0
+    );
     println!();
 
     conn.close().unwrap();
@@ -100,7 +115,10 @@ fn bench_batch_sql(total: usize, batch_size: usize) {
 }
 
 fn bench_prepared(total: usize, batch_size: usize) {
-    println!("【测试 3】Prepared Statement 批量（共 {} 行，{} 行/批，P0 优化）", total, batch_size);
+    println!(
+        "【测试 3】Prepared Statement 批量（共 {} 行，{} 行/批，P0 优化）",
+        total, batch_size
+    );
     let path = format!("/tmp/bench_prepared_{}_{}.db", total, batch_size);
     let _ = std::fs::remove_file(&path);
 
@@ -131,7 +149,11 @@ fn bench_prepared(total: usize, batch_size: usize) {
 
     let rows_per_sec = total as f64 / elapsed.as_secs_f64();
     println!("  耗时: {:.3}s", elapsed.as_secs_f64());
-    println!("  速度: {:.1} 行/秒 ({:.1} 万行/秒)", rows_per_sec, rows_per_sec / 10000.0);
+    println!(
+        "  速度: {:.1} 行/秒 ({:.1} 万行/秒)",
+        rows_per_sec,
+        rows_per_sec / 10000.0
+    );
     println!();
 
     conn.close().unwrap();
@@ -139,7 +161,10 @@ fn bench_prepared(total: usize, batch_size: usize) {
 }
 
 fn bench_prepared_large(total: usize) {
-    println!("【测试 4】Prepared Statement 大批量（{} 行，触发 P1 直接列式路径）", total);
+    println!(
+        "【测试 4】Prepared Statement 大批量（{} 行，触发 P1 直接列式路径）",
+        total
+    );
     let path = format!("/tmp/bench_prepared_large_{}.db", total);
     let _ = std::fs::remove_file(&path);
 
@@ -167,7 +192,11 @@ fn bench_prepared_large(total: usize) {
 
     let rows_per_sec = total as f64 / elapsed.as_secs_f64();
     println!("  耗时: {:.3}s", elapsed.as_secs_f64());
-    println!("  速度: {:.1} 行/秒 ({:.1} 万行/秒)", rows_per_sec, rows_per_sec / 10000.0);
+    println!(
+        "  速度: {:.1} 行/秒 ({:.1} 万行/秒)",
+        rows_per_sec,
+        rows_per_sec / 10000.0
+    );
     println!();
 
     conn.close().unwrap();

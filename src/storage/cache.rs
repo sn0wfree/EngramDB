@@ -110,9 +110,7 @@ impl KVCache {
         if let Some(&idx) = self.map.get(key) {
             let ttl = self.arena[idx].as_ref().unwrap().entry.ttl_seconds;
             if let Some(t) = ttl {
-                if self.arena[idx].as_ref().unwrap().entry.created_at.elapsed()
-                    > Duration::from_secs(t)
-                {
+                if self.arena[idx].as_ref().unwrap().entry.created_at.elapsed() > Duration::from_secs(t) {
                     self.remove_internal(*key);
                     self.stats.misses += 1;
                     return None;
@@ -182,8 +180,7 @@ impl KVCache {
 
         // TTL 索引
         if let Some(ttl) = ttl_seconds {
-            let expiry_bucket = (std::time::SystemTime::now()
-                + std::time::Duration::from_secs(ttl))
+            let expiry_bucket = (std::time::SystemTime::now() + std::time::Duration::from_secs(ttl))
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or(std::time::Duration::ZERO)
                 .as_secs();
@@ -226,10 +223,7 @@ impl KVCache {
             .unwrap_or(std::time::Duration::ZERO)
             .as_secs();
 
-        let expired_buckets: Vec<u64> = self.ttl_index
-            .range(..=now)
-            .map(|(k, _)| *k)
-            .collect();
+        let expired_buckets: Vec<u64> = self.ttl_index.range(..=now).map(|(k, _)| *k).collect();
 
         let mut count = 0;
         for bucket in expired_buckets {
@@ -307,11 +301,7 @@ impl KVCache {
 
     /// 把节点插入对应分区的 MRU（head）
     fn push_front(&mut self, idx: usize, protected: bool) {
-        let head = if protected {
-            self.p_head
-        } else {
-            self.pb_head
-        };
+        let head = if protected { self.p_head } else { self.pb_head };
         // 设新 head 的 prev = None, next = 旧 head
         {
             let node = self.arena[idx].as_mut().unwrap();
@@ -339,11 +329,7 @@ impl KVCache {
 
     /// 取对应分区的 LRU（tail）节点 idx 并 unlink（不释放 arena）
     fn pop_tail(&mut self, protected: bool) -> Option<usize> {
-        let tail = if protected {
-            self.p_tail
-        } else {
-            self.pb_tail
-        }?;
+        let tail = if protected { self.p_tail } else { self.pb_tail }?;
         self.unlink(tail);
         Some(tail)
     }
@@ -400,12 +386,7 @@ impl KVCache {
     }
 
     fn recalculate_memory(&mut self) {
-        self.current_memory = self
-            .arena
-            .iter()
-            .filter_map(|n| n.as_ref())
-            .map(|n| n.entry.size)
-            .sum();
+        self.current_memory = self.arena.iter().filter_map(|n| n.as_ref()).map(|n| n.entry.size).sum();
     }
 }
 

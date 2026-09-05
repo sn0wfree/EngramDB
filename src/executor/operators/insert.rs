@@ -4,9 +4,9 @@
 //! - 事务路径（enable_transaction=true）：保证 ACID，通过 WAL + MVCC
 //! - 非事务路径（enable_transaction=false）：高性能直接写入，跳过 WAL/MVCC
 
-use log::{error, warn, info, debug, trace};
+use log::{debug, error, info, trace, warn};
 
-use crate::common::error::{Result, EngramDbError};
+use crate::common::error::{EngramDbError, Result};
 use crate::common::types::DataType;
 use crate::storage::Database;
 use crate::txn::{ApplyOp, IsolationLevel};
@@ -46,17 +46,15 @@ pub(crate) fn coerce_rows_to_column_types(
     Ok(rows)
 }
 
-
 /// 执行行式插入（根据配置选择事务/非事务路径）
 ///
 /// `bypass_batch`：绕过 P0-2 攒批合并（INSERT ... RETURNING 需立即读回插入行）。
-pub fn execute(
-    db: &mut Database,
-    table_name: &str,
-    rows: Vec<Vec<Value>>,
-    bypass_batch: bool,
-) -> Result<u64> {
-    trace!("insert::execute called: table_name={}, rows_count={}", table_name, rows.len());
+pub fn execute(db: &mut Database, table_name: &str, rows: Vec<Vec<Value>>, bypass_batch: bool) -> Result<u64> {
+    trace!(
+        "insert::execute called: table_name={}, rows_count={}",
+        table_name,
+        rows.len()
+    );
 
     // 类型强转：字面量按列定义转换（如 100 → Int16、19.99 → Decimal）
     let rows = coerce_rows_to_column_types(db, table_name, rows)?;
@@ -64,32 +62,40 @@ pub fn execute(
     // 防御性检查：事务路径需要 txn_manager 已初始化
     if db.config().enable_transaction {
         debug!("Transaction path enabled, checking txn_manager readiness...");
-        
+
         if !db.txn_manager().is_ready() {
             error!("Transaction manager not ready");
             error!("Config: enable_transaction=true but txn_manager is not initialized");
             error!("This is likely a bug in Database initialization");
-            
+
             // 生产环境降级到非事务路径
             warn!("Falling back to non-transaction path due to txn_manager not ready");
             return execute_without_txn(db, table_name, rows);
         }
         debug!("✓ txn_manager is ready");
     }
-    
+
     // 防御性检查：表存在
     debug!("Checking if table '{}' exists...", table_name);
-    let _table_id = db.table_names().get(table_name)
-        .ok_or_else(|| {
-            error!("Table '{}' not found", table_name);
-            EngramDbError::TableNotFound(table_name.into())
-        })?;
+    let _table_id = db.table_names().get(table_name).ok_or_else(|| {
+        error!("Table '{}' not found", table_name);
+        EngramDbError::TableNotFound(table_name.into())
+    })?;
     debug!("✓ Table '{}' exists", table_name);
-    
+
     // 根据配置选择路径
-    let path = if db.config().enable_transaction { "txn" } else { "direct" };
-    info!("Executing INSERT: table={}, rows={}, path={}", table_name, rows.len(), path);
-    
+    let path = if db.config().enable_transaction {
+        "txn"
+    } else {
+        "direct"
+    };
+    info!(
+        "Executing INSERT: table={}, rows={}, path={}",
+        table_name,
+        rows.len(),
+        path
+    );
+
     if db.config().enable_transaction {
         // P0-2 攒批合并（autocommit 逐行 INSERT）：先入批，阈值触发才落盘。
         // v0.20：主键/唯一索引/NOT NULL 表也可入批（入批时即校验，错误
@@ -108,7 +114,8 @@ pub fn execute(
             let (pk_col, unique_cols) = match def {
                 Some(d) => (
                     d.primary_key_index(),
-                    d.indexes.iter()
+                    d.indexes
+                        .iter()
                         .filter(|i| i.unique)
                         .map(|i| (i.name.clone(), i.key_columns[0]))
                         .collect::<Vec<_>>(),
@@ -163,8 +170,8 @@ fn table_batchable(db: &Database, table_name: &str) -> bool {
     if !def.foreign_keys.is_empty() || def.ttl_column.is_some() {
         return false;
     }
-    let has_any_constraint = !def.indexes.is_empty()
-        || def.columns.iter().any(|c| !c.nullable || c.is_primary_key || c.auto_increment);
+    let has_any_constraint =
+        !def.indexes.is_empty() || def.columns.iter().any(|c| !c.nullable || c.is_primary_key || c.auto_increment);
     if !has_any_constraint {
         // 无约束表：无需预检，直接入批（v0.18 原行为，任何引擎）
         return true;
@@ -216,17 +223,14 @@ pub fn flush_all_batched(db: &mut Database) -> Result<()> {
 ///
 /// `pub(crate)`：事务级 Batcher（`Database::flush_txn_buffer`）复用此路径
 /// 将事务 buffer 一次性落盘。
-pub(crate) fn execute_with_txn(
-    db: &mut Database,
-    table_name: &str,
-    rows: Vec<Vec<Value>>,
-) -> Result<u64> {
+pub(crate) fn execute_with_txn(db: &mut Database, table_name: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
     debug!("Starting transaction path execution...");
 
     // 0. 冲突预检（PK / 唯一索引；失败零副作用，事务未开启）
     //    防止 apply 阶段失败导致 MVCC 已提交版本残留（rowid 复用误判 Update）
     if !rows.is_empty() {
-        let table_def = db.get_engine_table(table_name)
+        let table_def = db
+            .get_engine_table(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?
             .def()
             .clone();
@@ -234,9 +238,7 @@ pub(crate) fn execute_with_txn(
         // CHECK 约束验证（v0.22.0 新增）
         validate_check_constraints(&table_def, &rows)?;
 
-        let conflict_indices: Vec<usize> = table_def.primary_key_index()
-            .map(|pk| vec![pk])
-            .unwrap_or_default();
+        let conflict_indices: Vec<usize> = table_def.primary_key_index().map(|pk| vec![pk]).unwrap_or_default();
         if !conflict_indices.is_empty() {
             let pk_name = table_def.columns[conflict_indices[0]].name.clone();
             let mut seen = std::collections::HashSet::new();
@@ -248,14 +250,15 @@ pub(crate) fn execute_with_txn(
                     }
                     if !seen.insert(cell.clone()) {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: {}={:?}", pk_name, cell
+                            "UNIQUE constraint failed: {}={:?}",
+                            pk_name, cell
                         )));
                     }
-                    let conflict = db.get_engine_table_mut(table_name)
-                        .and_then(|t| t.lookup_primary_key(cell));
+                    let conflict = db.get_engine_table_mut(table_name).and_then(|t| t.lookup_primary_key(cell));
                     if conflict.is_some() {
                         return Err(EngramDbError::ConstraintViolation(format!(
-                            "UNIQUE constraint failed: {}={:?}", pk_name, cell
+                            "UNIQUE constraint failed: {}={:?}",
+                            pk_name, cell
                         )));
                     }
                 }
@@ -263,7 +266,9 @@ pub(crate) fn execute_with_txn(
         }
         // v0.20：唯一索引冲突预检（批内自重复 + 已提交点查；整批一次摊薄）。
         // 与批量 apply（update_indexes_for_rows）的键列语义一致：key_columns[0]。
-        let unique_idx: Vec<(String, usize)> = table_def.indexes.iter()
+        let unique_idx: Vec<(String, usize)> = table_def
+            .indexes
+            .iter()
             .filter(|i| i.unique)
             .map(|i| (i.name.clone(), i.key_columns[0]))
             .collect();
@@ -275,14 +280,17 @@ pub(crate) fn execute_with_txn(
                     if let Some(cell) = row.get(*key_col) {
                         if !seen[i].insert(cell.clone()) {
                             return Err(EngramDbError::ConstraintViolation(format!(
-                                "UNIQUE constraint failed: index '{}'", idx_name
+                                "UNIQUE constraint failed: index '{}'",
+                                idx_name
                             )));
                         }
-                        if db.get_engine_table(table_name)
+                        if db
+                            .get_engine_table(table_name)
                             .is_some_and(|t| t.unique_index_contains(idx_name, cell))
                         {
                             return Err(EngramDbError::ConstraintViolation(format!(
-                                "UNIQUE constraint failed: index '{}'", idx_name
+                                "UNIQUE constraint failed: index '{}'",
+                                idx_name
                             )));
                         }
                     }
@@ -290,31 +298,32 @@ pub(crate) fn execute_with_txn(
             }
         }
     }
-    
+
     // 1. 开启事务
     debug!("Beginning transaction...");
     let isolation = db.config().default_isolation_level;
     let txn_id = db.txn_manager_mut().begin(isolation)?;
     info!("Transaction started: txn_id={}, isolation={:?}", txn_id, isolation);
-    
+
     // 2. 事务内插入行（P-W2a：批量走 batch_insert，单次 WAL + MVCC）
     debug!("Inserting {} rows in transaction {}...", rows.len(), txn_id);
     let table_id = *db.table_names().get(table_name).unwrap();
-    let base_row_id = db
-        .get_engine_table(table_name)
-        .map(|et| et.def().row_count as u32)
-        .unwrap_or(0);
+    let base_row_id = db.get_engine_table(table_name).map(|et| et.def().row_count as u32).unwrap_or(0);
     let rows_len = rows.len();
 
     db.txn_manager_mut().batch_insert(txn_id, table_id, base_row_id as u64, rows)?;
     debug!("✓ All {} rows inserted in transaction {} (batch)", rows_len, txn_id);
-    
+
     // 3. 提交事务（会 fsync WAL）
     debug!("Committing transaction {}...", txn_id);
     let result = db.txn_manager_mut().commit(txn_id)?;
-    info!("Transaction {} committed: commit_ts={}, apply_ops_count={}",
-          txn_id, result.commit_ts, result.apply_ops.len());
-    
+    info!(
+        "Transaction {} committed: commit_ts={}, apply_ops_count={}",
+        txn_id,
+        result.commit_ts,
+        result.apply_ops.len()
+    );
+
     // 4. 应用到存储层；失败必须 abort 事务（清理 MVCC 残留版本，
     //    否则失败事务占用的 rowid 会残留版本链，导致后续语句被误判为 Update）
     debug!("Applying {} operations to storage...", result.apply_ops.len());
@@ -323,7 +332,7 @@ pub(crate) fn execute_with_txn(
         return Err(e);
     }
     info!("✓ Applied {} operations to storage", rows_len);
-    
+
     info!("Transaction path completed: {} rows inserted", rows_len);
     Ok(rows_len as u64)
 }
@@ -331,19 +340,16 @@ pub(crate) fn execute_with_txn(
 /// 非事务路径执行：高性能直接写入
 ///
 /// 直接调用 table.insert()，跳过 WAL 和 MVCC
-fn execute_without_txn(
-    db: &mut Database,
-    table_name: &str,
-    rows: Vec<Vec<Value>>,
-) -> Result<u64> {
+fn execute_without_txn(db: &mut Database, table_name: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
     debug!("Starting non-transaction path execution...");
-    
-    let table = db.get_engine_table_mut(table_name)
+
+    let table = db
+        .get_engine_table_mut(table_name)
         .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
-    
+
     debug!("Inserting {} rows directly into table '{}'...", rows.len(), table_name);
     table.insert_rows(rows.clone())?;
-    
+
     info!("Non-transaction path completed: {} rows inserted", rows.len());
     Ok(rows.len() as u64)
 }
@@ -361,12 +367,16 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
     let mut idx = 0;
     while idx < ops.len() {
         // P-W2c：InsertBatch 直接列式落盘（优先分支）
-        if let ApplyOp::InsertBatch { table_id, base_row_id, columns } = &ops[idx] {
-            let table = db.tables_mut().get_mut(table_id)
-                .ok_or_else(|| {
-                    error!("Table not found: table_id={}", table_id);
-                    EngramDbError::TableNotFound(format!("id={}", table_id))
-                })?;
+        if let ApplyOp::InsertBatch {
+            table_id,
+            base_row_id,
+            columns,
+        } = &ops[idx]
+        {
+            let table = db.tables_mut().get_mut(table_id).ok_or_else(|| {
+                error!("Table not found: table_id={}", table_id);
+                EngramDbError::TableNotFound(format!("id={}", table_id))
+            })?;
 
             // 仅当 base_row_id 与当前表行数对齐时走 insert_columns（列式批量）
             // 否则退回逐行 insert_row（保持 rowid 语义）
@@ -390,14 +400,20 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                     }
                     table.insert_row_with_check((*base_row_id + i as u64) as u32, &row, true)?;
                 }
-                debug!("✓ InsertBatch applied (non-aligned): table_id={}, rows={}", table_id, num_rows);
+                debug!(
+                    "✓ InsertBatch applied (non-aligned): table_id={}, rows={}",
+                    table_id, num_rows
+                );
             }
             idx += 1;
             continue;
         }
 
         // 检测当前位置开始的「连续同表 Insert」段
-        if let ApplyOp::Insert { table_id: start_tid, .. } = ops[idx] {
+        if let ApplyOp::Insert {
+            table_id: start_tid, ..
+        } = ops[idx]
+        {
             // 收集后续与 start_tid 相同的 Insert
             let mut run_end = idx + 1;
             while run_end < ops.len() {
@@ -417,23 +433,26 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(run_len);
                 let mut row_ids: Vec<u32> = Vec::with_capacity(run_len);
                 for op in &mut ops[idx..run_end] {
-                    if let ApplyOp::Insert { table_id: _, row_id, row } = op {
+                    if let ApplyOp::Insert {
+                        table_id: _,
+                        row_id,
+                        row,
+                    } = op
+                    {
                         rows.push(std::mem::take(row));
                         row_ids.push(*row_id as u32);
                     }
                 }
 
-                let table = db.tables_mut().get_mut(&start_tid)
-                    .ok_or_else(|| {
-                        error!("Table not found: table_id={}", start_tid);
-                        EngramDbError::TableNotFound(format!("id={}", start_tid))
-                    })?;
+                let table = db.tables_mut().get_mut(&start_tid).ok_or_else(|| {
+                    error!("Table not found: table_id={}", start_tid);
+                    EngramDbError::TableNotFound(format!("id={}", start_tid))
+                })?;
 
                 // 只有当 row_ids 与当前 table.def.row_count 连续对齐时，才能走 table.insert()
                 // （因为 insert() 内部使用 def.row_count 作为 base_row_id）
                 let base = table.def().row_count as u32;
-                let contiguous = row_ids.iter().enumerate()
-                    .all(|(i, &rid)| rid == base + i as u32);
+                let contiguous = row_ids.iter().enumerate().all(|(i, &rid)| rid == base + i as u32);
 
                 if contiguous {
                     // 走批量路径（内部一次 row_count += N，一次索引批量构建）
@@ -445,7 +464,10 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                     for (i, row) in rows.into_iter().enumerate() {
                         table.insert_row_with_check(row_ids[i], &row, true)?;
                     }
-                    debug!("✓ Insert applied (non-contiguous): table_id={}, count={}", start_tid, run_len);
+                    debug!(
+                        "✓ Insert applied (non-contiguous): table_id={}, count={}",
+                        start_tid, run_len
+                    );
                 }
 
                 idx = run_end;
@@ -460,23 +482,25 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
         match op {
             ApplyOp::Insert { table_id, row_id, row } => {
                 trace!("Insert: table_id={}, row_id={}, row={:?}", table_id, row_id, row);
-                let table = db.tables_mut().get_mut(table_id)
-                    .ok_or_else(|| {
-                        error!("Table not found: table_id={}", table_id);
-                        error!("This indicates a bug in collect_apply_ops()");
-                        EngramDbError::TableNotFound(format!("id={}", table_id))
-                    })?;
+                let table = db.tables_mut().get_mut(table_id).ok_or_else(|| {
+                    error!("Table not found: table_id={}", table_id);
+                    error!("This indicates a bug in collect_apply_ops()");
+                    EngramDbError::TableNotFound(format!("id={}", table_id))
+                })?;
                 table.insert_row_with_check(*row_id as u32, row, true)?;
                 debug!("✓ Insert applied: table_id={}, row_id={}", table_id, row_id);
             }
-            ApplyOp::InsertBatch { table_id, base_row_id, columns } => {
+            ApplyOp::InsertBatch {
+                table_id,
+                base_row_id,
+                columns,
+            } => {
                 // 防御分支：正常情况下 InsertBatch 在循环顶部已被处理
                 // （该分支仅当 ops 顺序异常时可达）
-                let table = db.tables_mut().get_mut(table_id)
-                    .ok_or_else(|| {
-                        error!("Table not found: table_id={}", table_id);
-                        EngramDbError::TableNotFound(format!("id={}", table_id))
-                    })?;
+                let table = db.tables_mut().get_mut(table_id).ok_or_else(|| {
+                    error!("Table not found: table_id={}", table_id);
+                    EngramDbError::TableNotFound(format!("id={}", table_id))
+                })?;
                 let num_rows = columns.first().map(|c| c.len()).unwrap_or(0);
                 for i in 0..num_rows {
                     let mut row = Vec::with_capacity(columns.len());
@@ -489,27 +513,37 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
                     }
                     table.insert_row_with_check((*base_row_id + i as u64) as u32, &row, true)?;
                 }
-                debug!("✓ InsertBatch applied (fallback): table_id={}, rows={}", table_id, num_rows);
+                debug!(
+                    "✓ InsertBatch applied (fallback): table_id={}, rows={}",
+                    table_id, num_rows
+                );
             }
-            ApplyOp::Update { table_id, row_id, new_row } => {
-                trace!("Update: table_id={}, row_id={}, new_row={:?}", table_id, row_id, new_row);
-                let table = db.tables_mut().get_mut(table_id)
-                    .ok_or_else(|| {
-                        error!("Table not found: table_id={}", table_id);
-                        error!("This indicates a bug in collect_apply_ops()");
-                        EngramDbError::TableNotFound(format!("id={}", table_id))
-                    })?;
+            ApplyOp::Update {
+                table_id,
+                row_id,
+                new_row,
+            } => {
+                trace!(
+                    "Update: table_id={}, row_id={}, new_row={:?}",
+                    table_id,
+                    row_id,
+                    new_row
+                );
+                let table = db.tables_mut().get_mut(table_id).ok_or_else(|| {
+                    error!("Table not found: table_id={}", table_id);
+                    error!("This indicates a bug in collect_apply_ops()");
+                    EngramDbError::TableNotFound(format!("id={}", table_id))
+                })?;
                 table.update_row(*row_id as u32, new_row)?;
                 debug!("✓ Update applied: table_id={}, row_id={}", table_id, row_id);
             }
             ApplyOp::Delete { table_id, row_id } => {
                 trace!("Delete: table_id={}, row_id={}", table_id, row_id);
-                let table = db.tables_mut().get_mut(table_id)
-                    .ok_or_else(|| {
-                        error!("Table not found: table_id={}", table_id);
-                        error!("This indicates a bug in collect_apply_ops()");
-                        EngramDbError::TableNotFound(format!("id={}", table_id))
-                    })?;
+                let table = db.tables_mut().get_mut(table_id).ok_or_else(|| {
+                    error!("Table not found: table_id={}", table_id);
+                    error!("This indicates a bug in collect_apply_ops()");
+                    EngramDbError::TableNotFound(format!("id={}", table_id))
+                })?;
                 table.delete_row(*row_id as u32)?;
                 debug!("✓ Delete applied: table_id={}, row_id={}", table_id, row_id);
             }
@@ -530,11 +564,7 @@ pub fn apply_to_storage(db: &mut Database, mut ops: Vec<ApplyOp>) -> Result<()> 
 /// - 非事务路径（enable_transaction=false）：直接列式写入
 ///   `table.insert_columns`（语义与 `table.insert(rows)` 一致：
 ///   类型强转 / AUTO_INCREMENT / TTL / NOT NULL / 索引维护）
-pub fn execute_columns(
-    db: &mut Database,
-    table_name: &str,
-    columns: Vec<Vec<Value>>,
-) -> Result<u64> {
+pub fn execute_columns(db: &mut Database, table_name: &str, columns: Vec<Vec<Value>>) -> Result<u64> {
     let num_rows = if columns.is_empty() { 0 } else { columns[0].len() };
     if num_rows == 0 {
         return Ok(0);
@@ -588,12 +618,9 @@ pub fn execute_columns(
 }
 
 /// 非事务路径的列式直写
-fn insert_columns_direct(
-    db: &mut Database,
-    table_name: &str,
-    columns: Vec<Vec<Value>>,
-) -> Result<u64> {
-    let table = db.get_engine_table_mut(table_name)
+fn insert_columns_direct(db: &mut Database, table_name: &str, columns: Vec<Vec<Value>>) -> Result<u64> {
+    let table = db
+        .get_engine_table_mut(table_name)
         .ok_or_else(|| crate::common::error::EngramDbError::TableNotFound(table_name.into()))?;
     table.insert_columns(columns)
 }
@@ -602,10 +629,7 @@ fn insert_columns_direct(
 ///
 /// 对每一行的每一列，如果列定义了 CHECK 约束，则验证约束是否满足。
 /// CHECK 表达式格式：简单的比较表达式，如 "age > 0"、"salary >= 1000"
-fn validate_check_constraints(
-    table_def: &crate::common::types::TableDef,
-    rows: &[Vec<Value>],
-) -> Result<()> {
+fn validate_check_constraints(table_def: &crate::common::types::TableDef, rows: &[Vec<Value>]) -> Result<()> {
     use crate::common::error::EngramDbError;
 
     for (col_idx, col_def) in table_def.columns.iter().enumerate() {
@@ -719,7 +743,7 @@ fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
         let abs_pos = start + pos;
         // 检查单词边界
         let before_ok = abs_pos == 0 || !upper.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
-        let after_ok = abs_pos + keyword.len() >= upper.len() 
+        let after_ok = abs_pos + keyword.len() >= upper.len()
             || !upper.as_bytes()[abs_pos + keyword.len()].is_ascii_alphanumeric();
         if before_ok && after_ok {
             return Some(abs_pos);
@@ -738,7 +762,7 @@ fn eval_between(expr: &str, value: &Value) -> Result<Option<bool>> {
             let high_str = expr[between_pos + 7 + and_pos + 3..].trim();
             let low = parse_literal(low_str);
             let high = parse_literal(high_str);
-            
+
             let ge_low = compare_values(value, &low, ">=")?;
             let le_high = compare_values(value, &high, "<=")?;
             return Ok(Some(ge_low && le_high));
@@ -771,58 +795,42 @@ fn eval_in_list(expr: &str, value: &Value) -> Result<Option<bool>> {
 fn compare_values(left: &Value, right: &Value, op: &str) -> Result<bool> {
     match (left, right) {
         (Value::Null, _) => Ok(true), // NULL 值跳过 CHECK（SQL 标准）
-        (Value::Int64(v), Value::Int64(l)) => {
-            match op {
-                ">" => Ok(v > l),
-                ">=" => Ok(v >= l),
-                "<" => Ok(v < l),
-                "<=" => Ok(v <= l),
-                "=" => Ok(v == l),
-                "!=" | "<>" => Ok(v != l),
-                _ => Ok(true),
-            }
-        }
-        (Value::Int32(v), Value::Int64(l)) => {
-            compare_values(&Value::Int64(*v as i64), right, op)
-        }
-        (Value::Int64(v), Value::Int32(l)) => {
-            compare_values(left, &Value::Int64(*l as i64), op)
-        }
-        (Value::Float64(v), Value::Float64(l)) => {
-            match op {
-                ">" => Ok(v > l),
-                ">=" => Ok(v >= l),
-                "<" => Ok(v < l),
-                "<=" => Ok(v <= l),
-                "=" => Ok(v == l),
-                "!=" | "<>" => Ok(v != l),
-                _ => Ok(true),
-            }
-        }
-        (Value::Float32(v), Value::Float64(l)) => {
-            compare_values(&Value::Float64(*v as f64), right, op)
-        }
-        (Value::Float64(v), Value::Float32(l)) => {
-            compare_values(left, &Value::Float64(*l as f64), op)
-        }
-        (Value::Varchar(v), Value::Varchar(l)) => {
-            match op {
-                "=" => Ok(v == l),
-                "!=" | "<>" => Ok(v != l),
-                ">" => Ok(v > l),
-                ">=" => Ok(v >= l),
-                "<" => Ok(v < l),
-                "<=" => Ok(v <= l),
-                _ => Ok(true),
-            }
-        }
-        (Value::Boolean(v), Value::Boolean(l)) => {
-            match op {
-                "=" => Ok(v == l),
-                "!=" | "<>" => Ok(v != l),
-                _ => Ok(true),
-            }
-        }
+        (Value::Int64(v), Value::Int64(l)) => match op {
+            ">" => Ok(v > l),
+            ">=" => Ok(v >= l),
+            "<" => Ok(v < l),
+            "<=" => Ok(v <= l),
+            "=" => Ok(v == l),
+            "!=" | "<>" => Ok(v != l),
+            _ => Ok(true),
+        },
+        (Value::Int32(v), Value::Int64(l)) => compare_values(&Value::Int64(*v as i64), right, op),
+        (Value::Int64(v), Value::Int32(l)) => compare_values(left, &Value::Int64(*l as i64), op),
+        (Value::Float64(v), Value::Float64(l)) => match op {
+            ">" => Ok(v > l),
+            ">=" => Ok(v >= l),
+            "<" => Ok(v < l),
+            "<=" => Ok(v <= l),
+            "=" => Ok(v == l),
+            "!=" | "<>" => Ok(v != l),
+            _ => Ok(true),
+        },
+        (Value::Float32(v), Value::Float64(l)) => compare_values(&Value::Float64(*v as f64), right, op),
+        (Value::Float64(v), Value::Float32(l)) => compare_values(left, &Value::Float64(*l as f64), op),
+        (Value::Varchar(v), Value::Varchar(l)) => match op {
+            "=" => Ok(v == l),
+            "!=" | "<>" => Ok(v != l),
+            ">" => Ok(v > l),
+            ">=" => Ok(v >= l),
+            "<" => Ok(v < l),
+            "<=" => Ok(v <= l),
+            _ => Ok(true),
+        },
+        (Value::Boolean(v), Value::Boolean(l)) => match op {
+            "=" => Ok(v == l),
+            "!=" | "<>" => Ok(v != l),
+            _ => Ok(true),
+        },
         _ => Ok(true), // 类型不匹配，默认通过
     }
 }
@@ -832,9 +840,7 @@ fn parse_literal(s: &str) -> Value {
     let s = s.trim();
 
     // 字符串字面量
-    if (s.starts_with('\'') && s.ends_with('\''))
-        || (s.starts_with('"') && s.ends_with('"'))
-    {
+    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
         return Value::Varchar(s[1..s.len() - 1].to_string());
     }
 
@@ -874,10 +880,16 @@ mod tests {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         let db = conn.database_mut();
-        let n = execute(db, "t", vec![
-            vec![Value::Int64(1), Value::Int64(10)],
-            vec![Value::Int64(2), Value::Int64(20)],
-        ], true).unwrap();
+        let n = execute(
+            db,
+            "t",
+            vec![
+                vec![Value::Int64(1), Value::Int64(10)],
+                vec![Value::Int64(2), Value::Int64(20)],
+            ],
+            true,
+        )
+        .unwrap();
         assert_eq!(n, 2);
         let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
         assert_eq!(rows.len(), 2);
@@ -922,7 +934,10 @@ mod tests {
         let db = conn.database_mut();
         execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(10)]], true).unwrap();
         let err = execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(99)]], true).unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)), "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}"
+        );
         // 失败无副作用：行数不变
         assert_eq!(db.get_table("t").unwrap().def().row_count, 1);
     }
@@ -934,10 +949,15 @@ mod tests {
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         let db = conn.database_mut();
-        let n = execute_columns(db, "t", vec![
-            vec![Value::Int64(1), Value::Int64(2)],
-            vec![Value::Int64(10), Value::Int64(20)],
-        ]).unwrap();
+        let n = execute_columns(
+            db,
+            "t",
+            vec![
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Int64(10), Value::Int64(20)],
+            ],
+        )
+        .unwrap();
         assert_eq!(n, 2);
         let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
         assert_eq!(rows.len(), 2);
@@ -1006,8 +1026,10 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         let err = conn.execute("INSERT INTO t VALUES (1, 99)").unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}"
+        );
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(1));
     }
@@ -1022,8 +1044,10 @@ mod tests {
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(1));
         let err = conn.execute("INSERT INTO t VALUES (5, 99)").unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1033,8 +1057,10 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, u INT UNIQUE)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         let err = conn.execute("INSERT INTO t VALUES (2, 100)").unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}"
+        );
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(1));
     }
@@ -1048,8 +1074,10 @@ mod tests {
         // 大批量（>threshold 走列式/批量 apply）含批内唯一重复
         let rows: Vec<Vec<Value>> = (0..2000).map(|i| vec![Value::Int64(i), Value::Int64(i % 100)]).collect();
         let err = crate::executor::operators::insert::execute(conn.database_mut(), "t", rows, true).unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -1058,8 +1086,10 @@ mod tests {
         let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL)").unwrap();
         let err = conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "got: {err:?}"
+        );
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(0));
     }
@@ -1068,7 +1098,8 @@ mod tests {
     fn test_auto_increment_pk_batched_ids_contiguous() {
         // auto_increment 主键表攒批：flush 分配 ID 连续正确
         let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
-        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v INT)").unwrap();
+        conn.execute("CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v INT)")
+            .unwrap();
         for i in 0..10 {
             conn.execute("INSERT INTO t (v) VALUES (100)").unwrap();
         }
@@ -1101,8 +1132,10 @@ mod tests {
         let mut txn = conn.begin().unwrap();
         txn.insert("t", vec![vec![Value::Int64(1), Value::Int64(10)]]).unwrap();
         let err = txn.insert("t", vec![vec![Value::Int64(1), Value::Int64(99)]]).unwrap_err();
-        assert!(matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
-            "Transaction API 重复 PK 应在 insert 即时报错, got: {err:?}");
+        assert!(
+            matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
+            "Transaction API 重复 PK 应在 insert 即时报错, got: {err:?}"
+        );
         txn.rollback().unwrap();
     }
 
@@ -1122,12 +1155,17 @@ mod tests {
         // FK 表仍绕过攒批（table_excludes_batch）：INSERT 立即落盘（非攒批）
         let mut conn = crate::Connection::open_with_config(":memory:", small_batch_cfg()).unwrap();
         conn.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
-        conn.execute("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))").unwrap();
+        conn.execute("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))")
+            .unwrap();
         conn.execute("INSERT INTO p VALUES (1)").unwrap();
         conn.execute("INSERT INTO c VALUES (10, 1)").unwrap();
         // FK 表不攒批：插入后立即可见（无需 flush 即可从原始 API 读到）
         let db = conn.database_mut();
-        let rows = db.get_engine_table_mut("c").unwrap().scan_to_rows_direct(&[0, 1], None).unwrap();
+        let rows = db
+            .get_engine_table_mut("c")
+            .unwrap()
+            .scan_to_rows_direct(&[0, 1], None)
+            .unwrap();
         assert_eq!(rows.len(), 1, "FK 表应绕过攒批、立即落盘");
         assert_eq!(rows[0][1], Value::Int64(1));
     }

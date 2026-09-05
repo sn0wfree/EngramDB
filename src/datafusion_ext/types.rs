@@ -53,9 +53,7 @@ pub fn make_field(name: &str, dt: &DataType, nullable: bool) -> Field {
 }
 
 /// 将 EngramDB 列定义转为 Arrow Schema
-pub fn columns_to_schema(
-    columns: &[(String, DataType, bool)],
-) -> arrow::datatypes::Schema {
+pub fn columns_to_schema(columns: &[(String, DataType, bool)]) -> arrow::datatypes::Schema {
     let fields: Vec<Field> = columns
         .iter()
         .map(|(name, dt, nullable)| make_field(name, dt, *nullable))
