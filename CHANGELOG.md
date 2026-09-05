@@ -3,6 +3,44 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [0.22.4] - 2026-08-30
+
+### 语义对齐与资源治理
+
+#### `:memory:` 临时文件治理
+- **Drop 不再泄漏临时文件**：`Connection::drop` 原用 `path == ":memory:"`
+  判断内存库，但 open 时路径已映射为随机临时名——检查永远不匹配，
+  每个内存库 Drop 都会 checkpoint 并在临时目录泄漏一个 `.hdb` 文件
+- **Database 新增 `is_memory` 标志**：open 时判定，Drop 时跳过持久化
+  （内存库的持久化永远不会再被读到）并删除主文件 + WAL 临时文件
+- 新增 `Database::remove_memory_files()` / `is_memory()` 公开方法
+
+#### 浮点除零对齐 SQLite（**行为变更**）
+- **`x / 0.0`、`x % 0.0` 返回 NULL 而非 NaN**：三条求值路径（标量
+  eval_arith、Typed 向量化 arith_typed_f64、Flat 向量化 arith_f64_pair）
+  全部对齐；NaN 参与排序/比较的非标准行为消除，差分测试噪音源清除
+- Typed 路径的除零 NULL 通过 nulls 位图标记（`arith_f64_pair_inner`
+  改为 `Option<f64>` 返回，与整数路径的既有模式一致）
+- 2 个断言 NaN 的测试更新；差分测试新增浮点除零用例
+
+#### CAST 溢出防护
+- **整数降位 CAST 越界返回 NULL**：`CAST(i64 AS INT32/SMALLINT)` 原
+  `as` 静默环绕（如 70000 → 4464）；现 `try_from` 校验，越界 → NULL
+  （与算术溢出约定一致）
+- **DECIMAL 缩放乘法 checked**：`CAST(大整数 AS DECIMAL(s=38))` 的
+  `i128 × 10^scale` 溢出从 panic/环绕改为 NULL
+
+#### 查询计划缓存
+- **大批量 DML 后缓存失效**：单语句影响 ≥512 行时清空计划缓存——
+  缓存计划基于优化时的数据分布，大批量变更后 CBO 的 join order 决策
+  可能严重过时；阈值避开逐行 UPDATE 场景的缓存抖动
+
+### 修改文件
+- `src/storage/mod.rs`：`is_memory` 字段 + open 链路 + `remove_memory_files`
+- `src/lib.rs`：Connection::drop 内存库分支 + execute DML 缓存失效
+- `src/executor/expression.rs`：三条浮点除零路径 + CAST/DECIMAL 防护 + 2 测试
+- `tests/differential_sqlite.rs`：除零差分用例 + 注释更新
+
 ## [0.22.3] - 2026-08-30
 
 ### 谓词下推正确性修复（错误结果级）

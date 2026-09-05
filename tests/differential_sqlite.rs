@@ -6,8 +6,9 @@
 //! 运行：`cargo test --release --test differential_sqlite -- --nocapture`
 //!
 //! 注：仅覆盖两边语义应当一致的保守 SQL 子集。
-//! 已知差异（不计入失败）：f64 除零 EngramDB 返回 NaN 而 SQLite 返回 NULL；
-//! LIMIT 非字面量（如 LIMIT 5+1）EngramDB 报解析错误（v0.22.1 起，见 docs/assessment-v0.22.md）。
+//! 已知差异（不计入失败）：LIMIT 非字面量（如 LIMIT 5+1）EngramDB 报解析
+//! 错误（v0.22.1 起，见 docs/assessment-v0.22.md）。
+//! v0.22.4 起浮点除零已对齐 SQLite（返回 NULL），纳入差分覆盖。
 
 use engramdb::{Connection, Value};
 
@@ -221,4 +222,7 @@ fn diff_expression_arith() {
     assert_same("mul add", &mut eng, &lite, "SELECT id, age * 2 + 1 FROM users WHERE id < 5 ORDER BY id");
     assert_same("agg expr", &mut eng, &lite, "SELECT SUM(amount * 2) FROM orders");
     assert_same("predicate expr", &mut eng, &lite, "SELECT id FROM orders WHERE amount * 2 >= 900 ORDER BY oid");
+    // v0.22.4：浮点除零 → NULL（对齐 SQLite；oid=1000 的 amount=0）
+    assert_same("float div by zero", &mut eng, &lite,
+        "SELECT amount * 1.0 / amount FROM orders WHERE oid = 1000");
 }

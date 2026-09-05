@@ -760,7 +760,7 @@ fn eval_binary_vectorized(left: &Vector, op: BinaryOperator, right: &Vector) -> 
 //
 // 语义约束（与原路径严格一致）：
 // - Int 算术：checked 溢出 / 除零 → NULL；结果 Int64（as_i64 优先于 as_f64）
-// - Float 算术：除零 → NAN；Float32 无 as_f64 → fallback（原路径得 NULL）
+// - Float 算术：除零/模零 → NULL（v0.22.4 对齐 SQLite）；Float32 无 as_f64 → fallback（原路径得 NULL）
 // - 比较：Int×Float 按 f64 partial_cmp（NaN → Equal）；Str/Bool 直接比较
 // - NULL 传播 / SQL 三值逻辑
 
@@ -1052,7 +1052,13 @@ fn const_arith_f64(v: &[f64], cv: f64, op: BinaryOperator, nulls: &Option<BitVec
             continue;
         }
         let (a, b) = if reversed { (cv, v[i]) } else { (v[i], cv) };
-        out.push(arith_f64_pair_inner(a, op, b));
+        match arith_f64_pair_inner(a, op, b) {
+            Some(r) => out.push(r),
+            None => {
+                out.push(0.0);
+                flags[i] = true;
+            }
+        }
     }
     (out, nulls_from_flags(&flags))
 }
@@ -1303,27 +1309,31 @@ fn arith_i64_pair_inner(a: i64, op: BinaryOperator, b: i64) -> Option<i64> {
     }
 }
 
-// --- 浮点算术（Typed；除零 → NAN，与原 eval_arith 一致）---
+// --- 浮点算术（Typed；除零/模零 → NULL，v0.22.4 对齐 SQLite）---
 
 fn arith_typed_f64(la: &[f64], ra: &[f64], op: BinaryOperator, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
     let mut out = Vec::with_capacity(la.len());
     let mut overflow = vec![false; la.len()];
     let has_null = ln.is_some() || rn.is_some();
-    if has_null {
-        for i in 0..la.len() {
-            if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+    // any_null：输入 NULL 或除零产生的新 NULL（决定是否需要构建位图）
+    let mut any_null = has_null;
+    for i in 0..la.len() {
+        if ln.as_ref().map_or(false, |b| b.test(i)) || rn.as_ref().map_or(false, |b| b.test(i)) {
+            out.push(0.0);
+            overflow[i] = true;
+            continue;
+        }
+        match arith_f64_pair_inner(la[i], op, ra[i]) {
+            Some(r) => out.push(r),
+            None => {
+                // v0.22.4：除零/模零 → NULL（原 NaN）
                 out.push(0.0);
                 overflow[i] = true;
-                continue;
+                any_null = true;
             }
-            out.push(arith_f64_pair_inner(la[i], op, ra[i]));
-        }
-    } else {
-        for i in 0..la.len() {
-            out.push(arith_f64_pair_inner(la[i], op, ra[i]));
         }
     }
-    let nulls = if has_null {
+    let nulls = if any_null {
         merge_nulls_with(ln, rn, &overflow, la.len())
     } else {
         None
@@ -1332,23 +1342,25 @@ fn arith_typed_f64(la: &[f64], ra: &[f64], op: BinaryOperator, ln: &Option<BitVe
 }
 
 #[inline(always)]
-fn arith_f64_pair_inner(a: f64, op: BinaryOperator, b: f64) -> f64 {
+fn arith_f64_pair_inner(a: f64, op: BinaryOperator, b: f64) -> Option<f64> {
+    // v0.22.4：除零/模零 → None（NULL，对齐 SQLite），与 arith_i64_pair_inner
+    // 的 Option 模式一致；原返回 NaN
     match op {
-        BinaryOperator::Plus => a + b,
-        BinaryOperator::Minus => a - b,
-        BinaryOperator::Multiply => a * b,
+        BinaryOperator::Plus => Some(a + b),
+        BinaryOperator::Minus => Some(a - b),
+        BinaryOperator::Multiply => Some(a * b),
         BinaryOperator::Divide => {
             if b == 0.0 {
-                f64::NAN
+                None
             } else {
-                a / b
+                Some(a / b)
             }
         }
         BinaryOperator::Modulo => {
             if b == 0.0 {
-                f64::NAN
+                None
             } else {
-                a % b
+                Some(a % b)
             }
         }
         _ => unreachable!(),
@@ -1713,25 +1725,16 @@ fn arith_f64(l: &[Value], op: BinaryOperator, r: &[Value]) -> Option<Vec<Value>>
 
 #[inline(always)]
 fn arith_f64_pair(a: f64, op: BinaryOperator, b: f64) -> Value {
+    // v0.22.4：浮点除零/模零 → NULL（对齐 SQLite，与 eval_arith 标量路径一致）
+    if b == 0.0 && matches!(op, BinaryOperator::Divide | BinaryOperator::Modulo) {
+        return Value::Null;
+    }
     let v = match op {
         BinaryOperator::Plus => a + b,
         BinaryOperator::Minus => a - b,
         BinaryOperator::Multiply => a * b,
-        // 与原 eval_arith 一致：浮点除零 → NAN（非 NULL）
-        BinaryOperator::Divide => {
-            if b == 0.0 {
-                f64::NAN
-            } else {
-                a / b
-            }
-        }
-        BinaryOperator::Modulo => {
-            if b == 0.0 {
-                f64::NAN
-            } else {
-                a % b
-            }
-        }
+        BinaryOperator::Divide => a / b,
+        BinaryOperator::Modulo => a % b,
         _ => unreachable!(),
     };
     Value::Float64(v)
@@ -1915,12 +1918,17 @@ fn eval_arith(left: &Value, op: BinaryOperator, right: &Value) -> Value {
 
     // 浮点运算
     if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
+        // v0.22.4：浮点除零/模零 → NULL（对齐 SQLite）。原返回 NaN，参与
+        // 排序/比较产生非标准行为，且是差分测试的持续噪音源
+        if r == 0.0 {
+            return Value::Null;
+        }
         let result = match op {
             Plus => l + r,
             Minus => l - r,
             Multiply => l * r,
-            Divide => if r == 0.0 { f64::NAN } else { l / r },
-            Modulo => if r == 0.0 { f64::NAN } else { l % r },
+            Divide => l / r,
+            Modulo => l % r,
             _ => unreachable!(),
         };
         return Value::Float64(result);
@@ -2111,8 +2119,10 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
         }
         Int32 => {
             if let Some(i) = v.as_i64() {
-                Value::Int32(i as i32)
+                // v0.22.4：越界返回 NULL（与算术溢出约定一致；原 `as i32` 静默环绕）
+                i32::try_from(i).map(Value::Int32).unwrap_or(Value::Null)
             } else if let Some(f) = v.as_f64() {
+                // 浮点→整型的 as 转换天然饱和（Rust 1.45+），保留
                 Value::Int32(f as i32)
             } else if let Value::Varchar(s) = v {
                 s.parse::<i32>().map(Value::Int32).unwrap_or(Value::Null)
@@ -2133,7 +2143,8 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
         }
         Int16 => {
             if let Some(i) = v.as_i64() {
-                Value::Int16(i as i16)
+                // v0.22.4：越界返回 NULL（同 Int32）
+                i16::try_from(i).map(Value::Int16).unwrap_or(Value::Null)
             } else if let Some(f) = v.as_f64() {
                 Value::Int16(f as i16)
             } else if let Value::Varchar(s) = v {
@@ -2144,8 +2155,13 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
         }
         Decimal { scale, .. } => {
             // 数值 → 定点 i128（按 scale 缩放；字符串格式化避免浮点误差）
+            // v0.22.4：缩放乘法 checked——大整数 × 大 scale（如 i64::MAX × 10^38）
+            // 此前会 i128 溢出 panic（debug）/静默环绕（release）
             if let Some(i) = v.as_i64() {
-                Value::Decimal(i as i128 * 10i128.pow(*scale as u32), *scale)
+                (i as i128)
+                    .checked_mul(10i128.pow(*scale as u32))
+                    .map(|n| Value::Decimal(n, *scale))
+                    .unwrap_or(Value::Null)
             } else if let Value::Float32(f) = v {
                 let s = format!("{:.*}", *scale as usize, *f);
                 match s.replace('.', "").parse::<i128>() {
@@ -5705,13 +5721,13 @@ mod tests {
         let out = try_eval_specialized(&big, BinaryOperator::Plus, &one).unwrap().unwrap();
         assert_eq!(out.to_flat(), vec![Value::Null]);
 
-        // 整数除零 → NULL；浮点除零 → NAN
+        // 整数除零 → NULL；浮点除零 → NULL（v0.22.4 对齐 SQLite）
         let z = Vector::Flat(vec![Value::Int64(0)]);
         let out = try_eval_specialized(&big, BinaryOperator::Divide, &z).unwrap().unwrap();
         assert_eq!(out.to_flat(), vec![Value::Null]);
         let fz = Vector::Flat(vec![Value::Float64(0.0)]);
         let out = try_eval_specialized(&big, BinaryOperator::Divide, &fz).unwrap().unwrap();
-        assert!(values_equal(&out.to_flat()[0], &Value::Float64(f64::NAN)));
+        assert_eq!(out.to_flat(), vec![Value::Null]);
 
         // Int × Float 组合 → f64
         let out = try_eval_specialized(&l, BinaryOperator::Multiply, &fz).unwrap().unwrap();
@@ -6116,11 +6132,11 @@ mod tests {
         let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Plus, &Vector::Typed(rd)).unwrap();
         assert_eq!(out.to_flat(), vec![Value::Null]); // 溢出
 
-        // 浮点除零 → NAN；NULL 比较 → NULL
+        // 浮点除零 → NULL（v0.22.4 对齐 SQLite）；NULL 比较 → NULL
         let ld = ColumnData::try_from_values(&vec![Value::Float64(1.0)]).unwrap();
         let rd = ColumnData::try_from_values(&vec![Value::Float64(0.0)]).unwrap();
         let out = eval_binary_vectorized(&Vector::Typed(ld), BinaryOperator::Divide, &Vector::Typed(rd)).unwrap();
-        assert!(values_equal(&out.to_flat()[0], &Value::Float64(f64::NAN)));
+        assert_eq!(out.to_flat(), vec![Value::Null]);
 
         // 布尔三值逻辑：false AND NULL = false；true AND NULL = NULL
         let ld = ColumnData::try_from_values(&vec![Value::Boolean(false), Value::Boolean(true)]).unwrap();

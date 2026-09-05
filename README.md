@@ -1,7 +1,7 @@
 # EngramDB
 
 > 专用分析型嵌入 AI Agent 数据引擎
-> **当前版本：v0.22.3 — 谓词下推正确性（Limit 穿越/派生表谓词丢弃）+ close 持久化契约**
+> **当前版本：v0.22.4 — :memory: 临时文件治理 + 浮点除零对齐 SQLite（NULL）+ CAST 溢出防护**
 
 兼具 **SQLite 的事务能力（ACID）** 与 **DuckDB 的列存压缩与分析性能**，单文件嵌入式部署，面向 AI Agent 工作负载优化。
 

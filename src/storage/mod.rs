@@ -60,6 +60,11 @@ pub struct ViewDef {
 /// 数据库实例
 pub struct Database {
     path: PathBuf,
+    /// v0.22.4：是否为 `:memory:` 库（映射为随机临时文件）。
+    /// Drop 时不持久化（持久化永远不会再被读到）并清理临时文件——
+    /// 原实现 Drop 的 `path == ":memory:"` 检查比对的是映射后路径、
+    /// 永远不匹配，导致每个内存库泄漏一个 .hdb 临时文件。
+    is_memory: bool,
     config: Config,
     header: FileHeader,
     tables: HashMap<u32, EngineTable>,
@@ -122,7 +127,8 @@ pub struct Database {
 impl Database {
     /// 打开或创建数据库
     pub fn open(path: &str) -> Result<Self> {
-        let path = if path == ":memory:" {
+        let is_memory = path == ":memory:";
+        let path = if is_memory {
             let mut p = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -135,15 +141,16 @@ impl Database {
         let config = Config::default();
 
         if path.exists() {
-            Self::open_existing(&path, config)
+            Self::open_existing(&path, config, is_memory)
         } else {
-            Self::create_new(&path, config)
+            Self::create_new(&path, config, is_memory)
         }
     }
 
     /// 使用指定配置打开或创建数据库
     pub fn open_with_config(path: &str, config: Config) -> Result<Self> {
-        let path = if path == ":memory:" {
+        let is_memory = path == ":memory:";
+        let path = if is_memory {
             let mut p = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -155,13 +162,13 @@ impl Database {
         let path = PathBuf::from(path);
 
         if path.exists() {
-            Self::open_existing(&path, config)
+            Self::open_existing(&path, config, is_memory)
         } else {
-            Self::create_new(&path, config)
+            Self::create_new(&path, config, is_memory)
         }
     }
 
-    fn create_new(path: &std::path::Path, config: Config) -> Result<Self> {
+    fn create_new(path: &std::path::Path, config: Config, is_memory: bool) -> Result<Self> {
         use std::io::Write;
 
         // v0.21：注册全局 Tokenizer（TokenDelta 压缩分派依赖）
@@ -187,6 +194,7 @@ impl Database {
 
         Ok(Self {
             path: path.to_path_buf(),
+            is_memory,
             config,
             header,
             tables: HashMap::new(),
@@ -213,7 +221,7 @@ impl Database {
         })
     }
 
-    fn open_existing(path: &std::path::Path, config: Config) -> Result<Self> {
+    fn open_existing(path: &std::path::Path, config: Config, is_memory: bool) -> Result<Self> {
         use std::io::{Read, Seek};
 
         // v0.21：注册全局 Tokenizer（TokenDelta 压缩分派依赖）
@@ -242,6 +250,7 @@ impl Database {
 
         let mut db = Self {
             path: path.to_path_buf(),
+            is_memory,
             config,
             header,
             tables: HashMap::new(),
@@ -1128,6 +1137,24 @@ impl Database {
         self.file.sync_all()?;
         self.plan_cache.clear();
         ckpt_result
+    }
+
+    /// v0.22.4：`:memory:` 库的临时文件清理（主文件 + WAL）
+    ///
+    /// 内存库的持久化永远不会被再次读取（路径为随机临时名，不对外暴露），
+    /// Connection::drop 时直接删除，避免临时目录堆积 .hdb 文件。
+    pub fn remove_memory_files(&self) {
+        if !self.is_memory {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.path);
+        let wal = format!("{}-wal", self.path.to_string_lossy());
+        let _ = std::fs::remove_file(&wal);
+    }
+
+    /// 是否为 `:memory:` 库（v0.22.4）
+    pub fn is_memory(&self) -> bool {
+        self.is_memory
     }
 
     /// 获取缓存的查询计划（Perf02 / v0.18 P0-1 计划缓存接线）

@@ -219,6 +219,13 @@ impl Connection {
          if is_ddl {
              self.db.clear_plan_cache();
          }
+         // v0.22.4：大批量 DML 后使计划缓存失效——缓存计划基于优化时的
+         // 统计/数据分布，大批量变更后 join order 等 CBO 决策可能严重过时
+         // （灾难计划防护）。阈值避开逐行 UPDATE 场景的缓存抖动；
+         // SELECT 的 rows_affected 恒为 0，不受影响。
+         if result.rows_affected >= 512 {
+             self.db.clear_plan_cache();
+         }
          Ok(result)
      }
 
@@ -559,12 +566,21 @@ pub fn set_compact_strategy(&mut self, strategy: crate::common::config::CompactS
 /// **注意**：`:memory:` 内存库无需持久化，Drop 时跳过。
 impl Drop for Connection {
     fn drop(&mut self) {
-        // 已显式 close 或内存库，跳过
+        // v0.22.4：内存库不持久化并清理临时文件。原实现用
+        // `path == ":memory:"` 判断，但 open 时路径已映射为随机临时名，
+        // 该检查永远不匹配 → 每个内存库 Drop 都 checkpoint 并泄漏一个
+        // .hdb 临时文件。内存库的持久化永远不会被再次读取（路径不对外
+        // 暴露），直接清理。
+        if self.db.is_memory() {
+            self.db.remove_memory_files();
+            return;
+        }
+        // 已显式 close：持久化已在 close 中完成
         if self.closed {
             return;
         }
         let path = self.db.path().to_string_lossy().to_string();
-        if path == ":memory:" || path.is_empty() {
+        if path.is_empty() {
             return;
         }
         // best-effort 持久化，失败不传播 panic
