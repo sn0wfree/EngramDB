@@ -7,7 +7,7 @@
 //!
 //! 注：仅覆盖两边语义应当一致的保守 SQL 子集。
 //! 已知差异（不计入失败）：f64 除零 EngramDB 返回 NaN 而 SQLite 返回 NULL；
-//! LIMIT 非字面量/OFFSET 行为不同（见 docs/assessment-v0.22.md P0-5）。
+//! LIMIT 非字面量（如 LIMIT 5+1）EngramDB 报解析错误（v0.22.1 起，见 docs/assessment-v0.22.md）。
 
 use engramdb::{Connection, Value};
 
@@ -138,6 +138,12 @@ fn diff_order_limit() {
     assert_same("order asc limit", &mut eng, &lite, "SELECT id, age FROM users ORDER BY age ASC LIMIT 5");
     assert_same("order by two keys", &mut eng, &lite, "SELECT id, city, age FROM users ORDER BY city, age DESC LIMIT 8");
     assert_same("limit larger than rows", &mut eng, &lite, "SELECT id FROM users WHERE age > 55 ORDER BY id LIMIT 100");
+    // v0.22.1：OFFSET 支持（此前被静默忽略，返回错误行集）
+    assert_same("limit offset", &mut eng, &lite, "SELECT id FROM users ORDER BY id LIMIT 5 OFFSET 3");
+    assert_same("offset beyond rows", &mut eng, &lite, "SELECT id FROM users ORDER BY id LIMIT 10 OFFSET 58");
+    // 注：EngramDB 另支持不带 LIMIT 的裸 OFFSET（SQLite 语法不允许，无法差分，此处用大 LIMIT 等价覆盖）
+    assert_same("offset effectively no limit", &mut eng, &lite, "SELECT id FROM users ORDER BY id LIMIT 1000 OFFSET 55");
+    assert_same("offset with where", &mut eng, &lite, "SELECT id, age FROM users WHERE age > 30 ORDER BY age, id LIMIT 4 OFFSET 2");
 }
 
 #[test]

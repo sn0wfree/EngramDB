@@ -891,6 +891,7 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         && stmt.having.is_none()
         && stmt.order_by.is_empty()
         && stmt.limit.is_none()
+        && stmt.offset.is_none()
         && stmt.select_list.len() == 1
     {
         if let SelectItem::Expression(expr, alias) = &stmt.select_list[0] {
@@ -1258,19 +1259,22 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         );
 
         if !sort_keys.is_empty() && !can_skip_sort {
+            // Top-N 需覆盖 offset + limit（offset 行参与排序后再跳过）
+            let topn_limit = stmt.limit.map(|l| l.saturating_add(stmt.offset.unwrap_or(0)));
             plan = PhysicalPlan::Sort {
                 input: Box::new(plan),
                 sort_keys,
-                limit: stmt.limit,
+                limit: topn_limit,
             };
         }
     }
 
-    // Limit
-    if let Some(limit) = stmt.limit {
+    // Limit（v0.22.1：支持 OFFSET）
+    if stmt.limit.is_some() || stmt.offset.is_some() {
         plan = PhysicalPlan::Limit {
             input: Box::new(plan),
-            limit,
+            limit: stmt.limit.unwrap_or(usize::MAX),
+            offset: stmt.offset.unwrap_or(0),
         };
     }
 
@@ -1490,19 +1494,22 @@ fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         }
 
         if !sort_keys.is_empty() {
+            // Top-N 需覆盖 offset + limit（offset 行参与排序后再跳过）
+            let topn_limit = stmt.limit.map(|l| l.saturating_add(stmt.offset.unwrap_or(0)));
             plan = PhysicalPlan::Sort {
                 input: Box::new(plan),
                 sort_keys,
-                limit: stmt.limit,
+                limit: topn_limit,
             };
         }
     }
 
-    // Limit
-    if let Some(limit) = stmt.limit {
+    // Limit（v0.22.1：支持 OFFSET）
+    if stmt.limit.is_some() || stmt.offset.is_some() {
         plan = PhysicalPlan::Limit {
             input: Box::new(plan),
-            limit,
+            limit: stmt.limit.unwrap_or(usize::MAX),
+            offset: stmt.offset.unwrap_or(0),
         };
     }
 
@@ -3096,7 +3103,7 @@ mod tests {
         }
         // LIMIT 不阻断（P3.3）
         match plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5 LIMIT 1") {
-            PhysicalPlan::Limit { input, limit: 1 } => {
+            PhysicalPlan::Limit { input, limit: 1, .. } => {
                 assert!(tree_has(&input, "PrimaryKeyLookup"));
             }
             other => panic!("expected Limit over PK lookup, got {other:?}"),
@@ -3428,7 +3435,7 @@ mod tests {
         match plan_ok(&mut conn,
             "SELECT t.id FROM t JOIN u ON t.id = u.tid WHERE t.age > 1 ORDER BY t.id LIMIT 3")
         {
-            PhysicalPlan::Limit { input, limit: 3 } => match *input {
+            PhysicalPlan::Limit { input, limit: 3, .. } => match *input {
                 PhysicalPlan::Sort { input, sort_keys, .. } => {
                     assert_eq!(sort_keys.len(), 1);
                     assert_eq!(sort_keys[0].column_index, 0);

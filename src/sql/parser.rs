@@ -1070,7 +1070,8 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
         }
     }
 
-    // LIMIT
+    // LIMIT / OFFSET
+    // v0.22.1：支持 OFFSET；非字面量不再静默丢弃（曾导致 LIMIT 5+1 被当成无限制全表返回）
     let limit = match &query.limit {
         Some(expr) => {
             if let sqlast::Expr::Value(sqlast::Value::Number(n, _)) = expr {
@@ -1078,7 +1079,23 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
                     EngramDbError::Parse("Invalid LIMIT value".into())
                 })?)
             } else {
-                None
+                return Err(EngramDbError::Parse(
+                    "LIMIT must be a literal integer".into(),
+                ));
+            }
+        }
+        None => None,
+    };
+    let offset = match &query.offset {
+        Some(off) => {
+            if let sqlast::Expr::Value(sqlast::Value::Number(n, _)) = &off.value {
+                Some(n.parse::<usize>().map_err(|_| {
+                    EngramDbError::Parse("Invalid OFFSET value".into())
+                })?)
+            } else {
+                return Err(EngramDbError::Parse(
+                    "OFFSET must be a literal integer".into(),
+                ));
             }
         }
         None => None,
@@ -1092,6 +1109,7 @@ fn convert_query(query: &sqlast::Query) -> Result<SelectStmt> {
         having,
         order_by,
         limit,
+        offset,
         distinct,
         ctes: extract_ctes(query),
         set_op,

@@ -160,6 +160,8 @@ pub struct SelectStmt {
     pub having: Option<Expression>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<usize>,
+    /// OFFSET 子句（v0.22.1 新增）：先跳过的行数，再应用 limit
+    pub offset: Option<usize>,
     pub distinct: bool,
     /// CTE (WITH 子句)
     pub ctes: Vec<Cte>,

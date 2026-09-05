@@ -173,15 +173,17 @@ impl Connection {
             self.flush_batches()?;
         }
          // 结构性 DDL / ANALYZE：不缓存，执行后清空缓存（计划依赖表结构与统计）
-         let is_ddl = matches!(&ast,
-             crate::sql::ast::Statement::CreateTable(_)
-             | crate::sql::ast::Statement::CreateIndex(_)
-             | crate::sql::ast::Statement::AlterTable(_)
-             | crate::sql::ast::Statement::TruncateTable { .. }
-             | crate::sql::ast::Statement::Analyze(_)
-             | crate::sql::ast::Statement::CreateMaterializedView(_)
-             | crate::sql::ast::Statement::DropMaterializedView(_)
-             | crate::sql::ast::Statement::RefreshMaterializedView(_));
+        let is_ddl = matches!(&ast,
+            crate::sql::ast::Statement::CreateTable(_)
+            | crate::sql::ast::Statement::CreateIndex(_)
+            | crate::sql::ast::Statement::AlterTable(_)
+            | crate::sql::ast::Statement::TruncateTable { .. }
+            | crate::sql::ast::Statement::Analyze(_)
+            | crate::sql::ast::Statement::CreateView(_)
+            | crate::sql::ast::Statement::DropView(_)
+            | crate::sql::ast::Statement::CreateMaterializedView(_)
+            | crate::sql::ast::Statement::DropMaterializedView(_)
+            | crate::sql::ast::Statement::RefreshMaterializedView(_));
         let plan = sql::planner::plan(ast, &self.db)?;
         // CountStar 是行数快照（Perf01 元数据短路），缓存即过期 → 不缓存
         // Rollback/RollbackToSavepoint：不缓存（缓存命中路径会前置 flush

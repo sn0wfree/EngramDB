@@ -153,9 +153,13 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
     },
     /// 限制行数
+    ///
+    /// v0.22.1：新增 `offset`（OFFSET 子句）——先跳过 `offset` 行，再取 `limit` 行。
     Limit {
         input: Box<PhysicalPlan>,
         limit: usize,
+        /// 跳过的行数（OFFSET 子句，默认 0）
+        offset: usize,
     },
     /// 分析表（收集统计信息）
     Analyze {

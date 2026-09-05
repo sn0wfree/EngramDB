@@ -1229,6 +1229,12 @@ impl ColumnStore {
         }
 
         let rg_count = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+        // v0.22.1：防御损坏文件——每个行组至少 8 字节头，超出必然非法（防超大预留）
+        if rg_count as u64 * 8 > data.len() as u64 {
+            return Err(crate::common::error::EngramDbError::InvalidFormat(
+                "corrupt row group count".into(),
+            ));
+        }
         let mut offset = 4;
         self.row_groups.clear();
         self.row_groups.reserve(rg_count);
@@ -1243,6 +1249,12 @@ impl ColumnStore {
             offset += 4;
             let column_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
+            // v0.22.1：防御损坏文件——每列至少 10 字节头（防超大 Vec 分配）
+            if column_count as u64 * 10 > (data.len() - offset) as u64 {
+                return Err(crate::common::error::EngramDbError::InvalidFormat(
+                    "corrupt column count".into(),
+                ));
+            }
 
             let mut columns = Vec::with_capacity(column_count);
             for _ in 0..column_count {
@@ -1283,8 +1295,19 @@ impl ColumnStore {
                 let mut min_value = None;
                 if offset < data.len() && data[offset] == 1 {
                     offset += 1;
+                    // v0.22.1：边界检查（此前文件尾部截断会直接 slice panic，库打不开）
+                    if offset + 4 > data.len() {
+                        return Err(crate::common::error::EngramDbError::InvalidFormat(
+                            "truncated min value length".into(),
+                        ));
+                    }
                     let mlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
+                    if offset + mlen > data.len() {
+                        return Err(crate::common::error::EngramDbError::InvalidFormat(
+                            "truncated min value".into(),
+                        ));
+                    }
                     let mvals = deserialize_values(&data[offset..offset + mlen], &data_type, 1);
                     offset += mlen;
                     if !mvals.is_empty() {
@@ -1297,8 +1320,19 @@ impl ColumnStore {
                 let mut max_value = None;
                 if offset < data.len() && data[offset] == 1 {
                     offset += 1;
+                    // v0.22.1：边界检查（同 min）
+                    if offset + 4 > data.len() {
+                        return Err(crate::common::error::EngramDbError::InvalidFormat(
+                            "truncated max value length".into(),
+                        ));
+                    }
                     let mlen = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
+                    if offset + mlen > data.len() {
+                        return Err(crate::common::error::EngramDbError::InvalidFormat(
+                            "truncated max value".into(),
+                        ));
+                    }
                     let mvals = deserialize_values(&data[offset..offset + mlen], &data_type, 1);
                     offset += mlen;
                     if !mvals.is_empty() {

@@ -6,6 +6,17 @@ use crate::common::error::{EngramDbError, Result};
 /// 文件魔数
 pub const MAGIC: &[u8; 17] = b"ENGRAMDB_FORMAT1\0";
 
+/// 头部核心区大小（v0.22.1）：magic..data_size 共 100 字节
+pub const HEADER_CORE_SIZE: usize = 100;
+/// 头部副本 B 在页内的起始偏移（v0.22.1）
+///
+/// 页布局：[核心区 0..100][CRC_A 100..104][保留 104..256][副本 256..356][CRC_B 356..360]。
+/// 整页一次写入（含两份相同副本）+ fsync；页内撕裂写会破坏其中一份，
+/// 另一份仍可校验通过。读取规则：B 的 CRC 有效则取 B，否则 A 有效取 A，
+/// 均无效按旧格式（无 CRC，v0.22.1 之前的文件）解析——此时 magic 校验兜底，
+/// 损坏会以 InvalidFormat 显式报错而非静默错值。
+pub const HEADER_REPLICA_OFFSET: usize = 256;
+
 /// 文件头（4KB 页对齐）
 #[derive(Debug, Clone)]
 pub struct FileHeader {
@@ -108,10 +119,53 @@ impl FileHeader {
         // 填充到页大小
         buf.resize(self.page_size as usize, 0);
 
+        // v0.22.1：头部 CRC + 页内副本（双副本抗撕裂写）
+        // 注意：page_size 必须容纳副本区；默认 4096，历史配置不会更小
+        debug_assert!(
+            self.page_size as usize >= HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE + 4,
+            "page_size too small for header replica"
+        );
+        let mut core = [0u8; HEADER_CORE_SIZE];
+        core.copy_from_slice(&buf[..HEADER_CORE_SIZE]);
+        let crc = crate::wal::crc32(&core).to_le_bytes();
+        buf[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].copy_from_slice(&crc);
+        buf[HEADER_REPLICA_OFFSET..HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE].copy_from_slice(&core);
+        buf[HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE..HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE + 4]
+            .copy_from_slice(&crc);
+
         Ok(buf)
     }
 
+    /// 从完整页字节解析（v0.22.1：副本 CRC 校验优先，旧格式回退）
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        // 副本 B（页内偏移 256）
+        if data.len() >= HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE + 4 {
+            let core = &data[HEADER_REPLICA_OFFSET..];
+            let stored = u32::from_le_bytes(
+                core[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].try_into().unwrap(),
+            );
+            if stored != 0 && stored == crate::wal::crc32(&core[..HEADER_CORE_SIZE]) {
+                return Self::parse_core(core);
+            }
+        }
+        // 副本 A（页首）
+        if data.len() >= HEADER_CORE_SIZE + 4 {
+            let stored = u32::from_le_bytes(
+                data[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].try_into().unwrap(),
+            );
+            if stored != 0 && stored == crate::wal::crc32(&data[..HEADER_CORE_SIZE]) {
+                return Self::parse_core(data);
+            }
+        }
+        // 旧格式（无 CRC）：按页首解析（magic 校验兜底）
+        Self::parse_core(data)
+    }
+
+    /// 解析头部核心字段（旧 from_bytes 主体）
+    ///
+    /// 入参从核心区起点开始；`data.len()` 只用于可选字段（catalog/data 段）的
+    /// 存在性判断，因此调用方应传入"核心区起点到页尾"的切片以保留可选字段。
+    fn parse_core(data: &[u8]) -> Result<Self> {
         if data.len() < 100 {
             return Err(EngramDbError::InvalidFormat(
                 "File header too short".into()
@@ -301,7 +355,9 @@ mod tests {
     #[test]
     fn test_header_bad_magic_rejected() {
         let mut bytes = FileHeader::new(&test_config()).to_bytes().unwrap();
+        // v0.22.1 双副本：必须两份副本同时损坏才不可恢复
         bytes[0] = b'X';
+        bytes[HEADER_REPLICA_OFFSET] = b'X';
         let err = FileHeader::from_bytes(&bytes).unwrap_err();
         assert!(err.to_string().contains("magic"));
     }
@@ -310,8 +366,79 @@ mod tests {
     fn test_header_bad_compression_rejected() {
         let mut bytes = FileHeader::new(&test_config()).to_bytes().unwrap();
         let magic_len = MAGIC.len();
-        bytes[magic_len + 58] = 99; // 非法压缩类型
+        // v0.22.1 双副本：核心区与副本区的压缩类型字段同时置为非法值
+        bytes[magic_len + 58] = 99;
+        bytes[HEADER_REPLICA_OFFSET + magic_len + 58] = 99;
         assert!(FileHeader::from_bytes(&bytes).is_err());
+    }
+
+    // --- v0.22.1：头部副本 CRC 恢复 ---
+
+    #[test]
+    fn test_header_replica_written() {
+        let h = FileHeader::new(&test_config());
+        let bytes = h.to_bytes().unwrap();
+        // 副本 B 与核心区内容一致
+        assert_eq!(
+            &bytes[..HEADER_CORE_SIZE],
+            &bytes[HEADER_REPLICA_OFFSET..HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE]
+        );
+        // 旧格式兼容：CRC 区为零的"伪旧页"应能按旧格式解析
+        // （核心区本身有效，只是没有 CRC——模拟 v0.22.1 之前的文件）
+        let mut legacy = bytes.clone();
+        legacy[HEADER_CORE_SIZE..HEADER_CORE_SIZE + 4].fill(0);
+        legacy[HEADER_REPLICA_OFFSET..].fill(0);
+        let back = FileHeader::from_bytes(&legacy).unwrap();
+        assert_eq!(back.uuid, h.uuid);
+    }
+
+    #[test]
+    fn test_header_torn_write_recovers_from_replica() {
+        let mut h = FileHeader::new(&test_config());
+        h.total_rows = 12345;
+        h.data_root = 4096;
+        let bytes = h.to_bytes().unwrap();
+
+        // 模拟撕裂写：核心区（副本 A）被写坏，副本 B 完好
+        let mut torn = bytes.clone();
+        torn[7] ^= 0xFF; // 破坏核心区字段
+        torn[30] ^= 0xFF;
+        let back = FileHeader::from_bytes(&torn).unwrap();
+        assert_eq!(back.total_rows, 12345, "应从副本 B 恢复");
+        assert_eq!(back.data_root, 4096);
+        assert_eq!(back.uuid, h.uuid);
+
+        // 反向：副本 B 被写坏，副本 A 完好
+        let mut torn_b = bytes.clone();
+        let b0 = HEADER_REPLICA_OFFSET;
+        torn_b[b0] ^= 0xFF;
+        torn_b[b0 + 50] ^= 0xFF;
+        let back_b = FileHeader::from_bytes(&torn_b).unwrap();
+        assert_eq!(back_b.total_rows, 12345, "应从副本 A 恢复");
+
+        // 两份都坏：必须显式报错（magic 兜底），而不是静默错值
+        let mut both_bad = bytes.clone();
+        both_bad[7] ^= 0xFF;
+        both_bad[b0] ^= 0xFF;
+        // 核心区 magic 已坏且无有效 CRC → 报 InvalidFormat
+        assert!(FileHeader::from_bytes(&both_bad).is_err());
+    }
+
+    #[test]
+    fn test_header_torn_crc_field_recovers() {
+        let mut h = FileHeader::new(&test_config());
+        h.total_rows = 777;
+        let mut bytes = h.to_bytes().unwrap();
+        // 只破坏 CRC_A 字段（核心区完好，副本 B 完好）
+        bytes[HEADER_CORE_SIZE] ^= 0xFF;
+        let back = FileHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(back.total_rows, 777);
+        // 只破坏 CRC_B 字段（应回落到副本 A）
+        let mut bytes2 = h.to_bytes().unwrap();
+        let crc_b_off = HEADER_REPLICA_OFFSET + HEADER_CORE_SIZE;
+        bytes2[crc_b_off] ^= 0xFF;
+        let back2 = FileHeader::from_bytes(&bytes2).unwrap();
+        assert_eq!(back2.total_rows, 777);
     }
 
     #[test]

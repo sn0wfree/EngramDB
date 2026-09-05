@@ -145,39 +145,44 @@ fn try_execute_chunks(
             let sorted = operators::sort::execute(&chunks, sort_keys, *limit)?;
             Ok(Some((cols, sorted)))
         }
-        PhysicalPlan::Limit { input, limit } => {
-            let (cols, chunks) = match try_execute_chunks(input, db)? {
-                Some(x) => x,
-                None => return Ok(None),
-            };
-            let mut remaining = *limit;
-            let mut out = Vec::new();
-            for ch in chunks {
-                if remaining == 0 {
-                    break;
-                }
-                let take = ch.count.min(remaining);
-                let columns: Vec<Vector> = ch
-                    .columns
-                    .iter()
-                    .map(|c| match c {
-                        Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
-                        Vector::Typed(d) => {
-                            let mut d = d.clone();
-                            Vector::Typed(d.take_front(take))
-                        }
-                        Vector::Flat(rows) => {
-                            Vector::Flat(rows.iter().take(take).cloned().collect())
-                        }
-                    })
-                    .collect();
-                out.push(DataChunk {
+        PhysicalPlan::Limit { input, limit, offset } => {
+            // v0.22.1：带 OFFSET 时列式快路径不处理跳行，交由下方物化路径 skip
+            if *offset == 0 {
+                let (cols, chunks) = match try_execute_chunks(input, db)? {
+                    Some(x) => x,
+                    None => return Ok(None),
+                };
+                let mut remaining = *limit;
+                let mut out = Vec::new();
+                for ch in chunks {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = ch.count.min(remaining);
+                    let columns: Vec<Vector> = ch
+                        .columns
+                        .iter()
+                        .map(|c| match c {
+                            Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
+                            Vector::Typed(d) => {
+                                let mut d = d.clone();
+                                Vector::Typed(d.take_front(take))
+                            }
+                            Vector::Flat(rows) => {
+                                Vector::Flat(rows.iter().take(take).cloned().collect())
+                            }
+                        })
+                        .collect();
+                    out.push(DataChunk {
                     columns,
                     count: take,
                 });
                 remaining -= take;
             }
-            Ok(Some((cols, out)))
+                Ok(Some((cols, out)))
+            }
+            // offset > 0：回落到 try_execute_chunks 的调用方物化路径（在下方 execute 分支处理 skip）
+            Ok(None)
         }
         PhysicalPlan::Aggregate {
             input,
@@ -1015,34 +1020,42 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             })
         }
 
-        PhysicalPlan::Limit { input, limit } => {
+        PhysicalPlan::Limit { input, limit, offset } => {
             // 列式优先：上游 chunks 直接取前 N 行，无需全表物化
-            if let Some((columns, in_chunks)) = try_execute_chunks(input.as_ref(), db)? {
-                let mut remaining = limit;
-                let mut out: Vec<DataChunk> = Vec::new();
-                for ch in in_chunks {
-                    if remaining == 0 {
-                        break;
+            // v0.22.1：带 OFFSET 时走物化路径先 skip 再 take
+            if *offset == 0 {
+                if let Some((columns, in_chunks)) = try_execute_chunks(input.as_ref(), db)? {
+                    let mut remaining = limit;
+                    let mut out: Vec<DataChunk> = Vec::new();
+                    for ch in in_chunks {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = ch.count.min(remaining);
+                        let cols: Vec<Vector> = ch.columns.iter().map(|c| match c {
+                            Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
+                            Vector::Typed(d) => {
+                                let mut d = d.clone();
+                                Vector::Typed(d.take_front(take))
+                            }
+                            Vector::Flat(rows) => {
+                                Vector::Flat(rows.iter().take(take).cloned().collect())
+                            }
+                        }).collect();
+                        out.push(DataChunk { columns: cols, count: take });
+                        remaining -= take;
                     }
-                    let take = ch.count.min(remaining);
-                    let cols: Vec<Vector> = ch.columns.iter().map(|c| match c {
-                        Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
-                        Vector::Typed(d) => {
-                            let mut d = d.clone();
-                            Vector::Typed(d.take_front(take))
-                        }
-                        Vector::Flat(rows) => {
-                            Vector::Flat(rows.iter().take(take).cloned().collect())
-                        }
-                    }).collect();
-                    out.push(DataChunk { columns: cols, count: take });
-                    remaining -= take;
+                    let rows = chunks_to_rows(&out);
+                    return Ok(QueryResult { columns, rows, rows_affected: 0 });
                 }
-                let rows = chunks_to_rows(&out);
-                return Ok(QueryResult { columns, rows, rows_affected: 0 });
             }
             let input_result = execute(*input, db)?;
-            let limited_rows: Vec<_> = input_result.rows.into_iter().take(limit).collect();
+            let limited_rows: Vec<_> = input_result
+                .rows
+                .into_iter()
+                .skip(*offset)
+                .take(*limit)
+                .collect();
 
             Ok(QueryResult {
                 columns: input_result.columns,
@@ -1584,8 +1597,12 @@ fn format_plan_tree(plan: &PhysicalPlan, indent: usize) -> String {
         PhysicalPlan::HashJoin { join_type, .. } => {
             format!(" [{:?}]", join_type)
         }
-        PhysicalPlan::Limit { limit, .. } => {
-            format!(" [limit: {}]", limit)
+        PhysicalPlan::Limit { limit, offset, .. } => {
+            if *offset > 0 {
+                format!(" [limit: {} offset: {}]", limit, offset)
+            } else {
+                format!(" [limit: {}]", limit)
+            }
         }
         PhysicalPlan::Insert { table_name, .. } => {
             format!(" [table: {}]", table_name)
@@ -1996,9 +2013,9 @@ fn resolve_subqueries_in_plan(plan: PhysicalPlan, db: &mut Database) -> Result<P
             let input = resolve_subqueries_in_plan(*input, db)?;
             Ok(PhysicalPlan::Sort { input: Box::new(input), sort_keys, limit })
         }
-        PhysicalPlan::Limit { input, limit } => {
+        PhysicalPlan::Limit { input, limit, offset } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
-            Ok(PhysicalPlan::Limit { input: Box::new(input), limit })
+            Ok(PhysicalPlan::Limit { input: Box::new(input), limit, offset })
         }
         PhysicalPlan::Window { input, window_functions, column_names } => {
             let input = resolve_subqueries_in_plan(*input, db)?;
@@ -2294,7 +2311,7 @@ mod tests {
             PhysicalPlan::Update { table_name: "t".into(), assignments: vec![], condition: None },
             PhysicalPlan::PrimaryKeyLookup { table_name: "t".into(), pk_value: Value::Int64(1), output_column_indices: vec![0] },
             PhysicalPlan::CountStar { output_name: "count(*)".into(), count: 42 },
-            PhysicalPlan::Limit { input: Box::new(plan_scan()), limit: 5 },
+            PhysicalPlan::Limit { input: Box::new(plan_scan()), limit: 5, offset: 0 },
             PhysicalPlan::Pragma(crate::sql::ast::PragmaStmt { name: "table_info".into(), arg: Some("t".into()) }),
             PhysicalPlan::AlterTable(crate::sql::ast::AlterTableStmt {
                 table_name: "t".into(),

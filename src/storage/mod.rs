@@ -224,10 +224,13 @@ impl Database {
             .write(true)
             .open(path)?;
 
-        // 读取文件头
-        let mut header_buf = vec![0u8; config.page_size as usize];
+        // 读取文件头（v0.22.1：读完整页以获取页内副本；按文件实际大小截取，
+        // 截断损坏文件走 InvalidFormat 报错而非 IO UnexpectedEof）
+        let file_len = file.metadata()?.len();
+        let read_len = std::cmp::min(config.page_size as u64, file_len) as usize;
+        let mut header_buf = vec![0u8; read_len];
         file.seek(std::io::SeekFrom::Start(0))?;
-        file.read_exact(&mut header_buf[..100])?;
+        file.read_exact(&mut header_buf)?;
 
         let header = FileHeader::from_bytes(&header_buf)?;
 
@@ -1200,15 +1203,10 @@ impl Database {
         self.file.write_all(&section_buf)?;
         self.file.flush()?;
 
-        // 更新文件头
+        // 更新文件头（v0.22.1：原子化 + fsync；数据段先行 sync_data 保证指向有效数据）
         self.header.index_root = index_root;
         self.header.index_size = section_buf.len() as u32;
-
-        // 重写文件头
-        let header_bytes = self.header.to_bytes()?;
-        self.file.seek(std::io::SeekFrom::Start(0))?;
-        self.file.write_all(&header_bytes)?;
-        self.file.flush()?;
+        self.persist_header()?;
 
         Ok(section_buf.len() as u64)
     }
@@ -1338,13 +1336,12 @@ impl Database {
         self.file.write_all(&section_buf)?;
         self.file.flush()?;
 
-        // 更新文件头
+        // 更新文件头（v0.22.1：数据段先 fsync 落盘，头再指向它 + 原子化头部）
         self.header.catalog_root = catalog_root;
         self.header.catalog_size = section_buf.len() as u32;
-        let header_bytes = self.header.to_bytes()?;
-        self.file.seek(std::io::SeekFrom::Start(0))?;
-        self.file.write_all(&header_bytes)?;
         self.file.flush()?;
+        self.file.sync_data()?;
+        self.persist_header()?;
 
         Ok(section_buf.len() as u64)
     }
@@ -1423,6 +1420,22 @@ impl Database {
     // 解决 P0：数据未持久化，重启后数据丢失
     // ========================================================================
 
+    /// v0.22.1：原子化更新文件头
+    ///
+    /// to_bytes 现生成含 CRC + 页内双副本的完整页；整页一次写入后 sync_data。
+    /// 崩溃在写入中途：页内至少一份副本完整（CRC 可验），损坏则以 InvalidFormat
+    /// 显式报错——不再可能出现"头写一半、库静默损坏"。
+    fn persist_header(&mut self) -> Result<()> {
+        use std::io::{Seek, Write};
+
+        let header_bytes = self.header.to_bytes()?;
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        self.file.write_all(&header_bytes)?;
+        self.file.flush()?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     /// 保存所有表的列存数据到文件
     ///
     /// **注意**：仅保存列存 RowGroup 数据，Delta 层未持久化。
@@ -1467,16 +1480,17 @@ impl Database {
 
         let data_root = aligned_offset as u32;
         self.file.seek(std::io::SeekFrom::Start(aligned_offset))?;
+        // v0.22.1：数据段先 fsync 落盘，头再指向它（防"头已指向、数据未落盘"）
         self.file.write_all(&section_buf)?;
         self.file.flush()?;
+        self.file.sync_data()?;
 
-        // 更新文件头
-        self.header.data_root = data_root;
-        self.header.data_size = section_buf.len() as u32;
-        let header_bytes = self.header.to_bytes()?;
-        self.file.seek(std::io::SeekFrom::Start(0))?;
-        self.file.write_all(&header_bytes)?;
+        // 更新文件头（v0.22.1：索引段先 fsync 落盘，头再指向它 + 原子化头部）
+        self.header.index_root = index_root;
+        self.header.index_size = section_buf.len() as u32;
         self.file.flush()?;
+        self.file.sync_data()?;
+        self.persist_header()?;
 
         Ok(section_buf.len() as u64)
     }

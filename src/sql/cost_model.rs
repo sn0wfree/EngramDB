@@ -117,7 +117,7 @@ impl<'a> CostModel<'a> {
             PhysicalPlan::Aggregate { input, group_by, aggregates } => {
                 self.cost_aggregate(input, group_by.len(), aggregates.len())
             }
-            PhysicalPlan::Limit { input, limit } => {
+            PhysicalPlan::Limit { input, limit, .. } => {
                 self.cost_limit(input, *limit)
             }
             PhysicalPlan::Sort { input, sort_keys, .. } => {
@@ -623,6 +623,7 @@ mod tests {
         let limit = PhysicalPlan::Limit {
             input: Box::new(scan.clone()),
             limit: 10,
+            offset: 0,
         };
 
         let full_cost = model.calculate(&scan);

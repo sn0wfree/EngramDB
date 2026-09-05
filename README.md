@@ -1,7 +1,7 @@
 # EngramDB
 
 > 专用分析型嵌入 AI Agent 数据引擎
-> **当前版本：v0.22.0 — VIEW/CHECK约束/标量子查询/递归CTE/ALTER TABLE**
+> **当前版本：v0.22.1 — 崩溃安全加固（文件头双副本 CRC/fsync）+ OFFSET 支持 + 打开路径防损坏**
 
 兼具 **SQLite 的事务能力（ACID）** 与 **DuckDB 的列存压缩与分析性能**，单文件嵌入式部署，面向 AI Agent 工作负载优化。
 

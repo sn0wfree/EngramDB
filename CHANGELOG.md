@@ -3,6 +3,37 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [0.22.1] - 2026-08-30
+
+### 崩溃安全加固（P0 修复）
+
+#### 文件头原子性
+- **双副本 + CRC32**：文件头页现在包含两份带 CRC 校验的头部副本（页内偏移 0 与 256），任一份撕裂写入时另一份可校验恢复；两份均损坏时以 `InvalidFormat` 显式报错，不再静默错值
+- **fsync 顺序**：`save_data` 数据段先 `sync_data` 落盘，头部再指向它；`save_data` / `save_catalog` / `save_indexes` 三处头部更新统一走 `persist_header`（原子页写 + fsync）
+- **向后兼容**：旧格式文件（无 CRC）仍可正常打开
+
+#### OFFSET 支持
+- **`LIMIT n OFFSET m`**：SELECT 支持 OFFSET 子句（此前被静默忽略，返回错误行集）
+- **纯 OFFSET**：`OFFSET m` 不带 LIMIT 时跳过前 m 行
+- **ORDER BY + OFFSET**：Top-N 排序正确覆盖 offset + limit
+- **严格解析**：`LIMIT 5+1` 等非字面量不再被静默当作"无限制"，改为报 Parse error
+
+#### 打开路径防损坏
+- **截断文件不再 panic**：列存反序列化（`data_from_bytes`）对 min/max 段补齐边界检查，文件尾部截断返回 `InvalidFormat` 而非 slice 越界 panic
+- **防超大分配**：损坏的 row group / column count 触发防御性校验，防止打开损坏文件时 OOM
+
+#### 查询计划缓存
+- **失效清单补全**：`CREATE VIEW` / `DROP VIEW` 现在会清空计划缓存（此前 DROP VIEW 后可能命中旧计划返回错误结果）
+
+### 修改文件
+- `src/storage/file_format.rs`：头部双副本 + CRC + `parse_core` 重构 + 撕裂恢复测试
+- `src/storage/mod.rs`：`persist_header` 助手 + fsync 顺序 + 加载路径读完整页
+- `src/storage/column_store.rs`：`data_from_bytes` 边界检查
+- `src/sql/ast.rs` / `src/sql/parser.rs`：`SelectStmt.offset` + OFFSET/LIMIT 严格解析
+- `src/sql/planner.rs` / `src/executor/` / `src/sql/optimizer.rs` / `src/sql/cost_model.rs`：`PhysicalPlan::Limit.offset` 全链路
+- `src/lib.rs`：计划缓存失效清单补 CreateView/DropView
+- `tests/differential_sqlite.rs`：OFFSET 差分测试用例
+
 ## [0.22.0] - 2026-08-25
 
 ### SQL 功能完善（高优先级）

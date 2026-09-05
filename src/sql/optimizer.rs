@@ -256,11 +256,12 @@ fn optimize_build_sides(plan: PhysicalPlan) -> Result<PhysicalPlan> {
                 aggregates,
             })
         }
-        PhysicalPlan::Limit { input, limit } => {
+        PhysicalPlan::Limit { input, limit, offset } => {
             let opt_input = optimize_build_sides(*input)?;
             Ok(PhysicalPlan::Limit {
                 input: Box::new(opt_input),
                 limit,
+                offset,
             })
         }
         PhysicalPlan::Window { input, window_functions, column_names } => {
@@ -300,7 +301,7 @@ fn estimate_rows(plan: &PhysicalPlan) -> u64 {
                 ((estimate_rows(input) as f64 * 0.1) as u64).max(1)
             }
         }
-        PhysicalPlan::Limit { input, limit } => estimate_rows(input).min(*limit as u64),
+        PhysicalPlan::Limit { input, limit, .. } => estimate_rows(input).min(*limit as u64),
         PhysicalPlan::HashJoin { left, right, .. } => {
             // 连接输出行数：笛卡尔积 × 选择率（默认 0.1）
             (((estimate_rows(left) as f64) * (estimate_rows(right) as f64) * 0.1) as u64).max(1)
@@ -340,11 +341,12 @@ fn constant_folding(plan: PhysicalPlan) -> Result<PhysicalPlan> {
                 column_names,
             })
         }
-        PhysicalPlan::Limit { input, limit } => {
+        PhysicalPlan::Limit { input, limit, offset } => {
             let folded_input = constant_folding(*input)?;
             Ok(PhysicalPlan::Limit {
                 input: Box::new(folded_input),
                 limit,
+                offset,
             })
         }
         PhysicalPlan::Aggregate {
@@ -725,11 +727,12 @@ fn pushdown_predicates(plan: PhysicalPlan, pending_predicates: Vec<Expression>) 
         }
 
         // Limit: 谓词可以穿过 Limit 下推（过滤后再 limit 结果等价）
-        PhysicalPlan::Limit { input, limit } => {
+        PhysicalPlan::Limit { input, limit, offset } => {
             let pushed_input = pushdown_predicates(*input, pending_predicates)?;
             Ok(PhysicalPlan::Limit {
                 input: Box::new(pushed_input),
                 limit,
+                offset,
             })
         }
 
@@ -996,11 +999,12 @@ fn pushdown_projection(plan: PhysicalPlan, required_cols: &[String]) -> Result<P
             })
         }
 
-        PhysicalPlan::Limit { input, limit } => {
+        PhysicalPlan::Limit { input, limit, offset } => {
             let pushed_input = pushdown_projection(*input, required_cols)?;
             Ok(PhysicalPlan::Limit {
                 input: Box::new(pushed_input),
                 limit,
+                offset,
             })
         }
 
@@ -1106,9 +1110,10 @@ fn identity_projection_elimination(plan: PhysicalPlan) -> PhysicalPlan {
             input: Box::new(identity_projection_elimination(*input)),
             condition,
         },
-        PhysicalPlan::Limit { input, limit } => PhysicalPlan::Limit {
+        PhysicalPlan::Limit { input, limit, offset } => PhysicalPlan::Limit {
             input: Box::new(identity_projection_elimination(*input)),
             limit,
+            offset,
         },
         PhysicalPlan::Sort { input, sort_keys, limit } => PhysicalPlan::Sort {
             input: Box::new(identity_projection_elimination(*input)),
@@ -1185,11 +1190,12 @@ fn filter_reorder(plan: PhysicalPlan) -> Result<PhysicalPlan> {
             })
         }
 
-        PhysicalPlan::Limit { input, limit } => {
+        PhysicalPlan::Limit { input, limit, offset } => {
             let reordered_input = filter_reorder(*input)?;
             Ok(PhysicalPlan::Limit {
                 input: Box::new(reordered_input),
                 limit,
+                offset,
             })
         }
 
@@ -1405,6 +1411,7 @@ mod tests {
                     column_indices: vec![0, 1],
                 }),
                 limit: 10,
+                offset: 0,
             }),
             condition: BinaryOp {
                 left: Box::new(ColumnRef {
@@ -2073,6 +2080,7 @@ mod tests {
                     condition: cmp_expr(Lt, col_ref("b"), lit_i(100)),
                 }),
                 limit: 10,
+                offset: 0,
             }),
             condition: cmp_expr(GtEq, col_ref("a"), lit_i(50)),
         };
@@ -2106,10 +2114,11 @@ mod tests {
                 condition: cmp_expr(Gt, col_ref("x"), lit_i(0)),
             }),
             limit: 5,
+            offset: 0,
         };
         let result = projection_pushdown(plan).unwrap();
         match &result {
-            PhysicalPlan::Limit { input, limit: 5 } => match input.as_ref() {
+            PhysicalPlan::Limit { input, limit: 5, .. } => match input.as_ref() {
                 PhysicalPlan::Filter { input, .. } => {
                     assert!(matches!(input.as_ref(), PhysicalPlan::Projection { .. }));
                 }
@@ -2343,6 +2352,7 @@ mod tests {
         let lim = PhysicalPlan::Limit {
             input: Box::new(scan("t", &[0])),
             limit: 7,
+            offset: 0,
         };
         assert_eq!(estimate_rows(&lim), 7);
         // HashJoin 笛卡尔积 × 0.1
@@ -2585,6 +2595,7 @@ mod tests {
                     },
                 }),
                 limit: 50,
+                offset: 0,
             }),
             expressions: vec![col_ref("a")],
             column_names: vec!["a".into()],
