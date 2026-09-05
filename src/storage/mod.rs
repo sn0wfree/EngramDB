@@ -1116,12 +1116,18 @@ impl Database {
         use std::io::Write;
         // v0.12.1: checkpoint 持久化 catalog/data/indexes
         // checkpoint 内部会先 compact_all，再依次保存三段
-        let _ = self.checkpoint();
+        // v0.22.3：失败不再吞掉——error! 日志 + 向调用方传播（flush/sync
+        // 仍执行，尽量兜底）；"close 即持久化"的契约不因静默失败而落空。
+        // （Connection::drop 的 best-effort checkpoint 保持不变，Drop 无法传播。）
+        let ckpt_result = self.checkpoint();
+        if let Err(ref e) = ckpt_result {
+            log::error!("checkpoint failed during close: {} (data may not be fully persisted)", e);
+        }
 
         self.file.flush()?;
         self.file.sync_all()?;
         self.plan_cache.clear();
-        Ok(())
+        ckpt_result
     }
 
     /// 获取缓存的查询计划（Perf02 / v0.18 P0-1 计划缓存接线）

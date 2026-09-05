@@ -3,6 +3,42 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [0.22.3] - 2026-08-30
+
+### 谓词下推正确性修复（错误结果级）
+
+#### Limit 穿越修复
+- **谓词不再穿越 Limit**：`Filter(Limit(X))` 语义是"先取 N 行再过滤"，
+  原规则下推后变为"先过滤再取 N 行"，结果不同（例：LIMIT 5 + x>3 过滤，
+  原语义 [4,5]，下推后 [4,5,6,7,8]）。挂起谓词现保持在 Limit 之上
+  （与 Aggregate/HashJoin 臂同一回包模式）；Limit 之下的内部谓词仍正常
+  下推。重写 2 个断言了错误变换的测试
+
+#### 派生表谓词丢弃修复（兜底臂）
+- **`other` 臂不再静默丢弃谓词**：原兜底臂 `other => Ok(other)` 会把
+  Filter 悬挂的谓词直接丢掉——WHERE over 派生表（`SELECT ... FROM
+  (SELECT ...) sub WHERE ...`）命中 SubqueryScan 后外层条件被丢、
+  返回未过滤结果集。现谓词包回当前节点之上。连带覆盖 SetUnion /
+  RecursiveCte 等所有未枚举节点。新增 SubqueryScan 谓词保留测试 +
+  2 个差分回归用例
+
+#### 持久化契约
+- **close() checkpoint 失败不再吞掉**：`error!` 日志 + 向调用方传播
+  （flush/sync 仍执行尽量兜底）。"close 即持久化"的契约不因静默失败
+  而落空；`Connection::drop` 的 best-effort checkpoint 保持不变
+
+#### 清理
+- WAL 读取器死代码移除（`rest_len.min(0)` 对 u64 恒为 0）
+- `set_wal_group_commit_size` 文档修正：默认 16（Perf04）而非 0，
+  进程崩溃不丢数据（行已在 WAL 文件中）、掉电最多丢 16 条事务
+
+### 修改文件
+- `src/sql/optimizer.rs`：Limit 臂 + other 臂修复 + 3 个测试重写/新增
+- `src/storage/mod.rs`：close() 契约
+- `src/wal/reader.rs`：死代码清理
+- `src/lib.rs`：组提交默认值文档
+- `tests/differential_sqlite.rs`：派生表 WHERE 差分回归
+
 ## [0.22.2] - 2026-08-30
 
 ### P0 剩余修复（恢复/MVCC/panic 面/持久性默认值）

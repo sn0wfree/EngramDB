@@ -478,12 +478,14 @@ impl Connection {
     /// Sync 模式下，多条事务共享一次 fsync，写入吞吐可提升数倍至数十倍。
     /// 崩溃时最多丢 `size` 条未 fsync 的事务。
     ///
-    /// - `size = 0`：禁用组提交，每次 commit 都 fsync（最安全，默认）
-    /// - `size = 8~32`：推荐范围，吞吐提升 5~20x
+    /// - 默认 `16`（Perf04）：吞吐提升 5~10×，崩溃时最多丢 16 条未 fsync 事务
+    /// - `size = 0`：禁用组提交，每次 commit 都 fsync（最严格持久性）
+    /// - `size = 8~32`：推荐范围，更高值吞吐提升可达 20x
     /// - 配合 `sync_wal()` 可在关键节点强制刷盘
     ///
     /// 典型场景（AI Agent 交互存储）：
-    /// 高频率小写入 + 可容忍极少量数据丢失（进程崩溃时）
+    /// 高频率小写入 + 可容忍极少量数据丢失（掉电时；进程崩溃不丢，
+    /// 数据已在 WAL 文件中）
     pub fn set_wal_group_commit_size(&mut self, size: usize) {
         self.db.set_wal_group_commit_size(size);
     }

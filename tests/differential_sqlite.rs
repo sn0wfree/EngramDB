@@ -129,6 +129,11 @@ fn diff_projection_and_filter() {
     assert_same("where in list", &mut eng, &lite, "SELECT id FROM users WHERE id IN (3, 7, 15, 44) ORDER BY id");
     assert_same("where between", &mut eng, &lite, "SELECT id, age FROM users WHERE age BETWEEN 30 AND 35 ORDER BY id");
     assert_same("where neq", &mut eng, &lite, "SELECT id FROM users WHERE city != '北京' AND id < 8 ORDER BY id");
+    // v0.22.3 回归：WHERE over 派生表——optimizer 兜底臂此前会把外层谓词静默丢弃
+    assert_same("where over derived table", &mut eng, &lite,
+        "SELECT id, name FROM (SELECT id, name, age FROM users) sub WHERE id < 5 ORDER BY id");
+    assert_same("where over derived with limit", &mut eng, &lite,
+        "SELECT id FROM (SELECT id, age FROM users WHERE age > 30) sub WHERE id >= 10 ORDER BY id LIMIT 4");
 }
 
 #[test]

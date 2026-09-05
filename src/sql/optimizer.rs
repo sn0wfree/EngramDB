@@ -726,14 +726,28 @@ fn pushdown_predicates(plan: PhysicalPlan, pending_predicates: Vec<Expression>) 
             Ok(result)
         }
 
-        // Limit: 谓词可以穿过 Limit 下推（过滤后再 limit 结果等价）
+        // Limit: 谓词不得穿越 Limit（v0.22.3 正确性修复）
+        //
+        // Filter(Limit(X)) 语义是"先取 N 行再过滤"；若把谓词下推到 Limit
+        // 之下，语义变为"先过滤再取 N 行"，结果不同（例：100 行、LIMIT 5、
+        // 过滤 x>3 → 原语义 [4,5]，下推后 [4,5,6,7,8]）。挂起谓词保持在
+        // Limit 之上（与 Aggregate/HashJoin 臂同一模式）；Limit 输入侧的
+        // 内部谓词仍正常递归下推。
         PhysicalPlan::Limit { input, limit, offset } => {
-            let pushed_input = pushdown_predicates(*input, pending_predicates)?;
-            Ok(PhysicalPlan::Limit {
+            let pushed_input = pushdown_predicates(*input, Vec::new())?;
+            let mut result = PhysicalPlan::Limit {
                 input: Box::new(pushed_input),
                 limit,
                 offset,
-            })
+            };
+            if !pending_predicates.is_empty() {
+                let combined = combine_predicates(pending_predicates);
+                result = PhysicalPlan::Filter {
+                    input: Box::new(result),
+                    condition: combined,
+                };
+            }
+            Ok(result)
         }
 
         // Aggregate: 只有引用了 GROUP BY 列的谓词才能下推
@@ -814,8 +828,25 @@ fn pushdown_predicates(plan: PhysicalPlan, pending_predicates: Vec<Expression>) 
             Ok(result)
         }
 
-        // 其他节点直接递归
-        other => Ok(other),
+        // 其他节点（SubqueryScan / Window / SetUnion / RecursiveCte 等）：
+        // 挂起谓词保持在当前节点之上（v0.22.3 正确性修复）
+        //
+        // 原 `other => Ok(other)` 会把 Filter(X) 悬挂的谓词**静默丢弃**——
+        // 如 WHERE over 派生表：planner 构建 Filter(SubqueryScan(inner))，
+        // 下推时 Filter 收集谓词后命中本臂，谓词被丢、结果集不过滤
+        // （planner 侧 v0.15 Q23 已修外层条件叠加，此处是 optimizer 侧残留）。
+        // 节点内部不递归下推（保守，与原行为一致）。
+        other => {
+            if pending_predicates.is_empty() {
+                Ok(other)
+            } else {
+                let combined = combine_predicates(pending_predicates);
+                Ok(PhysicalPlan::Filter {
+                    input: Box::new(other),
+                    condition: combined,
+                })
+            }
+        }
     }
 }
 
@@ -1403,7 +1434,8 @@ mod tests {
 
     #[test]
     fn test_predicate_pushdown_through_limit() {
-        // Filter(Limit(Scan)) -> Limit(Filter(Scan))
+        // v0.22.3：Filter(Limit(Scan)) 谓词不得穿越 Limit —— Filter 保持在
+        // Limit 之上（"先取 N 行再过滤"），Limit 输入保持无谓词的扫描
         let plan = PhysicalPlan::Filter {
             input: Box::new(PhysicalPlan::Limit {
                 input: Box::new(PhysicalPlan::TableScan {
@@ -1424,13 +1456,40 @@ mod tests {
         };
 
         let result = predicate_pushdown(plan).unwrap();
-        // 结果应该是 Limit 在 Filter 之上
         match result {
-            PhysicalPlan::Limit { input, .. } => match input.as_ref() {
-                PhysicalPlan::Filter { .. } => {}
-                _ => panic!("Expected Filter inside Limit"),
-            },
-            _ => panic!("Expected Limit at top"),
+            PhysicalPlan::Filter { condition, input } => {
+                // 谓词保留在 Limit 之上
+                assert!(matches!(condition, BinaryOp { op: Gt, .. }), "a>5 stays above limit");
+                match *input {
+                    PhysicalPlan::Limit { input, limit: 10, offset: 0 } => {
+                        assert!(matches!(*input, PhysicalPlan::TableScan { .. }),
+                            "limit input is the bare scan");
+                    }
+                    other => panic!("Expected Limit inside Filter, got {other:?}"),
+                }
+            }
+            other => panic!("Expected Filter at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_predicate_preserved_above_subqueryscan() {
+        // v0.22.3：Filter(SubqueryScan(X)) 的谓词不得被 other 臂静默丢弃
+        //（WHERE over 派生表此前会返回未过滤结果），保留为 Filter 之上
+        let plan = PhysicalPlan::Filter {
+            input: Box::new(PhysicalPlan::SubqueryScan {
+                plan: Box::new(scan("t", &[0, 1])),
+            }),
+            condition: cmp_expr(Gt, col_ref("a"), lit_i(1)),
+        };
+        let result = predicate_pushdown(plan).unwrap();
+        match &result {
+            PhysicalPlan::Filter { condition, input } => {
+                assert!(format!("{condition:?}").contains("Gt"), "predicate preserved: {condition:?}");
+                assert!(matches!(input.as_ref(), PhysicalPlan::SubqueryScan { .. }),
+                    "subquery scan intact");
+            }
+            other => panic!("expected Filter at top, got {other:?}"),
         }
     }
 
@@ -2065,7 +2124,9 @@ mod tests {
 
     #[test]
     fn test_pushdown_through_limit_deep_chain() {
-        // Filter(Limit(Filter(Projection(Filter(Scan))))) → 全部谓词汇聚到扫描
+        // Filter(Limit(Filter(Projection(Filter(Scan))))) →
+        // 顶层谓词 a>=50 不得穿越 Limit（v0.22.3），保持在 Limit 之上；
+        // Limit 之下的谓词（b<100、a>1）仍正常下推到扫描附近
         let plan = PhysicalPlan::Filter {
             input: Box::new(PhysicalPlan::Limit {
                 input: Box::new(PhysicalPlan::Filter {
@@ -2085,17 +2146,23 @@ mod tests {
             condition: cmp_expr(GtEq, col_ref("a"), lit_i(50)),
         };
         let result = predicate_pushdown(plan).unwrap();
-        // 顶层为 Limit，所有谓词（a>=50、b<100、a>1）都下沉到扫描附近
-        assert!(matches!(&result, PhysicalPlan::Limit { .. }));
-        let tree = format!("{result:?}");
-        assert!(tree.contains("TableScan"), "scan preserved: {tree}");
-        assert!(tree.contains("GtEq"), "a>=50 preserved: {tree}");
-        assert!(tree.contains("Lt"), "b<100 preserved: {tree}");
-        assert!(tree.contains("Gt"), "a>1 preserved: {tree}");
-        // Limit 之下仍有 Filter（谓词未丢失）
-        if let PhysicalPlan::Limit { input, .. } = &result {
-            assert!(format!("{input:?}").contains("Filter"),
-                "predicates pushed below limit: {input:?}");
+        // 顶层为 Filter（a>=50 保留在 Limit 之上，不穿越）
+        match &result {
+            PhysicalPlan::Filter { condition, input } => {
+                assert!(format!("{condition:?}").contains("GtEq"),
+                    "a>=50 stays above limit: {condition:?}");
+                // 之内是 Limit，其输入树包含下推后的内部谓词
+                match input.as_ref() {
+                    PhysicalPlan::Limit { input, .. } => {
+                        let tree = format!("{input:?}");
+                        assert!(tree.contains("TableScan"), "scan preserved: {tree}");
+                        assert!(tree.contains("Lt"), "b<100 pushed below limit: {tree}");
+                        assert!(tree.contains("Gt"), "a>1 pushed to scan: {tree}");
+                    }
+                    other => panic!("expected Limit inside Filter, got {other:?}"),
+                }
+            }
+            other => panic!("expected Filter at top, got {other:?}"),
         }
     }
 

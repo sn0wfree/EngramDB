@@ -90,16 +90,14 @@ impl WalReader {
     /// 按指定头部长度与记录总长读取并解析（含 CRC 校验）
     /// 返回 Ok(None) 表示解析失败或到文件末尾
     fn try_read_record(&mut self, record_start: u64, header_len: usize, total: usize) -> Result<Option<WalRecord>> {
-        let rest_len = total as u64 - header_len as u64;
         let mut full = vec![0u8; total];
         // 重读完整记录（头部已在 buffer 中，直接 seek 重读简单可靠）
         self.file.seek(SeekFrom::Start(record_start))?;
         match self.file.read_exact(&mut full) {
             Ok(_) => {}
             Err(_) => {
-                // 不完整，到达文件末尾
-                self.position = record_start + header_len as u64 + rest_len.min(0);
-                // 读取了多少算多少：按已读位置推进（简化：EOF 返回 None）
+                // 不完整（EOF/部分写入）：推进到记录头末尾，返回 None 结束
+                //（v0.22.3 清理：原 `rest_len.min(0)` 对 u64 恒为 0 的死代码已移除）
                 self.position = record_start + header_len as u64;
                 self.file.seek(SeekFrom::Start(self.position))?;
                 return Ok(None);
