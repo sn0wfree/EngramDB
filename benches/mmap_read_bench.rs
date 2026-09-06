@@ -9,8 +9,8 @@
 //! - 列存扫描内存峰值 -50%（vs 内堆 Vec）
 
 // 依赖 feature = "mmap-read"（storage::mmap_reader 模块为 cfg gate）。
-// 无 feature 编译（如 `cargo build --benches`）时整个 bench 为空。
-#![cfg(feature = "mmap-read")]
+// 注意：不能用文件级 `#![cfg(...)]`——会把 main 一起 gate 掉（E0601）。
+// mmap 相关场景在 main 内用 #[cfg] 块 gate，无 feature 时编译为空 crate。
 
 use std::fs::File;
 use std::io::Write;
@@ -37,6 +37,10 @@ fn fmt_us(ns: u128) -> String {
 }
 
 fn main() {
+    if !cfg!(feature = "mmap-read") {
+        println!("skip: built without feature = \"mmap-read\" (storage::mmap_reader unavailable)");
+        return;
+    }
     println!("=== Phase 2 P0-A: mmap Read Path Bench ===");
     println!(
         "File size: {} MB, {} iters per scenario",
@@ -53,50 +57,53 @@ fn main() {
         f.write_all(&data).unwrap();
     }
 
-    // -------- 场景 A：mmap 顺序读 1MB --------
-    println!("--- 场景 A：mmap 顺序读 1MB × 16 ---");
-    let mut samples = Vec::new();
-    for _ in 0..N_ITERS {
-        let reader = engramdb::storage::mmap_reader::MmapReader::open(&path).unwrap();
-        let t0 = Instant::now();
-        let mut total = 0usize;
-        for offset in (0..FILE_SIZE).step_by(1024 * 1024) {
-            let slice = reader.slice(offset, 1024 * 1024);
-            total += slice.len();
+    // -------- 场景 A/B：mmap 读路径（feature = "mmap-read"）--------
+    #[cfg(feature = "mmap-read")]
+    {
+        println!("--- 场景 A：mmap 顺序读 1MB × 16 ---");
+        let mut samples = Vec::new();
+        for _ in 0..N_ITERS {
+            let reader = engramdb::storage::mmap_reader::MmapReader::open(&path).unwrap();
+            let t0 = Instant::now();
+            let mut total = 0usize;
+            for offset in (0..FILE_SIZE).step_by(1024 * 1024) {
+                let slice = reader.slice(offset, 1024 * 1024);
+                total += slice.len();
+            }
+            let _ = total;
+            samples.push(t0.elapsed().as_nanos());
         }
-        let _ = total;
-        samples.push(t0.elapsed().as_nanos());
-    }
-    println!(
-        "  mmap 顺序读 16MB: median={} (total bytes consumed)",
-        fmt_us(median(samples.clone()))
-    );
-    println!();
+        println!(
+            "  mmap 顺序读 16MB: median={} (total bytes consumed)",
+            fmt_us(median(samples.clone()))
+        );
+        println!();
 
-    // -------- 场景 B：mmap 随机读 4KB × 1000 --------
-    println!("--- 场景 B：mmap 随机读 4KB × 1000 ---");
-    let mut samples = Vec::new();
-    let mut last_byte = 0u8;
-    for _ in 0..N_ITERS {
-        let reader = engramdb::storage::mmap_reader::MmapReader::open(&path).unwrap();
-        let t0 = Instant::now();
-        // 伪随机但确定性偏移
-        for i in 0..1000 {
-            let offset = ((i * 4093) % (FILE_SIZE - 4096)) & !0xFFF; // 4KB 对齐
-            let slice = reader.slice(offset, 4096);
-            // 实际使用数据，避免 dead-code elimination
-            last_byte = last_byte.wrapping_add(slice[0]).wrapping_add(slice[slice.len() - 1]);
+        // -------- 场景 B：mmap 随机读 4KB × 1000 --------
+        println!("--- 场景 B：mmap 随机读 4KB × 1000 ---");
+        let mut samples = Vec::new();
+        let mut last_byte = 0u8;
+        for _ in 0..N_ITERS {
+            let reader = engramdb::storage::mmap_reader::MmapReader::open(&path).unwrap();
+            let t0 = Instant::now();
+            // 伪随机但确定性偏移
+            for i in 0..1000 {
+                let offset = ((i * 4093) % (FILE_SIZE - 4096)) & !0xFFF; // 4KB 对齐
+                let slice = reader.slice(offset, 4096);
+                // 实际使用数据，避免 dead-code elimination
+                last_byte = last_byte.wrapping_add(slice[0]).wrapping_add(slice[slice.len() - 1]);
+            }
+            samples.push(t0.elapsed().as_nanos());
         }
-        samples.push(t0.elapsed().as_nanos());
-    }
-    let mmap_rand = median(samples.clone());
-    println!(
-        "  mmap 随机读 1000 次: median={} ({:.2} ns/op), last_byte={}",
-        fmt_us(mmap_rand),
-        mmap_rand as f64 / 1000.0,
-        last_byte
-    );
-    println!();
+        let mmap_rand = median(samples.clone());
+        println!(
+            "  mmap 随机读 1000×4KB: median = {} ({:.2} ns/op)",
+            fmt_us(mmap_rand),
+            mmap_rand as f64 / 1000.0,
+            last_byte
+        );
+        println!();
+    } // end cfg(feature = "mmap-read")
 
     // -------- 场景 C：与 EngramDB Connection 对比（基线）--------
     println!("--- 场景 C：EngramDB Connection（基线对比） ---");
@@ -105,23 +112,26 @@ fn main() {
     println!();
 
     println!("=== 总结 ===");
-    println!("  mmap 顺序读 16MB:  median = {}", fmt_us(median(samples)));
-    println!(
-        "  mmap 随机读 1000×4KB: median = {} ({:.2} ns/op)",
-        fmt_us(mmap_rand),
-        mmap_rand as f64 / 1000.0
-    );
-    println!();
-    println!("Phase 2 P0-A KPI:");
-    println!(
-        "  热数据点查 ≤ 1µs (mmap 页缓存命中): {}",
-        if mmap_rand as f64 / 1000.0 < 1000.0 {
-            "✅ 达成"
-        } else {
-            "⚠️  待优化"
-        }
-    );
-    println!("  零拷贝（指针直接借用 mmap 内存）: ✅ 已实现");
+    #[cfg(feature = "mmap-read")]
+    {
+        println!("  mmap 顺序读 16MB:  median = {}", fmt_us(median(samples)));
+        println!(
+            "  mmap 随机读 1000×4KB: median = {} ({:.2} ns/op)",
+            fmt_us(mmap_rand),
+            mmap_rand as f64 / 1000.0
+        );
+        println!();
+        println!("Phase 2 P0-A KPI:");
+        println!(
+            "  热数据点查 ≤ 1µs (mmap 页缓存命中): {}",
+            if mmap_rand as f64 / 1000.0 < 1000.0 {
+                "✅ 达成"
+            } else {
+                "⚠️  待优化"
+            }
+        );
+        println!("  零拷贝（指针直接借用 mmap 内存）: ✅ 已实现");
+    } // end cfg(feature = "mmap-read") — KPI 总结
 
     // 清理
     let _ = std::fs::remove_file(&path);
