@@ -2039,17 +2039,27 @@ fn eval_arith(left: &Value, op: BinaryOperator, right: &Value) -> Value {
 
     // 浮点运算
     if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
-        // v0.22.4：浮点除零/模零 → NULL（对齐 SQLite）。原返回 NaN，参与
-        // 排序/比较产生非标准行为，且是差分测试的持续噪音源
-        if r == 0.0 {
-            return Value::Null;
-        }
         let result = match op {
             Plus => l + r,
             Minus => l - r,
             Multiply => l * r,
-            Divide => l / r,
-            Modulo => l % r,
+            // v0.22.4：浮点除零/模零 → NULL（对齐 SQLite）。原返回 NaN，参与
+            // 排序/比较产生非标准行为，且是差分测试的持续噪音源。
+            // 注意：检查只在 Divide/Modulo 分支内——曾误写为所有运算符共享
+            // 的前置检查，导致 `float + 0` 也被误判为除零返回 NULL
+            // （随机一致性测试 test_specialized_matches_pair_random 抓到）。
+            Divide => {
+                if r == 0.0 {
+                    return Value::Null;
+                }
+                l / r
+            }
+            Modulo => {
+                if r == 0.0 {
+                    return Value::Null;
+                }
+                l % r
+            }
             _ => unreachable!(),
         };
         return Value::Float64(result);
@@ -5781,6 +5791,30 @@ mod tests {
         let flat = r.to_flat();
         assert_eq!(flat[0], Value::Null);
         assert_eq!(flat[1], Value::Null);
+    }
+
+    #[test]
+    fn test_float_add_zero_not_null() {
+        // v0.22.4 回归：浮点除零检查曾误写在所有运算符共享位置，导致
+        // `float + 0` 被误判为除零返回 NULL（随机一致性测试抓到）
+        use crate::executor::vector::Vector as V;
+        let l = V::Flat(vec![Value::Float64(-81.93)]);
+        let r = V::Flat(vec![Value::Int32(0)]);
+        let out = eval_binary_vectorized(&l, BinaryOperator::Plus, &r).unwrap();
+        assert_eq!(out.to_flat(), vec![Value::Float64(-81.93)]);
+
+        // 标量路径同验
+        let v = eval_binary_pair(&Value::Float64(-81.93), BinaryOperator::Plus, &Value::Int32(0));
+        assert_eq!(v, Value::Float64(-81.93));
+        // 乘 0 也不是 NULL
+        let v = eval_binary_pair(&Value::Float64(5.0), BinaryOperator::Multiply, &Value::Int64(0));
+        assert_eq!(v, Value::Float64(0.0));
+        // 减 0 不是 NULL
+        let v = eval_binary_pair(&Value::Float64(5.0), BinaryOperator::Minus, &Value::Float64(0.0));
+        assert_eq!(v, Value::Float64(5.0));
+        // 除零仍是 NULL
+        let v = eval_binary_pair(&Value::Float64(5.0), BinaryOperator::Divide, &Value::Int32(0));
+        assert_eq!(v, Value::Null);
     }
 
     #[test]
