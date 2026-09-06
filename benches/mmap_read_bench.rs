@@ -8,6 +8,10 @@
 //! - 热数据点查 ≤ 1µs（mmap 后命中页缓存）
 //! - 列存扫描内存峰值 -50%（vs 内堆 Vec）
 
+// 依赖 feature = "mmap-read"（storage::mmap_reader 模块为 cfg gate）。
+// 无 feature 编译（如 `cargo build --benches`）时整个 bench 为空。
+#![cfg(feature = "mmap-read")]
+
 use std::fs::File;
 use std::io::Write;
 use std::time::Instant;
