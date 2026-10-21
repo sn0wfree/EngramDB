@@ -153,10 +153,7 @@ fn try_execute_chunks(plan: &PhysicalPlan, db: &mut Database) -> Result<Option<(
                         .iter()
                         .map(|c| match c {
                             Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
-                            Vector::Typed(d) => {
-                                let mut d = d.clone();
-                                Vector::Typed(d.take_front(take))
-                            }
+                            Vector::Typed(d) => Vector::Typed(d.from_range(0, take)),
                             Vector::Flat(rows) => Vector::Flat(rows.iter().take(take).cloned().collect()),
                         })
                         .collect();
@@ -177,7 +174,7 @@ fn try_execute_chunks(plan: &PhysicalPlan, db: &mut Database) -> Result<Option<(
                 Some(x) => x,
                 None => return Ok(None),
             };
-            let agg_funcs: Vec<_> = aggregates.iter().map(|a| (a.func, a.input, a.distinct)).collect();
+            let (chunks, agg_funcs) = materialize_aggregate_inputs(&chunks, &cols, aggregates)?;
             let result = if group_by.is_empty() {
                 operators::aggregate::execute(&chunks, &agg_funcs)?
             } else {
@@ -293,10 +290,7 @@ fn truncate_chunk(chunk: &DataChunk, n: usize) -> DataChunk {
         .iter()
         .map(|c| match c {
             Vector::Constant(v, _) => Vector::Constant(v.clone(), n),
-            Vector::Typed(d) => {
-                let mut d = d.clone();
-                Vector::Typed(d.take_front(n))
-            }
+            Vector::Typed(d) => Vector::Typed(d.from_range(0, n)),
             Vector::Flat(rows) => Vector::Flat(rows.iter().take(n).cloned().collect()),
         })
         .collect();
@@ -989,7 +983,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         } => {
             // M1-3：列式路径（子计划列式执行 + 聚合），失败回退行式
             if let Some((sub_cols, chunks)) = try_execute_chunks(&input, db)? {
-                let agg_funcs: Vec<_> = aggregates.iter().map(|a| (a.func, a.input, a.distinct)).collect();
+                let (chunks, agg_funcs) = materialize_aggregate_inputs(&chunks, &sub_cols, aggregates)?;
 
                 let result = if group_by.is_empty() {
                     operators::aggregate::execute(&chunks, &agg_funcs)?
@@ -1019,7 +1013,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_result = execute(*input, db)?;
             let input_chunks = rows_to_chunks(&input_result.rows);
 
-            let agg_funcs: Vec<_> = aggregates.iter().map(|a| (a.func, a.input, a.distinct)).collect();
+            let (input_chunks, agg_funcs) =
+                materialize_aggregate_inputs(&input_chunks, &input_result.columns, aggregates)?;
 
             let result = if group_by.is_empty() {
                 // 无 GROUP BY：简单聚合
@@ -1099,10 +1094,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                             .iter()
                             .map(|c| match c {
                                 Vector::Constant(v, _) => Vector::Constant(v.clone(), take),
-                                Vector::Typed(d) => {
-                                    let mut d = d.clone();
-                                    Vector::Typed(d.take_front(take))
-                                }
+                                Vector::Typed(d) => Vector::Typed(d.from_range(0, take)),
                                 Vector::Flat(rows) => Vector::Flat(rows.iter().take(take).cloned().collect()),
                             })
                             .collect();
@@ -1264,6 +1256,8 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 let r = db.txn_manager_mut().commit(txn_id)?;
                 db.discard_txn_buffer();
                 db.set_current_txn_id(None);
+                // Auto 表分层迁移 tick（每 1000 次 commit 触发一次）
+                db.on_commit();
                 Ok(r)
             } else {
                 Err(crate::common::error::EngramDbError::Internal(
@@ -1797,6 +1791,58 @@ pub fn debug_chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {
 
 fn chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {
     super::vector::flatten_to_rows(chunks)
+}
+
+/// 聚合输入物化：`AggregateExpr.input_expr` 非空时，对每个 chunk 求值并
+/// 追加为临时列，返回可直接喂给聚合算子的 (func, col_idx, distinct) 列表。
+///
+/// 修差分 bug：`SUM(amount * 2)` 原先被当成 `SUM(col0)`（表达式被丢弃）。
+fn materialize_aggregate_inputs(
+    chunks: &[DataChunk],
+    col_names: &[String],
+    aggregates: &[crate::executor::physical_plan::AggregateExpr],
+) -> Result<(
+    std::borrow::Cow<'_, [DataChunk]>,
+    Vec<(crate::executor::physical_plan::AggregateFunc, usize, bool)>,
+)> {
+    use crate::executor::physical_plan::AggregateExpr;
+
+    let needs_materialize = aggregates.iter().any(|a| a.input_expr.is_some());
+    if !needs_materialize {
+        let funcs = aggregates
+            .iter()
+            .map(|a: &AggregateExpr| (a.func, a.input, a.distinct))
+            .collect();
+        return Ok((std::borrow::Cow::Borrowed(chunks), funcs));
+    }
+
+    let base_cols = chunks.first().map(|c| c.columns.len()).unwrap_or(0);
+    let mut out_chunks = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let mut cols = chunk.columns.clone();
+        for a in aggregates {
+            if let Some(expr) = &a.input_expr {
+                let vec = super::expression::eval_vectorized(expr, chunk, col_names)?;
+                cols.push(vec);
+            }
+        }
+        out_chunks.push(DataChunk {
+            columns: cols,
+            count: chunk.count,
+        });
+    }
+
+    let mut next = base_cols;
+    let mut funcs = Vec::with_capacity(aggregates.len());
+    for a in aggregates {
+        if a.input_expr.is_some() {
+            funcs.push((a.func, next, a.distinct));
+            next += 1;
+        } else {
+            funcs.push((a.func, a.input, a.distinct));
+        }
+    }
+    Ok((std::borrow::Cow::Owned(out_chunks), funcs))
 }
 
 fn rows_to_chunks(rows: &[Vec<crate::Value>]) -> Vec<DataChunk> {

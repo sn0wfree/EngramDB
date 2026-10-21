@@ -282,11 +282,9 @@ fn diff_aggregates() {
     );
 }
 
-/// 已知 bug（差分发现，CI Run #60）：HAVING 中的聚合泄漏进投影输出——
-/// `SELECT city, COUNT(*) ... HAVING COUNT(*) > 10` 输出 3 列（多出一个
-/// COUNT(*)），SQLite 输出 2 列。修复 planner 聚合投影列收集后解除 ignore。
+/// 回归：HAVING 中的聚合不得泄漏进投影输出
+/// （曾：`SELECT city, COUNT(*) ... HAVING COUNT(*) > 10` 多出一列）
 #[test]
-#[ignore = "known bug: HAVING 聚合泄漏进投影列（输出多一列）"]
 fn known_bug_having_projection_leak() {
     let (mut eng, lite) = fresh();
     assert_same(
@@ -429,11 +427,9 @@ fn diff_expression_arith() {
     );
 }
 
-/// 已知 bug（差分发现，CI Run #60）：聚合内的表达式被忽略——
-/// `SELECT SUM(amount * 2) FROM orders` 结果等于 SUM(amount)（9640），
-/// SQLite 正确值 19280。聚合求值未应用 ×2 表达式。修复后解除 ignore。
+/// 回归：聚合内表达式必须生效
+/// （曾：`SUM(amount * 2)` 被当成 `SUM(amount)`）
 #[test]
-#[ignore = "known bug: 聚合内表达式被忽略（SUM(amount*2) == SUM(amount)）"]
 fn known_bug_aggregate_expression_ignored() {
     let (mut eng, lite) = fresh();
     assert_same("agg expr", &mut eng, &lite, "SELECT SUM(amount * 2) FROM orders");

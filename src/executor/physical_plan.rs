@@ -292,6 +292,9 @@ pub struct AggregateExpr {
     pub func: AggregateFunc,
     pub input: usize,   // 输入列索引
     pub distinct: bool, // DISTINCT 去重
+    /// 非简单列引用的聚合参数（如 `SUM(amount * 2)`）。执行前按行/列求值后
+    /// 作为临时输入列；`None` 时直接读 `input` 列。
+    pub input_expr: Option<Expression>,
 }
 
 /// 聚合函数

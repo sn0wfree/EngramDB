@@ -317,6 +317,7 @@ pub(crate) fn execute_with_txn(db: &mut Database, table_name: &str, rows: Vec<Ve
     // 3. 提交事务（会 fsync WAL）
     debug!("Committing transaction {}...", txn_id);
     let result = db.txn_manager_mut().commit(txn_id)?;
+    db.on_commit();
     info!(
         "Transaction {} committed: commit_ts={}, apply_ops_count={}",
         txn_id,

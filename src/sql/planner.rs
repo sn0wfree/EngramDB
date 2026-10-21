@@ -1170,31 +1170,7 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             collect_agg_exprs(having, &mut agg_exprs);
         }
 
-        aggregates = agg_exprs
-            .iter()
-            .filter_map(|(func_name, arg_expr, distinct)| {
-                // 解析聚合函数的输入列索引
-                let input_col = match arg_expr {
-                    Expression::ColumnRef { column, .. } => scan_column_names.iter().position(|c| c == column)?,
-                    _ => 0, // 默认第 0 列（简化处理）
-                };
-
-                let func = match func_name.to_uppercase().as_str() {
-                    "COUNT" => AggregateFunc::Count,
-                    "SUM" => AggregateFunc::Sum,
-                    "AVG" => AggregateFunc::Avg,
-                    "MIN" => AggregateFunc::Min,
-                    "MAX" => AggregateFunc::Max,
-                    _ => return None,
-                };
-
-                Some(AggregateExpr {
-                    func,
-                    input: input_col,
-                    distinct: *distinct,
-                })
-            })
-            .collect();
+        aggregates = build_aggregate_exprs(&agg_exprs, &scan_column_names);
 
         plan = PhysicalPlan::Aggregate {
             input: Box::new(plan),
@@ -1213,6 +1189,19 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                 condition: rewritten,
             };
         }
+    }
+
+    // 聚合输出裁剪（修差分 bug：HAVING 聚合泄漏进投影列）
+    // Aggregate 输出 = group_by 列 + 全部聚合列（含仅 HAVING 使用的）；
+    // 必须再投影成 SELECT 列表，否则多出来的聚合列会泄漏到结果。
+    if needs_aggregate {
+        plan = apply_select_projection_after_aggregate(
+            plan,
+            &stmt.select_list,
+            &group_by_indices,
+            &aggregates,
+            &scan_column_names,
+        )?;
     }
 
     // 检测窗口函数
@@ -1255,8 +1244,7 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     )?;
 
     if needs_aggregate {
-        // 有聚合时，直接输出聚合结果（group_by 列 + 聚合列）
-        // MVP 阶段简化：不做额外投影，列顺序由聚合执行器保证
+        // 已在 HAVING 后经 apply_select_projection_after_aggregate 裁剪
     } else if !proj_expressions.is_empty() {
         // 无聚合时添加投影（确保列顺序与 SELECT 列表一致）
         plan = PhysicalPlan::Projection {
@@ -1270,23 +1258,8 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     if !stmt.order_by.is_empty() {
         // 确定当前计划的输出列名
         let output_columns = if needs_aggregate {
-            // 聚合输出：group_by 列 + 聚合列
-            let mut cols: Vec<String> = group_by_indices
-                .iter()
-                .map(|&i| {
-                    if i < scan_column_names.len() {
-                        scan_column_names[i].clone()
-                    } else {
-                        format!("group_{}", i)
-                    }
-                })
-                .collect();
-            // 聚合列名（简化处理）
-            let agg_count = aggregates.len();
-            for i in 0..agg_count {
-                cols.push(format!("agg_{}", i));
-            }
-            cols
+            // 聚合后已按 SELECT 列表投影，ORDER BY 应对投影后的列名
+            proj_names.clone()
         } else {
             // 非聚合：用投影列名或扫描列名
             if !proj_expressions.is_empty() {
@@ -1427,28 +1400,7 @@ fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             let qualified_having = qualify_column_refs(having_expr);
             collect_agg_exprs(&qualified_having, &mut agg_exprs);
         }
-        aggregates = agg_exprs
-            .iter()
-            .filter_map(|(func_name, arg_expr, distinct)| {
-                let input_col = match arg_expr {
-                    Expression::ColumnRef { column, .. } => scan_column_names.iter().position(|c| c == column)?,
-                    _ => 0,
-                };
-                let func = match func_name.to_uppercase().as_str() {
-                    "COUNT" => AggregateFunc::Count,
-                    "SUM" => AggregateFunc::Sum,
-                    "AVG" => AggregateFunc::Avg,
-                    "MIN" => AggregateFunc::Min,
-                    "MAX" => AggregateFunc::Max,
-                    _ => return None,
-                };
-                Some(AggregateExpr {
-                    func,
-                    input: input_col,
-                    distinct: *distinct,
-                })
-            })
-            .collect();
+        aggregates = build_aggregate_exprs(&agg_exprs, &scan_column_names);
 
         plan = PhysicalPlan::Aggregate {
             input: Box::new(plan),
@@ -1467,6 +1419,27 @@ fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
                 condition: rewritten,
             };
         }
+    }
+
+    // 聚合输出裁剪（同单表：HAVING 聚合不得泄漏进 SELECT 投影）
+    if needs_aggregate {
+        let qualified_select: Vec<SelectItem> = stmt
+            .select_list
+            .iter()
+            .map(|item| match item {
+                SelectItem::Expression(expr, alias) => {
+                    SelectItem::Expression(qualify_column_refs(expr), alias.clone())
+                }
+                other => other.clone(),
+            })
+            .collect();
+        plan = apply_select_projection_after_aggregate(
+            plan,
+            &qualified_select,
+            &group_by_indices,
+            &aggregates,
+            &scan_column_names,
+        )?;
     }
 
     // 窗口函数：JOIN 查询暂不支持
@@ -1492,7 +1465,7 @@ fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         .collect();
 
     if needs_aggregate {
-        // 聚合结果直接输出（列顺序由聚合执行器保证）
+        // 已在 HAVING 后经 apply_select_projection_after_aggregate 裁剪
     } else if !proj_expressions.is_empty() {
         plan = PhysicalPlan::Projection {
             input: Box::new(plan),
@@ -1504,32 +1477,8 @@ fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     // ORDER BY
     if !stmt.order_by.is_empty() {
         let output_columns = if needs_aggregate {
-            // group_by 列名（裸名）+ 聚合列输出名（SELECT 别名优先，与
-            // Aggregate 输出列顺序一致：group_by 列在前，聚合列在后）
-            let mut cols: Vec<String> = group_by_indices
-                .iter()
-                .map(|&i| {
-                    scan_column_names
-                        .get(i)
-                        .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
-                        .unwrap_or_else(|| format!("group_{}", i))
-                })
-                .collect();
-            let agg_out_names: Vec<String> = qualified_select
-                .iter()
-                .filter_map(|item| {
-                    if let SelectItem::Expression(expr, alias) = item {
-                        if let Expression::Function { name, .. } = expr {
-                            if matches!(name.to_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
-                                return Some(alias.clone().unwrap_or_else(|| name.to_lowercase()));
-                            }
-                        }
-                    }
-                    None
-                })
-                .collect();
-            cols.extend(agg_out_names);
-            cols
+            // 聚合后已按 SELECT 列表投影
+            proj_names.clone()
         } else if !proj_expressions.is_empty() {
             proj_names.clone()
         } else {
@@ -2614,6 +2563,46 @@ fn expr_has_aggregate(expr: &Expression) -> bool {
 }
 
 /// 从 SELECT 列表中提取聚合函数
+/// 从聚合提取结果构建 AggregateExpr 列表。
+///
+/// - 简单列引用 → `input` 列索引
+/// - 复杂参数（如 `SUM(amount * 2)`）→ `input_expr`，执行前求值为临时列
+fn build_aggregate_exprs(
+    agg_exprs: &[(String, Expression, bool)],
+    scan_column_names: &[String],
+) -> Vec<AggregateExpr> {
+    agg_exprs
+        .iter()
+        .filter_map(|(func_name, arg_expr, distinct)| {
+            let func = match func_name.to_uppercase().as_str() {
+                "COUNT" => AggregateFunc::Count,
+                "SUM" => AggregateFunc::Sum,
+                "AVG" => AggregateFunc::Avg,
+                "MIN" => AggregateFunc::Min,
+                "MAX" => AggregateFunc::Max,
+                _ => return None,
+            };
+            let (input, input_expr) = match arg_expr {
+                Expression::ColumnRef { column, .. } => {
+                    let idx = scan_column_names.iter().position(|c| c == column)?;
+                    (idx, None)
+                }
+                Expression::Literal(_) if matches!(func, AggregateFunc::Count) => {
+                    // COUNT(常量) / COUNT(*)：按行计数，不依赖输入列
+                    (0, None)
+                }
+                other => (0, Some(other.clone())),
+            };
+            Some(AggregateExpr {
+                func,
+                input,
+                distinct: *distinct,
+                input_expr,
+            })
+        })
+        .collect()
+}
+
 fn extract_aggregates_from_select(items: &[SelectItem]) -> (Vec<(String, Expression, bool)>, Vec<Expression>) {
     let mut aggs = Vec::new();
     let mut non_aggs = Vec::new();
@@ -2682,6 +2671,59 @@ fn collect_agg_exprs(expr: &Expression, out: &mut Vec<(String, Expression, bool)
         Expression::IsNull(e) => collect_agg_exprs(e, out),
         _ => {}
     }
+}
+
+/// 聚合/HAVING 之后按 SELECT 列表裁剪输出列。
+///
+/// Aggregate 输出 schema 为 `group_by 列 + 全部聚合列`（含 HAVING 独有聚合）。
+/// SQLite 语义下结果列只能是 SELECT 列表——此处用与 rewrite_having_aggregates
+/// 相同的命名约定把聚合函数换成 ColumnRef，再挂 Projection。
+fn apply_select_projection_after_aggregate(
+    plan: PhysicalPlan,
+    select_list: &[SelectItem],
+    group_by_indices: &[usize],
+    aggregates: &[AggregateExpr],
+    scan_column_names: &[String],
+) -> Result<PhysicalPlan> {
+    let mut expressions = Vec::new();
+    let mut names = Vec::new();
+    for item in select_list {
+        match item {
+            SelectItem::Expression(expr, alias) => {
+                let rewritten =
+                    rewrite_having_aggregates(expr, group_by_indices, aggregates, scan_column_names);
+                let name = alias.clone().unwrap_or_else(|| match expr {
+                    Expression::ColumnRef { column, .. } => column.clone(),
+                    Expression::Function { name, .. } => name.clone(),
+                    _ => "?column?".to_string(),
+                });
+                expressions.push(rewritten);
+                names.push(name);
+            }
+            SelectItem::Wildcard => {
+                // GROUP BY 场景的 * ：只展开分组键（与 SQLite 一致）
+                for &gi in group_by_indices {
+                    let col = scan_column_names
+                        .get(gi)
+                        .cloned()
+                        .unwrap_or_else(|| format!("group_{}", gi));
+                    expressions.push(Expression::ColumnRef {
+                        table: None,
+                        column: col.clone(),
+                    });
+                    names.push(col);
+                }
+            }
+        }
+    }
+    if expressions.is_empty() {
+        return Ok(plan);
+    }
+    Ok(PhysicalPlan::Projection {
+        input: Box::new(plan),
+        expressions,
+        column_names: names,
+    })
 }
 
 /// 将 HAVING 中的聚合函数调用替换为 ColumnRef
@@ -4642,6 +4684,7 @@ mod tests {
             func: AggregateFunc::Count,
             input: 0,
             distinct: false,
+            input_expr: None,
         };
         let gt = Expression::BinaryOp {
             left: Box::new(Expression::Function {
@@ -4691,6 +4734,7 @@ mod tests {
                 func: AggregateFunc::Sum,
                 input: 0,
                 distinct: false,
+                input_expr: None,
             }],
             &["age".to_string()],
         );

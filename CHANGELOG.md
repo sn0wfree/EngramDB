@@ -14,6 +14,16 @@
 - **WAL Checkpoint 不再 truncate**：`set_len` 从尾部截断会切掉刚写入的
   Checkpoint 标记；现只写标记 + sync。旧段回收待 WAL segment rolling。
 
+### Bug 修复
+- **HAVING 聚合泄漏进投影列**：聚合后按 SELECT 列表裁剪输出
+- **聚合内表达式被忽略**：`SUM(amount*2)` 原先变成 `SUM(col0)`；
+  `AggregateExpr.input_expr` 执行前物化为临时列
+
+### 接线 / 清理
+- `on_commit` Auto 分层迁移接入各提交路径（原先仅定义未调用）
+- executor Limit 路径 `take_front` → `from_range`
+- 新增 `docs/历史包袱清单.md`
+
 ### 文档
 - 归档其他 agent 历史文档（v0.14 全景 / v0.18–v0.22 路线图，已标注基线）
 - 新增 `docs/EngramDB 后续路线图 v0.23+.md`（校准未完成项与优先级）

@@ -63,6 +63,7 @@ impl<'a> Transaction<'a> {
         self.db.flush_txn_buffer()?;
         self.db.discard_txn_buffer();
         let result = self.db.txn_manager_mut().commit(txn_id)?;
+        self.db.on_commit();
         // P1.5 修复：之前丢弃 apply_ops 导致数据只停留在 MVCC/WAL，
         // 必须将写操作应用到存储层（否则读取路径看不到提交的数据）
         apply_to_storage(self.db, result.apply_ops)?;
