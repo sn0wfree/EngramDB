@@ -43,3 +43,11 @@ venv/
 
 # graphify 输出
 graphify-out/
+
+# 其他 agent 交付物 / 对照草稿
+other/
+_other_extract/
+
+# 本地工具垫片（dlltool 等）
+target/toolshim/
+.toolshim/

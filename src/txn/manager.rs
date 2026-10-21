@@ -661,20 +661,20 @@ impl TransactionManager {
     }
 
     /// 执行 Checkpoint
+    ///
+    /// 写入 Checkpoint 记录并 sync。恢复时从最后一条 Checkpoint 之后开始回放。
+    ///
+    /// 不做 truncate：`WalWriter::truncate` 用 `set_len` 从尾部截断，而
+    /// checkpoint 记录写在尾部——截掉的是标记自己（以及之后可能的新写入）。
+    /// 真正的旧段丢弃需要 WAL segment rolling，另开任务。
     pub fn checkpoint(&mut self) -> Result<u64> {
-        // 写入 Checkpoint 记录
-        let checkpoint_lsn = self.wal.current_lsn();
-        let payload = super::super::wal::make_checkpoint_payload(checkpoint_lsn);
+        let start_lsn = self.wal.current_lsn();
+        let payload = super::super::wal::make_checkpoint_payload(start_lsn);
         self.wal
             .write_record(WalRecordType::Checkpoint, 0, 0, EngineType::Columnar, &payload)?;
         self.wal.sync()?;
 
-        // 截断 WAL（保留 Checkpoint 之后的部分）
-        // 实际生产中需要确保所有数据已刷到主存储
-        // MVP：保留 Checkpoint 记录本身
-        self.wal.truncate(checkpoint_lsn)?;
-
-        Ok(checkpoint_lsn)
+        Ok(self.wal.current_lsn())
     }
 
     /// 垃圾回收旧版本
@@ -1194,10 +1194,10 @@ mod tests {
 
         let lsn_before = mgr.current_wal_lsn();
         let checkpoint_lsn = mgr.checkpoint().unwrap();
-        assert!(checkpoint_lsn > 0);
-        // Checkpoint 后 WAL 应该被截断，LSN 可能重置
+        assert!(checkpoint_lsn > lsn_before, "checkpoint 应写入一条记录，LSN 递增");
+        // 只写标记、不 truncate，故 LSN 单调不减
         let lsn_after = mgr.current_wal_lsn();
-        assert!(lsn_after <= lsn_before || lsn_after == checkpoint_lsn);
+        assert_eq!(lsn_after, checkpoint_lsn);
 
         cleanup(&path);
     }

@@ -107,6 +107,71 @@ impl PartialAggState {
         }
     }
 
+    /// 类型化累加：调用方已过滤 NULL。Sum/Avg/Count 零 Value 构造；
+    /// Min/Max 保持与源列一致的 Value 变体（Int32 不抬成 Int64）。
+    #[inline]
+    pub fn accumulate_i64(&mut self, val: i64) {
+        self.accumulate_typed_num(val as f64, Value::Int64(val))
+    }
+
+    #[inline]
+    pub fn accumulate_i32(&mut self, val: i32) {
+        self.accumulate_typed_num(val as f64, Value::Int32(val))
+    }
+
+    #[inline]
+    pub fn accumulate_i16(&mut self, val: i16) {
+        self.accumulate_typed_num(val as f64, Value::Int16(val))
+    }
+
+    #[inline]
+    pub fn accumulate_f64(&mut self, val: f64) {
+        self.accumulate_typed_num(val, Value::Float64(val))
+    }
+
+    #[inline]
+    pub fn accumulate_f32(&mut self, val: f32) {
+        self.accumulate_typed_num(val as f64, Value::Float32(val))
+    }
+
+    #[inline]
+    pub fn accumulate_timestamp(&mut self, val: i64) {
+        self.accumulate_typed_num(val as f64, Value::Timestamp(val))
+    }
+
+    #[inline]
+    fn accumulate_typed_num(&mut self, num: f64, minmax_val: Value) {
+        match self {
+            PartialAggState::Count { count } => {
+                *count += 1;
+            }
+            PartialAggState::Sum { sum, has_value } => {
+                *sum += num;
+                *has_value = true;
+            }
+            PartialAggState::Avg { sum, count } => {
+                *sum += num;
+                *count += 1;
+            }
+            PartialAggState::Min { value } => match value {
+                None => *value = Some(minmax_val),
+                Some(m) => {
+                    if value_less(&minmax_val, m) {
+                        *value = Some(minmax_val);
+                    }
+                }
+            },
+            PartialAggState::Max { value } => match value {
+                None => *value = Some(minmax_val),
+                Some(m) => {
+                    if value_greater(&minmax_val, m) {
+                        *value = Some(minmax_val);
+                    }
+                }
+            },
+        }
+    }
+
     /// 合并另一个 partial state（可交换、可结合）
     pub fn merge(&mut self, other: &PartialAggState) {
         match (self, other) {
@@ -593,52 +658,80 @@ fn try_execute_grouped_int(
 
         if group_col < chunk.columns.len() {
             let col = &chunk.columns[group_col];
-            for row_idx in 0..chunk.count {
-                let v = col.get(row_idx);
-                if v.is_null() {
-                    ensure_states(&mut null_states, aggregates);
-                    let states = null_states.as_mut().unwrap();
-                    accumulate_all(states, chunk, row_idx, aggregates);
-                    continue;
-                }
-                let t = match key_type {
-                    Some(t) => t,
-                    None => {
-                        let t = detect_key_type(&v)?;
-                        key_type = Some(t);
-                        t
+
+            // P1-1：键列 + 聚合列均为 Typed 时走零 Value 路径
+            let typed_done = if let Some(key_data) = col.as_typed() {
+                let accessors = build_typed_agg_accessors(chunk, aggregates);
+                if accessors.iter().all(|a| !matches!(a, TypedAggCol::Fallback)) {
+                    match try_accumulate_chunk_typed(
+                        key_data,
+                        &accessors,
+                        chunk.count,
+                        &mut key_type,
+                        &mut map,
+                        &mut null_states,
+                        aggregates,
+                    ) {
+                        TypedChunkResult::Done => true,
+                        TypedChunkResult::FallbackFrom(row) => {
+                            // 键类型探测失败等：row 起改走 Value 路径（map 已有前缀结果）
+                            for row_idx in row..chunk.count {
+                                let v = col.get(row_idx);
+                                if v.is_null() {
+                                    ensure_states(&mut null_states, aggregates);
+                                    let states = null_states.as_mut().unwrap();
+                                    accumulate_all(states, chunk, row_idx, aggregates);
+                                    continue;
+                                }
+                                let t = match key_type {
+                                    Some(t) => t,
+                                    None => {
+                                        let t = detect_key_type(&v)?;
+                                        key_type = Some(t);
+                                        t
+                                    }
+                                };
+                                let k = key_to_i64(&v, t)?;
+                                let states =
+                                    map.entry(k).or_insert_with(|| new_states(aggregates));
+                                accumulate_all(states, chunk, row_idx, aggregates);
+                            }
+                            true
+                        }
                     }
-                };
-                let k = key_to_i64(&v, t)?;
-                let states = map.entry(k).or_insert_with(|| new_states(aggregates));
-                accumulate_all(states, chunk, row_idx, aggregates);
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !typed_done {
+                for row_idx in 0..chunk.count {
+                    let v = col.get(row_idx);
+                    if v.is_null() {
+                        ensure_states(&mut null_states, aggregates);
+                        let states = null_states.as_mut().unwrap();
+                        accumulate_all(states, chunk, row_idx, aggregates);
+                        continue;
+                    }
+                    let t = match key_type {
+                        Some(t) => t,
+                        None => {
+                            let t = detect_key_type(&v)?;
+                            key_type = Some(t);
+                            t
+                        }
+                    };
+                    let k = key_to_i64(&v, t)?;
+                    let states = map.entry(k).or_insert_with(|| new_states(aggregates));
+                    accumulate_all(states, chunk, row_idx, aggregates);
+                }
             }
         }
 
         // 合并进全局表
-        use std::collections::hash_map::Entry;
-        for (key, source_states) in map {
-            match merged.entry(key) {
-                Entry::Vacant(v) => {
-                    v.insert(source_states);
-                }
-                Entry::Occupied(mut o) => {
-                    for (t, s) in o.get_mut().iter_mut().zip(source_states.iter()) {
-                        t.merge(s);
-                    }
-                }
-            }
-        }
-        if let Some(s) = null_states {
-            match &mut merged_null {
-                None => merged_null = Some(s),
-                Some(t) => {
-                    for (t, s) in t.iter_mut().zip(s.iter()) {
-                        t.merge(s);
-                    }
-                }
-            }
-        }
+        merge_chunk_into_global(&mut merged, &mut merged_null, map, null_states);
     }
 
     // key_type None 且 merged 为空 → 全 NULL / 列缺失，交还原路径处理
@@ -699,6 +792,201 @@ fn accumulate_all(
         if *col_idx < chunk.columns.len() {
             let val = chunk.columns[*col_idx].get(row_idx);
             states[agg_idx].accumulate(&val);
+        }
+    }
+}
+
+/// 将 chunk 的 partial 哈希表合并进全局表
+fn merge_chunk_into_global(
+    merged: &mut FxHashMap<i64, Vec<PartialAggState>>,
+    merged_null: &mut Option<Vec<PartialAggState>>,
+    map: FxHashMap<i64, Vec<PartialAggState>>,
+    null_states: Option<Vec<PartialAggState>>,
+) {
+    use std::collections::hash_map::Entry;
+    for (key, source_states) in map {
+        match merged.entry(key) {
+            Entry::Vacant(v) => {
+                v.insert(source_states);
+            }
+            Entry::Occupied(mut o) => {
+                for (t, s) in o.get_mut().iter_mut().zip(source_states.iter()) {
+                    t.merge(s);
+                }
+            }
+        }
+    }
+    if let Some(s) = null_states {
+        match merged_null {
+            None => *merged_null = Some(s),
+            Some(t) => {
+                for (t, s) in t.iter_mut().zip(s.iter()) {
+                    t.merge(s);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// P1-1：类型化分组聚合辅助（零 Value 热路径；Min/Max 保持源列 Value 变体）
+// ============================================================================
+
+enum TypedAggCol<'a> {
+    Int64(&'a [i64], Option<&'a crate::common::column_data::BitVec>),
+    Int32(&'a [i32], Option<&'a crate::common::column_data::BitVec>),
+    Int16(&'a [i16], Option<&'a crate::common::column_data::BitVec>),
+    Float64(&'a [f64], Option<&'a crate::common::column_data::BitVec>),
+    Float32(&'a [f32], Option<&'a crate::common::column_data::BitVec>),
+    Timestamp(&'a [i64], Option<&'a crate::common::column_data::BitVec>),
+    /// 非数值/列缺失/Boolean（Sum 语义与 as_f64=None 一致，须走 Value 路径）
+    Fallback,
+}
+
+fn build_typed_agg_accessors<'a>(
+    chunk: &'a DataChunk,
+    aggregates: &[(AggregateFunc, usize, bool)],
+) -> Vec<TypedAggCol<'a>> {
+    use crate::common::column_data::ColumnValue;
+    aggregates
+        .iter()
+        .map(|(_, col_idx, _)| {
+            if *col_idx >= chunk.columns.len() {
+                return TypedAggCol::Fallback;
+            }
+            let col = &chunk.columns[*col_idx];
+            match col.as_typed() {
+                Some(data) => match &data.values {
+                    ColumnValue::Int64(v) => TypedAggCol::Int64(v, data.nulls.as_ref()),
+                    ColumnValue::Int32(v) => TypedAggCol::Int32(v, data.nulls.as_ref()),
+                    ColumnValue::Int16(v) => TypedAggCol::Int16(v, data.nulls.as_ref()),
+                    ColumnValue::Float64(v) => TypedAggCol::Float64(v, data.nulls.as_ref()),
+                    ColumnValue::Float32(v) => TypedAggCol::Float32(v, data.nulls.as_ref()),
+                    ColumnValue::Timestamp(v) => TypedAggCol::Timestamp(v, data.nulls.as_ref()),
+                    _ => TypedAggCol::Fallback,
+                },
+                None => TypedAggCol::Fallback,
+            }
+        })
+        .collect()
+}
+
+enum TypedChunkResult {
+    Done,
+    /// 从指定行起改走 Value 路径（map/null_states 已含前缀）
+    FallbackFrom(usize),
+}
+
+/// 键列 Typed 分组累加。键提取失败时从该行 FallbackFrom。
+fn try_accumulate_chunk_typed(
+    key_data: &crate::common::column_data::ColumnData,
+    accessors: &[TypedAggCol],
+    count: usize,
+    key_type: &mut Option<GroupKeyType>,
+    map: &mut FxHashMap<i64, Vec<PartialAggState>>,
+    null_states: &mut Option<Vec<PartialAggState>>,
+    aggregates: &[(AggregateFunc, usize, bool)],
+) -> TypedChunkResult {
+    for row_idx in 0..count {
+        if let Some(nulls) = &key_data.nulls {
+            if nulls.test(row_idx) {
+                ensure_states(null_states, aggregates);
+                let states = null_states.as_mut().unwrap();
+                accumulate_all_typed(states, accessors, row_idx);
+                continue;
+            }
+        }
+
+        let k = match *key_type {
+            Some(t) => match typed_key_at(key_data, row_idx, t) {
+                Some(k) => k,
+                None => return TypedChunkResult::FallbackFrom(row_idx),
+            },
+            None => {
+                let t = match typed_detect_key_type(key_data) {
+                    Some(t) => t,
+                    None => return TypedChunkResult::FallbackFrom(row_idx),
+                };
+                *key_type = Some(t);
+                match typed_key_at(key_data, row_idx, t) {
+                    Some(k) => k,
+                    None => return TypedChunkResult::FallbackFrom(row_idx),
+                }
+            }
+        };
+        let states = map.entry(k).or_insert_with(|| new_states(aggregates));
+        accumulate_all_typed(states, accessors, row_idx);
+    }
+    TypedChunkResult::Done
+}
+
+#[inline]
+fn typed_key_at(
+    data: &crate::common::column_data::ColumnData,
+    row_idx: usize,
+    key_type: GroupKeyType,
+) -> Option<i64> {
+    use crate::common::column_data::ColumnValue;
+    match (&data.values, key_type) {
+        (ColumnValue::Int64(v), GroupKeyType::Int64) => v.get(row_idx).copied(),
+        (ColumnValue::Int32(v), GroupKeyType::Int32) => v.get(row_idx).map(|x| *x as i64),
+        (ColumnValue::Boolean(v), GroupKeyType::Boolean) => {
+            v.get(row_idx).map(|x| *x as i64)
+        }
+        (ColumnValue::Timestamp(v), GroupKeyType::Timestamp) => v.get(row_idx).copied(),
+        _ => None,
+    }
+}
+
+fn typed_detect_key_type(data: &crate::common::column_data::ColumnData) -> Option<GroupKeyType> {
+    use crate::common::column_data::ColumnValue;
+    match &data.values {
+        ColumnValue::Int64(_) => Some(GroupKeyType::Int64),
+        ColumnValue::Int32(_) => Some(GroupKeyType::Int32),
+        ColumnValue::Boolean(_) => Some(GroupKeyType::Boolean),
+        ColumnValue::Timestamp(_) => Some(GroupKeyType::Timestamp),
+        _ => None,
+    }
+}
+
+#[inline]
+fn accumulate_all_typed(states: &mut [PartialAggState], accessors: &[TypedAggCol], row_idx: usize) {
+    for (state, acc) in states.iter_mut().zip(accessors.iter()) {
+        let null_at = |n: Option<&crate::common::column_data::BitVec>| {
+            n.map_or(false, |n| n.test(row_idx))
+        };
+        match acc {
+            TypedAggCol::Int64(v, nulls) => {
+                if row_idx < v.len() && !null_at(*nulls) {
+                    state.accumulate_i64(v[row_idx]);
+                }
+            }
+            TypedAggCol::Int32(v, nulls) => {
+                if row_idx < v.len() && !null_at(*nulls) {
+                    state.accumulate_i32(v[row_idx]);
+                }
+            }
+            TypedAggCol::Int16(v, nulls) => {
+                if row_idx < v.len() && !null_at(*nulls) {
+                    state.accumulate_i16(v[row_idx]);
+                }
+            }
+            TypedAggCol::Float64(v, nulls) => {
+                if row_idx < v.len() && !null_at(*nulls) {
+                    state.accumulate_f64(v[row_idx]);
+                }
+            }
+            TypedAggCol::Float32(v, nulls) => {
+                if row_idx < v.len() && !null_at(*nulls) {
+                    state.accumulate_f32(v[row_idx]);
+                }
+            }
+            TypedAggCol::Timestamp(v, nulls) => {
+                if row_idx < v.len() && !null_at(*nulls) {
+                    state.accumulate_timestamp(v[row_idx]);
+                }
+            }
+            TypedAggCol::Fallback => {}
         }
     }
 }

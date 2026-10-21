@@ -3,6 +3,21 @@
 本文件记录 EngramDB 的版本变更历史。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [Unreleased]
+
+### 性能
+- **P1-1 类型化 GROUP BY**：`try_execute_grouped_int` 热路径零 Value 构造
+  （Typed 键 + Typed 聚合列直读底层数组）；Min/Max 保持源列 Value 变体
+  （Int32 不抬升为 Int64）。失败行起自动回退 Value 路径。
+
+### Bug 修复
+- **WAL Checkpoint 不再 truncate**：`set_len` 从尾部截断会切掉刚写入的
+  Checkpoint 标记；现只写标记 + sync。旧段回收待 WAL segment rolling。
+
+### 文档
+- 归档其他 agent 历史文档（v0.14 全景 / v0.18–v0.22 路线图，已标注基线）
+- 新增 `docs/EngramDB 后续路线图 v0.23+.md`（校准未完成项与优先级）
+
 ## [0.22.4] - 2026-08-30
 
 ### 语义对齐与资源治理
