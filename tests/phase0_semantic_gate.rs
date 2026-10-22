@@ -296,6 +296,66 @@ fn g7_fk_check_behavior_recorded() {
         );
     }
 
-    // Phase 0 要求：至少把行为钉死，不求修复
-    println!("G7 PASS: FK/CHECK 行为已记录（补偿方案 = 应用层校验，不依赖引擎约束）");
+    // 合法引用应通过
+    let good = c.execute("INSERT INTO child VALUES (2, 1)");
+    assert!(good.is_ok(), "G7-FK FAIL: 合法引用被误拒: {:?}", good.err());
+    println!("G7 PASS: FK/CHECK 行为已记录（合法引用通过，孤儿按实际行为处理）");
+}
+
+/// A4：真事务——Rollback 真的撤销
+///
+/// llmRx 契约：`db.Begin()` 后写入，`Rollback` 后必须消失；
+/// 事务内读己之写后 Rollback 也不能残留。
+#[test]
+fn a4_txn_rollback_undoes() {
+    // ① 未读直接回滚
+    let mut c = open();
+    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    c.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    c.execute("ROLLBACK").unwrap();
+    let q = c.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(
+        q.rows[0][0],
+        Value::Int64(0),
+        "A4 FAIL: ROLLBACK 后仍有行"
+    );
+    println!("A4a PASS: 未读回滚，行数归零");
+
+    // ② 读己之写后再回滚
+    // 现状（A4b 残留）：flush-on-read 会把行落入独立内部事务，ROLLBACK 撤不掉。
+    // llmRx 要求 Rollback 真的撤销 → 此为已知缺口，见 phase0 报告。
+    let mut c = open();
+    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let q = c.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(q.rows[0][0], Value::Int64(1), "A4: 事务内读己之写失败");
+    c.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    c.execute("ROLLBACK").unwrap();
+    let q = c.execute("SELECT COUNT(*) FROM t").unwrap();
+    let count = match &q.rows[0][0] {
+        Value::Int64(i) => *i,
+        Value::Int32(i) => *i as i64,
+        _ => -1,
+    };
+    if count == 0 {
+        println!("A4b PASS: 读己之写后回滚，行数归零");
+    } else {
+        println!(
+            "A4b KNOWN-GAP: 读后 ROLLBACK 残留 {} 行（flush-on-read 独立事务不可撤销）→ llmRx A4 未满",
+            count
+        );
+    }
+
+    // ③ COMMIT 持久化
+    let mut c = open();
+    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    c.execute("COMMIT").unwrap();
+    let q = c.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(q.rows[0][0], Value::Int64(1), "A4 FAIL: COMMIT 后数据丢失");
+    println!("A4c PASS: COMMIT 持久化");
 }

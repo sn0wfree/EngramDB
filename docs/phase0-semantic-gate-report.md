@@ -24,36 +24,28 @@
 | 约束 | 行为 | 补偿方案 |
 |------|------|---------|
 | CHECK（列级） | **ENFORCED** — 非法值被拒 | 无需补偿 |
-| FOREIGN KEY | **SILENT** — 孤儿 pid=99 入库 | 应用层校验；不得依赖 `ON DELETE CASCADE` |
+| FOREIGN KEY | **ENFORCED**（v0.22.5）— 孤儿引用被拒 | 无需补偿 |
 
-## G2b 修复（v0.22.5）
+## A4 事务回滚（新增闸门）
 
-根因：`sql::ast::ColumnDef` 无 `default_value`，parser 不提取 `ColumnOption::Default`，
-INSERT 省略列时用 `Value::Null` 填充 → NOT NULL 直接拒绝。
-
-改动：
-
-1. `sql::ast::ColumnDef` 增加 `default_value: Option<String>`
-2. `parser.rs` CREATE TABLE / ALTER ADD COLUMN 提取 `ColumnOption::Default`
-3. `planner.rs` `plan_create_table` 映射到 `types::ColumnDef.default()`
-4. `plan_insert` / `eval_insert_rows` 用 `row_with_defaults` 预填省略列
-5. `alter_table.rs` 传递 `default_value` 到元数据
-
-字面量转换 `default_literal_to_value`：`0`/`0.1`/`'abc'`/`true`/`NULL`。
-
-## 判定
-
-| 问题 | 判定 |
+| 路径 | 结果 |
 |------|------|
-| Phase 0 语义面 | **全过** |
-| 能否当 llmRx 主存储？ | **否**（仍缺 A4 真回滚 / A5 并发 / C1 FK / D5 ATTACH） |
-| 能否当分析层/向量层？ | **可以** |
+| A4a 未读直接 ROLLBACK | ✅ 行数归零 |
+| A4b 读己之写后 ROLLBACK | ⚠️ **KNOWN-GAP**：flush-on-read 走独立内部事务，ROLLBACK 撤不掉已 flush 行 |
+| A4c COMMIT 持久化 | ✅ |
+
+**A4b 根因**：`flush_txn_buffer` 调 `execute_with_txn` 开独立事务落盘，
+外层 `ROLLBACK` 只能撤未 flush 的 buffer。llmRx 要求「Rollback 真的撤销」→ 未满。
+
+**修复方向**：flush 时不走独立事务，行进外层事务的 staging/undo-log；
+或 rollback 时按 write_set 删除已 flush 的 rowid。属 P1 架构改动。
 
 ## 修复优先级（若仍要碰主存储）
 
 1. **P0** ~~DEFAULT 填充~~ ✅ 已修
-2. **P1** 表级 `FOREIGN KEY` 强制（或文档明确不支持 + llmRx 侧补偿）
-3. P2 真事务回滚 / 多连接并发（A4/A5）
-4. P3 ATTACH 等价（D5 按天分片）
+2. **P0** ~~FK 强制~~ ✅ 已修
+3. **P1** A4b 读后回滚撤销（undo-log / staging）
+4. P2 多连接并发（A5）
+5. P3 ATTACH 等价（D5 按天分片）
 
-Phase 0 闭环：**七项语义闸门全绿。**
+Phase 0 闭环：**七项语义闸门全绿 + A4 部分达成（A4b 已知缺口）。**
