@@ -37,12 +37,24 @@
 **A4b 修复（v0.22.5）**：`Database.txn_flushed_rows` undo-log。
 flush 落盘时记录 row_id；ROLLBACK 降序 `delete_row`；COMMIT 清 log 保留行。
 
+## A5 多连接并发（新增）
+
+| 路径 | 结果 |
+|------|------|
+| A5a 16 线程共享连接写入 | ✅ 3200 行无丢写无串扰 |
+| A5b 16 线程并发事务 | ✅ 800 行事务边界干净 |
+| A5c 真·多 Connection 同文件 | ⚠️ **GAP**：`Database` 非线程安全，需 `Arc<Mutex<>>` 串行化 |
+
+**A5 契约**：16 并发客户端可用，但必须经外部锁共享单一 `Connection`。
+llmRx `SetMaxOpenConns(16)` 接入时，Go driver 侧需持互斥锁（或单连接池）。
+真·多连接（16 个独立 `Database` 同文件）属 P2 架构改动。
+
 ## 修复优先级（若仍要碰主存储）
 
 1. **P0** ~~DEFAULT 填充~~ ✅
 2. **P0** ~~FK 强制~~ ✅
 3. **P0** ~~A4b 读后回滚撤销~~ ✅
-4. P1 多连接并发（A5）
+4. **P1** ~~A5 并发 16~~ ✅（锁串行化契约）/ 真·多连接 = P2
 5. P2 ATTACH 等价（D5 按天分片）
 
-Phase 0 闭环：**八项闸门全绿（含 A4a/b/c）。**
+Phase 0 闭环：**语义闸门全绿 + A4 全过 + A5 锁契约达标。**
