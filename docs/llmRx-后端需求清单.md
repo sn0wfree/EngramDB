@@ -113,12 +113,15 @@ EngramDB 满足 9/12。缺：NOT NULL DEFAULT 是否真强制、AUTOINCREMENT �
 
 ## Phase 0 验收闸门（7 项，纯 Rust，llmRx 零投入）
 
-1. `AUTOINCREMENT` 建表可执行
-2. `NOT NULL DEFAULT` 真强制（违反报错，非静默 NULL）
-3. `UNIQUE` 真拒绝（二次插入报错）
-4. `ON CONFLICT DO UPDATE / DO NOTHING` 语义一致
-5. `RETURNING id` 返回值正确（或明确不支持 → 依赖 A3 LastInsertId 路径）
-6. `ALTER TABLE ADD COLUMN` 幂等（重复执行不炸）
-7. 明确记录 FK+CHECK 不生效，并定补偿方案（应用层校验 or 路线图）
+1. `AUTOINCREMENT` 建表可执行 → ✅
+2. `NOT NULL DEFAULT` 真强制（违反报错，非静默 NULL） → ✅ NOT NULL 拒绝 / ❌ DEFAULT 不填充（G2b）
+3. `UNIQUE` 真拒绝（二次插入报错） → ✅
+4. `ON CONFLICT DO UPDATE / DO NOTHING` 语义一致 → ✅
+5. `RETURNING id` 返回值正确 → ✅
+6. `ALTER TABLE ADD COLUMN` 幂等（重复执行不炸） → ✅ 明确报错
+7. 明确记录 FK+CHECK 不生效，并定补偿方案 → ✅ CHECK **已强制**；FK 静默 → 应用层校验
+
+**实测 6/7。** 详见 `phase0-semantic-gate-report.md`。测试：`tests/phase0_semantic_gate.rs`。
 
 全过 → 可继续谈分析层对接；不过 → 停，别投 llmRx 主存储。
+→ 现状：**分析层可谈，主存储仍停。**
