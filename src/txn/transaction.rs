@@ -62,6 +62,7 @@ impl<'a> Transaction<'a> {
         let txn_id = self.id;
         self.db.flush_txn_buffer()?;
         self.db.discard_txn_buffer();
+        self.db.clear_txn_flushed_rows();
         let result = self.db.txn_manager_mut().commit(txn_id)?;
         self.db.on_commit();
         // P1.5 修复：之前丢弃 apply_ops 导致数据只停留在 MVCC/WAL，
@@ -73,9 +74,11 @@ impl<'a> Transaction<'a> {
     /// 回滚事务
     ///
     /// P0-2 事务级 Batcher：丢弃事务 buffer（撤销未 flush 的写入段）。
+    /// A4b：同时删除已 flush 落盘的行（undo-log），保证 Rollback 真的撤销。
     pub fn rollback(mut self) -> Result<()> {
         let txn_id = self.id;
         self.db.discard_txn_buffer();
+        self.db.rollback_flushed_rows()?;
         self.db.txn_manager_mut().rollback(txn_id)?;
         Ok(())
     }

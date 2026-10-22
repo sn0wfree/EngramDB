@@ -2616,8 +2616,8 @@ mod value_tests {
 
     #[test]
     fn test_txn_batch_rollback_after_read_keeps_flushed() {
-        // 读触发 flush 后：已 flush 的数据保留（内部事务已落盘），
-        // 未 flush 的写入段可回滚
+        // A4b（v0.22.5）：读触发 flush 后 ROLLBACK 也必须撤销已落盘行
+        // （undo-log：txn_flushed_rows → delete_row）
         let mut conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT64)").unwrap();
 
@@ -2628,11 +2628,11 @@ mod value_tests {
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(r.rows[0][0], crate::Value::Int64(2));
         conn.execute("INSERT INTO t VALUES (3)").unwrap();
-        // ROLLBACK：3 被撤销，1、2 保留（与 flush-on-read 语义一致）
+        // ROLLBACK：全部撤销（含已 flush 的 1、2）
         conn.execute("ROLLBACK").unwrap();
 
         let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
-        assert_eq!(r.rows[0][0], crate::Value::Int64(2));
+        assert_eq!(r.rows[0][0], crate::Value::Int64(0));
     }
 
     #[test]

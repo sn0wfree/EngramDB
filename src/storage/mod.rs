@@ -103,6 +103,11 @@ pub struct Database {
     /// 本 seen-set 维护批内自重复判重（O(1)），discard/flush 时清空。
     txn_buffer_pk_seen: HashMap<String, std::collections::HashSet<Value>>,
     txn_buffer_unique_seen: HashMap<String, HashMap<String, std::collections::HashSet<Value>>>,
+    /// A4b undo-log：显式事务内 flush 落盘的 row_id（表名 → row_id 升序）
+    ///
+    /// flush-on-read 会把 buffer 行经独立内部事务落盘；ROLLBACK 需按此表
+    /// 删除已 flush 行，保证「Rollback 真的撤销」。COMMIT 时清空（行保留）。
+    txn_flushed_rows: HashMap<String, Vec<u32>>,
     /// Phase 2.5 P1：HeatTracker（每表访问热度）
     ///
     /// 每次访问表（scan/insert）调用 `record_access()` 递增。
@@ -218,6 +223,7 @@ impl Database {
             txn_buffer_rows: 0,
             txn_buffer_pk_seen: HashMap::new(),
             txn_buffer_unique_seen: HashMap::new(),
+            txn_flushed_rows: HashMap::new(),
             heat_tracker: heat_tracker::HeatTracker::new(),
             commit_count: 0,
             last_tier_tick_at: 0,
@@ -274,6 +280,7 @@ impl Database {
             txn_buffer_rows: 0,
             txn_buffer_pk_seen: HashMap::new(),
             txn_buffer_unique_seen: HashMap::new(),
+            txn_flushed_rows: HashMap::new(),
             heat_tracker: heat_tracker::HeatTracker::new(),
             commit_count: 0,
             last_tier_tick_at: 0,
@@ -861,12 +868,54 @@ impl Database {
         self.txn_buffer_rows = 0;
         self.txn_buffer_pk_seen.clear();
         self.txn_buffer_unique_seen.clear();
+        let in_txn = self.current_txn_id.is_some();
         for (table_name, rows) in pending {
             if !rows.is_empty() {
+                let n = rows.len() as u32;
+                // 记录 flush 前 row_count，作为本批 row_id 基址
+                let base = self
+                    .get_engine_table(&table_name)
+                    .map(|et| et.def().row_count as u32)
+                    .unwrap_or(0);
                 crate::executor::operators::insert::execute_with_txn(self, &table_name, rows)?;
+                // A4b undo-log：显式事务内记录已落盘 row_id，ROLLBACK 时删除
+                if in_txn {
+                    let ids = self.txn_flushed_rows.entry(table_name.clone()).or_default();
+                    for i in 0..n {
+                        ids.push(base + i);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// A4b：撤销显式事务内已 flush 落盘的行
+    ///
+    /// 供 ROLLBACK 调用。按 row_id 降序删除（配合 delete_row 的 row_count 递减语义），
+    /// 然后清空 undo-log。COMMIT 路径不调用（行保留，仅清 undo-log）。
+    pub fn rollback_flushed_rows(&mut self) -> Result<()> {
+        let flushed = std::mem::take(&mut self.txn_flushed_rows);
+        for (table_name, ids) in flushed {
+            if ids.is_empty() {
+                continue;
+            }
+            // 降序删，保持 row_count 递减一致
+            let mut sorted = ids;
+            sorted.sort_unstable();
+            sorted.dedup();
+            for &row_id in sorted.iter().rev() {
+                if let Some(table) = self.get_engine_table_mut(&table_name) {
+                    let _ = table.delete_row(row_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// COMMIT 后清空 undo-log（行保留）
+    pub fn clear_txn_flushed_rows(&mut self) {
+        self.txn_flushed_rows.clear();
     }
 
     /// 手动触发 WAL fsync（用于 Periodic 刷盘模式）

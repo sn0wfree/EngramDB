@@ -1240,6 +1240,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 .begin(crate::common::config::IsolationLevel::SnapshotIsolation)?;
             // P0-2 事务级 Batcher：防御性清空（异常残留时避免跨事务串数据）
             db.discard_txn_buffer();
+            db.clear_txn_flushed_rows();
             db.set_current_txn_id(Some(txn_id));
             Ok(QueryResult {
                 columns: vec!["status".to_string()],
@@ -1255,6 +1256,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
                 db.flush_txn_buffer()?;
                 let r = db.txn_manager_mut().commit(txn_id)?;
                 db.discard_txn_buffer();
+                db.clear_txn_flushed_rows();
                 db.set_current_txn_id(None);
                 // Auto 表分层迁移 tick（每 1000 次 commit 触发一次）
                 db.on_commit();
@@ -1274,9 +1276,11 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         PhysicalPlan::Rollback => {
             // 实际回滚事务（v0.15.0 Txn05 新增）
             // P0-2 事务级 Batcher：丢弃 buffer（撤销未 flush 的写入段）
+            // A4b：同时删除已 flush 落盘的行（undo-log）
             let result = if let Some(txn_id) = db.current_txn_id() {
                 db.txn_manager_mut().rollback(txn_id)?;
                 db.discard_txn_buffer();
+                db.rollback_flushed_rows()?;
                 db.set_current_txn_id(None);
                 Ok(())
             } else {
