@@ -26,7 +26,7 @@ fn test_m4_redo_recovery_columnar() {
     let path = tmp_db("redo_col");
     cleanup(&path);
     {
-        let mut conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open_exclusive(&path).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
         conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
@@ -35,7 +35,7 @@ fn test_m4_redo_recovery_columnar() {
         simulate_crash(conn);
     }
     // 重新打开 → WAL 重放已提交事务
-    let mut conn = Connection::open(&path).unwrap();
+    let mut conn = Connection::open_exclusive(&path).unwrap();
     let r = conn.execute("SELECT id, v FROM t ORDER BY id").unwrap();
     assert_eq!(r.rows.len(), 2, "重放后应有 2 行");
     assert_eq!(r.rows[0], vec![Value::Int64(1), Value::Varchar("A".into())], "UPDATE 应重放");
@@ -49,7 +49,7 @@ fn test_m4_redo_recovery_log_engine() {
     let path = tmp_db("redo_log");
     cleanup(&path);
     {
-        let mut conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open_exclusive(&path).unwrap();
         conn.execute("CREATE TABLE events (ts INT64, e TEXT) ENGINE = Log").unwrap();
         for i in 0..100 {
             conn.execute(&format!("INSERT INTO events VALUES ({}, 'e{}')", i, i)).unwrap();
@@ -58,7 +58,7 @@ fn test_m4_redo_recovery_log_engine() {
         conn.sync_wal().unwrap();
         simulate_crash(conn);
     }
-    let mut conn = Connection::open(&path).unwrap();
+    let mut conn = Connection::open_exclusive(&path).unwrap();
     let r = conn.execute("SELECT COUNT(*) FROM events").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(100), "Log 表 WAL 重放恢复");
     // 时间范围查询仍正常（恢复后 MinMax 可用）
@@ -73,7 +73,7 @@ fn test_m4_redo_skips_memory_engine() {
     let path = tmp_db("redo_mem");
     cleanup(&path);
     {
-        let mut conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open_exclusive(&path).unwrap();
         conn.execute("CREATE TABLE col (id INT, v TEXT)").unwrap();
         conn.execute("CREATE TABLE mem (id INT, v TEXT) ENGINE = Memory").unwrap();
         conn.execute("INSERT INTO col VALUES (1, 'persist')").unwrap();
@@ -82,7 +82,7 @@ fn test_m4_redo_skips_memory_engine() {
         conn.sync_wal().unwrap();
         simulate_crash(conn);
     }
-    let mut conn = Connection::open(&path).unwrap();
+    let mut conn = Connection::open_exclusive(&path).unwrap();
     // Columnar 表恢复；Memory 表无 WAL 记录 → 为空（符合语义）
     let r = conn.execute("SELECT v FROM col WHERE id = 1").unwrap();
     assert_eq!(r.rows[0][0], Value::Varchar("persist".into()));
@@ -96,7 +96,7 @@ fn test_m4_redo_skips_memory_engine() {
 fn test_m4_cross_engine_txn() {
     let path = tmp_db("cross_engine");
     cleanup(&path);
-    let mut conn = Connection::open(&path).unwrap();
+    let mut conn = Connection::open_exclusive(&path).unwrap();
     conn.execute("CREATE TABLE col (id INT PRIMARY KEY, v TEXT)").unwrap();
     conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v TEXT) ENGINE = Memory").unwrap();
 
@@ -130,7 +130,7 @@ fn test_m4_cross_engine_txn_crash_recovery() {
     let path = tmp_db("cross_crash");
     cleanup(&path);
     {
-        let mut conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open_exclusive(&path).unwrap();
         conn.execute("CREATE TABLE col (id INT PRIMARY KEY, v TEXT)").unwrap();
         conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v TEXT) ENGINE = Memory").unwrap();
         conn.execute("BEGIN").unwrap();
@@ -139,7 +139,7 @@ fn test_m4_cross_engine_txn_crash_recovery() {
         conn.execute("COMMIT").unwrap();
         simulate_crash(conn);
     }
-    let mut conn = Connection::open(&path).unwrap();
+    let mut conn = Connection::open_exclusive(&path).unwrap();
     let r = conn.execute("SELECT COUNT(*) FROM col").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(1), "崩溃后 col 事务恢复");
     let r = conn.execute("SELECT COUNT(*) FROM mem").unwrap();

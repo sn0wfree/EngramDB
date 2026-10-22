@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn test_tick_decisions_on_empty_database() {
         let mut conn = setup();
-        let decisions = tick_decisions(conn.database_mut());
+        let decisions = tick_decisions(&mut *conn.database_mut());
         assert_eq!(decisions.len(), 0);
     }
 
@@ -113,7 +113,7 @@ mod tests {
             conn.database_mut().record_access(id);
         }
 
-        let decisions = tick_decisions(conn.database_mut());
+        let decisions = tick_decisions(&mut *conn.database_mut());
         assert_eq!(decisions.len(), 1);
         let d = &decisions[0];
         assert_eq!(d.from_engine, EngineType::Columnar);
@@ -129,13 +129,14 @@ mod tests {
         // 模拟 200K 行（无需真插入，仅修改 def.row_count 测试决策逻辑）
         let id = conn.database_mut().table_id_by_name("cold").unwrap();
         {
-            let table = conn.database_mut().get_engine_table_mut_by_id(id).unwrap();
+            let mut table_g = conn.database_mut();
+            let table = table_g.get_engine_table_mut_by_id(id).unwrap();
             if let crate::storage::engine::EngineTable::Columnar(t) = table {
                 t.def_mut().row_count = 200_000;
             }
         }
         // 不做任何访问 → score ≈ 0
-        let decisions = tick_decisions(conn.database_mut());
+        let decisions = tick_decisions(&mut *conn.database_mut());
         assert_eq!(decisions.len(), 1);
         let d = &decisions[0];
         assert_eq!(d.to_engine, EngineType::Log);
@@ -149,7 +150,7 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO fixed VALUES (1)").unwrap();
 
-        let decisions = tick_decisions(conn.database_mut());
+        let decisions = tick_decisions(&mut *conn.database_mut());
         assert_eq!(decisions.len(), 0);
     }
 }

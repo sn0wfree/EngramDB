@@ -105,19 +105,21 @@ fn test_layered_compact_consistency() {
         }
     };
     check(&mut conn);
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     check(&mut conn);
     // compact 后再插入一批，再 compact（第二批段追加）
     for i in 500..700 {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 2)).unwrap();
     }
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     for i in [499usize, 500, 650, 699] {
         let r = conn.execute(&format!("SELECT v FROM t WHERE id = {i}")).unwrap();
         assert_eq!(r.rows[0][0], Value::Int64((i * 2) as i64));
     }
     // 全部落入列存后，稀疏 granule 应已建立
-    let table = conn.database_mut().get_table("t").unwrap();
+        let mut table_g = conn.database_mut();
+
+        let table = table_g.get_table("t").unwrap();
     assert!(
         table.column_store().sparse_granule_count() > 0,
         "compact 后稀疏索引应有 granule"
@@ -134,18 +136,21 @@ fn test_layered_unsorted_load_degrades_gracefully() {
     for i in 100..200 {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i)).unwrap();
     }
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     // 第二批：主键整体小于第一批
     for i in 0..100 {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i)).unwrap();
     }
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
 
-    let table = conn.database_mut().get_table("t").unwrap();
-    assert!(
-        !table.column_store().sparse_sorted(),
-        "乱序追加后应降级为无序模式"
-    );
+    {
+        let mut table_guard = conn.database_mut();
+        let table = table_guard.get_table("t").unwrap();
+        assert!(
+            !table.column_store().sparse_sorted(),
+            "乱序追加后应降级为无序模式"
+        );
+    }
     for i in [0usize, 50, 99, 100, 150, 199] {
         let r = conn.execute(&format!("SELECT v FROM t WHERE id = {i}")).unwrap();
         assert_eq!(
@@ -164,7 +169,7 @@ fn test_layered_pk_conflict_across_layers() {
     for i in 0..500 {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i)).unwrap();
     }
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     // 撞列存中的主键
     let err = conn
         .execute("INSERT INTO t VALUES (100, 999)")
@@ -208,11 +213,15 @@ fn test_layered_sparse_persistence_roundtrip() {
         let r = conn.execute("SELECT v FROM t WHERE id = 777").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(777));
         // 稀疏索引应从持久化段恢复（granule 数 > 0，无需重建）
-        let table = conn.database_mut().get_table("t").unwrap();
-        assert!(
-            table.column_store().sparse_granule_count() > 0,
-            "重启后稀疏索引应从持久化段恢复"
-        );
+        {
+            let mut table_g = conn.database_mut();
+
+            let table = table_g.get_table("t").unwrap();
+            assert!(
+                table.column_store().sparse_granule_count() > 0,
+                "重启后稀疏索引应从持久化段恢复"
+            );
+        }
         conn.close().unwrap();
     }
     std::fs::remove_file(&path).ok();
@@ -228,7 +237,7 @@ fn test_layered_normalized_pk_across_layers() {
     // delta 层归一化
     let r = conn.execute("SELECT v FROM t WHERE id = 1").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(10));
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     // 列存层归一化
     let r = conn.execute("SELECT v FROM t WHERE id = 1").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(10));
@@ -240,10 +249,12 @@ fn test_layered_no_pk_table_unaffected() {
     let mut conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(2));
-    let table = conn.database_mut().get_table("t").unwrap();
+        let mut table_g = conn.database_mut();
+
+        let table = table_g.get_table("t").unwrap();
     assert_eq!(table.column_store().sparse_granule_count(), 0, "无主键表无稀疏索引");
 }
 
@@ -256,8 +267,8 @@ fn test_pk_cache_lifecycle() {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 2)).unwrap();
     }
     // v0.20：主键表 INSERT 走攒批，compact 前需 flush（否则 compact 的是空表）
-    crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
-    force_compact(conn.database_mut());
+    crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
+    force_compact(&mut *conn.database_mut());
     assert!(
         !conn.database_mut().get_table("t").unwrap().column_store().pk_cache_built(),
         "compact 后未点查前不应构建缓存"
@@ -276,7 +287,7 @@ fn test_pk_cache_lifecycle() {
     let r = conn.execute("SELECT v FROM t WHERE id = 300").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(600));
     // 重建后的缓存命中新数据（新行在 delta，列存缓存重建覆盖旧列存段）
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     let r = conn.execute("SELECT v FROM t WHERE id = 300").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(600));
     let r = conn.execute("SELECT v FROM t WHERE id = 299").unwrap();
@@ -291,11 +302,11 @@ fn test_pk_cache_unsorted_correctness() {
     for i in 100..300 {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i)).unwrap();
     }
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     for i in 0..100 {
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i)).unwrap();
     }
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     for i in [0usize, 50, 99, 100, 150, 299] {
         let r = conn.execute(&format!("SELECT v FROM t WHERE id = {i}")).unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(i as i64), "乱序 + 缓存点查必须正确 id={i}");
@@ -308,7 +319,7 @@ fn test_pk_cache_varchar_skipped() {
     let mut conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY, v INT)").unwrap();
     conn.execute("INSERT INTO t VALUES ('k1', 10), ('k2', 20), ('k3', 30)").unwrap();
-    force_compact(conn.database_mut());
+    force_compact(&mut *conn.database_mut());
     let r = conn.execute("SELECT v FROM t WHERE id = 'k2'").unwrap();
     assert_eq!(r.rows[0][0], Value::Int64(20));
     assert!(

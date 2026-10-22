@@ -307,7 +307,7 @@ mod tests {
     fn test_delete_all_direct() {
         let mut conn = open_db(false);
         seed(&mut conn);
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         assert_eq!(execute(db, "t", None).unwrap(), 3);
         assert!(rows(db).is_empty());
     }
@@ -316,7 +316,7 @@ mod tests {
     fn test_delete_with_condition_direct() {
         let mut conn = open_db(false);
         seed(&mut conn);
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         assert_eq!(execute(db, "t", Some(gt_id(1))).unwrap(), 2);
         let remaining = rows(db);
         assert_eq!(remaining.len(), 1);
@@ -329,7 +329,7 @@ mod tests {
     fn test_delete_condition_no_match() {
         let mut conn = open_db(false);
         seed(&mut conn);
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         assert_eq!(execute(db, "t", Some(gt_id(100))).unwrap(), 0);
         assert_eq!(rows(db).len(), 3);
     }
@@ -338,7 +338,7 @@ mod tests {
     fn test_delete_table_not_found() {
         let mut conn = open_db(false);
         seed(&mut conn);
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let err = execute(db, "nope", None).unwrap_err();
         assert!(matches!(err, EngramDbError::TableNotFound(_)), "got: {err:?}");
     }
@@ -350,7 +350,7 @@ mod tests {
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE log_t (ts INT64, v INT64) ENGINE = Log").unwrap();
         conn.execute("INSERT INTO log_t VALUES (1, 10)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let err = execute(db, "log_t", None).unwrap_err();
         assert!(matches!(err, EngramDbError::NotSupported(_)), "got: {err:?}");
     }
@@ -363,7 +363,7 @@ mod tests {
         conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory")
             .unwrap();
         conn.execute("INSERT INTO mem VALUES (1, 10), (2, 20)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         assert_eq!(execute(db, "mem", Some(gt_id(1))).unwrap(), 1);
         let remaining = db
             .get_engine_table_mut("mem")
@@ -381,8 +381,8 @@ mod tests {
         let mut conn = open_db(true);
         seed(&mut conn);
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
-        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
+        let db = &mut *conn.database_mut();
         assert_eq!(execute(db, "t", Some(gt_id(1))).unwrap(), 2);
         assert_eq!(rows(db).len(), 1);
         assert_eq!(execute(db, "t", None).unwrap(), 1);

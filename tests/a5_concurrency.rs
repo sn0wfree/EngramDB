@@ -135,39 +135,66 @@ fn a5_16_threads_concurrent_txns() {
     );
 }
 
-/// 钉死缺口：真·多 Connection 同文件（当前不支持）
+/// A5c：真·多 Connection 同文件共享数据（v0.22.5 Arc<Mutex> 注册表）
 ///
-/// llmRx `SetMaxOpenConns(16)` 期望 16 个独立 DB 连接。
-/// EngramDB `Database` 非线程安全 → 必须外部锁串行化。
-/// 此测试记录契约：共享锁是当前唯一正确用法。
+/// 同一 path 的多个 `Connection` 共享同一 `Database`。
+/// `:memory:` 各自独立。`open_exclusive` 绕过注册表（崩溃恢复测试用）。
 #[test]
-fn a5_multi_connection_gap_documented() {
-    // 模拟「真·多连接」：各自 open 同一 path —— 内存库各是独立实例
-    // （文件库行为另测；此处记录语义差异）
+fn a5c_true_multi_connection_shared() {
+    let path = std::env::temp_dir().join("engramdb_a5c_shared.hdb");
+    let path_str = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path_str));
+
+    // 两个独立 Connection，同一文件
+    let mut c1 = Connection::open(&path_str).unwrap();
+    let mut c2 = Connection::open(&path_str).unwrap();
+
+    c1.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    // c2 看到同一张表
+    c2.execute("INSERT INTO t VALUES (1, 'from_c2')").unwrap();
+    // c1 读到 c2 写入的数据
+    let r = c1.execute("SELECT COUNT(*) FROM t").unwrap();
+    let n = match &r.rows[0][0] {
+        engramdb::Value::Int64(i) => *i,
+        engramdb::Value::Int32(i) => *i as i64,
+        _ => -1,
+    };
+    assert_eq!(n, 1, "A5c FAIL: c1 未看到 c2 写入的数据");
+
+    c1.execute("INSERT INTO t VALUES (2, 'from_c1')").unwrap();
+    let r = c2.execute("SELECT COUNT(*) FROM t").unwrap();
+    let n = match &r.rows[0][0] {
+        engramdb::Value::Int64(i) => *i,
+        engramdb::Value::Int32(i) => *i as i64,
+        _ => -1,
+    };
+    assert_eq!(n, 2, "A5c FAIL: c2 未看到 c1 写入的数据");
+
+    println!("A5c PASS: 同文件多 Connection 共享数据（Arc<Mutex> 注册表）");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path_str));
+}
+
+/// :memory: 连接各自独立（不共享）
+#[test]
+fn a5c_memory_connections_independent() {
     let mut c1 = Connection::open(":memory:").unwrap();
     let mut c2 = Connection::open(":memory:").unwrap();
     c1.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
     c2.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
     c1.execute("INSERT INTO t VALUES (1)").unwrap();
-    c2.execute("INSERT INTO t VALUES (2)").unwrap();
-
     let r1 = c1.execute("SELECT COUNT(*) FROM t").unwrap();
     let r2 = c2.execute("SELECT COUNT(*) FROM t").unwrap();
     let n1 = match &r1.rows[0][0] {
         engramdb::Value::Int64(i) => *i,
-        engramdb::Value::Int32(i) => *i as i64,
         _ => -1,
     };
     let n2 = match &r2.rows[0][0] {
         engramdb::Value::Int64(i) => *i,
-        engramdb::Value::Int32(i) => *i as i64,
         _ => -1,
     };
-    // 各自独立：n1=1, n2=1 —— 不是共享库
     assert_eq!(n1, 1);
-    assert_eq!(n2, 1);
-    println!(
-        "A5c GAP: 真·多 Connection 同文件不支持（Database 非线程安全）\
-         —— llmRx SetMaxOpenConns(16) 需外部 Arc<Mutex<>> 串行化；当前契约已钉死"
-    );
+    assert_eq!(n2, 0, ":memory: 不应共享");
+    println!("A5c PASS: :memory: 连接各自独立");
 }

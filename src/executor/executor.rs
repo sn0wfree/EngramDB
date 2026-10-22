@@ -2717,7 +2717,7 @@ mod tests {
     fn test_execute_explain_plan() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let r = execute_explain(plan_filter(), db).unwrap();
         assert_eq!(r.rows.len(), 1);
         let text = match &r.rows[0][0] {
@@ -2731,7 +2731,7 @@ mod tests {
     #[test]
     fn test_execute_create_table_plan() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let def = crate::common::types::TableDef {
             id: 0,
             name: "newt".into(),
@@ -2767,7 +2767,7 @@ mod tests {
     fn test_execute_insert_and_countstar() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let r = execute(
             PhysicalPlan::Insert {
                 table_name: "t".into(),
@@ -2813,8 +2813,8 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
-        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
+        let db = &mut *conn.database_mut();
         let r = execute(
             PhysicalPlan::Update {
                 table_name: "t".into(),
@@ -2841,7 +2841,7 @@ mod tests {
     #[test]
     fn test_execute_begin_commit_rollback_plans() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         execute(PhysicalPlan::BeginTransaction, db).unwrap();
         execute(PhysicalPlan::Commit, db).unwrap();
         execute(PhysicalPlan::BeginTransaction, db).unwrap();
@@ -2854,8 +2854,8 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
-        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
+        let db = &mut *conn.database_mut();
         let r = execute(
             PhysicalPlan::SubqueryScan {
                 plan: Box::new(plan_scan()),
@@ -2872,8 +2872,8 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
-        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
+        let db = &mut *conn.database_mut();
         let r = execute(
             PhysicalPlan::Insert {
                 table_name: "t".into(),

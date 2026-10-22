@@ -135,8 +135,11 @@ fn test_mark_index_persistence() {
         let r = conn.execute("SELECT v FROM t WHERE id = 4321").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(8642));
         // 分层索引：列存稀疏索引应从持久化段完整恢复（granule 数 = ceil(5000/8192)）
-        let table = conn.database_mut().get_table("t").unwrap();
-        assert!(table.column_store().sparse_granule_count() >= 1, "稀疏索引应从持久化段恢复");
+        {
+            let mut table_g = conn.database_mut();
+            let table = table_g.get_table("t").unwrap();
+            assert!(table.column_store().sparse_granule_count() >= 1, "稀疏索引应从持久化段恢复");
+        }
         conn.close().unwrap();
     }
     std::fs::remove_file(&path).ok();
@@ -158,7 +161,7 @@ fn test_mark_index_rebuild_fallback() {
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
         // 模拟旧文件：清空内存主键索引后重新加载索引段（索引段无主键段时触发兜底重建）
         {
-            let db = conn.database_mut();
+            let db = &mut *conn.database_mut();
             let table = db.get_table_mut("t").unwrap();
             table.clear_primary_index_for_test();
         }
@@ -166,7 +169,9 @@ fn test_mark_index_rebuild_fallback() {
         assert!(rebuilt >= 0); // load_indexes 返回索引总数（rebuild 是内部兜底）
         let r = conn.execute("SELECT v FROM t WHERE id = 2").unwrap();
         let hit = r.rows[0][0].clone();
-        let idx_count = conn.database_mut().get_table("t").unwrap()
+        let mut idx_count_guard = conn.database_mut();
+
+        let idx_count = idx_count_guard.get_table("t").unwrap()
             .primary_index().map(|i| i.len()).unwrap_or(0);
         (idx_count, hit)
     };

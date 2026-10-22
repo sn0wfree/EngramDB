@@ -37,24 +37,26 @@
 **A4b 修复（v0.22.5）**：`Database.txn_flushed_rows` undo-log。
 flush 落盘时记录 row_id；ROLLBACK 降序 `delete_row`；COMMIT 清 log 保留行。
 
-## A5 多连接并发（新增）
+## A5 多连接并发
 
 | 路径 | 结果 |
 |------|------|
 | A5a 16 线程共享连接写入 | ✅ 3200 行无丢写无串扰 |
 | A5b 16 线程并发事务 | ✅ 800 行事务边界干净 |
-| A5c 真·多 Connection 同文件 | ⚠️ **GAP**：`Database` 非线程安全，需 `Arc<Mutex<>>` 串行化 |
+| A5c 真·多 Connection 同文件 | ✅ **PASS**（v0.22.5 Arc<Mutex> 注册表） |
+| A5c `:memory:` 独立 | ✅ 各自独立 |
 
-**A5 契约**：16 并发客户端可用，但必须经外部锁共享单一 `Connection`。
-llmRx `SetMaxOpenConns(16)` 接入时，Go driver 侧需持互斥锁（或单连接池）。
-真·多连接（16 个独立 `Database` 同文件）属 P2 架构改动。
+**A5c 修复（v0.22.5）**：`Connection.db: Arc<Mutex<Database>>` + 全局 path 注册表。
+同一文件的多个 `Connection` 共享同一 `Database`（Mutex 串行化）。
+`:memory:` 不进注册表，各自独立。`open_exclusive` 绕过注册表（崩溃恢复测试）。
+`database_mut()` 返回 `MutexGuard`；`Transaction` 持 guard。
 
 ## 修复优先级（若仍要碰主存储）
 
 1. **P0** ~~DEFAULT 填充~~ ✅
 2. **P0** ~~FK 强制~~ ✅
 3. **P0** ~~A4b 读后回滚撤销~~ ✅
-4. **P1** ~~A5 并发 16~~ ✅（锁串行化契约）/ 真·多连接 = P2
-5. P2 ATTACH 等价（D5 按天分片）
+4. **P0** ~~A5 多连接并发~~ ✅（含真·多连接）
+5. P1 ATTACH 等价（D5 按天分片）
 
-Phase 0 闭环：**语义闸门全绿 + A4 全过 + A5 锁契约达标。**
+Phase 0 闭环：**语义闸门 + A4 + A5 全绿。**

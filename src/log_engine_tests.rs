@@ -254,8 +254,11 @@ fn test_log_block_rows_configurable() {
         let r = conn.execute("SELECT COUNT(*) FROM t WHERE ts >= 18").unwrap();
         assert_eq!(r.rows[0][0], Value::Int64(2));
         // 点查（typed 读取路径）
-        let table = conn.database_mut().get_engine_table_mut("t").unwrap();
-        assert_eq!(table.def().row_count, 20);
+        {
+            let mut table_g = conn.database_mut();
+            let table = table_g.get_engine_table_mut("t").unwrap();
+            assert_eq!(table.def().row_count, 20);
+        }
         conn.close().unwrap();
     }
     let _ = std::fs::remove_file(&db_path);

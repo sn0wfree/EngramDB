@@ -21,14 +21,19 @@ use super::{IsolationLevel, TxnId, TxnState};
 /// 持有对 Database 的可变引用，通过事务管理器操作数据
 pub struct Transaction<'a> {
     id: TxnId,
-    db: &'a mut Database,
+    /// v0.22.5：持有 MutexGuard（多连接共享 Database，经锁访问）
+    db: std::sync::MutexGuard<'a, crate::storage::Database>,
     /// 是否只读事务（v0.15.0 Txn09）
     read_only: bool,
 }
 
 impl<'a> Transaction<'a> {
     /// 开始一个新事务（由 Database 调用）
-    pub(crate) fn begin(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
+    pub(crate) fn begin(
+        db: std::sync::MutexGuard<'a, crate::storage::Database>,
+        isolation_level: IsolationLevel,
+    ) -> Result<Self> {
+        let mut db = db;
         let txn_id = db.txn_manager_mut().begin(isolation_level)?;
         Ok(Self {
             id: txn_id,
@@ -38,7 +43,11 @@ impl<'a> Transaction<'a> {
     }
 
     /// 开始一个只读事务（跳过 WAL，v0.15.0 Txn09）
-    pub(crate) fn begin_readonly(db: &'a mut Database, isolation_level: IsolationLevel) -> Result<Self> {
+    pub(crate) fn begin_readonly(
+        db: std::sync::MutexGuard<'a, crate::storage::Database>,
+        isolation_level: IsolationLevel,
+    ) -> Result<Self> {
+        let mut db = db;
         let txn_id = db.txn_manager_mut().begin_readonly(isolation_level)?;
         Ok(Self {
             id: txn_id,
@@ -67,7 +76,7 @@ impl<'a> Transaction<'a> {
         self.db.on_commit();
         // P1.5 修复：之前丢弃 apply_ops 导致数据只停留在 MVCC/WAL，
         // 必须将写操作应用到存储层（否则读取路径看不到提交的数据）
-        apply_to_storage(self.db, result.apply_ops)?;
+        apply_to_storage(&mut *self.db, result.apply_ops)?;
         Ok(())
     }
 

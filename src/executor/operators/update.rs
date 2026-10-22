@@ -359,7 +359,7 @@ mod tests {
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
 
         // v = v + 1 WHERE id > 1
         let assign = vec![(
@@ -388,7 +388,7 @@ mod tests {
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
 
         let assign = vec![(1usize, Expression::Literal(Value::Int64(99)))];
         assert_eq!(execute(db, "t", &assign, None).unwrap(), 2);
@@ -403,7 +403,7 @@ mod tests {
         cfg.enable_transaction = false;
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let err = execute(db, "nope", &[(0usize, Expression::Literal(Value::Int64(1)))], None).unwrap_err();
         assert!(matches!(err, EngramDbError::TableNotFound(_)), "got: {err:?}");
     }
@@ -415,7 +415,7 @@ mod tests {
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE log_t (ts INT64, v INT64) ENGINE = Log").unwrap();
         conn.execute("INSERT INTO log_t VALUES (1, 10)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let err = execute(db, "log_t", &[(1usize, Expression::Literal(Value::Int64(99)))], None).unwrap_err();
         assert!(matches!(err, EngramDbError::NotSupported(_)), "got: {err:?}");
     }
@@ -428,7 +428,7 @@ mod tests {
         conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory")
             .unwrap();
         conn.execute("INSERT INTO mem VALUES (1, 10), (2, 20)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let assign = vec![(1usize, Expression::Literal(Value::Int64(7)))];
         assert_eq!(execute(db, "mem", &assign, Some(gt_id(1))).unwrap(), 1);
         let remaining = db
@@ -449,8 +449,8 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
-        let db = conn.database_mut();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
+        let db = &mut *conn.database_mut();
         let assign = vec![(1usize, Expression::Literal(Value::Int64(5)))];
         assert_eq!(execute(db, "t", &assign, Some(gt_id(1))).unwrap(), 2);
         let after = rows(db);

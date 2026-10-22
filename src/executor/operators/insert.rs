@@ -978,7 +978,7 @@ mod tests {
     fn test_insert_direct_txn_path() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let n = execute(
             db,
             "t",
@@ -1001,7 +1001,7 @@ mod tests {
         cfg.enable_transaction = false;
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let n = execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(10)]], false).unwrap();
         assert_eq!(n, 1);
         let rows = db.get_table_mut("t").unwrap().scan_to_rows_direct(&[0, 1]).unwrap();
@@ -1012,7 +1012,7 @@ mod tests {
     fn test_insert_empty_rows() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let n = execute(db, "t", vec![], true).unwrap();
         assert_eq!(n, 0);
     }
@@ -1021,7 +1021,7 @@ mod tests {
     fn test_insert_table_not_found() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let err = execute(db, "nope", vec![vec![Value::Int64(1)]], true).unwrap_err();
         assert!(matches!(err, EngramDbError::TableNotFound(_)), "got: {err:?}");
     }
@@ -1030,7 +1030,7 @@ mod tests {
     fn test_insert_duplicate_pk_rejected() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(10)]], true).unwrap();
         let err = execute(db, "t", vec![vec![Value::Int64(1), Value::Int64(99)]], true).unwrap_err();
         assert!(
@@ -1047,7 +1047,7 @@ mod tests {
         cfg.enable_transaction = false;
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let n = execute_columns(
             db,
             "t",
@@ -1067,7 +1067,7 @@ mod tests {
     fn test_insert_columns_empty() {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let n = execute_columns(db, "t", vec![]).unwrap();
         assert_eq!(n, 0);
     }
@@ -1078,7 +1078,7 @@ mod tests {
         cfg.enable_transaction = true;
         let mut conn = crate::Connection::open_with_config(":memory:", cfg).unwrap();
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         // 无挂起批次 → 空操作
         flush_all_batched(db).unwrap();
         // 有挂起批次（小批入 batcher）
@@ -1172,7 +1172,7 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, u INT UNIQUE)").unwrap();
         // 大批量（>threshold 走列式/批量 apply）含批内唯一重复
         let rows: Vec<Vec<Value>> = (0..2000).map(|i| vec![Value::Int64(i), Value::Int64(i % 100)]).collect();
-        let err = crate::executor::operators::insert::execute(conn.database_mut(), "t", rows, true).unwrap_err();
+        let err = crate::executor::operators::insert::execute(&mut *conn.database_mut(), "t", rows, true).unwrap_err();
         assert!(
             matches!(err, crate::common::error::EngramDbError::ConstraintViolation(_)),
             "got: {err:?}"
@@ -1259,7 +1259,7 @@ mod tests {
         conn.execute("INSERT INTO p VALUES (1)").unwrap();
         conn.execute("INSERT INTO c VALUES (10, 1)").unwrap();
         // FK 表不攒批：插入后立即可见（无需 flush 即可从原始 API 读到）
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let rows = db
             .get_engine_table_mut("c")
             .unwrap()

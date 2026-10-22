@@ -114,14 +114,14 @@ mod tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
         conn
     }
 
     #[test]
     fn test_scan_basic() {
         let mut conn = setup();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let chunks = execute(db, "t", &[0, 1]).unwrap();
         let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
         assert_eq!(rows.len(), 3);
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn test_scan_projection() {
         let mut conn = setup();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let chunks = execute(db, "t", &[1]).unwrap();
         let rows = crate::executor::executor::debug_chunks_to_rows(&chunks);
         assert_eq!(rows.len(), 3);
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn test_scan_table_not_found() {
         let mut conn = setup();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let err = execute(db, "nope", &[0]).unwrap_err();
         assert!(matches!(err, crate::common::error::EngramDbError::TableNotFound(_)));
     }
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn test_scan_with_filter_pushdown() {
         let mut conn = setup();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         crate::executor::operators::insert::flush_all_batched(db).unwrap();
         let chunks = execute_with_filter_pushdown(
             db,
@@ -169,7 +169,7 @@ mod tests {
         conn.execute("CREATE TABLE mem (id INT PRIMARY KEY, v INT) ENGINE = Memory")
             .unwrap();
         conn.execute("INSERT INTO mem VALUES (1, 10)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         crate::executor::operators::insert::flush_all_batched(db).unwrap();
         let chunks = execute_with_filter_pushdown(
             db,
@@ -188,7 +188,7 @@ mod tests {
         let mut conn = crate::Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE lg (ts INT64, v INT64) ENGINE = Log").unwrap();
         conn.execute("INSERT INTO lg VALUES (1, 10)").unwrap();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         crate::executor::operators::insert::flush_all_batched(db).unwrap();
         let chunks = execute_with_filter_pushdown(
             db,
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn test_estimate_skipping_placeholder() {
         let mut conn = setup();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         let (total, skipped) = estimate_skipping(db, "t", 0, &Value::Int64(0), &Value::Int64(100)).unwrap();
         assert_eq!((total, skipped), (0, 0));
     }

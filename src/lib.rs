@@ -110,22 +110,67 @@ impl PreparedStatement {
 }
 
 /// 数据库连接
+///
+/// v0.22.5：`db` 改为 `Arc<Mutex<Database>>`，同一 path 的多个 `Connection`
+/// 共享同一 `Database`（全局注册表），支持多连接并发（A5c）。
+/// 内部以 Mutex 串行化——真·并行读写需 P2 架构改动。
 pub struct Connection {
-    db: Database,
+    db: std::sync::Arc<std::sync::Mutex<Database>>,
     closed: bool,
 }
 
+/// 全局已打开数据库注册表：path → 弱引用共享句柄
+///
+/// 同一 path 复用同一 `Arc<Mutex<Database>>`，保证多 Connection 看到同一份数据。
+type SharedDb = std::sync::Arc<std::sync::Mutex<Database>>;
+
+fn open_shared_db(path: &str, create: impl FnOnce() -> Result<Database>) -> Result<SharedDb> {
+    // :memory: 每个 open 都是独立库，不进共享注册表
+    if path == ":memory:" {
+        return Ok(std::sync::Arc::new(std::sync::Mutex::new(create()?)));
+    }
+    static SHARED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<std::sync::Mutex<Database>>>>,
+    > = std::sync::OnceLock::new();
+    let shared = SHARED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = path.to_string();
+    let mut map = shared.lock().unwrap();
+    if let Some(weak) = map.get(&key) {
+        if let Some(arc) = weak.upgrade() {
+            return Ok(arc);
+        }
+    }
+    let db = create()?;
+    let arc: SharedDb = std::sync::Arc::new(std::sync::Mutex::new(db));
+    map.insert(key, std::sync::Arc::downgrade(&arc));
+    Ok(arc)
+}
+
 impl Connection {
-    /// 打开或创建数据库
+    /// 打开或创建数据库（同一 path 共享同一 Database）
     pub fn open(path: &str) -> Result<Self> {
-        let db = Database::open(path)?;
+        let db = open_shared_db(path, || Database::open(path))?;
         Ok(Self { db, closed: false })
     }
 
-    /// 使用指定配置打开或创建数据库
+    /// 使用指定配置打开或创建数据库（同一 path 共享同一 Database）
     pub fn open_with_config(path: &str, config: crate::common::config::Config) -> Result<Self> {
-        let db = Database::open_with_config(path, config)?;
+        let db = open_shared_db(path, || {
+            Database::open_with_config(path, config)
+        })?;
         Ok(Self { db, closed: false })
+    }
+
+    /// 打开独立 Database（不进共享注册表）
+    ///
+    /// 用于崩溃恢复测试：模拟进程崩溃后从磁盘/WAL 恢复，
+    /// 不复用可能仍存活的共享句柄。
+    pub fn open_exclusive(path: &str) -> Result<Self> {
+        let db = Database::open(path)?;
+        Ok(Self {
+            db: std::sync::Arc::new(std::sync::Mutex::new(db)),
+            closed: false,
+        })
     }
 
     /// P0-2：非裸 INSERT 语句执行前冲刷攒批缓冲（读己之写 + 语句间顺序）
@@ -134,11 +179,11 @@ impl Connection {
     /// Batcher 自行攒批/触发，其余语句（SELECT/UPDATE/DELETE/DDL/CTAS/
     /// InsertSelect/UPSERT/INSERT...RETURNING）必须先落盘缓冲行。
     fn flush_batches(&mut self) -> Result<()> {
-        crate::executor::operators::insert::flush_all_batched(&mut self.db)?;
+        crate::executor::operators::insert::flush_all_batched(&mut *self.db.lock().unwrap())?;
         // P0-2 事务级 Batcher：显式事务内 buffer 同样遵守冲刷语义
         // （非裸 INSERT 语句执行前读己之写）
-        if self.db.in_explicit_txn() {
-            self.db.flush_txn_buffer()?;
+        if self.db.lock().unwrap().in_explicit_txn() {
+            self.db.lock().unwrap().flush_txn_buffer()?;
         }
         Ok(())
     }
@@ -158,12 +203,13 @@ impl Connection {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         use executor::physical_plan::PhysicalPlan;
         // v0.18 P0-1 计划缓存：命中跳过 parse/plan/optimize（同 SQL 重复场景）
-        if let Some((cached, clean)) = self.db.get_plan_cache(sql).cloned() {
+        let cached_plan = self.db.lock().unwrap().get_plan_cache(sql).cloned();
+        if let Some((cached, clean)) = cached_plan {
             // 命中路径同样遵守攒批冲刷语义（非裸 INSERT 语句先 flush）
             if !clean {
                 self.flush_batches()?;
             }
-            return executor::execute(cached, &mut self.db);
+            return executor::execute(cached, &mut *self.db.lock().unwrap());
         }
         let ast = sql::parser::parse(sql)?;
         // P0-2：非裸 INSERT 语句前置冲刷攒批
@@ -187,7 +233,7 @@ impl Connection {
                 | crate::sql::ast::Statement::DropMaterializedView(_)
                 | crate::sql::ast::Statement::RefreshMaterializedView(_)
         );
-        let plan = sql::planner::plan(ast, &self.db)?;
+        let plan = sql::planner::plan(ast, &*self.db.lock().unwrap())?;
         // CountStar 是行数快照（Perf01 元数据短路），缓存即过期 → 不缓存
         // Rollback/RollbackToSavepoint：不缓存（缓存命中路径会前置 flush
         // 事务 buffer，破坏回滚语义；且回滚语句无重复执行价值）
@@ -207,28 +253,28 @@ impl Connection {
                 | PhysicalPlan::Limit { .. }
         );
         let result = if needs_optimize {
-            let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+            let stats: Vec<_> = self.db.lock().unwrap().statistics_cache().values().cloned().collect();
             let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
             // 缓存最终（优化后）计划
             if !is_ddl && cacheable {
-                self.db.set_plan_cache(sql, optimized.clone(), batcher_clean);
+                self.db.lock().unwrap().set_plan_cache(sql, optimized.clone(), batcher_clean);
             }
-            executor::execute(optimized, &mut self.db)
+            executor::execute(optimized, &mut *self.db.lock().unwrap())
         } else {
             if !is_ddl && cacheable {
-                self.db.set_plan_cache(sql, plan.clone(), batcher_clean);
+                self.db.lock().unwrap().set_plan_cache(sql, plan.clone(), batcher_clean);
             }
-            executor::execute(plan, &mut self.db)
+            executor::execute(plan, &mut *self.db.lock().unwrap())
         }?;
         if is_ddl {
-            self.db.clear_plan_cache();
+            self.db.lock().unwrap().clear_plan_cache();
         }
         // v0.22.4：大批量 DML 后使计划缓存失效——缓存计划基于优化时的
         // 统计/数据分布，大批量变更后 join order 等 CBO 决策可能严重过时
         // （灾难计划防护）。阈值避开逐行 UPDATE 场景的缓存抖动；
         // SELECT 的 rows_affected 恒为 0，不受影响。
         if result.rows_affected >= 512 {
-            self.db.clear_plan_cache();
+            self.db.lock().unwrap().clear_plan_cache();
         }
         Ok(result)
     }
@@ -236,8 +282,8 @@ impl Connection {
     /// 解释 SQL 执行计划（用于调试和验证优化器）
     pub fn explain(&mut self, sql: &str) -> Result<String> {
         let ast = sql::parser::parse(sql)?;
-        let plan = sql::planner::plan(ast, &self.db)?;
-        let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+        let plan = sql::planner::plan(ast, &*self.db.lock().unwrap())?;
+        let stats: Vec<_> = self.db.lock().unwrap().statistics_cache().values().cloned().collect();
         let optimized = sql::optimizer::optimize_with_stats(plan.clone(), &stats)?;
         Ok(format!("原始计划:\n{:#?}\n\n优化后:\n{:#?}", plan, optimized))
     }
@@ -294,9 +340,9 @@ impl Connection {
                     }
                     rows
                 } else {
-                    sql::planner::eval_insert_rows(ins, &self.db, params)?
+                    sql::planner::eval_insert_rows(ins, &*self.db.lock().unwrap(), params)?
                 };
-                let count = executor::operators::insert::execute(&mut self.db, &ins.table_name, rows, false)?;
+                let count = executor::operators::insert::execute(&mut *self.db.lock().unwrap(), &ins.table_name, rows, false)?;
                 return Ok(QueryResult {
                     columns: vec!["rows_inserted".to_string()],
                     rows: vec![vec![crate::Value::Int64(count as i64)]],
@@ -304,7 +350,7 @@ impl Connection {
                 });
             }
         }
-        let plan = sql::planner::plan_with_params(stmt.ast.clone(), &self.db, params)?;
+        let plan = sql::planner::plan_with_params(stmt.ast.clone(), &*self.db.lock().unwrap(), params)?;
 
         let needs_optimize = matches!(
             plan,
@@ -316,11 +362,11 @@ impl Connection {
                 | PhysicalPlan::Limit { .. }
         );
         if needs_optimize {
-            let stats: Vec<_> = self.db.statistics_cache().values().cloned().collect();
+            let stats: Vec<_> = self.db.lock().unwrap().statistics_cache().values().cloned().collect();
             let optimized = sql::optimizer::optimize_with_stats(plan, &stats)?;
-            executor::execute(optimized, &mut self.db)
+            executor::execute(optimized, &mut *self.db.lock().unwrap())
         } else {
-            executor::execute(plan, &mut self.db)
+            executor::execute(plan, &mut *self.db.lock().unwrap())
         }
     }
 
@@ -338,53 +384,56 @@ impl Connection {
         if batcher_clean {
             if let crate::sql::ast::Statement::Insert(ins) = &stmt.ast {
                 for params in params_batch {
-                    let rows = sql::planner::eval_insert_rows(ins, &self.db, params)?;
-                    total += executor::operators::insert::execute(&mut self.db, &ins.table_name, rows, false)?;
+                    let rows = sql::planner::eval_insert_rows(ins, &*self.db.lock().unwrap(), params)?;
+                    total += executor::operators::insert::execute(&mut *self.db.lock().unwrap(), &ins.table_name, rows, false)?;
                 }
-                if !self.db.insert_batcher().is_empty() {
+                if !self.db.lock().unwrap().insert_batcher().is_empty() {
                     self.flush_batches()?;
                 }
                 return Ok(total);
             }
         }
         for params in params_batch {
-            let plan = sql::planner::plan_with_params(stmt.ast.clone(), &self.db, params)?;
-            let result = executor::execute(plan, &mut self.db)?;
+            let plan = sql::planner::plan_with_params(stmt.ast.clone(), &*self.db.lock().unwrap(), params)?;
+            let result = executor::execute(plan, &mut *self.db.lock().unwrap())?;
             total += result.rows_affected;
         }
         // P0-2：批量执行结束冲刷攒批（RETURNING 语义 + 顺序保证）
-        if batcher_clean && !self.db.insert_batcher().is_empty() {
+        if batcher_clean && !self.db.lock().unwrap().insert_batcher().is_empty() {
             self.flush_batches()?;
         }
         Ok(total)
     }
 
     /// 开始事务
-    pub fn begin(&mut self) -> Result<Transaction> {
+    pub fn begin(&mut self) -> Result<Transaction<'_>> {
         self.flush_batches()?;
-        Transaction::begin(&mut self.db, txn::IsolationLevel::default())
+        Transaction::begin(self.db.lock().unwrap(), txn::IsolationLevel::default())
     }
 
     /// 开始一个只读事务（v0.15.0 Txn09）
     ///
     /// 只读事务跳过 WAL 写入，避免不必要的 fsync 开销。
     /// 适用于只进行 SELECT 查询的场景。
-    pub fn begin_readonly(&mut self) -> Result<Transaction> {
+    pub fn begin_readonly(&mut self) -> Result<Transaction<'_>> {
         self.flush_batches()?;
-        Transaction::begin_readonly(&mut self.db, txn::IsolationLevel::default())
+        Transaction::begin_readonly(self.db.lock().unwrap(), txn::IsolationLevel::default())
     }
 
     /// 关闭数据库
     pub fn close(&mut self) -> Result<()> {
         self.flush_batches()?;
-        let result = self.db.close();
+        let result = self.db.lock().unwrap().close();
         self.closed = true;
         result
     }
 
     /// 获取底层 Database 的可变引用（用于高级 API 操作）
-    pub fn database_mut(&mut self) -> &mut Database {
-        &mut self.db
+    ///
+    /// v0.22.5：返回 `MutexGuard`（多连接共享同一 Database，需经锁访问）。
+    /// 方法调用经 `DerefMut` 自动解引用；作为函数参数传 `&mut *conn.database_mut()`。
+    pub fn database_mut(&mut self) -> std::sync::MutexGuard<'_, Database> {
+        self.db.lock().unwrap()
     }
 
     // -----------------------------------------------------------------------
@@ -407,8 +456,8 @@ impl Connection {
         // P0-2：先冲刷攒批，保证行序（缓冲行先入表）
         self.flush_batches()?;
 
-        let engine = self
-            .db
+        let mut db_guard = self.db.lock().unwrap();
+        let engine = db_guard
             .get_engine_table_mut(table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(table_name.into()))?;
 
@@ -459,7 +508,7 @@ impl Connection {
     /// 手动触发 WAL fsync（用于 Periodic 模式下主动刷盘）
     pub fn sync_wal(&mut self) -> Result<()> {
         self.flush_batches()?;
-        self.db.sync_wal()
+        self.db.lock().unwrap().sync_wal()
     }
 
     /// Phase 2.5 P2：手动触发 Auto 表分层迁移 tick
@@ -468,7 +517,7 @@ impl Connection {
     /// 通常由 `on_commit` 每 1000 次自动触发一次；用户可手动调用以立即评估。
     pub fn tier_migration_tick(&mut self) -> Vec<crate::storage::tier_migration::MigrationDecision> {
         let _ = self.flush_batches();
-        self.db.tier_migration_tick()
+        self.db.lock().unwrap().tier_migration_tick()
     }
 
     /// Phase 3 P0：手动触发 Auto 表数据迁移（执行决策）
@@ -476,12 +525,12 @@ impl Connection {
     /// 返回所有执行的迁移结果。
     pub fn migrate_all_auto(&mut self) -> Vec<crate::storage::migration::MigrationResult> {
         let _ = self.flush_batches();
-        self.db.migrate_all_auto()
+        self.db.lock().unwrap().migrate_all_auto()
     }
 
     /// 设置 WAL 刷盘策略
     pub fn set_wal_flush_mode(&mut self, mode: crate::common::config::WalFlushMode) {
-        self.db.set_wal_flush_mode(mode);
+        self.db.lock().unwrap().set_wal_flush_mode(mode);
     }
 
     /// 设置 WAL 组提交大小（WAL 加速核心机制）
@@ -498,7 +547,7 @@ impl Connection {
     /// 高频率小写入 + 可容忍极少量数据丢失（掉电时；进程崩溃不丢，
     /// 数据已在 WAL 文件中）
     pub fn set_wal_group_commit_size(&mut self, size: usize) {
-        self.db.set_wal_group_commit_size(size);
+        self.db.lock().unwrap().set_wal_group_commit_size(size);
     }
 
     /// 设置指定表的聚簇列（方案B：Delta 聚簇）
@@ -509,7 +558,7 @@ impl Connection {
     /// 典型场景：AI Agent 交互存储按 `session_id` 聚簇，
     /// 查询单个会话的全部消息时只需顺序扫描少量连续数据块。
     pub fn set_cluster_key(&mut self, table_name: &str, column_name: &str) -> Result<()> {
-        self.db.set_cluster_key(table_name, column_name)
+        self.db.lock().unwrap().set_cluster_key(table_name, column_name)
     }
 
     /// 手动合并指定表的 Delta 层到列存（全量合并）
@@ -517,14 +566,14 @@ impl Connection {
     /// 适合批量导入后或业务低峰期调用，将 Delta 层数据全部合并到列存主存储，
     /// 提升后续查询性能。返回合并的行数。
     pub fn compact(&mut self, table_name: &str) -> Result<u64> {
-        self.db.compact_table(table_name)
+        self.db.lock().unwrap().compact_table(table_name)
     }
 
     /// 合并所有表的 Delta 层到列存
     ///
     /// 返回合并的总行数。
     pub fn compact_all(&mut self) -> Result<u64> {
-        self.db.compact_all()
+        self.db.lock().unwrap().compact_all()
     }
 
     /// 设置全局默认 Delta 合并策略（新建表生效）
@@ -535,27 +584,29 @@ impl Connection {
     /// - `CompactStrategy::incremental(threshold, batch_size)` — 增量式，分批合并
     /// - `CompactStrategy::default_adaptive(row_group_size)` — 自适应分桶（默认）
     pub fn set_compact_strategy(&mut self, strategy: crate::common::config::CompactStrategy) {
-        self.db.set_default_compact_strategy(strategy);
+        self.db.lock().unwrap().set_default_compact_strategy(strategy);
     }
 
     /// 设置 KV 缓存预算（字节）
     pub fn set_cache_size(&mut self, bytes: usize) {
-        self.db.kv_cache.set_max_memory(bytes);
+        self.db.lock().unwrap().kv_cache.set_max_memory(bytes);
     }
 
     /// 获取 KV 缓存统计
     pub fn cache_stats(&self) -> crate::storage::cache::CacheStats {
-        self.db.kv_cache.stats().clone()
+        self.db.lock().unwrap().kv_cache.stats().clone()
     }
 
     /// 清除 KV 缓存
     pub fn clear_cache(&mut self) {
-        self.db.kv_cache.clear();
+        self.db.lock().unwrap().kv_cache.clear();
     }
 
     /// 获取 KV 缓存引擎的可变引用（用于高级操作）
-    pub fn cache(&mut self) -> &mut crate::storage::cache::KVCache {
-        &mut self.db.kv_cache
+    /// 获取 KV 缓存的可变访问（经闭包，避免返回借用临时锁的引用）
+    pub fn with_cache<R>(&mut self, f: impl FnOnce(&mut crate::storage::cache::KVCache) -> R) -> R {
+        let mut db = self.db.lock().unwrap();
+        f(&mut db.kv_cache)
     }
 
     /// 设置指定表的 Delta 合并策略（运行时动态切换）
@@ -564,7 +615,7 @@ impl Connection {
         table_name: &str,
         strategy: crate::common::config::CompactStrategy,
     ) -> Result<()> {
-        self.db.set_table_compact_strategy(table_name, strategy)
+        self.db.lock().unwrap().set_table_compact_strategy(table_name, strategy)
     }
 }
 
@@ -579,20 +630,20 @@ impl Drop for Connection {
         // 该检查永远不匹配 → 每个内存库 Drop 都 checkpoint 并泄漏一个
         // .hdb 临时文件。内存库的持久化永远不会被再次读取（路径不对外
         // 暴露），直接清理。
-        if self.db.is_memory() {
-            self.db.remove_memory_files();
+        if self.db.lock().unwrap().is_memory() {
+            self.db.lock().unwrap().remove_memory_files();
             return;
         }
         // 已显式 close：持久化已在 close 中完成
         if self.closed {
             return;
         }
-        let path = self.db.path().to_string_lossy().to_string();
+        let path = self.db.lock().unwrap().path().to_string_lossy().to_string();
         if path.is_empty() {
             return;
         }
         // best-effort 持久化，失败不传播 panic
-        let _ = self.db.checkpoint();
+        let _ = self.db.lock().unwrap().checkpoint();
     }
 }
 
@@ -2299,7 +2350,7 @@ mod value_tests {
             ColumnDef::new("vec", DataType::Vector { dim: 4 }),
         ];
         let table_def = TableDef::new(0, "items", columns);
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         db.create_table(table_def).unwrap();
 
         // 写入数据
@@ -2412,7 +2463,7 @@ mod value_tests {
             ColumnDef::new("vec", DataType::Vector { dim: 4 }),
         ];
         let table_def = TableDef::new(0, "items", columns);
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         db.create_table(table_def).unwrap();
 
         // 插入 10 个向量
@@ -2469,7 +2520,7 @@ mod value_tests {
             ColumnDef::new("vec", DataType::VectorInt8 { dim: 4 }),
         ];
         let table_def = TableDef::new(0, "items", columns);
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         db.create_table(table_def).unwrap();
 
         // 插入 20 个向量
@@ -2791,7 +2842,7 @@ mod value_tests {
         table_def.ttl_seconds = Some(60); // 60 秒过期
         table_def.ttl_column = Some(2); // created_at 列是 TTL 参考列
 
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         db.create_table(table_def).unwrap();
 
         // 插入数据（TTL 会自动填充 created_at 为当前时间）
@@ -4098,8 +4149,9 @@ mod multi_engine_tests {
 
         // 默认 Columnar
         conn.execute("CREATE TABLE c (id INT)").unwrap();
-        let engine = conn.database_mut().get_engine_table("c").map(|et| et.engine_type());
-        assert_eq!(engine, Some(common::types::EngineType::Columnar));
+        let engine2 = conn.database_mut().get_engine_table("c").map(|et| et.engine_type());
+
+        assert_eq!(engine2, Some(common::types::EngineType::Columnar));
     }
 
     #[test]
@@ -4127,10 +4179,12 @@ mod multi_engine_tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
 
         // 引擎句柄访问
-        let engine = conn.database_mut().get_engine_table_mut("t").unwrap();
+        let mut engine_g = conn.database_mut();
+
+        let engine = engine_g.get_engine_table_mut("t").unwrap();
         assert_eq!(engine.engine_type(), common::types::EngineType::Columnar);
         assert_eq!(engine.def().name, "t");
         assert!(engine.as_columnar().is_some());
@@ -4180,16 +4234,19 @@ mod multi_engine_tests {
         conn.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
         // v0.20：主键表 INSERT 走攒批，原始 API 读前需 flush（SQL 层自动冲刷）
-        crate::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
+        crate::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
 
-        let mut table = conn.database_mut().get_table_mut("t").unwrap();
-        // 通过 trait 对象调用
-        let ops: &mut dyn EngineTableOps = table;
-        assert_eq!(ops.engine_type(), common::types::EngineType::Columnar);
-        let chunks = ops.scan_to_chunks(&[0, 1], None).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].count, 1);
-        assert!(ops.lookup_primary_key(&Value::Int64(1)).is_some());
+        {
+            let mut guard = conn.database_mut();
+            let table = guard.get_table_mut("t").unwrap();
+            // 通过 trait 对象调用
+            let ops: &mut dyn EngineTableOps = table;
+            assert_eq!(ops.engine_type(), common::types::EngineType::Columnar);
+            let chunks = ops.scan_to_chunks(&[0, 1], None).unwrap();
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].count, 1);
+            assert!(ops.lookup_primary_key(&Value::Int64(1)).is_some());
+        }
     }
 
     #[test]

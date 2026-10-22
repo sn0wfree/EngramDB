@@ -73,8 +73,7 @@ impl<'a> DocumentIngestor<'a> {
             ColumnDef::new("embedding", DataType::Vector { dim: embedding_dim }),
         ];
         let table_def = TableDef::new(0, table_name, columns);
-        let db = conn.database_mut();
-        db.create_table(table_def)?;
+        conn.database_mut().create_table(table_def)?;
         Ok(DocumentIngestor {
             conn,
             table_name: table_name.to_string(),
@@ -89,7 +88,7 @@ impl<'a> DocumentIngestor<'a> {
     ///
     /// `metric`: 距离度量（默认 Cosine 适合文本嵌入）
     pub fn create_vector_index(&mut self, metric: DistanceMetric) -> Result<()> {
-        let db = self.conn.database_mut();
+        let mut db = self.conn.database_mut();
         db.create_vector_index(&self.table_name, "idx_embedding", "embedding", metric, 16, 100)
     }
 
@@ -106,7 +105,7 @@ impl<'a> DocumentIngestor<'a> {
             return Ok(0);
         }
 
-        let db = self.conn.database_mut();
+        let mut db = self.conn.database_mut();
         let table = db
             .get_table_mut(&self.table_name)
             .ok_or_else(|| EngramDbError::TableNotFound(self.table_name.clone()))?;

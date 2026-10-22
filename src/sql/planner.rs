@@ -3165,15 +3165,17 @@ mod tests {
         conn.execute("CREATE TABLE log_t (ts INT64, v INT64) ENGINE = Log").unwrap();
         conn.execute("CREATE TABLE mem_t (id INT PRIMARY KEY, v INT) ENGINE = Memory")
             .unwrap();
-        let db = conn.database_mut();
-        db.create_index("t", "idx_age", &[2], &[1], false).unwrap();
-        db.create_index("t", "idx_dept", &[3], &[], false).unwrap();
+        {
+            let mut guard = conn.database_mut();
+            guard.create_index("t", "idx_age", &[2], &[1], false).unwrap();
+            guard.create_index("t", "idx_dept", &[3], &[], false).unwrap();
+        }
         conn
     }
 
     fn plan_sql(conn: &mut Connection, sql: &str) -> Result<PhysicalPlan> {
         let stmt = parse(sql).unwrap();
-        plan(stmt, conn.database_mut())
+        plan(stmt, &*conn.database_mut())
     }
 
     fn plan_ok(conn: &mut Connection, sql: &str) -> PhysicalPlan {
@@ -4268,7 +4270,7 @@ mod tests {
         // TRUNCATE：AST 级直接规划（sqlparser 版本语法不兼容）
         match plan(
             crate::sql::ast::Statement::TruncateTable { table_name: "t".into() },
-            conn.database_mut(),
+            &mut *conn.database_mut(),
         )
         .unwrap()
         {
@@ -4306,7 +4308,7 @@ mod tests {
             table_name: "t".into(),
             operation: crate::sql::ast::AlterTableOp::RenameTable { new_name: "t9".into() },
         });
-        match plan(stmt, conn.database_mut()).unwrap() {
+        match plan(stmt, &*conn.database_mut()).unwrap() {
             PhysicalPlan::AlterTable(crate::sql::ast::AlterTableStmt {
                 operation: crate::sql::ast::AlterTableOp::RenameTable { new_name },
                 ..
@@ -4324,7 +4326,8 @@ mod tests {
             table_name: "t".into(),
             columns: vec!["name".into()],
         });
-        match plan(stmt, conn.database_mut()).unwrap() {
+        let planned = plan(stmt, &*conn.database_mut()).unwrap();
+        match planned {
             PhysicalPlan::Analyze { column_indices, .. } => assert_eq!(column_indices, vec![1]),
             other => panic!("expected Analyze column, got {other:?}"),
         }
@@ -4343,7 +4346,7 @@ mod tests {
             view_name: "mv1".into(),
             concurrently: true,
         });
-        match plan(stmt, conn.database_mut()).unwrap() {
+        match plan(stmt, &*conn.database_mut()).unwrap() {
             PhysicalPlan::RefreshMaterializedView { concurrently: true, .. } => {}
             other => panic!("expected RefreshMaterializedView, got {other:?}"),
         }
@@ -4423,7 +4426,7 @@ mod tests {
         let stmt = parse("INSERT INTO t VALUES (?, ?, ?, ?)").unwrap();
         match plan_with_params(
             stmt,
-            conn.database_mut(),
+            &mut *conn.database_mut(),
             &[
                 crate::Value::Int64(1),
                 crate::Value::Varchar("a".into()),
@@ -4449,7 +4452,7 @@ mod tests {
         // SELECT 参数替换后仍走主键短路
         let stmt = parse("SELECT * FROM t WHERE id = ?").unwrap();
         match find_node(
-            &plan_with_params(stmt, conn.database_mut(), &[crate::Value::Int64(5)]).unwrap(),
+            &plan_with_params(stmt, &mut *conn.database_mut(), &[crate::Value::Int64(5)]).unwrap(),
             "PrimaryKeyLookup",
         ) {
             Some(PhysicalPlan::PrimaryKeyLookup { pk_value, .. }) => {
@@ -4459,7 +4462,7 @@ mod tests {
         }
         // DELETE / UPDATE 参数替换
         let stmt = parse("DELETE FROM t WHERE id = ?").unwrap();
-        match plan_with_params(stmt, conn.database_mut(), &[crate::Value::Int64(5)]).unwrap() {
+        match plan_with_params(stmt, &mut *conn.database_mut(), &[crate::Value::Int64(5)]).unwrap() {
             PhysicalPlan::Delete { condition, .. } => {
                 // 参数替换后 WHERE id = 5 保持 Eq 表达式（参数已替换为字面量）
                 assert!(matches!(condition, Some(crate::sql::ast::Expression::BinaryOp {
@@ -4472,7 +4475,7 @@ mod tests {
         let stmt = parse("UPDATE t SET age = ? WHERE id = ?").unwrap();
         match plan_with_params(
             stmt,
-            conn.database_mut(),
+            &mut *conn.database_mut(),
             &[crate::Value::Int64(10), crate::Value::Int64(5)],
         )
         .unwrap()
@@ -4488,7 +4491,7 @@ mod tests {
         }
         // 无参数：占位符保留 → 无法短路
         let stmt = parse("SELECT * FROM t WHERE id = ?").unwrap();
-        match find_node(&plan_with_params(stmt, conn.database_mut(), &[]).unwrap(), "Filter") {
+        match find_node(&plan_with_params(stmt, &mut *conn.database_mut(), &[]).unwrap(), "Filter") {
             Some(PhysicalPlan::Filter { condition, .. }) => {
                 // WHERE id = ? → BinaryOp 右操作数为占位符
                 assert!(matches!(condition, crate::sql::ast::Expression::BinaryOp { right, .. }
@@ -4499,7 +4502,7 @@ mod tests {
         // INSERT 参数越界 → 明确报错
         let stmt = parse("INSERT INTO t VALUES (?, ?, ?, ?)").unwrap();
         assert!(matches!(
-            plan_with_params(stmt, conn.database_mut(), &[crate::Value::Int64(1)]),
+            plan_with_params(stmt, &mut *conn.database_mut(), &[crate::Value::Int64(1)]),
             Err(EngramDbError::Parse(_))
         ));
     }
@@ -4508,7 +4511,7 @@ mod tests {
     #[test]
     fn test_eval_insert_rows() {
         let mut conn = setup();
-        let db = conn.database_mut();
+        let db = &mut *conn.database_mut();
         // 无列名：直接求值
         let stmt = parse("INSERT INTO t VALUES (1, 'a', 2, 'x'), (3, 'b', 4, 'y')").unwrap();
         if let crate::sql::ast::Statement::Insert(s) = stmt {
