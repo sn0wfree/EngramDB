@@ -46,11 +46,13 @@ fn test_migrate_all_auto_on_cold_large_table() {
         .unwrap();
 
     let id = conn.database_mut().table_id_by_name("cold").unwrap();
-    let table = conn.database_mut().get_engine_table_mut_by_id(id).unwrap();
-    if let engramdb::storage::engine::EngineTable::Columnar(t) = table {
-        t.def_mut().row_count = 200_000;
+    {
+        let mut db = conn.database_mut();
+        let table = db.get_engine_table_mut_by_id(id).unwrap();
+        if let engramdb::storage::engine::EngineTable::Columnar(t) = table {
+            t.def_mut().row_count = 200_000;
+        }
     }
-    drop(table);
 
     let results = conn.migrate_all_auto();
     assert_eq!(results.len(), 1);
@@ -160,7 +162,7 @@ fn test_migration_via_on_commit_tick() {
 
     // 验证迁移已执行（通过查看表引擎）
     let table_engine = {
-        let db = conn.database_mut();
+        let mut db = conn.database_mut();
         let table_id = db.table_id_by_name("t").unwrap();
         if let Some(et) = db.get_engine_table_mut_by_id(table_id) {
             et.engine_type()

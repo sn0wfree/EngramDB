@@ -434,3 +434,156 @@ fn known_bug_aggregate_expression_ignored() {
     let (mut eng, lite) = fresh();
     assert_same("agg expr", &mut eng, &lite, "SELECT SUM(amount * 2) FROM orders");
 }
+
+
+// ============================================================================
+// B4：扩大差分面（窗口 / CAST / CASE / 集合运算 / 字符串函数 / FULL JOIN）
+// ============================================================================
+
+#[test]
+fn diff_cast() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "cast int to text",
+        &mut eng,
+        &lite,
+        "SELECT CAST(age AS TEXT) FROM users WHERE id < 5 ORDER BY id",
+    );
+    assert_same(
+        "cast numeric text",
+        &mut eng,
+        &lite,
+        "SELECT CAST(age AS TEXT) FROM users WHERE id = 1",
+    );
+    // 非数字前缀 CAST：SQLite 取前缀数字（无则 0），EngramDB 当 NULL — 记为 known gap
+    // 覆盖在 known_bug_cast_nonnumeric 中
+    assert_same(
+        "cast float",
+        &mut eng,
+        &lite,
+        "SELECT CAST(amount AS FLOAT64) / 2 FROM orders WHERE oid = 1000",
+    );
+}
+
+#[test]
+fn diff_case_when() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "case simple",
+        &mut eng,
+        &lite,
+        "SELECT id, CASE WHEN age < 30 THEN 'young' ELSE 'old' END FROM users WHERE id < 8 ORDER BY id",
+    );
+    assert_same(
+        "case searched",
+        &mut eng,
+        &lite,
+        "SELECT CASE WHEN amount = 0 THEN 'zero' WHEN amount < 100 THEN 'low' ELSE 'high' END FROM orders WHERE oid < 1010 ORDER BY oid",
+    );
+    assert_same(
+        "case null",
+        &mut eng,
+        &lite,
+        "SELECT CASE WHEN 1 = 2 THEN 'a' END FROM users WHERE id = 0",
+    );
+}
+
+#[test]
+fn diff_set_operations() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "union",
+        &mut eng,
+        &lite,
+        "SELECT id FROM users WHERE id < 3 UNION SELECT id FROM users WHERE id > 55 ORDER BY id",
+    );
+    // UNION ALL 两侧各自有序 + 外层 ORDER BY
+    assert_same(
+        "union all",
+        &mut eng,
+        &lite,
+        "SELECT id FROM users WHERE id < 2 UNION ALL SELECT id FROM users WHERE id < 2 ORDER BY id",
+    );
+}
+
+#[test]
+fn diff_string_functions() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "upper lower",
+        &mut eng,
+        &lite,
+        "SELECT UPPER(name), LOWER(name) FROM users WHERE id = 1",
+    );
+    assert_same(
+        "substr",
+        &mut eng,
+        &lite,
+        "SELECT SUBSTR(name, 1, 4) FROM users WHERE id < 4 ORDER BY id",
+    );
+    assert_same(
+        "coalesce",
+        &mut eng,
+        &lite,
+        "SELECT COALESCE(city, 'none') FROM users WHERE id < 3 ORDER BY id",
+    );
+}
+
+#[test]
+fn diff_left_join() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "left join",
+        &mut eng,
+        &lite,
+        "SELECT users.id, orders.oid FROM users LEFT JOIN orders ON users.id = orders.uid WHERE users.id < 5 ORDER BY users.id, orders.oid",
+    );
+}
+
+#[test]
+fn diff_window_row_number() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "row_number",
+        &mut eng,
+        &lite,
+        "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM users WHERE id < 10 ORDER BY id",
+    );
+}
+
+#[test]
+fn diff_full_outer_join() {
+    let (mut eng, lite) = fresh();
+    // 全外连接：两侧未匹配行以 NULL 填充
+    assert_same(
+        "full outer",
+        &mut eng,
+        &lite,
+        "SELECT users.id, orders.oid FROM users FULL OUTER JOIN orders ON users.id = orders.uid WHERE users.id >= 28 OR orders.uid >= 28 ORDER BY users.id, orders.oid",
+    );
+}
+
+/// 回归/差异：非数字文本 CAST INT —— SQLite 得 0/前缀数字，EngramDB 得 NULL
+#[test]
+#[ignore = "known gap: CAST(text AS INT) 非数字前缀语义与 SQLite 不一致"]
+fn known_bug_cast_nonnumeric() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "cast nonnumeric",
+        &mut eng,
+        &lite,
+        "SELECT CAST(name AS INT) FROM users WHERE id = 1",
+    );
+}
+
+/// 回归/差异：UNION ALL 后 ORDER BY
+#[test]
+fn diff_union_all_order_by() {
+    let (mut eng, lite) = fresh();
+    assert_same(
+        "union all order",
+        &mut eng,
+        &lite,
+        "SELECT id FROM users WHERE id < 3 UNION ALL SELECT id FROM users WHERE id >= 57 ORDER BY id",
+    );
+}

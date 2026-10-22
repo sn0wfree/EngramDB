@@ -25,7 +25,7 @@ fn test_async_compress_doesnt_block_writes() {
         conn.execute(&format!("INSERT INTO t VALUES ({}, {})", i, (i as f64) * 1.61803398))
             .unwrap();
     }
-    engramdb::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
+    engramdb::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
 
     let write_duration = start.elapsed();
     println!("10K INSERTs took: {:?}", write_duration);
@@ -76,7 +76,7 @@ fn test_async_compress_multiple_blocks() {
     for i in 0..5000 {
         conn.execute(&format!("INSERT INTO t VALUES ({}, 'r{}')", i, i)).unwrap();
     }
-    engramdb::executor::operators::insert::flush_all_batched(conn.database_mut()).unwrap();
+    engramdb::executor::operators::insert::flush_all_batched(&mut *conn.database_mut()).unwrap();
     conn.compact_all().unwrap();
 
     let queue = CompressionQueue::new();

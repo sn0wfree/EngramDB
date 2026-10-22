@@ -10,6 +10,9 @@
   （Typed 键 + Typed 聚合列直读底层数组）；Min/Max 保持源列 Value 变体
   （Int32 不抬升为 Int64）。失败行起自动回退 Value 路径。
 
+### 测试
+- **B4 扩大 SQLite 差分面**：CAST / CASE / UNION / 字符串函数 / LEFT·FULL JOIN /
+  ROW_NUMBER 窗口；修复 UNION 后 ORDER BY 作用在集合结果上、窗口投影改写为输出列
 ### 架构
 - **WAL 段滚动（A1–A2）**：checkpoint 主存储落盘后轮转 WAL 段并删除 `.seg*`，
   不再从尾部 truncate；恢复扫描主文件 + 历史段，崩溃窗口安全

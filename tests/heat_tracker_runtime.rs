@@ -21,7 +21,7 @@ fn test_record_access_on_scan() {
     conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT)").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
 
-    let db = conn.database_mut();
+    let mut db = conn.database_mut();
     let before = db.heat_tracker().access_count(1);
     db.record_access(1);
     let after = db.heat_tracker().access_count(1);
@@ -38,7 +38,7 @@ fn test_record_access_by_name() {
     conn.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)").unwrap();
     conn.execute("CREATE TABLE t2 (id INT64 PRIMARY KEY)").unwrap();
 
-    let db = conn.database_mut();
+    let mut db = conn.database_mut();
     db.record_access_by_name("t1");
     db.record_access_by_name("t1");
     db.record_access_by_name("t2");
@@ -59,7 +59,7 @@ fn test_heat_score_increases_with_access() {
     conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
-    let db = conn.database_mut();
+    let mut db = conn.database_mut();
     let id = db.table_id_by_name("t").unwrap();
 
     // 初始：heat_score ≈ 0

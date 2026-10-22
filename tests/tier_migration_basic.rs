@@ -59,7 +59,8 @@ fn test_tier_migration_cold_large_to_log() {
 
     let id = conn.database_mut().table_id_by_name("cold").unwrap();
     {
-        let table = conn.database_mut().get_engine_table_mut_by_id(id).unwrap();
+        let mut db = conn.database_mut();
+        let table = db.get_engine_table_mut_by_id(id).unwrap();
         if let engramdb::storage::engine::EngineTable::Columnar(t) = table {
             t.def_mut().row_count = 200_000;
         }
@@ -106,7 +107,8 @@ fn test_tier_migration_mixed_tables() {
         .unwrap();
     {
         let id = conn.database_mut().table_id_by_name("cold_auto").unwrap();
-        let table = conn.database_mut().get_engine_table_mut_by_id(id).unwrap();
+        let mut db = conn.database_mut();
+        let table = db.get_engine_table_mut_by_id(id).unwrap();
         if let engramdb::storage::engine::EngineTable::Columnar(t) = table {
             t.def_mut().row_count = 200_000;
         }
@@ -117,7 +119,8 @@ fn test_tier_migration_mixed_tables() {
     conn.execute("INSERT INTO warm_auto VALUES (1), (2), (3)").unwrap();
     {
         let id = conn.database_mut().table_id_by_name("warm_auto").unwrap();
-        let table = conn.database_mut().get_engine_table_mut_by_id(id).unwrap();
+        let mut db = conn.database_mut();
+        let table = db.get_engine_table_mut_by_id(id).unwrap();
         if let engramdb::storage::engine::EngineTable::Columnar(t) = table {
             t.def_mut().row_count = 50_000;
         }

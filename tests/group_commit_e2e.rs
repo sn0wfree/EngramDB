@@ -9,7 +9,13 @@ use engramdb::common::config::Config;
 use engramdb::Connection;
 
 fn open_with(group: usize, timeout_ms: u64) -> Connection {
-    let path = format!("/tmp/m1_e2e_{}_{}_{}.hdb", group, timeout_ms, std::process::id());
+    let path = format!(
+        "/tmp/m1_e2e_{}_{}_{}_{}.hdb",
+        group,
+        timeout_ms,
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path));
     let mut cfg = Config::default();

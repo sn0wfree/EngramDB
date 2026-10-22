@@ -215,6 +215,34 @@ fn expr_has_window(expr: &Expression) -> bool {
     }
 }
 
+/// 把表达式中的窗口函数调用替换为对 Window 输出列的 ColumnRef
+fn rewrite_window_expr_to_colrefs(
+    expr: &Expression,
+    window_funcs: &[crate::executor::physical_plan::WindowFunctionExpr],
+) -> Expression {
+    match expr {
+        Expression::Function { name, over: Some(_), .. } => {
+            let key = name.to_lowercase();
+            let col = window_funcs
+                .iter()
+                .find(|w| w.output_name == key || w.output_name == *name)
+                .or_else(|| window_funcs.first())
+                .map(|w| w.output_name.clone())
+                .unwrap_or_else(|| key);
+            Expression::ColumnRef {
+                table: None,
+                column: col,
+            }
+        }
+        Expression::BinaryOp { left, op, right } => Expression::BinaryOp {
+            left: Box::new(rewrite_window_expr_to_colrefs(left, window_funcs)),
+            op: *op,
+            right: Box::new(rewrite_window_expr_to_colrefs(right, window_funcs)),
+        },
+        other => other.clone(),
+    }
+}
+
 /// 提取窗口函数信息
 fn extract_window_functions(
     expr: &Expression,
@@ -1266,9 +1294,26 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         };
     }
 
+    // 窗口函数已由 Window 算子计算并追加为输出列；投影改写为引用 output_name，
+    // 避免 Projection 再把 ROW_NUMBER() 当标量函数求值。
+    let select_for_proj: Vec<SelectItem> = if window_funcs.is_empty() {
+        stmt.select_list.clone()
+    } else {
+        stmt.select_list
+            .iter()
+            .map(|item| match item {
+                SelectItem::Expression(expr, alias) => SelectItem::Expression(
+                    rewrite_window_expr_to_colrefs(expr, &window_funcs),
+                    alias.clone(),
+                ),
+                other => other.clone(),
+            })
+            .collect()
+    };
+
     // Projection（计算 SELECT 列表中的表达式）
     let (proj_expressions, proj_names) = plan_projection(
-        &stmt.select_list,
+        &select_for_proj,
         &scan_column_names,
         needs_aggregate,
         window_table_cols,
@@ -1286,7 +1331,9 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     }
 
     // ORDER BY（v0.12.0 新增）
-    if !stmt.order_by.is_empty() {
+    // 集合运算时 ORDER BY/LIMIT 作用于整个结果，须在 SetUnion 之后套用
+    let defer_sort_limit = stmt.set_op.is_some();
+    if !defer_sort_limit && !stmt.order_by.is_empty() {
         // 确定当前计划的输出列名
         let output_columns = if needs_aggregate {
             // 聚合后已按 SELECT 列表投影，ORDER BY 应对投影后的列名
@@ -1339,7 +1386,7 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
     }
 
     // Limit（v0.22.1：支持 OFFSET）
-    if stmt.limit.is_some() || stmt.offset.is_some() {
+    if !defer_sort_limit && (stmt.limit.is_some() || stmt.offset.is_some()) {
         plan = PhysicalPlan::Limit {
             input: Box::new(plan),
             limit: stmt.limit.unwrap_or(usize::MAX),
@@ -1366,6 +1413,55 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             left: Box::new(plan),
             right: Box::new(right_plan),
         };
+
+        // ORDER BY / LIMIT 作用于集合结果（列名取左侧输出）
+        if !stmt.order_by.is_empty() {
+            let output_columns = if !proj_expressions.is_empty() {
+                proj_names.clone()
+            } else {
+                scan_column_names.clone()
+            };
+            let mut sort_keys = Vec::new();
+            for item in &stmt.order_by {
+                // 支持 ORDER BY 列名 或 ORDER BY <序号>
+                let idx = match &item.expr {
+                    Expression::ColumnRef { column, .. } => {
+                        output_columns.iter().position(|c| c == column)
+                    }
+                    Expression::Literal(crate::Value::Int64(n)) if *n >= 1 => {
+                        Some((*n as usize) - 1)
+                    }
+                    _ => None,
+                };
+                if let Some(idx) = idx {
+                    if idx < output_columns.len() {
+                        sort_keys.push(crate::executor::physical_plan::SortKey {
+                            column_index: idx,
+                            direction: if item.ascending {
+                                crate::executor::physical_plan::SortDirection::Asc
+                            } else {
+                                crate::executor::physical_plan::SortDirection::Desc
+                            },
+                        });
+                    }
+                }
+            }
+            if !sort_keys.is_empty() {
+                let topn_limit = stmt.limit.map(|l| l.saturating_add(stmt.offset.unwrap_or(0)));
+                plan = PhysicalPlan::Sort {
+                    input: Box::new(plan),
+                    sort_keys,
+                    limit: topn_limit,
+                };
+            }
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            plan = PhysicalPlan::Limit {
+                input: Box::new(plan),
+                limit: stmt.limit.unwrap_or(usize::MAX),
+                offset: stmt.offset.unwrap_or(0),
+            };
+        }
     }
 
     Ok(plan)
