@@ -481,7 +481,7 @@ fn strip_using_hnsw(sql: &str) -> String {
 fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
     match stmt {
         sqlast::Statement::CreateTable {
-            name, columns, query, ..
+            name, columns, query, constraints, ..
         } => {
             let table_name = name.to_string();
             let mut cols = Vec::new();
@@ -548,11 +548,29 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
             } else {
                 None
             };
+            // 表级 FOREIGN KEY 约束（v0.22.5）
+            let mut foreign_keys = Vec::new();
+            for constraint in constraints {
+                if let sqlast::TableConstraint::ForeignKey {
+                    columns: local_cols,
+                    foreign_table,
+                    referred_columns,
+                    ..
+                } = constraint
+                {
+                    foreign_keys.push(SqlForeignKey {
+                        local_columns: local_cols.iter().map(|c| c.value.clone()).collect(),
+                        foreign_table: foreign_table.to_string(),
+                        foreign_columns: referred_columns.iter().map(|c| c.value.clone()).collect(),
+                    });
+                }
+            }
             Ok(Statement::CreateTable(CreateTableStmt {
                 table_name,
                 columns: cols,
                 as_select,
                 engine: None,
+                foreign_keys,
             }))
         }
 

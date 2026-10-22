@@ -238,6 +238,9 @@ pub(crate) fn execute_with_txn(db: &mut Database, table_name: &str, rows: Vec<Ve
         // CHECK 约束验证（v0.22.0 新增）
         validate_check_constraints(&table_def, &rows)?;
 
+        // FOREIGN KEY 约束验证（v0.22.5 新增）
+        validate_foreign_keys(db, &table_def, &rows)?;
+
         let conflict_indices: Vec<usize> = table_def.primary_key_index().map(|pk| vec![pk]).unwrap_or_default();
         if !conflict_indices.is_empty() {
             let pk_name = table_def.columns[conflict_indices[0]].name.clone();
@@ -643,6 +646,101 @@ fn validate_check_constraints(table_def: &crate::common::types::TableDef, rows: 
                             col_def.name, check_expr, row_idx, value
                         )));
                     }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// FOREIGN KEY 约束验证（v0.22.5）
+///
+/// 对每个 FK：取本地列值，在父表对应列中查找匹配行。
+/// NULL 外键值跳过（SQL 标准：NULL 不触发引用检查）。
+/// 父表不存在时跳过（SQLite 默认不强制未建父表的 FK）。
+fn validate_foreign_keys(
+    db: &mut crate::storage::Database,
+    table_def: &crate::common::types::TableDef,
+    rows: &[Vec<Value>],
+) -> Result<()> {
+    use crate::common::error::EngramDbError;
+
+    for fk in &table_def.foreign_keys {
+        let parent = match db.get_engine_table_mut(&fk.foreign_table) {
+            Some(t) => t,
+            None => continue,
+        };
+        let parent_def = parent.def().clone();
+
+        let parent_idxs: Vec<usize> = if !fk.foreign_columns.is_empty() {
+            fk.foreign_columns.clone()
+        } else {
+            let mut idxs = Vec::with_capacity(fk.foreign_column_names.len());
+            for name in &fk.foreign_column_names {
+                let idx = parent_def.column_index(name).ok_or_else(|| {
+                    EngramDbError::ConstraintViolation(format!(
+                        "FOREIGN KEY: parent column '{}.{}' not found",
+                        fk.foreign_table, name
+                    ))
+                })?;
+                idxs.push(idx);
+            }
+            idxs
+        };
+
+        let parent_rows = parent
+            .scan_to_rows_direct(&parent_idxs, None)
+            .map_err(|e| EngramDbError::Internal(format!("FK parent scan failed: {}", e)))?;
+
+        if fk.local_columns.len() == 1 && parent_idxs.len() == 1 {
+            let local_i = fk.local_columns[0];
+            let mut parent_keys = std::collections::HashSet::new();
+            for row in &parent_rows {
+                if let Some(v) = row.first() {
+                    if !v.is_null() {
+                        parent_keys.insert(v.clone());
+                    }
+                }
+            }
+            for (row_idx, row) in rows.iter().enumerate() {
+                if let Some(val) = row.get(local_i) {
+                    if val.is_null() {
+                        continue;
+                    }
+                    if !parent_keys.contains(val) {
+                        return Err(EngramDbError::ConstraintViolation(format!(
+                            "FOREIGN KEY constraint failed: table '{}' col[{}] value {:?} not in '{}'.{} (row {})",
+                            table_def.name, local_i, val, fk.foreign_table,
+                            fk.foreign_column_names.first().map(|s| s.as_str()).unwrap_or("?"),
+                            row_idx
+                        )));
+                    }
+                }
+            }
+        } else {
+            let mut parent_tuples = std::collections::HashSet::new();
+            for row in &parent_rows {
+                if row.len() == parent_idxs.len() && !row.iter().any(|v| v.is_null()) {
+                    parent_tuples.insert(row.clone());
+                }
+            }
+            for (row_idx, row) in rows.iter().enumerate() {
+                let tuple: Vec<Value> = fk
+                    .local_columns
+                    .iter()
+                    .filter_map(|&i| row.get(i).cloned())
+                    .collect();
+                if tuple.len() != fk.local_columns.len() {
+                    continue;
+                }
+                if tuple.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                if !parent_tuples.contains(&tuple) {
+                    return Err(EngramDbError::ConstraintViolation(format!(
+                        "FOREIGN KEY constraint failed: table '{}' values {:?} not in '{}' (row {})",
+                        table_def.name, tuple, fk.foreign_table, row_idx
+                    )));
                 }
             }
         }

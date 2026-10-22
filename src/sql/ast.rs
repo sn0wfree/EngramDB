@@ -106,6 +106,16 @@ pub struct CreateTableStmt {
     pub as_select: Option<Box<SelectStmt>>,
     /// 存储引擎（v0.17.0 M0 多引擎）：`ENGINE = Memory` 等，None = Columnar
     pub engine: Option<String>,
+    /// 表级 FOREIGN KEY 约束（v0.22.5 新增，列名为字符串，规划期解析为索引）
+    pub foreign_keys: Vec<SqlForeignKey>,
+}
+
+/// SQL 层外键（列名尚未解析为索引）
+#[derive(Debug, Clone)]
+pub struct SqlForeignKey {
+    pub local_columns: Vec<String>,
+    pub foreign_table: String,
+    pub foreign_columns: Vec<String>,
 }
 
 /// 列定义

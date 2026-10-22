@@ -329,6 +329,10 @@ pub struct ForeignKeyDef {
     pub local_columns: Vec<usize>,
     pub foreign_table: String,
     pub foreign_columns: Vec<usize>,
+    /// 父表列名（延迟解析：建子表时父表可能尚未创建）
+    /// `#[serde(default)]`：旧版本文件无此字段时反序列化为空。
+    #[serde(default)]
+    pub foreign_column_names: Vec<String>,
     pub on_delete: ForeignKeyAction,
     pub on_update: ForeignKeyAction,
 }

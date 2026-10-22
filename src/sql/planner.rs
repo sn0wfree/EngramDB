@@ -421,6 +421,33 @@ fn plan_create_table(stmt: CreateTableStmt, db: &Database) -> Result<PhysicalPla
 
     let mut table_def = TableDef::new(0, &stmt.table_name, columns);
 
+    // v0.22.5：解析表级 FOREIGN KEY → ForeignKeyDef（本地列名 → 索引；父列名延迟解析）
+    for fk in &stmt.foreign_keys {
+        let local_cols: Vec<usize> = fk
+            .local_columns
+            .iter()
+            .map(|name| {
+                stmt.columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or_else(|| {
+                        EngramDbError::Parse(format!(
+                            "FOREIGN KEY column '{}' not found in table '{}'",
+                            name, stmt.table_name
+                        ))
+                    })
+            })
+            .collect::<Result<_>>()?;
+        table_def.foreign_keys.push(crate::common::types::ForeignKeyDef {
+            local_columns: local_cols,
+            foreign_table: fk.foreign_table.clone(),
+            foreign_columns: vec![],
+            foreign_column_names: fk.foreign_columns.clone(),
+            on_delete: crate::common::types::ForeignKeyAction::NoAction,
+            on_update: crate::common::types::ForeignKeyAction::NoAction,
+        });
+    }
+
     // v0.17.0 M0：ENGINE 子句 → TableDef.engine（校验引擎名）
     if let Some(engine_name) = &stmt.engine {
         table_def.engine = crate::common::types::EngineType::from_str(engine_name).ok_or_else(|| {
