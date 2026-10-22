@@ -3203,6 +3203,14 @@ mod tests {
     }
 
     // ===== Perf01：COUNT(*) 元数据短路 =====
+    /// 聚合查询现经 Projection 裁剪（HAVING 不泄漏），测试需剥掉外层 Projection。
+    fn peel_projection(plan: &PhysicalPlan) -> &PhysicalPlan {
+        match plan {
+            PhysicalPlan::Projection { input, .. } => peel_projection(input),
+            other => other,
+        }
+    }
+
     #[test]
     fn test_count_star_shortcut() {
         let mut conn = setup();
@@ -3222,7 +3230,7 @@ mod tests {
             other => panic!("expected CountStar for COUNT(1), got {other:?}"),
         }
         // COUNT(列) 不短路
-        match plan_ok(&mut conn, "SELECT COUNT(id) FROM t") {
+        match peel_projection(&plan_ok(&mut conn, "SELECT COUNT(id) FROM t")) {
             PhysicalPlan::Aggregate { aggregates, .. } => {
                 assert_eq!(aggregates.len(), 1);
                 assert!(matches!(aggregates[0].func, AggregateFunc::Count));
@@ -3230,16 +3238,16 @@ mod tests {
             other => panic!("expected Aggregate for COUNT(col), got {other:?}"),
         }
         // WHERE 阻断短路
-        match plan_ok(&mut conn, "SELECT COUNT(*) FROM t WHERE age > 1") {
+        match peel_projection(&plan_ok(&mut conn, "SELECT COUNT(*) FROM t WHERE age > 1")) {
             PhysicalPlan::Aggregate { input, aggregates, .. } => {
                 assert!(matches!(aggregates[0].func, AggregateFunc::Count));
-                assert!(matches!(*input, PhysicalPlan::Filter { .. }));
+                assert!(matches!(input.as_ref(), PhysicalPlan::Filter { .. }));
             }
             other => panic!("expected Aggregate over Filter, got {other:?}"),
         }
         // GROUP BY 阻断短路
         assert!(matches!(
-            plan_ok(&mut conn, "SELECT COUNT(*) FROM t GROUP BY dept"),
+            peel_projection(&plan_ok(&mut conn, "SELECT COUNT(*) FROM t GROUP BY dept")),
             PhysicalPlan::Aggregate { .. }
         ));
         // JOIN 不走短路
@@ -3308,7 +3316,7 @@ mod tests {
         ));
         // GROUP BY 阻断
         assert!(matches!(
-            plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5 GROUP BY name"),
+            peel_projection(&plan_ok(&mut conn, "SELECT * FROM t WHERE id = 5 GROUP BY name")),
             PhysicalPlan::Aggregate { .. }
         ));
     }
@@ -3519,17 +3527,17 @@ mod tests {
     #[test]
     fn test_aggregate_plan() {
         let mut conn = setup();
-        match plan_ok(&mut conn, "SELECT dept, COUNT(*) FROM t GROUP BY dept") {
+        match peel_projection(&plan_ok(&mut conn, "SELECT dept, COUNT(*) FROM t GROUP BY dept")) {
             PhysicalPlan::Aggregate {
                 group_by, aggregates, ..
             } => {
-                assert_eq!(group_by, vec![0]);
+                assert_eq!(group_by.as_slice(), &[0]);
                 assert_eq!(aggregates.len(), 1);
                 assert!(matches!(aggregates[0].func, AggregateFunc::Count));
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
-        match plan_ok(&mut conn, "SELECT dept, SUM(age) FROM t GROUP BY dept") {
+        match peel_projection(&plan_ok(&mut conn, "SELECT dept, SUM(age) FROM t GROUP BY dept")) {
             PhysicalPlan::Aggregate { aggregates, .. } => {
                 assert!(matches!(aggregates[0].func, AggregateFunc::Sum));
                 assert_eq!(aggregates[0].input, 1);
@@ -3543,7 +3551,7 @@ mod tests {
             ("SELECT MAX(age) FROM t", AggregateFunc::Max),
             ("SELECT AVG(age) FROM t", AggregateFunc::Avg),
         ] {
-            match plan_ok(&mut conn, sql) {
+            match peel_projection(&plan_ok(&mut conn, sql)) {
                 PhysicalPlan::Aggregate { aggregates, .. } => {
                     assert!(matches!(aggregates[0].func, f));
                 }
@@ -3551,18 +3559,18 @@ mod tests {
             }
         }
         // HAVING：聚合重写为输出列引用（HAVING 聚合不在 SELECT 中也能重写）
-        match plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1") {
+        match peel_projection(&plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1")) {
             PhysicalPlan::Filter { input, condition } => {
-                assert!(matches!(*input, PhysicalPlan::Aggregate { .. }));
+                assert!(matches!(input.as_ref(), PhysicalPlan::Aggregate { .. }));
                 let rewritten = format!("{condition:?}");
                 assert!(rewritten.contains("Count(0)"), "HAVING rewrite: {rewritten}");
             }
             other => panic!("expected HAVING Filter, got {other:?}"),
         }
         // HAVING 单独引用聚合：聚合节点必须包含该聚合（修复后）
-        match plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING SUM(age) > 100") {
+        match peel_projection(&plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING SUM(age) > 100")) {
             PhysicalPlan::Filter { input, condition } => {
-                match *input {
+                match input.as_ref() {
                     PhysicalPlan::Aggregate { aggregates, .. } => {
                         assert!(matches!(aggregates[0].func, AggregateFunc::Sum), "{aggregates:?}");
                     }
@@ -3578,7 +3586,7 @@ mod tests {
         // GROUP BY + ORDER BY
         match plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept ORDER BY dept") {
             PhysicalPlan::Sort { input, .. } => {
-                assert!(matches!(*input, PhysicalPlan::Aggregate { .. }));
+                assert!(matches!(peel_projection(input.as_ref()), PhysicalPlan::Aggregate { .. }));
             }
             other => panic!("expected Sort over Aggregate, got {other:?}"),
         }
@@ -3747,10 +3755,10 @@ mod tests {
             other => panic!("expected Limit pipeline, got {other:?}"),
         }
         // JOIN + GROUP BY 聚合
-        match plan_ok(
+        match peel_projection(&plan_ok(
             &mut conn,
             "SELECT u.tid, COUNT(*) FROM t JOIN u ON t.id = u.tid GROUP BY u.tid",
-        ) {
+        )) {
             PhysicalPlan::Aggregate {
                 group_by, aggregates, ..
             } => {
