@@ -522,6 +522,14 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                             None
                         }
                     });
+                    // 检测 DEFAULT 字面量（v0.22.5 新增）
+                    let default_value = col_def.options.iter().find_map(|o| {
+                        if let sqlast::ColumnOption::Default(expr) = &o.option {
+                            Some(expr.to_string())
+                        } else {
+                            None
+                        }
+                    });
                     cols.push(ColumnDef {
                         name: col_name,
                         data_type: dt,
@@ -530,6 +538,7 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                         auto_increment,
                         unique,
                         check_expr,
+                        default_value,
                     });
                 }
             }
@@ -900,6 +909,13 @@ fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
                             auto_increment,
                             unique: false,
                             check_expr: None,
+                            default_value: column_def.options.iter().find_map(|o| {
+                                if let sqlast::ColumnOption::Default(expr) = &o.option {
+                                    Some(expr.to_string())
+                                } else {
+                                    None
+                                }
+                            }),
                         },
                         position: None,
                     }

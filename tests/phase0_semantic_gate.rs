@@ -66,11 +66,21 @@ fn g2_not_null_default_enforced() {
     );
     println!("G2a PASS: 显式 NULL 被 NOT NULL 拒绝");
 
-    // G2b：省略列应吃到 DEFAULT
-    let r = c.execute("INSERT INTO t (name) VALUES ('a')");
+    // G2b：省略列应吃到 DEFAULT（单独路径，避免 G2a 失败插入的残留影响）
+    let mut c2 = open();
+    c2.execute(
+        "CREATE TABLE t (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role INTEGER NOT NULL DEFAULT 0,
+            status INTEGER NOT NULL DEFAULT 1,
+            name TEXT NOT NULL
+        )",
+    )
+    .unwrap();
+    let r = c2.execute("INSERT INTO t (name) VALUES ('a')");
     match r {
         Ok(_) => {
-            let q = c.execute("SELECT role, status FROM t").unwrap();
+            let q = c2.execute("SELECT role, status FROM t").unwrap();
             let role = &q.rows[0][0];
             let status = &q.rows[0][1];
             let role_ok = matches!(role, Value::Int64(0) | Value::Int32(0));

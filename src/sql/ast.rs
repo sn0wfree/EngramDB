@@ -121,6 +121,8 @@ pub struct ColumnDef {
     pub unique: bool,
     /// CHECK 约束表达式（v0.22.0 新增）
     pub check_expr: Option<String>,
+    /// DEFAULT 字面量（v0.22.5 新增），如 `"0"` / `"'abc'"` / `"0.1"`
+    pub default_value: Option<String>,
 }
 
 /// INSERT 语句

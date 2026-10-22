@@ -404,6 +404,9 @@ fn plan_create_table(stmt: CreateTableStmt, db: &Database) -> Result<PhysicalPla
                 if let Some(ref check) = c.check_expr {
                     col = col.check(check);
                 }
+                if let Some(ref dv) = c.default_value {
+                    col = col.default(dv);
+                }
                 col
             })
             .collect()
@@ -744,10 +747,10 @@ fn plan_insert(stmt: InsertStmt, db: &Database, params: &[Value]) -> Result<Phys
     let mut rows = Vec::with_capacity(num_rows);
 
     match &col_map {
-        // 有列名重排：直接按目标列数构造行
+        // 有列名重排：先按 DEFAULT 预填，再覆盖显式提供的列
         Some(indices) => {
             for value_row in &stmt.values {
-                let mut full_row = vec![Value::Null; num_cols];
+                let mut full_row = row_with_defaults(table.def());
                 for (i, expr) in value_row.iter().enumerate() {
                     if let Some(&idx) = indices.get(i) {
                         full_row[idx] = eval_constant_expr(expr, params)?;
@@ -805,7 +808,8 @@ pub fn eval_insert_rows(stmt: &InsertStmt, db: &Database, params: &[Value]) -> R
     let indices: Vec<usize> = col_names.iter().filter_map(|name| table.def().column_index(name)).collect();
     let mut rows = Vec::with_capacity(stmt.values.len());
     for value_row in &stmt.values {
-        let mut full_row = vec![Value::Null; num_cols];
+        // 先按 DEFAULT 预填，再覆盖显式提供的列
+        let mut full_row = row_with_defaults(table.def());
         for (i, expr) in value_row.iter().enumerate() {
             if let Some(&idx) = indices.get(i) {
                 full_row[idx] = eval_constant_expr(expr, params)?;
@@ -2910,6 +2914,54 @@ pub(crate) fn eval_constant_expr(expr: &Expression, params: &[Value]) -> Result<
             "Non-constant expression in VALUES not supported".into(),
         )),
     }
+}
+
+/// DEFAULT 字面量（parser 存的字符串）→ Value
+///
+/// 接受 sqlparser `Expr::to_string()` 形态：`0` / `0.1` / `'abc'` / `true` / `NULL`。
+pub(crate) fn default_literal_to_value(s: &str) -> Value {
+    let t = s.trim();
+    if t.is_empty() {
+        return Value::Null;
+    }
+    // 带引号字符串（'...' 或 "..."）
+    let bytes = t.as_bytes();
+    if (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' && t.len() >= 2)
+        || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' && t.len() >= 2)
+    {
+        return Value::Varchar(t[1..t.len() - 1].to_string());
+    }
+    if t.eq_ignore_ascii_case("null") {
+        return Value::Null;
+    }
+    if t.eq_ignore_ascii_case("true") {
+        return Value::Boolean(true);
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return Value::Boolean(false);
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Value::Int64(i);
+    }
+    if let Ok(f) = t.parse::<f64>() {
+        return Value::Float64(f);
+    }
+    Value::Varchar(t.to_string())
+}
+
+/// 按表定义用 DEFAULT 预填一行；无 DEFAULT 的列填 Null。
+#[inline]
+fn row_with_defaults(table_def: &crate::common::types::TableDef) -> Vec<Value> {
+    table_def
+        .columns
+        .iter()
+        .map(|c| {
+            c.default_value
+                .as_deref()
+                .map(default_literal_to_value)
+                .unwrap_or(Value::Null)
+        })
+        .collect()
 }
 
 // ============================================================
