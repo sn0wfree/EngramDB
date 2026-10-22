@@ -983,7 +983,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
         } => {
             // M1-3：列式路径（子计划列式执行 + 聚合），失败回退行式
             if let Some((sub_cols, chunks)) = try_execute_chunks(&input, db)? {
-                let (chunks, agg_funcs) = materialize_aggregate_inputs(&chunks, &sub_cols, aggregates)?;
+                let (chunks, agg_funcs) = materialize_aggregate_inputs(&chunks, &sub_cols, &aggregates)?;
 
                 let result = if group_by.is_empty() {
                     operators::aggregate::execute(&chunks, &agg_funcs)?
@@ -1014,7 +1014,7 @@ pub fn execute(plan: PhysicalPlan, db: &mut Database) -> Result<QueryResult> {
             let input_chunks = rows_to_chunks(&input_result.rows);
 
             let (input_chunks, agg_funcs) =
-                materialize_aggregate_inputs(&input_chunks, &input_result.columns, aggregates)?;
+                materialize_aggregate_inputs(&input_chunks, &input_result.columns, &aggregates)?;
 
             let result = if group_by.is_empty() {
                 // 无 GROUP BY：简单聚合
@@ -1797,12 +1797,12 @@ fn chunks_to_rows(chunks: &[DataChunk]) -> Vec<Vec<crate::Value>> {
 /// 追加为临时列，返回可直接喂给聚合算子的 (func, col_idx, distinct) 列表。
 ///
 /// 修差分 bug：`SUM(amount * 2)` 原先被当成 `SUM(col0)`（表达式被丢弃）。
-fn materialize_aggregate_inputs(
-    chunks: &[DataChunk],
+fn materialize_aggregate_inputs<'a>(
+    chunks: &'a [DataChunk],
     col_names: &[String],
     aggregates: &[crate::executor::physical_plan::AggregateExpr],
 ) -> Result<(
-    std::borrow::Cow<'_, [DataChunk]>,
+    std::borrow::Cow<'a, [DataChunk]>,
     Vec<(crate::executor::physical_plan::AggregateFunc, usize, bool)>,
 )> {
     use crate::executor::physical_plan::AggregateExpr;
