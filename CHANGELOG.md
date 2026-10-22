@@ -10,6 +10,9 @@
   （Typed 键 + Typed 聚合列直读底层数组）；Min/Max 保持源列 Value 变体
   （Int32 不抬升为 Int64）。失败行起自动回退 Value 路径。
 
+### 架构
+- **WAL 段滚动（A1–A2）**：checkpoint 主存储落盘后轮转 WAL 段并删除 `.seg*`，
+  不再从尾部 truncate；恢复扫描主文件 + 历史段，崩溃窗口安全
 ### Bug 修复
 - **WAL Checkpoint 不再 truncate**：`set_len` 从尾部截断会切掉刚写入的
   Checkpoint 标记；现只写标记 + sync。旧段回收待 WAL segment rolling。

@@ -1808,6 +1808,9 @@ impl Database {
         // v0.21.1：token 流缓存使命完成（TD 压缩已消费可命中项；残留清空防内存泄漏）
         crate::storage::compression::clear_token_stream_cache();
 
+        // A1–A2：主存储落盘后 WAL 段滚动（写 Checkpoint 标记并丢弃旧段）
+        let _ = self.txn_manager.checkpoint();
+
         Ok(())
     }
 }

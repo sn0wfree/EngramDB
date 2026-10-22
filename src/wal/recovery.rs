@@ -40,17 +40,55 @@ enum TxnRecoveryState {
 /// 执行崩溃恢复
 ///
 /// 返回恢复结果统计。实际的数据恢复需要调用方根据 redo_records 和 undo_txns 执行。
+/// 收集 WAL 相关文件（主文件 + `.seg*` 轮转段），按写入顺序返回。
+///
+/// 段滚动崩溃窗口下可能同时存在 `{path}` 与 `{path}.segN`。
+fn wal_segment_paths(wal_path: &str) -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let path = Path::new(wal_path);
+    let mut out = Vec::new();
+    let file_name = match path.file_name().map(|s| s.to_string_lossy().into_owned()) {
+        Some(n) => n,
+        None => return out,
+    };
+    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+
+    // 先收集 .seg* 并按编号排序（历史段在前）
+    let mut segs: Vec<(u64, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name.strip_prefix(&format!("{file_name}.seg")) {
+                if let Ok(n) = rest.parse::<u64>() {
+                    segs.push((n, ent.path()));
+                }
+            }
+        }
+    }
+    segs.sort_by_key(|(n, _)| *n);
+    for (_, p) in segs {
+        out.push(p);
+    }
+    if path.exists() {
+        out.push(path.to_path_buf());
+    }
+    out
+}
+
 pub fn recover(wal_path: &str) -> Result<RecoveryResult> {
     let mut result = RecoveryResult::default();
 
-    // 检查 WAL 文件是否存在
-    if !std::path::Path::new(wal_path).exists() {
+    let paths = wal_segment_paths(wal_path);
+    if paths.is_empty() {
         result.success = true;
         return Ok(result);
     }
 
-    let mut reader = WalReader::open(wal_path)?;
-    let records = reader.read_all()?;
+    let mut records: Vec<WalRecord> = Vec::new();
+    for p in &paths {
+        let mut reader = WalReader::open(p.to_string_lossy().as_ref())?;
+        records.extend(reader.read_all()?);
+    }
 
     if records.is_empty() {
         result.success = true;
@@ -244,12 +282,16 @@ pub fn recover_and_apply(db: &mut crate::storage::Database) -> Result<RecoveryRe
 
 /// 获取需要重做的记录列表（供调用方实际应用）
 pub fn get_redo_records(wal_path: &str) -> Result<Vec<WalRecord>> {
-    if !std::path::Path::new(wal_path).exists() {
+    let paths = wal_segment_paths(wal_path);
+    if paths.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut reader = WalReader::open(wal_path)?;
-    let records = reader.read_all()?;
+    let mut records = Vec::new();
+    for p in &paths {
+        let mut reader = WalReader::open(p.to_string_lossy().as_ref())?;
+        records.extend(reader.read_all()?);
+    }
 
     // 找出最后一个 Checkpoint 的位置
     let mut last_ckpt_idx: Option<usize> = None;

@@ -656,25 +656,33 @@ impl TransactionManager {
     }
 
     /// 获取当前待 fsync 的 commit 数量
+    /// WAL 文件路径（段滚动/测试用）
+    pub fn wal_path(&self) -> String {
+        self.wal.path().to_string_lossy().into_owned()
+    }
+
     pub fn wal_pending_commits(&self) -> usize {
         self.wal.pending_commits()
     }
 
-    /// 执行 Checkpoint
+    /// 执行 Checkpoint（A1–A2：WAL 段滚动）
     ///
-    /// 写入 Checkpoint 记录并 sync。恢复时从最后一条 Checkpoint 之后开始回放。
+    /// 写入 Checkpoint 记录并 sync 后，轮转 WAL 文件并删除旧段。
+    /// 调用方应保证主存储已持久化（`Database::checkpoint` 落盘后调用）。
     ///
-    /// 不做 truncate：`WalWriter::truncate` 用 `set_len` 从尾部截断，而
-    /// checkpoint 记录写在尾部——截掉的是标记自己（以及之后可能的新写入）。
-    /// 真正的旧段丢弃需要 WAL segment rolling，另开任务。
+    /// 不再 `set_len` 从尾部截断（会切掉 Checkpoint 自己）。
     pub fn checkpoint(&mut self) -> Result<u64> {
         let start_lsn = self.wal.current_lsn();
         let payload = super::super::wal::make_checkpoint_payload(start_lsn);
         self.wal
             .write_record(WalRecordType::Checkpoint, 0, 0, EngineType::Columnar, &payload)?;
         self.wal.sync()?;
+        let end_lsn = self.wal.current_lsn();
 
-        Ok(self.wal.current_lsn())
+        // 段滚动：改名旧段 → 新空 WAL → 删掉 `.seg*`
+        self.wal.roll_segment()?;
+        let _ = self.wal.delete_rotated_segments()?;
+        Ok(end_lsn)
     }
 
     /// 垃圾回收旧版本
@@ -1195,9 +1203,19 @@ mod tests {
         let lsn_before = mgr.current_wal_lsn();
         let checkpoint_lsn = mgr.checkpoint().unwrap();
         assert!(checkpoint_lsn > lsn_before, "checkpoint 应写入一条记录，LSN 递增");
-        // 只写标记、不 truncate，故 LSN 单调不减
+        // A1：段滚动后新开 WAL，LSN 从 0 重新计
         let lsn_after = mgr.current_wal_lsn();
-        assert_eq!(lsn_after, checkpoint_lsn);
+        assert_eq!(lsn_after, 0, "roll 后新段从 0 开始");
+        // 旧段已删除，不应残留 .seg*
+        let wal = mgr.wal_path();
+        let dir = std::path::Path::new(&wal).parent().unwrap();
+        let name = std::path::Path::new(&wal).file_name().unwrap().to_string_lossy().into_owned();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}.seg")))
+            .collect();
+        assert!(leftover.is_empty(), "checkpoint 后应清理 .seg*，got {leftover:?}");
 
         cleanup(&path);
     }

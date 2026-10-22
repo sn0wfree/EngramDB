@@ -305,6 +305,63 @@ impl WalWriter {
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
+
+    /// 轮转当前 WAL 段（A1）。
+    ///
+    /// 前提：调用方已写入 Checkpoint 记录并 `sync`（数据已持久化到主存储）。
+    /// 步骤：flush/sync → 将本文件改名为 `path.seg{N}` → 打开新的空 WAL。
+    ///
+    /// 崩溃窗口：
+    /// - rename 后、新建前：只剩 `.segN`，恢复需扫描 `.seg*`
+    /// - 新建后、清理前：空主文件 + `.segN`，恢复读两者
+    /// - 清理后：仅空主文件
+    pub fn roll_segment(&mut self) -> Result<()> {
+        self.flush()?;
+        self.sync()?;
+
+        let file_name = self
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "wal".to_string());
+        let dir = self.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+
+        let mut n = 1u64;
+        let mut rotated = dir.join(format!("{file_name}.seg{n}"));
+        while rotated.exists() {
+            n += 1;
+            rotated = dir.join(format!("{file_name}.seg{n}"));
+        }
+        std::fs::rename(&self.path, &rotated)?;
+
+        self.file = OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        self.offset = 0;
+        self.buffer.clear();
+        self.pending_commits = 0;
+        self.bytes_since_sync = 0;
+        Ok(())
+    }
+
+    /// 删除全部已轮转段 `path.seg*`（A2）。返回删除数量。
+    pub fn delete_rotated_segments(&self) -> Result<usize> {
+        let file_name = self
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "wal".to_string());
+        let dir = self.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut removed = 0usize;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&format!("{file_name}.seg")) {
+                    let _ = std::fs::remove_file(ent.path());
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
 }
 
 impl Drop for WalWriter {
