@@ -563,10 +563,9 @@ fn diff_full_outer_join() {
     );
 }
 
-/// 回归/差异：非数字文本 CAST INT —— SQLite 得 0/前缀数字，EngramDB 得 NULL
+/// 回归：非数字文本 CAST INT 对齐 SQLite（前缀数字 / 无则 0）
 #[test]
-#[ignore = "known gap: CAST(text AS INT) 非数字前缀语义与 SQLite 不一致"]
-fn known_bug_cast_nonnumeric() {
+fn diff_cast_nonnumeric() {
     let (mut eng, lite) = fresh();
     assert_same(
         "cast nonnumeric",

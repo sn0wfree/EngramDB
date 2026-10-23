@@ -2238,6 +2238,80 @@ pub fn cast_value_public(v: &Value, target: &DataType) -> Value {
     cast_value(v, target).unwrap_or(Value::Null)
 }
 
+
+/// SQLite 文本→整数 CAST 语义：取前导可选空白/符号 + 数字前缀；
+/// 无数字则 0（`CAST('user_01' AS INT)` → 0，`CAST('123abc' AS INT)` → 123）。
+fn sqlite_text_to_i64(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, t) = if let Some(r) = t.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = t.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, t)
+    };
+    let mut n: i64 = 0;
+    let mut any = false;
+    for c in t.chars() {
+        match c.to_digit(10) {
+            Some(d) => {
+                any = true;
+                n = n.saturating_mul(10).saturating_add(d as i64);
+            }
+            None => break,
+        }
+    }
+    if !any {
+        return 0;
+    }
+    if neg {
+        -n
+    } else {
+        n
+    }
+}
+
+/// SQLite 文本→浮点 CAST 语义：解析数字前缀，失败得 0.0
+fn sqlite_text_to_f64(s: &str) -> f64 {
+    let t = s.trim_start();
+    // 手动扫浮点前缀：[+-]? digits [. digits] [eE [+-] digits]
+    let bytes = t.as_bytes();
+    let mut i = 0usize;
+    let mut any_digits = false;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        any_digits = true;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+            any_digits = true;
+        }
+    }
+    if any_digits && i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let save = i;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let exp_digits = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_digits {
+            i = save; // 指数不完整，不消费
+        }
+    }
+    if !any_digits {
+        return 0.0;
+    }
+    t[..i].parse::<f64>().unwrap_or(0.0)
+}
+
 fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
     use crate::common::types::DataType::*;
 
@@ -2262,7 +2336,8 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
                 // 浮点→整型的 as 转换天然饱和（Rust 1.45+），保留
                 Value::Int32(f as i32)
             } else if let Value::Varchar(s) = v {
-                s.parse::<i32>().map(Value::Int32).unwrap_or(Value::Null)
+                let n = sqlite_text_to_i64(s);
+                Value::Int32(n.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
             } else {
                 Value::Null
             }
@@ -2273,7 +2348,7 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
             } else if let Some(f) = v.as_f64() {
                 Value::Int64(f as i64)
             } else if let Value::Varchar(s) = v {
-                s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Null)
+                Value::Int64(sqlite_text_to_i64(s))
             } else {
                 Value::Null
             }
@@ -2285,7 +2360,8 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
             } else if let Some(f) = v.as_f64() {
                 Value::Int16(f as i16)
             } else if let Value::Varchar(s) = v {
-                s.parse::<i16>().map(Value::Int16).unwrap_or(Value::Null)
+                let n = sqlite_text_to_i64(s);
+                Value::Int16(n as i16)
             } else {
                 Value::Null
             }
@@ -2324,7 +2400,7 @@ fn cast_value(v: &Value, target: &DataType) -> Result<Value> {
             if let Some(f) = v.as_f64() {
                 Value::Float64(f)
             } else if let Value::Varchar(s) = v {
-                s.parse::<f64>().map(Value::Float64).unwrap_or(Value::Null)
+                Value::Float64(sqlite_text_to_f64(s))
             } else {
                 Value::Null
             }

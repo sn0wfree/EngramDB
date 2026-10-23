@@ -13,6 +13,9 @@
 ### 性能
 - **B1 Varchar offset+data 双数组**：`ColumnValue::Varchar(StringArray)`，
   消除每格 `String` 堆分配；序列化格式不变（u32 长度 + 字节）
+### Bug 修复
+- **CAST 文本→数值对齐 SQLite**：取数字前缀，无则 0/0.0
+  （原 `parse` 失败得 NULL）；差分 `diff_cast_nonnumeric` 转正
 ### 测试
 - **B4 扩大 SQLite 差分面**：CAST / CASE / UNION / 字符串函数 / LEFT·FULL JOIN /
   ROW_NUMBER 窗口；修复 UNION 后 ORDER BY 作用在集合结果上、窗口投影改写为输出列
