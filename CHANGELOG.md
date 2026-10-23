@@ -10,6 +10,9 @@
   （Typed 键 + Typed 聚合列直读底层数组）；Min/Max 保持源列 Value 变体
   （Int32 不抬升为 Int64）。失败行起自动回退 Value 路径。
 
+### 性能
+- **B1 Varchar offset+data 双数组**：`ColumnValue::Varchar(StringArray)`，
+  消除每格 `String` 堆分配；序列化格式不变（u32 长度 + 字节）
 ### 测试
 - **B4 扩大 SQLite 差分面**：CAST / CASE / UNION / 字符串函数 / LEFT·FULL JOIN /
   ROW_NUMBER 窗口；修复 UNION 后 ORDER BY 作用在集合结果上、窗口投影改写为输出列

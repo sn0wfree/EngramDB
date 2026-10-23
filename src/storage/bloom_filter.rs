@@ -138,7 +138,7 @@ pub fn build_bloom_from_column(
             crate::common::column_data::ColumnValue::Timestamp(v) => bloom.insert(&v[i]),
             crate::common::column_data::ColumnValue::Float32(v) => bloom.insert(&f32_to_i64_key(v[i])),
             crate::common::column_data::ColumnValue::Float64(v) => bloom.insert(&f64_to_i64_key(v[i])),
-            crate::common::column_data::ColumnValue::Varchar(v) => bloom.insert(&str_to_i64_key(&v[i])),
+            crate::common::column_data::ColumnValue::Varchar(v) => bloom.insert(&str_to_i64_key(v.get(i).unwrap_or(""))),
             crate::common::column_data::ColumnValue::Json(v) => bloom.insert(&str_to_i64_key(&v[i])),
             // Vector / Blob / Boolean 不支持（成本过高）
             _ => return None,

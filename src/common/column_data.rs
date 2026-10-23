@@ -77,6 +77,153 @@ impl BitVec {
     }
 }
 
+/// offset+data 双数组字符串列（B1）
+///
+/// `offsets.len() == len()+1`，第 i 个串为 `data[offsets[i]..offsets[i+1]]`。
+/// 相对 `Vec<String>`：消除每格堆分配，比较/切片可连续 memcmp 区间。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StringArray {
+    offsets: Vec<u32>,
+    data: Vec<u8>,
+}
+
+impl StringArray {
+    pub fn new() -> Self {
+        Self {
+            offsets: vec![0],
+            data: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            offsets: Vec::with_capacity(n + 1),
+            data: Vec::with_capacity(n * 8),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, i: usize) -> Option<&str> {
+        if i >= self.len() {
+            return None;
+        }
+        let s = self.offsets[i] as usize;
+        let e = self.offsets[i + 1] as usize;
+        std::str::from_utf8(&self.data[s..e]).ok()
+    }
+
+    pub fn get_string(&self, i: usize) -> String {
+        self.get(i).unwrap_or_default().to_string()
+    }
+
+    pub fn push(&mut self, s: impl AsRef<str>) {
+        let b = s.as_ref().as_bytes();
+        self.data.extend_from_slice(b);
+        let end = self.data.len() as u32;
+        if self.offsets.is_empty() {
+            self.offsets.push(0);
+        }
+        self.offsets.push(end);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        (0..self.len()).map(move |i| self.get(i).unwrap_or(""))
+    }
+
+    /// 截取前 n 个（take_front 语义，不修改 self 的剩余部分由调用方处理）
+    pub fn take_front(&mut self, n: usize) -> StringArray {
+        let n = n.min(self.len());
+        let out = self.slice(0, n);
+        // self 只保留 [n, len)
+        *self = self.slice(n, self.len());
+        out
+    }
+
+    /// [start, end) 子列
+    pub fn slice(&self, start: usize, end: usize) -> StringArray {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        let mut out = StringArray::with_capacity(end - start);
+        for i in start..end {
+            out.push(self.get(i).unwrap_or(""));
+        }
+        out
+    }
+
+    pub fn gather(&self, indices: &[usize]) -> StringArray {
+        let mut out = StringArray::with_capacity(indices.len());
+        for &i in indices {
+            out.push(self.get(i).unwrap_or(""));
+        }
+        out
+    }
+
+    pub fn append(&mut self, other: &StringArray) {
+        for s in other.iter() {
+            self.push(s);
+        }
+    }
+
+    pub fn extend_from_slice(&mut self, other: &StringArray) {
+        self.append(other);
+    }
+
+    pub fn clear(&mut self) {
+        self.offsets.clear();
+        self.offsets.push(0);
+        self.data.clear();
+    }
+
+    /// 拼接字节区间（序列化/比较用）
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+}
+
+impl From<Vec<String>> for StringArray {
+    fn from(v: Vec<String>) -> Self {
+        let mut a = StringArray::with_capacity(v.len());
+        for s in v {
+            a.push(s);
+        }
+        a
+    }
+}
+
+impl From<&[String]> for StringArray {
+    fn from(v: &[String]) -> Self {
+        let mut a = StringArray::with_capacity(v.len());
+        for s in v {
+            a.push(s.as_str());
+        }
+        a
+    }
+}
+
+impl From<StringArray> for Vec<String> {
+    fn from(a: StringArray) -> Self {
+        (0..a.len()).map(|i| a.get_string(i)).collect()
+    }
+}
+
+impl std::ops::Index<usize> for StringArray {
+    type Output = str;
+    fn index(&self, i: usize) -> &str {
+        self.get(i).unwrap_or("")
+    }
+}
+
 /// 类型化列值数组
 #[derive(Debug, Clone)]
 pub enum ColumnValue {
@@ -86,7 +233,7 @@ pub enum ColumnValue {
     Int64(Vec<i64>),
     Float32(Vec<f32>),
     Float64(Vec<f64>),
-    Varchar(Vec<String>),
+    Varchar(StringArray),
     Json(Vec<String>),
     /// v0.22.0 新增
     Jsonb(Vec<String>),
@@ -149,7 +296,7 @@ impl ColumnData {
             ColumnValue::Int64(v) => Value::Int64(v[i]),
             ColumnValue::Float32(v) => Value::Float32(v[i]),
             ColumnValue::Float64(v) => Value::Float64(v[i]),
-            ColumnValue::Varchar(v) => Value::Varchar(v[i].clone()),
+            ColumnValue::Varchar(v) => Value::Varchar(v.get_string(i)),
             ColumnValue::Json(v) => Value::Json(v[i].clone()),
             ColumnValue::Jsonb(v) => Value::Jsonb(v[i].clone()),
             ColumnValue::Blob(v) => Value::Blob(v[i].clone()),
@@ -196,7 +343,7 @@ impl ColumnData {
             ColumnValue::Int64(v) => ColumnValue::Int64(v.drain(0..n).collect()),
             ColumnValue::Float32(v) => ColumnValue::Float32(v.drain(0..n).collect()),
             ColumnValue::Float64(v) => ColumnValue::Float64(v.drain(0..n).collect()),
-            ColumnValue::Varchar(v) => ColumnValue::Varchar(v.drain(0..n).collect()),
+            ColumnValue::Varchar(v) => ColumnValue::Varchar(v.take_front(n)),
             ColumnValue::Json(v) => ColumnValue::Json(v.drain(0..n).collect()),
             ColumnValue::Jsonb(v) => ColumnValue::Jsonb(v.drain(0..n).collect()),
             ColumnValue::Blob(v) => ColumnValue::Blob(v.drain(0..n).collect()),
@@ -249,7 +396,7 @@ impl ColumnData {
             ColumnValue::Int64(v) => ColumnValue::Int64(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Float32(v) => ColumnValue::Float32(indices.iter().map(|&i| v[i]).collect()),
             ColumnValue::Float64(v) => ColumnValue::Float64(indices.iter().map(|&i| v[i]).collect()),
-            ColumnValue::Varchar(v) => ColumnValue::Varchar(indices.iter().map(|&i| v[i].clone()).collect()),
+            ColumnValue::Varchar(v) => ColumnValue::Varchar(v.gather(indices)),
             ColumnValue::Json(v) => ColumnValue::Json(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::Jsonb(v) => ColumnValue::Jsonb(indices.iter().map(|&i| v[i].clone()).collect()),
             ColumnValue::Blob(v) => ColumnValue::Blob(indices.iter().map(|&i| v[i].clone()).collect()),
@@ -297,7 +444,7 @@ impl ColumnData {
             ColumnValue::Int64(v) => ColumnValue::Int64(v[start..end].to_vec()),
             ColumnValue::Float32(v) => ColumnValue::Float32(v[start..end].to_vec()),
             ColumnValue::Float64(v) => ColumnValue::Float64(v[start..end].to_vec()),
-            ColumnValue::Varchar(v) => ColumnValue::Varchar(v[start..end].to_vec()),
+            ColumnValue::Varchar(v) => ColumnValue::Varchar(v.slice(start, end)),
             ColumnValue::Json(v) => ColumnValue::Json(v[start..end].to_vec()),
             ColumnValue::Jsonb(v) => ColumnValue::Jsonb(v[start..end].to_vec()),
             ColumnValue::Blob(v) => ColumnValue::Blob(v[start..end].to_vec()),
@@ -405,7 +552,7 @@ impl ColumnData {
             DataType::Int64 => (ColumnValue::Int64(Vec::with_capacity(values.len())), None),
             DataType::Float32 => (ColumnValue::Float32(Vec::with_capacity(values.len())), None),
             DataType::Float64 => (ColumnValue::Float64(Vec::with_capacity(values.len())), None),
-            DataType::Varchar => (ColumnValue::Varchar(Vec::with_capacity(values.len())), None),
+            DataType::Varchar => (ColumnValue::Varchar(StringArray::with_capacity(values.len())), None),
             DataType::Json => (ColumnValue::Json(Vec::with_capacity(values.len())), None),
             DataType::Jsonb => (ColumnValue::Jsonb(Vec::with_capacity(values.len())), None),
             DataType::Blob => (ColumnValue::Blob(Vec::with_capacity(values.len())), None),
@@ -467,7 +614,7 @@ impl ColumnData {
             DataType::Int64 => ColumnValue::Int64(Vec::with_capacity(count)),
             DataType::Float32 => ColumnValue::Float32(Vec::with_capacity(count)),
             DataType::Float64 => ColumnValue::Float64(Vec::with_capacity(count)),
-            DataType::Varchar => ColumnValue::Varchar(Vec::with_capacity(count)),
+            DataType::Varchar => ColumnValue::Varchar(StringArray::with_capacity(count)),
             DataType::Json => ColumnValue::Json(Vec::with_capacity(count)),
             DataType::Jsonb => ColumnValue::Jsonb(Vec::with_capacity(count)),
             DataType::Blob => ColumnValue::Blob(Vec::with_capacity(count)),
@@ -536,12 +683,27 @@ impl ColumnData {
                         true
                     }
                 }
-                ColumnValue::Varchar(a) | ColumnValue::Json(a) => {
+                ColumnValue::Varchar(a) => {
                     if offset + 4 <= data.len() {
                         let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                         offset += 4;
                         if offset + len <= data.len() {
                             // 与 deserialize_values 一致：长度 0 → 空串（非 NULL）
+                            a.push(String::from_utf8_lossy(&data[offset..offset + len]).as_ref());
+                            offset += len;
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                }
+                ColumnValue::Json(a) => {
+                    if offset + 4 <= data.len() {
+                        let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                        offset += 4;
+                        if offset + len <= data.len() {
                             a.push(String::from_utf8_lossy(&data[offset..offset + len]).to_string());
                             offset += len;
                             false
@@ -670,7 +832,7 @@ impl ColumnData {
             ValueType::Int64 => ColumnValue::Int64(Vec::with_capacity(values.len())),
             ValueType::Float32 => ColumnValue::Float32(Vec::with_capacity(values.len())),
             ValueType::Float64 => ColumnValue::Float64(Vec::with_capacity(values.len())),
-            ValueType::Varchar => ColumnValue::Varchar(Vec::with_capacity(values.len())),
+            ValueType::Varchar => ColumnValue::Varchar(StringArray::with_capacity(values.len())),
             ValueType::Json => ColumnValue::Json(Vec::with_capacity(values.len())),
             ValueType::Jsonb => ColumnValue::Jsonb(Vec::with_capacity(values.len())),
             ValueType::Blob => ColumnValue::Blob(Vec::with_capacity(values.len())),
@@ -698,7 +860,7 @@ impl ColumnData {
                     ColumnValue::Int64(a) => a.push(0),
                     ColumnValue::Float32(a) => a.push(0.0),
                     ColumnValue::Float64(a) => a.push(0.0),
-                    ColumnValue::Varchar(a) => a.push(String::new()),
+                    ColumnValue::Varchar(a) => a.push(""),
                     ColumnValue::Json(a) => a.push(String::new()),
                     ColumnValue::Jsonb(a) => a.push(String::new()),
                     ColumnValue::Blob(a) => a.push(Vec::new()),
@@ -721,7 +883,7 @@ impl ColumnData {
                 (ColumnValue::Int64(a), Value::Int64(x)) => a.push(*x),
                 (ColumnValue::Float32(a), Value::Float32(x)) => a.push(*x),
                 (ColumnValue::Float64(a), Value::Float64(x)) => a.push(*x),
-                (ColumnValue::Varchar(a), Value::Varchar(x)) => a.push(x.clone()),
+                (ColumnValue::Varchar(a), Value::Varchar(x)) => a.push(x.as_str()),
                 (ColumnValue::Json(a), Value::Json(x)) => a.push(x.clone()),
                 (ColumnValue::Jsonb(a), Value::Jsonb(x)) => a.push(x.clone()),
                 (ColumnValue::Blob(a), Value::Blob(x)) => a.push(x.clone()),
@@ -1028,7 +1190,7 @@ fn push_null_placeholder(arr: &mut ColumnValue) {
         ColumnValue::Int64(a) => a.push(0),
         ColumnValue::Float32(a) => a.push(0.0),
         ColumnValue::Float64(a) => a.push(0.0),
-        ColumnValue::Varchar(a) => a.push(String::new()),
+        ColumnValue::Varchar(a) => a.push(""),
         ColumnValue::Json(a) => a.push(String::new()),
         ColumnValue::Jsonb(a) => a.push(String::new()),
         ColumnValue::Blob(a) => a.push(Vec::new()),

@@ -1650,7 +1650,7 @@ pub fn matches_predicate_typed(data: &ColumnData, row: usize, op: PredicateOp, t
         (ColumnValue::Float64(v), Int32(t)) => cmp_f(v[row], *t as f64),
         (ColumnValue::Float64(v), Int64(t)) => cmp_f(v[row], *t as f64),
         // Varchar / Boolean 同类型
-        (ColumnValue::Varchar(v), Varchar(t)) => cmp(v[row].as_str().cmp(t.as_str())),
+        (ColumnValue::Varchar(v), Varchar(t)) => cmp(v.get(row).unwrap_or("").cmp(t.as_str())),
         (ColumnValue::Boolean(v), Boolean(t)) => cmp(v[row].cmp(t)),
         _ => matches_predicate(&data.get(row), op, target),
     }
@@ -2073,7 +2073,7 @@ fn data_byte_size(data: &ColumnData, data_type: &DataType) -> usize {
         (DataType::Int64, ColumnValue::Int64(v)) => v.len() * 8,
         (DataType::Float32, ColumnValue::Float32(v)) => v.len() * 4,
         (DataType::Float64, ColumnValue::Float64(v)) => v.len() * 8,
-        (DataType::Varchar, ColumnValue::Varchar(v)) => v.iter().map(|s| 4 + s.len()).sum(),
+        (DataType::Varchar, ColumnValue::Varchar(v)) => v.iter().map(|s: &str| 4 + s.len()).sum(),
         (DataType::Json, ColumnValue::Json(v)) => v.iter().map(|s| 4 + s.len()).sum(),
         (DataType::Jsonb, ColumnValue::Jsonb(v)) => v.iter().map(|s| 4 + s.len()).sum(),
         (DataType::Blob, ColumnValue::Blob(v)) => v.iter().map(|b| 4 + b.len()).sum(),

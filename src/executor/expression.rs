@@ -847,7 +847,7 @@ fn eval_typed_binary(l: &ColumnData, op: BinaryOperator, r: &ColumnData) -> Opti
                 let rb: Vec<f64> = ra.iter().map(|&x| x as f64).collect();
                 cmp_typed_f64(&la[..len], &rb[..len], op, &l.nulls, &r.nulls)
             }
-            (Varchar(la), Varchar(ra)) => cmp_typed_str(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
+            (Varchar(la), Varchar(ra)) => cmp_typed_str(la, ra, op, &l.nulls, &r.nulls),
             (Boolean(la), Boolean(ra)) => cmp_typed_bool(&la[..len], &ra[..len], op, &l.nulls, &r.nulls),
             _ => return None,
         },
@@ -856,7 +856,7 @@ fn eval_typed_binary(l: &ColumnData, op: BinaryOperator, r: &ColumnData) -> Opti
             _ => return None,
         },
         Concat => match (&l.values, &r.values) {
-            (Varchar(la), Varchar(ra)) => concat_typed(&la[..len], &ra[..len], &l.nulls, &r.nulls),
+            (Varchar(la), Varchar(ra)) => concat_typed(la, ra, &l.nulls, &r.nulls),
             _ => return None,
         },
     };
@@ -977,16 +977,16 @@ fn eval_typed_constant(
         }
         (Varchar(v), Value::Varchar(cv)) => match op {
             Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-                let out = const_cmp_str(&v[..len], cv.as_str(), op, &col.nulls, reversed);
+                let out = const_cmp_str(v, cv.as_str(), op, &col.nulls, reversed);
                 ColumnData {
                     values: ColumnValue::Boolean(out.0),
                     nulls: out.1,
                 }
             }
             Concat => {
-                let out = const_concat_str(&v[..len], cv, op, &col.nulls, reversed);
+                let out = const_concat_str(v, cv, op, &col.nulls, reversed);
                 ColumnData {
-                    values: ColumnValue::Varchar(out.0),
+                    values: ColumnValue::Varchar(out.0.into()),
                     nulls: out.1,
                 }
             }
@@ -1132,7 +1132,7 @@ fn const_cmp_f64(
 }
 
 fn const_cmp_str(
-    v: &[String],
+    v: &crate::common::column_data::StringArray,
     cv: &str,
     op: BinaryOperator,
     nulls: &Option<BitVec>,
@@ -1148,9 +1148,9 @@ fn const_cmp_str(
             continue;
         }
         let (a, b) = if reversed {
-            (cv, v[i].as_str())
+            (cv, &v[i])
         } else {
-            (v[i].as_str(), cv)
+            (&v[i], cv)
         };
         out.push(cmp_pair_typed(a.cmp(b), op));
     }
@@ -1180,7 +1180,7 @@ fn const_cmp_bool(
 }
 
 fn const_concat_str(
-    v: &[String],
+    v: &crate::common::column_data::StringArray,
     cv: &str,
     _op: BinaryOperator,
     nulls: &Option<BitVec>,
@@ -1507,14 +1507,15 @@ fn cmp_typed_f64(la: &[f64], ra: &[f64], op: BinaryOperator, ln: &Option<BitVec>
 }
 
 fn cmp_typed_str(
-    la: &[String],
-    ra: &[String],
+    la: &crate::common::column_data::StringArray,
+    ra: &crate::common::column_data::StringArray,
     op: BinaryOperator,
     ln: &Option<BitVec>,
     rn: &Option<BitVec>,
 ) -> ColumnData {
-    let mut out = Vec::with_capacity(la.len());
-    let mut overflow = vec![false; la.len()];
+    let n = la.len().min(ra.len());
+    let mut out = Vec::with_capacity(n);
+    let mut overflow = vec![false; n];
     let has_null = ln.is_some() || rn.is_some();
     if has_null {
         for i in 0..la.len() {
@@ -1660,9 +1661,10 @@ fn logic_typed(la: &[bool], ra: &[bool], op: BinaryOperator, ln: &Option<BitVec>
 
 // --- 字符串拼接（Typed）---
 
-fn concat_typed(la: &[String], ra: &[String], ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
-    let mut out = Vec::with_capacity(la.len());
-    let mut overflow = vec![false; la.len()];
+fn concat_typed(la: &crate::common::column_data::StringArray, ra: &crate::common::column_data::StringArray, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+    let n = la.len().min(ra.len());
+    let mut out = Vec::with_capacity(n);
+    let mut overflow = vec![false; n];
     for i in 0..la.len() {
         let a_null = ln.as_ref().map_or(false, |b| b.test(i));
         let b_null = rn.as_ref().map_or(false, |b| b.test(i));
@@ -1678,7 +1680,7 @@ fn concat_typed(la: &[String], ra: &[String], ln: &Option<BitVec>, rn: &Option<B
     }
     let nulls = merge_nulls_with(ln, rn, &overflow, la.len());
     ColumnData {
-        values: ColumnValue::Varchar(out),
+        values: ColumnValue::Varchar(out.into()),
         nulls,
     }
 }
