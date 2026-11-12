@@ -143,7 +143,7 @@
 | H5 bench 参考环境 | **A · WSL 固定机 + 报告头元数据**（E3 U1–U8） | A-Bench | 2026-11-12 |
 | 补强 2 证据模板 | **启用**：progress 必贴 CI run URL 或 WSL 命令输出摘要 | Lead | 2026-11-12 |
 | 补强 5 红灯驱动 | **允许**：A-Test 可在 B2 未合前先落失败 case（标 `issue` 注释） | A-Test | 2026-11-12 |
-| W-1 执行时机 | **本轮只填表，不执行**；代码侧见 `1dde714`（fmt+bench 修复），**全绿 run id 仍待补** 后才 spawn | Lead / A-Infra | 2026-11-12 |
+| W-1 执行时机 | **已完成**：push `36660a6` → run **[43148487238](https://github.com/sn0wfree/EngramDB/actions/runs/43148487238)** `conclusion=success`（fmt ✅ · Build&Test ✅ · Clippy ⚠️ 非阻塞，符合 Q3=A） | Lead / A-Infra | 2026-11-12 |
 
 **Q1=B 对首批名单的修正**（相对二轮「三路」推荐）：
 

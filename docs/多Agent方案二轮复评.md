@@ -105,7 +105,7 @@ WSL `cargo test` 全量：
 
 **硬门槛（不过不 spawn）**
 
-- [ ] **W-1 完成**：CI 一次全绿 run id（fmt + default test + benches 编译；clippy 可红但需与 E1 一致）
+- [x] **W-1 完成**：run **43148487238** success（fmt + default test + benches；clippy 非阻塞 Q3=A）
 - [ ] Q1 / Q2 / Q5（及 Q6）决议勾选
 - [ ] H2 = assert 硬化（无需再讨论过渡方案）
 - [ ] H1 任务卡（A-Persist）含断言定义
@@ -142,4 +142,4 @@ WSL `cargo test` 全量：
 | W-1 超 3 天或出现新编译面 | 冻结 spawn，重评 H6 |
 | 评审会决议 Q1/Q2/Q5 有保留 | 仅 W-1 与文档任务继续，功能 Agent 等待 |
 
-**签署后动作（2026-11-12 更新）**：决议表已填（D2 §7）。**W-1 本轮不执行**——代码侧已见 `1dde714`（fmt + bench 借用修复），仍缺 **CI 全绿 run id**。run id 入表后按 **Q1=B** spawn：首批 **A-Test ∥ A-Persist**，A-SQL/A-Bench 随后。
+**签署后动作（2026-11-12 更新）**：决议表已填（D2 §7）。**W-1 已完成**：run **43148487238** `success`（fmt + Build&Test 绿；Clippy 非阻塞）。**开跑门已齐** → 可按 **Q1=B** spawn：首批 **A-Test ∥ A-Persist**，A-SQL/A-Bench 随后。
