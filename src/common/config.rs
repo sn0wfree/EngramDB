@@ -163,8 +163,18 @@ pub struct Config {
     pub buffer_pool_size: usize,
     /// Row Group 行数
     pub row_group_size: u32,
-    /// WAL 自动 Checkpoint 阈值（字节）
+    /// WAL 自动 Checkpoint 字节阈值（A3）
+    ///
+    /// 语义：自上次 WAL checkpoint（段滚动）以来，WAL 累计字节数
+    /// （≈ 当前段 LSN）达到该值即触发自动 checkpoint；0 = 禁用字节触发。
+    /// 触发后走完整 checkpoint（主存储落盘 + WAL 段滚动/回收）。
     pub wal_checkpoint_threshold: u64,
+    /// WAL 自动 Checkpoint 时间阈值（毫秒，A3；0 = 禁用时间触发）
+    ///
+    /// 语义：距上次 WAL checkpoint 超过该毫秒数、且 WAL 非空（有未
+    /// checkpoint 的字节）时，下次提交触发自动 checkpoint。
+    /// 与 `wal_checkpoint_threshold` 为 OR 关系：任一启用条件满足即触发。
+    pub wal_checkpoint_timeout_ms: u64,
     /// WAL 刷盘策略
     pub wal_flush_mode: WalFlushMode,
     /// WAL 缓冲区大小（字节）
@@ -316,7 +326,8 @@ impl Default for Config {
             block_size: 262_144,    // 256KB
             buffer_pool_size: 1024, // 4MB (1024 * 4KB)
             row_group_size,
-            wal_checkpoint_threshold: 16 * 1024 * 1024, // 16MB
+            wal_checkpoint_threshold: 16 * 1024 * 1024, // 16MB（0 = 禁用字节触发）
+            wal_checkpoint_timeout_ms: 0,               // A3：默认禁用时间触发（可选阈值）
             wal_flush_mode: WalFlushMode::Sync,
             wal_buffer_size: 65536, // 64KB
             wal_compression: WalCompression::None,
@@ -365,6 +376,8 @@ mod tests {
         assert_eq!(cfg.buffer_pool_size, 1024);
         assert_eq!(cfg.row_group_size, 122_880);
         assert_eq!(cfg.wal_flush_mode, WalFlushMode::Sync);
+        assert_eq!(cfg.wal_checkpoint_threshold, 16 * 1024 * 1024);
+        assert_eq!(cfg.wal_checkpoint_timeout_ms, 0);
         assert_eq!(cfg.wal_group_commit_size, 16);
         assert_eq!(cfg.wal_group_commit_max_bytes, 65536);
         assert_eq!(cfg.wal_group_commit_timeout_ms, 10);
@@ -393,6 +406,8 @@ mod tests {
         cfg.txn_batch_bypass_constraint_tables = false;
         cfg.log_block_rows = 32768;
         cfg.wal_group_commit_size = 0;
+        cfg.wal_checkpoint_threshold = 1024 * 1024;
+        cfg.wal_checkpoint_timeout_ms = 5000;
         assert!(!cfg.wal_batch_insert);
         assert_eq!(cfg.insert_batch_rows, 4096);
         assert_eq!(cfg.insert_batch_timeout_ms, 0);
@@ -401,6 +416,8 @@ mod tests {
         assert!(!cfg.txn_batch_bypass_constraint_tables);
         assert_eq!(cfg.log_block_rows, 32768);
         assert_eq!(cfg.wal_group_commit_size, 0);
+        assert_eq!(cfg.wal_checkpoint_threshold, 1024 * 1024);
+        assert_eq!(cfg.wal_checkpoint_timeout_ms, 5000);
         // clone 后修改不影响原配置
         let mut cloned = cfg.clone();
         cloned.wal_batch_insert = true;

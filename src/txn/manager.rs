@@ -76,6 +76,8 @@ impl TransactionManager {
             config.wal_group_commit_max_bytes,
         )?;
         wal.set_max_sync_interval_ms(config.wal_group_commit_timeout_ms);
+        // A3：自动 checkpoint 阈值接线（字节 + 可选时间）
+        wal.set_checkpoint_policy(config.wal_checkpoint_threshold, config.wal_checkpoint_timeout_ms);
 
         Ok(Self {
             active_table: ActiveTxnTable::new(),
@@ -663,6 +665,19 @@ impl TransactionManager {
 
     pub fn wal_pending_commits(&self) -> usize {
         self.wal.pending_commits()
+    }
+
+    /// A3：WAL 是否已达到自动 checkpoint 阈值（字节 OR 时间，见 Config）
+    ///
+    /// 达到后上层应调用完整 checkpoint（主存储落盘 → `TransactionManager::checkpoint`
+    /// 段滚动）。WAL 单独滚动会丢弃未落盘 redo，禁止只滚不落。
+    pub fn auto_checkpoint_due(&self) -> bool {
+        self.wal.checkpoint_due()
+    }
+
+    /// A3：运行时调整自动 checkpoint 阈值（测试/调优用）
+    pub fn set_wal_checkpoint_policy(&mut self, byte_threshold: u64, timeout_ms: u64) {
+        self.wal.set_checkpoint_policy(byte_threshold, timeout_ms);
     }
 
     /// 执行 Checkpoint（A1–A2：WAL 段滚动）
