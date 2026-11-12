@@ -310,8 +310,9 @@ fn a4_txn_rollback_undoes() {
     println!("A4a PASS: 未读回滚，行数归零");
 
     // ② 读己之写后再回滚
-    // 现状（A4b 残留）：flush-on-read 会把行落入独立内部事务，ROLLBACK 撤不掉。
-    // llmRx 要求 Rollback 真的撤销 → 此为已知缺口，见 phase0 报告。
+    // 历史：flush-on-read 曾把行落入独立内部事务，ROLLBACK 撤不掉（残留行
+    // 只 println 不断言 → 假绿，H2/F4）。E2 实测已 PASS，此处硬化为硬断言：
+    // 读后 ROLLBACK 必须归零，否则 llmRx A4 未满，门禁红。
     let mut c = open();
     c.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
     c.execute("BEGIN").unwrap();
@@ -326,14 +327,12 @@ fn a4_txn_rollback_undoes() {
         Value::Int32(i) => *i as i64,
         _ => -1,
     };
-    if count == 0 {
-        println!("A4b PASS: 读己之写后回滚，行数归零");
-    } else {
-        println!(
-            "A4b KNOWN-GAP: 读后 ROLLBACK 残留 {} 行（flush-on-read 独立事务不可撤销）→ llmRx A4 未满",
-            count
-        );
-    }
+    assert_eq!(
+        count, 0,
+        "A4b FAIL: 读后 ROLLBACK 残留 {} 行（flush-on-read 独立事务不可撤销）→ llmRx A4 未满",
+        count
+    );
+    println!("A4b PASS: 读己之写后回滚，行数归零");
 
     // ③ COMMIT 持久化
     let mut c = open();
