@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use crate::common::config::{WalCompression, WalFlushMode};
 use crate::common::error::Result;
 
-use super::{WalRecord, WalRecordType, WAL_MAGIC, WAL_RECORD_HEADER_SIZE};
+use super::{CheckpointTrigger, WalRecord, WalRecordType, WAL_MAGIC, WAL_RECORD_HEADER_SIZE};
 
 /// WAL 写入器
 pub struct WalWriter {
@@ -43,6 +43,8 @@ pub struct WalWriter {
     max_sync_interval: Option<std::time::Duration>,
     /// 上次 fsync 时刻
     last_sync: std::time::Instant,
+    /// A3：自动 checkpoint 触发器（字节/时间阈值；默认禁用，由 Config 接线）
+    checkpoint_trigger: CheckpointTrigger,
 }
 
 impl WalWriter {
@@ -78,6 +80,7 @@ impl WalWriter {
             bytes_since_sync: 0,
             max_sync_interval: None,
             last_sync: std::time::Instant::now(),
+            checkpoint_trigger: CheckpointTrigger::new(0, 0),
         })
     }
 
@@ -274,6 +277,22 @@ impl WalWriter {
         self.offset
     }
 
+    /// A3：设置自动 checkpoint 阈值策略（由 `TransactionManager::new` 从 Config 接线）
+    ///
+    /// `byte_threshold`：自上次段滚动以来 WAL 累计字节 ≥ 该值触发（0 = 禁用）。
+    /// `timeout_ms`：距上次段滚动超时且 WAL 非空时触发（0 = 禁用）。
+    pub fn set_checkpoint_policy(&mut self, byte_threshold: u64, timeout_ms: u64) {
+        self.checkpoint_trigger.set_policy(byte_threshold, timeout_ms);
+    }
+
+    /// A3：是否已达到自动 checkpoint 阈值
+    ///
+    /// 字节数取 `current_lsn()`（含未刷盘缓冲）——段滚动后 offset 归零，
+    /// 因此该值 ≈ 自上次 checkpoint 以来的 WAL 累计字节。
+    pub fn checkpoint_due(&self) -> bool {
+        self.checkpoint_trigger.should_trigger(self.current_lsn())
+    }
+
     /// 截断到指定 LSN（Checkpoint 后清理 WAL）
     pub fn truncate(&mut self, lsn: u64) -> Result<()> {
         self.flush()?;
@@ -339,6 +358,8 @@ impl WalWriter {
         self.buffer.clear();
         self.pending_commits = 0;
         self.bytes_since_sync = 0;
+        // A3：段滚动 = 完成一次 checkpoint，重置自动触发时间窗
+        self.checkpoint_trigger.mark_checkpointed();
         Ok(())
     }
 
@@ -889,5 +910,118 @@ mod tests {
 
         writer.sync().unwrap();
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ========================================================================
+    // A3：自动 checkpoint 阈值（WalWriter 侧）
+    // ========================================================================
+
+    #[test]
+    fn test_checkpoint_due_default_disabled() {
+        let tmp = tmp("ckpt_disabled");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut writer = WalWriter::open(&tmp).unwrap();
+        for i in 0..100 {
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    i,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[0u8; 64],
+                )
+                .unwrap();
+        }
+        writer.sync().unwrap();
+        // 默认策略 (0,0) = 禁用：写再多也不 due
+        assert!(!writer.checkpoint_due(), "默认禁用阈值时不应 due");
+
+        writer.sync().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_checkpoint_due_byte_threshold_and_reset_on_roll() {
+        let tmp = tmp("ckpt_bytes");
+        let _ = std::fs::remove_file(&tmp);
+        // 同时清理可能残留的段文件
+        for n in 1..8 {
+            let _ = std::fs::remove_file(format!("{tmp}.seg{n}"));
+        }
+
+        let mut writer = WalWriter::open(&tmp).unwrap();
+        writer.set_checkpoint_policy(256, 0); // 256 字节阈值
+
+        // 未达阈值：不 due
+        writer
+            .write_record(
+                WalRecordType::Begin,
+                1,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        assert!(!writer.checkpoint_due(), "未达字节阈值不应 due");
+
+        // 写到超过阈值：due
+        while writer.current_lsn() < 256 {
+            writer
+                .write_record(
+                    WalRecordType::Insert,
+                    1,
+                    1,
+                    crate::common::types::EngineType::Columnar,
+                    &[7u8; 32],
+                )
+                .unwrap();
+        }
+        writer.sync().unwrap();
+        assert!(writer.checkpoint_due(), "达到字节阈值应 due");
+
+        // 段滚动（checkpoint 完成）→ 字节归零，不再 due
+        writer.roll_segment().unwrap();
+        assert!(!writer.checkpoint_due(), "段滚动后应清零不再 due");
+        assert_eq!(writer.current_lsn(), 0, "新段从 0 开始");
+
+        writer.sync().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let _ = writer.delete_rotated_segments();
+    }
+
+    #[test]
+    fn test_checkpoint_due_time_threshold() {
+        let tmp = tmp("ckpt_time");
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut writer = WalWriter::open(&tmp).unwrap();
+        writer.set_checkpoint_policy(0, 1); // 仅时间触发：1ms
+
+        // 空 WAL：超时也不 due
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!writer.checkpoint_due(), "空 WAL 不应 due");
+
+        // 写入非空字节后：超时 → due
+        writer
+            .write_record(
+                WalRecordType::Commit,
+                1,
+                0,
+                crate::common::types::EngineType::Columnar,
+                &[],
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        assert!(writer.checkpoint_due(), "超时且 WAL 非空应 due");
+
+        // 段滚动重置时间窗
+        writer.roll_segment().unwrap();
+        assert!(!writer.checkpoint_due(), "滚动后时间窗重置");
+
+        writer.sync().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let _ = writer.delete_rotated_segments();
     }
 }

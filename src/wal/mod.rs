@@ -7,10 +7,12 @@
 //! - LSN 单调递增
 //! - 崩溃恢复：Redo + Undo
 
+pub mod checkpoint;
 pub mod reader;
 pub mod recovery;
 pub mod writer;
 
+pub use checkpoint::CheckpointTrigger;
 pub use reader::WalReader;
 pub use writer::WalWriter;
 
