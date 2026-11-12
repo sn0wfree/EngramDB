@@ -23,11 +23,29 @@
 
 ### 全局成功定义（GO 候选）
 
-1. v0.23 退出标准满足  
+1. v0.23 退出标准满足（含 **A1–A2 长跑不膨胀**）  
 2. P0 挂账清零且在 CI/WSL 复验  
-3. 崩溃注入 + SQLite 差分在 CI 默认路径运行  
-4. 统一 bench 报告入库（固定种子/场景/口径）  
-5. 无「未解释分歧」的 `#[ignore]` / KNOWN-GAP 残留（或书面豁免）
+3. 崩溃注入（确定性 kill 点）+ SQLite 差分在 CI 默认路径运行  
+4. 统一 bench 报告入库（固定种子/场景/口径 + **参考环境记录**）  
+5. 无**未文档化**缺口；已文档化豁免（如 LogEngine 语义限制）可接受  
+6. 门禁类测试不得「只 println 不 assert」（A4b 模式禁止）
+
+---
+
+## 0.1 评估修订记录（2026-10 复盘）
+
+| 发现 | 处置 |
+|---|---|
+| 漏「长跑不膨胀」退出标准 | 新增 W0-P1 任务 |
+| A4b 软断言假绿风险 | W0-P2：改为 assert 或显式 ignore+豁免 |
+| 列存 DELETE 2–3 天低估 | 估 4–5 天，设计先行，W1 串行深工 |
+| 随机 crash×100 必 flaky | 确定性 kill 点进 PR；随机压力 nightly |
+| B3 无参考环境 | 报告强制记录机器/命令/种子 |
+| A3 单开 Agent 开销过大 | 并入 A-Persist，不单开分支 |
+| 测试文件单写过死 | 区域共写 + A-Test review |
+| `-D warnings` 与在途分支冲突 | W0/W1 只「不新增」；批量清零在 W0 合并后 |
+| clippy --all-features 含第三方冲突 | 只保证默认 feature 阻塞 |
+| config.rs 未入热点清单 | 已列入单写者 |
 
 ---
 
@@ -46,7 +64,9 @@
 | `.github/workflows/**`, `scripts/wsl_*`, CI 相关 | **A-Infra** | 其他 |
 | `docs/**` 路线图/清单 | **Lead（主会话）** | Agent 只写自己条目的 progress |
 
-共享热点（`src/lib.rs`、`src/storage/mod.rs`、`Cargo.toml`）：**仅 Lead 或指定单一 Agent 改**；他人提需求到 Lead 合并。
+共享热点（`src/lib.rs`、`src/storage/mod.rs`、`src/common/config.rs`、`Cargo.toml`）：**仅 Lead 或当周指定单一 Agent 改**；他人提需求到 Lead 合并。
+
+**测试文件**：按功能区共写（A-SQL 可加 `differential_sqlite` 中 JOIN case），**A-Test 任 review + 基线维护**；冲突以 A-Test 为裁定人。
 
 ### 1.2 分支与提交
 
@@ -106,63 +126,66 @@ Lead（主会话）
 
 ---
 
-### W0 — 关账 v0.23（可 4 并行）
+### W0 — 关账 v0.23（**3 路**并行；A3 不单开）
 
-#### A-Persist · A3 Checkpoint 触发策略（P1，~1d）
+#### A-Persist · A3 + WAL 长跑（P1/P0，~2d，同一分支 `wave0/persist-a3-longrun`）
 
-- **交付**：可配置阈值（WAL 字节 / 时间间隔）；`Config` 字段 + 自动触发路径  
-- **文件**：`src/wal/**`、`src/common/config.rs`（若改 config → 提前告知 Lead）  
-- **测试**：超过阈值触发 checkpoint；不超不触发；恢复仍正确  
-- **依赖**：无（A1/A2 已合入）
+- **交付 A3**：可配置 checkpoint 阈值（WAL 字节 / 时间）；`Config` 字段 + 自动触发  
+- **交付 P0**：**长跑不膨胀**断言（循环写+checkpoint 后 WAL/段文件体积有上界），满足路线图退出标准第三条  
+- **文件**：`src/wal/**`、`src/common/config.rs`（config 热点：本周归 A-Persist）  
+- **测试**：阈值触发/不触发；长跑体积；恢复正确  
+- **依赖**：A1/A2 已合入
 
 #### A-SQL · B2 LEFT/RIGHT JOIN 类型化键（P1，~2d）
 
 - **交付**：Hash Join 外连接热路径类型化键（对齐 P1-1 GROUP BY 模式）  
-- **文件**：`src/executor/operators/hash_join.rs`（+ 必要时 planner 只读）  
-- **测试**：差分外连接用例；基准 micro 或挂到现有 join bench  
-- **依赖**：与 A-Bench 约定勿改同一 bench 文件
+- **文件**：`src/executor/operators/hash_join.rs`；差分 case 可写入 `tests/differential_sqlite.rs`（A-Test review）  
+- **测试**：差分外连接；可挂现有 join bench（**不改** A-Bench 新建的统一入口）  
+- **依赖**：无
 
 #### A-Bench · B3 统一 bench + 可复现报告（P1，~2d）
 
 - **交付**：  
   1. 固定场景清单（种子、行数、查询集）  
-  2. 一键脚本 `scripts/bench_unified.sh`（WSL 可跑）  
-  3. 报告 `docs/benchmarks/unified-report.md`（或 `scripts/benchmarks/` 已有目录）  
+  2. 一键脚本 `scripts/bench_unified.sh`（WSL）  
+  3. 报告 `docs/benchmarks/unified-report.md`（或 `scripts/benchmarks/`）  
+- **强制**：报告头记录 **CPU / OS / cargo profile / 命令 / 种子 / git SHA**；数字换环境即失效  
 - **文件**：`benches/**` 新文件优先；**不改**功能源码  
-- **退出**：与 `v0_13_acceptance` / SQLite 对比口径写清；数字可复现  
-- **依赖**：无代码依赖；在 WSL 跑（Windows SAC）
+- **依赖**：无
 
-#### A-Test · B4 差分收尾 + 闸门（P0，~1–2d）
+#### A-Test · B4 差分收尾 + 门禁硬化（P0，~1–2d）
 
-- **交付**：补 REC CTE 收敛、DECIMAL 边界、更多 JOIN 变体；清无用 `#[ignore]` 或标 KNOWN-GAP 原因  
+- **交付**：补 REC CTE 收敛、DECIMAL 边界、更多 JOIN 变体  
+- **交付**：**A4b 软断言硬化**——残留行必须 `assert`（或 `#[ignore]`+书面豁免），禁止只 println  
 - **文件**：`tests/differential_sqlite.rs`、`tests/phase0_semantic_gate.rs`  
-- **依赖**：A-SQL 修 bug 时由 A-Test 提 repro，A-SQL 修
+- **职责**：审核他人提交的差分 case，维持基线绿
 
-**W0 合并顺序建议**：A-Test → A-SQL → A-Persist → A-Bench（测试先落地，功能随后，报告最后出数）
+**W0 合并顺序**：A-Test（门禁）→ A-SQL → A-Persist → A-Bench（报告最后出数）
 
 ---
 
 ### W1 — P0 正确性（2–3 路）
 
-#### A-Storage · 列存 DELETE tombstone + compact（P0）
+#### A-Storage · 列存 DELETE tombstone + compact（P0，**串行深工，估 4–5d**）
 
-- **交付**：列存层逻辑删（tombstone）+ compact 物理回收；Delta 已有模式可参考  
+- **前置**：半页设计说明（tombstone 位图/标记列、compact 触发、与压缩段/MVCC 交互）→ Lead 点头再动码  
+- **交付**：列存层逻辑删 + compact 物理回收；Delta 模式可参考但勿大重构  
 - **文件**：`src/storage/{table,column_store,delta_store,compact*}.rs`、`operators/delete.rs`  
-- **测试**：删后查不到；compact 后空间/行数；崩溃恢复不复活已删行  
-- **风险**：与 mmap/压缩路径交叉 → 改动保持最小 diff，压缩格式变更需版本头
+- **测试**：删后查不到；compact 后行数/空间；恢复不复活；旧文件读路径  
+- **风险**：与 mmap/压缩交叉 → 最小 diff；格式变更须版本头。**W1 期间他人不碰 storage 核心**
 
-#### A-Persist · 崩溃注入自动化 + P0 复验（P0）
+#### A-Persist · 崩溃注入自动化 + P0 复验（P0，~2–3d）
 
 - **交付**：  
-  1. `examples/inject_crash_*` → `tests/crash_injection.rs`（N 次随机 kill + 恢复断言）  
-  2. 文件头原子性 / 打开路径等 assessment P0 用例在 **WSL 全量跑绿**  
-- **文件**：`tests/crash_injection.rs`、必要时 `wal/recovery` 仅 bugfix  
-- **CI**：标记 `#[ignore]` 长跑或独立 job（A-Infra 接线）
+  1. `tests/crash_injection.rs`：**确定性 kill 点**（写后/checkpoint 后/半写 header 等固定点位）+ 恢复断言，进 `cargo test`  
+  2. 随机 kill 压力 → `#[ignore]` 或 nightly，**不进 PR 阻塞**  
+  3. assessment P0（文件头原子性等）在 WSL 全量复验记录  
+- **文件**：`tests/crash_injection.rs`；wal/recovery 仅 bugfix  
+- **CI**：长跑 job 由 A-Infra 接线
 
-#### A-Test · 差分+闸门回归看护
+#### A-Test · 差分看护 + DELETE 用例
 
-- **交付**：W0 后保持绿；为 A-Storage DELETE 补差分 DELETE/UPDATE 面  
-- **文件**：`tests/**`（除 crash 由 A-Persist 主写）
+- **交付**：W0 后保持绿；为 A-Storage 补 DELETE/UPDATE 差分面（可与 Storage 共写）
 
 **W1 依赖**：A-Storage 与 A-Persist 都可能碰恢复语义 → **DELETE 功能先合，崩溃测随后扩 case**；或 Lead 指定同一周内串行 review。
 
@@ -174,9 +197,9 @@ Lead（主会话）
 
 | 项 | 动作 |
 |---|---|
-| 警告治理 | 清理 ~74 unused；恢复 `-D warnings`（或按 lint 分批） |
-| Clippy 阻塞 | 修 datafusion/chrono 冲突或 feature 隔离后去掉 `continue-on-error` |
-| datafusion 测试 | 能绿则阻塞；不能则文档豁免 + 独立 allowlist |
+| 警告规则 | W0/W1：**不新增**警告；W0 合并后一次性清 ~74 unused，再恢复 `-D warnings` |
+| Clippy 阻塞 | **默认 feature** clippy 阻塞；`--all-features`/datafusion 不承诺绿（第三方 chrono/arrow 冲突，pin/隔离即可） |
+| datafusion 测试 | 能绿则阻塞；不能则书面豁免 + allowlist |
 | 崩溃/长跑 job | `workflow_dispatch` 或 nightly，不拖 PR |
 | rust-toolchain pin | 增加 `rust-toolchain.toml` 与 CI 一致 |
 | （可选）cargo-deny / audit | 许可证与漏洞 |
@@ -193,22 +216,22 @@ Lead（主会话）
 ## 3. 并行时序（甘特示意）
 
 ```
-Week 1  W0
-  A-Test    ██████ B4
+Week 1  W0（3 路）
+  A-Test    ██████ B4 + A4b 硬断言
   A-SQL     ████████ B2
-  A-Persist ████ A3
-  A-Bench   ████████ B3 ──► 报告
+  A-Persist ████████ A3 + WAL 长跑不膨胀
+  A-Bench   ████████ B3 ──► 报告（含参考环境）
   Lead      合并队列 + 文档
 
-Week 2  W1 (+ W2 启动)
-  A-Storage ██████████ 列存 DELETE
-  A-Persist ████████ crash + P0 复验
-  A-Infra   ████████ CI 警告/clippy
+Week 2  W1（串行深工为主）+ W2
+  A-Storage ██████████ 列存 DELETE（设计→实现，4–5d）
+  A-Persist ████████ crash 确定性 kill + P0 复验
+  A-Infra   ████████ 警告清零 + clippy 默认 feature
   A-Test    ████ 看护 + DELETE 差分
 
 Week 3  收尾
-  Lead      GO 检查表 → 打 tag v0.23.x / 更新 assessment
-  可选      启动 W3（DataPoint / Graph，单线程先行）
+  Lead      GO 检查表 → tag v0.23.x / 更新 assessment
+  可选      W3（DataPoint / Graph，单线程先行）
 ```
 
 ---
@@ -249,46 +272,52 @@ Week 3  收尾
 |---|---|
 | Windows 无法本地编译 | 统一 WSL 脚本；PR 以 CI 为门禁；禁止「我本地没跑但应该行」 |
 | `storage/mod.rs` / `lib.rs` 巨石冲突 | 热点文件单写者；拆分重构不进本波次 |
-| CI 排队慢 | 并行 ≤4；bench/长跑不进 PR 阻塞路径 |
+| CI 排队慢（并行 Agent 的**真实串行点**） | 首轮并行 **3** 路；bench/长跑不进 PR 阻塞路径 |
 | DELETE 改格式破坏兼容 | 版本头/feature 开关；旧文件读路径测试 |
 | 范围膨胀到 v0.24 | W0–W2 不做 DataPoint/Graph；需求进 backlog |
 | 多 Agent 文档打架 | Lead 独占真源文档 |
+| 崩溃测试 flaky 拖垮 CI 信任 | PR 只跑确定性 kill 点；随机压力 nightly |
+| W0/W1 在途代码引入新警告 | 规则「不新增警告」；批量清零单独提交 |
+| B3 数字不可比 | 报告锁参考环境；换机器必须重跑整表 |
+| datafusion/chrono 依赖冲突 | 不承诺 `--all-features` clippy 绿；pin/隔离即可 |
 
 ---
 
 ## 7. 立即执行顺序（若现在开跑）
 
-1. Lead：建 6 张任务卡（A3/B2/B3/B4/列存DELETE/CI）并标依赖  
-2. 并行 spawn：**A-Bench、A-Test、A-Persist(A3)**（文件零重叠）  
-3. A-SQL(B2) 在 A-Test 第一版差分基线绿后加入  
-4. W0 全部 merge + 文档勾选 → 开 W1  
-5. W1/W2 按上表；每波结束 Lead 打检查表
+1. Lead：建任务卡（A3+长跑 / B2 / B3 / B4+A4b / 列存DELETE / crash / CI）并标依赖  
+2. 并行 spawn **3 路**：**A-Bench、A-Test、A-Persist**（零文件重叠；A3 不单开）  
+3. A-SQL(B2) 在 A-Test 第一版基线绿后加入；存储 DELETE 进 W1 再开  
+4. W0 全部 merge + 退出标准三条勾选 → 开 W1  
+5. 每波结束 Lead 打检查表
 
 ---
 
 ## 8. 检查表（复制用）
 
-**W0 关账**
+**W0 关账（含退出标准三条）**
 
 - [ ] A3 阈值可配 + 测试  
+- [ ] **WAL 长跑不膨胀** 断言测试  
 - [ ] B2 外连接类型化 + 差分  
-- [ ] B3 报告入库 + 一键脚本  
-- [ ] B4 无未解释 ignore  
+- [ ] B3 报告入库（含机器/命令/种子）+ 一键脚本  
+- [ ] B4 无未解释分歧  
+- [ ] A4b 门禁：assert 或书面豁免（禁止 println 假绿）  
 - [ ] 路线图退出标准改「已满足」
 
 **W1 GO 前置**
 
-- [ ] 列存 DELETE tombstone+compact+测试  
-- [ ] crash 测试进 `cargo test`（或 CI job）  
-- [ ] assessment P0 复验记录（WSL/CI 日志链接）  
+- [ ] 列存 DELETE 设计半页 → 实现 → 测试（含旧文件读路径）  
+- [ ] crash **确定性 kill 点**进 `cargo test`（随机压力仅 nightly）  
+- [ ] assessment P0 复验记录（WSL/CI 日志）  
 - [ ] 历史包袱 P0 表清零  
 
 **W2**
 
-- [ ] `-D warnings` 或等价门禁恢复  
-- [ ] clippy 默认 feature 阻塞  
+- [ ] 警告清零后 `-D warnings`（或等价）恢复  
+- [ ] clippy **默认 feature** 阻塞（all-features 豁免须书面）  
 - [ ] toolchain pin  
-- [ ] （可选）nightly 长跑 job  
+- [ ] （可选）nightly 长跑/随机 crash job  
 
 ---
 
@@ -298,3 +327,15 @@ Week 3  收尾
 - v0.25 SEARCH/RRF（映射已写好，另开波次）  
 - 重构 `expression.rs` / `planner.rs` 拆文件  
 - 分布式 / 完整 SQL 标准 / 应用层记忆运营  
+- 修复 datafusion/chrono **上游**不兼容（只 pin/隔离）  
+- 批量清理 73 篇历史 docs（W2 末尾可选）  
+
+---
+
+## 10. 合理性结论（2026-10 复盘）
+
+**判定：修改后可执行。** 原稿若直接开跑会在五处翻车：长跑退出标准无任务、A4b println 假绿、DELETE 工期低估、crash 随机 kill 必 flaky、B3 无参考环境。
+
+- 保留强点：所有权/合并协议、WSL/CI 完成定义、W0–W2 范围冻结  
+- 已收紧：并行 4→3、A3 并入 Persist、crash 确定性 kill 点、clippy 只保默认 feature、GO 允许文档化豁免  
+- 残留风险：CI 排队是物理串行点；列存 DELETE 无法靠加人压缩日历（串行深工）
