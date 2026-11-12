@@ -51,3 +51,12 @@ wal_growth 失败分析（**观测逻辑 bug，非触发接线失效**）：
 
 - 无硬阻塞。共享工作区曾把 HEAD 带到 `wave0/b4-a4b-gate`（A-Test 已 commit db2e012），已切回本分支，commit 只含本 Agent 7 文件。
 - `cargo fmt`（stable）会因 rustfmt.toml nightly-only 选项与全库格式不兼容，**勿在本仓库跑 stable fmt**（本次已确认无内容损伤，仅行尾噪音，checkout 后已消失）。
+
+## 修复记录（wal_growth 观测断言，仅改 tests/wal_growth.rs）
+
+- `wal_growth_auto_checkpoint_bounded`：首次触发检测从「观测到 total ≥ 阈值」改为「**total 出现下降**」（触发与观测同 commit，达阈值瞬间已被滚动重置，下降即证明 checkpoint 发生）；floor 断言 `ITERATIONS*40` → `ITERATIONS*150`（原 80KB floor 低于峰值预算 224KB，一旦首断言通过必假失败）。
+- `auto_checkpoint_due_semantics` 拆为三段：
+  - (A) Connection 默认 16MB 不达不触发（保留，已过）；
+  - (B) **直接构造 `TransactionManager`**（无自动消费）：不达断言 → `set_wal_checkpoint_policy(4096,0)` 循环到 `auto_checkpoint_due()==true`（begin/commit 空写集，BEGIN 记录 22B/次）→ `tm.checkpoint()` 段滚动后复位为 false；
+  - (C) Connection 小阈值 4KB 下写 500 事务：逐笔观测 total 下降证明自动 checkpoint 发生 + `COUNT(*)==520` 数据完整。
+- 验证（WSL）：`cargo test --test wal_growth` → **ok. 2 passed; 0 failed**；`cargo test --lib wal::` → **ok. 78 passed; 0 failed**。

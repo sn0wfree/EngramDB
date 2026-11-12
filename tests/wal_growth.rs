@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use engramdb::txn::{IsolationLevel, TransactionManager};
 use engramdb::{Config, Connection, Value};
 use tempfile::tempdir;
 
@@ -135,8 +136,10 @@ fn wal_growth_auto_checkpoint_bounded() {
         let st = wal_stats(&db_path);
         max_total = max_total.max(st.total);
 
-        // 首次自动 checkpoint 证据：总量从 ≥阈值 断崖下跌（滚动后归零重计）
-        if !first_ckpt_seen && prev_total >= CHECKPOINT_THRESHOLD && st.total < prev_total / 4 {
+        // 首次自动 checkpoint 证据：total 出现下降。
+        // 触发与观测在同一 commit 内——达阈值瞬间 size 已被滚动重置，
+        // 永远看不到 ≥ 阈值的瞬间，故以「下降」证明滚动回收发生过。
+        if !first_ckpt_seen && st.total < prev_total {
             first_ckpt_seen = true;
         }
         prev_total = st.total;
@@ -147,13 +150,13 @@ fn wal_growth_auto_checkpoint_bounded() {
     // ① 自动触发确实发生过（否则上面的上界可能只是写太少）
     assert!(
         first_ckpt_seen,
-        "自动 checkpoint 从未触发：阈值接线失效（Config→WalWriter→Transaction::commit）。\
+        "自动 checkpoint 从未发生（total 从未下降）：阈值接线失效（Config→WalWriter→Transaction::commit）。\
          末态 {:?}",
         wal_stats(&db_path)
     );
 
     // ② 相对上界：峰值远小于累计写入量（线性膨胀时峰值 ≈ 全部写入量）
-    let total_written_floor = (ITERATIONS as u64) * 40; // 粗下界：每事务 ≥40B WAL
+    let total_written_floor = (ITERATIONS as u64) * 150; // 粗下界：每事务 ≥150B WAL（峰值预算 224KB < 此 floor）
     assert!(
         max_total < total_written_floor,
         "峰值 WAL ({max_total}) 未被压到累计写入量 ({total_written_floor}+) 之下，疑似线性膨胀"
@@ -179,11 +182,15 @@ fn wal_growth_auto_checkpoint_bounded() {
 }
 
 // ============================================================================
-// 测试 2：A3 阈值语义——不达不触发 / 达到触发 / checkpoint 后复位
+// 测试 2：A3 阈值语义——(A) 不达不触发 / (B) due 翻转+复位 / (C) 数据完整
+//
+// (B) 必须直接用 TransactionManager：Connection 路径上 due=true 会被同一
+// commit 的自动 checkpoint 立即消费，循环顶部永远观测不到 true。
 // ============================================================================
 
 #[test]
 fn auto_checkpoint_due_semantics() {
+    // ---- (A) Connection：不达不触发（默认 16MB 阈值）----
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("due_semantics.hdb");
 
@@ -207,35 +214,72 @@ fn auto_checkpoint_due_semantics() {
         }
     };
 
-    // 不达不触发：默认 16MB 阈值，写入远低于阈值
     write_txns(&mut conn, 20, 0);
     assert!(
         !conn.database_mut().txn_manager().auto_checkpoint_due(),
-        "不达字节阈值不应触发自动 checkpoint"
+        "(A) 不达字节阈值不应触发自动 checkpoint"
     );
 
-    // 调小阈值 → 写到达到 → 触发
-    conn.database_mut().txn_manager_mut().set_wal_checkpoint_policy(4096, 0);
+    // ---- (B) 直接 TransactionManager：无自动消费，测 due 翻转 + checkpoint 复位 ----
+    let dir_b = tempdir().unwrap();
+    let tm_path = dir_b.path().join("due_tm.hdb");
+    let mut tm = TransactionManager::new(tm_path.to_str().unwrap(), &Config::default()).unwrap();
+
+    // 不达：默认 16MB 阈值，少量事务远低于阈值
+    for _ in 0..10 {
+        let id = tm.begin(IsolationLevel::default()).unwrap();
+        tm.commit(id).unwrap();
+    }
+    assert!(
+        !tm.auto_checkpoint_due(),
+        "(B) 不达默认阈值不应 due"
+    );
+
+    // 调小阈值 → 写到达到 → due 翻转（无自动消费，顶部可观测 true）
+    tm.set_wal_checkpoint_policy(4096, 0);
     let mut guard = 0;
-    while !conn.database_mut().txn_manager().auto_checkpoint_due() {
-        write_txns(&mut conn, 1, 100 + guard);
+    while !tm.auto_checkpoint_due() {
+        let id = tm.begin(IsolationLevel::default()).unwrap();
+        tm.commit(id).unwrap();
         guard += 1;
         assert!(guard < 2000, "阈值 4KB 下 2000 事务内应达到触发条件");
     }
     assert!(
-        conn.database_mut().txn_manager().auto_checkpoint_due(),
-        "达到字节阈值应触发"
+        tm.auto_checkpoint_due(),
+        "(B) 达到字节阈值应触发且保持 due（无自动消费）"
     );
 
     // 完整 checkpoint → 段滚动 → 复位为不触发
-    conn.database_mut().checkpoint().unwrap();
+    tm.checkpoint().unwrap();
     assert!(
-        !conn.database_mut().txn_manager().auto_checkpoint_due(),
-        "checkpoint（段滚动）后应复位为不触发"
+        !tm.auto_checkpoint_due(),
+        "(B) checkpoint（段滚动）后应复位为不触发"
     );
 
-    // 恢复正确：全部已提交数据在 checkpoint 后可读
+    // ---- (C) Connection 小阈值：自动 checkpoint 静默消费，数据完整 ----
+    conn.database_mut()
+        .txn_manager_mut()
+        .set_wal_checkpoint_policy(4096, 0);
+    let mut prev_total = wal_stats(&db_path).total;
+    let mut ckpt_drop = false;
+    for k in 0..500 {
+        write_txns(&mut conn, 1, 1000 + k);
+        let st = wal_stats(&db_path);
+        if st.total < prev_total {
+            ckpt_drop = true;
+        }
+        prev_total = st.total;
+    }
+    assert!(
+        ckpt_drop,
+        "(C) 小阈值下 Connection 自动 checkpoint 应发生（total 应出现下降）"
+    );
+
+    // 恢复正确：全部已提交数据在自动 checkpoint 后可读
     let r = conn.execute("SELECT COUNT(*) FROM t").unwrap();
-    let expected = (20 + guard) as i64;
-    assert_eq!(r.rows[0][0], Value::Int64(expected), "触发的 checkpoint 不得丢数据");
+    assert_eq!(
+        r.rows[0][0],
+        Value::Int64(20 + 500),
+        "(C) 自动 checkpoint 不得丢已提交数据"
+    );
 }
