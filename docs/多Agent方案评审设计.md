@@ -1,7 +1,7 @@
 # 《多 Agent 方案评审设计》
 
 > 角色：技术评审主席输出稿 · 用途：评审会拍板与开跑门禁  
-> 日期：2026-10 · 状态：**提交评审**  
+> 日期：2026-10 · 状态：**已决议**（2026-11-12 · §6 已填；回写见 D2 §7）  
 > 新帖增量：**无**（“若为空，则仅以上述材料为准”）  
 > 纪律：本文只做评审设计与决议选项；**不直接修改** `多Agent开发计划.md` / 代码；证据标注 = 已证实 / 材料推断 / 待核实
 
@@ -266,24 +266,25 @@
 
 ---
 
-## §6 决议表模板
+## §6 决议表（2026-11-12 落印）
 
 | ID | 议题 | 选项（A/B/C） | 决议 | Owner | 截止 | 验收证据 | 状态 |
 |---|---|---|---|---|---|---|---|
-| H1 | WAL 长跑测试形态 | A 集成测 / B nightly / C 手工 | | A-Persist | | CI URL + 断言说明 | ☐ |
-| H2 | A4b 门禁 | A assert / B ignore+豁免 / C 双用例 | | A-Test | | 测试输出或 CI | ☐ |
-| H3 | DELETE 阶段门 | A 深工 / B 移出 / C 分阶段 | | A-Storage | | 设计签字+测试 | ☐ |
-| H4 | crash kill 点 | A 确定+nightly / B 全 nightly / C 手工 | | A-Persist | | 清单+测试时长 | ☐ |
-| H5 | bench 口径 | A WSL / B CI / C 双表 | | A-Bench | | 报告头元数据 | ☐ |
-| Q1 | 并行度 | A 3 / B 2 / C 4 | | 评审主席+Lead | | spawn 名单 | ☐ |
-| Q2 | DELETE 进否 W1 | A 进 / B 1.5 / C 分阶段进 | | Lead | | W1 任务卡 | ☐ |
-| Q3 | clippy 范围 | A 默认 / B 全 feature | | Lead+A-Infra | | CI 注释 | ☐ |
-| Q4 | GO 豁免 | A 文档化 / B 清零 | | 评审主席 | | 豁免格式启用 | ☐ |
-| Q5 | 执行载体 | A actor / B 外部 / C 混合 | | Lead | | 启动模板 | ☐ |
-| Q6 | main 直提 | A 禁 / B 许 / C 仅 Lead | | Lead | | D1 §1.2 | ☐ |
-| X1 | 红灯驱动 B2/B4 | 允许失败 case 先落 / 不允许 | | A-Test | | 用例注释规范 | ☐ |
+| H1 | WAL 长跑测试形态 | A 集成测 / B nightly / C 手工 | **A**（二轮推荐默认） | A-Persist | W0 | CI URL + 断言说明 | ☑ |
+| H2 | A4b 门禁 | A assert / B ignore+豁免 / C 双用例 | **A**（E2 已 PASS） | A-Test | W0 首批 | assert 版 patch + WSL 输出 | ☑ |
+| H3 | DELETE 阶段门 | A 深工 / B 移出 / C 分阶段 | **C**（=Q2） | A-Storage / Lead | 设计 T0+3 | 设计签字+阶段测试 | ☑ |
+| H4 | crash kill 点 | A 确定+nightly / B 全 nightly / C 手工 | **A** | A-Persist | 清单 T0+2 | 清单+测试时长 | ☑ |
+| H5 | bench 口径 | A WSL / B CI / C 双表 | **A** | A-Bench | W0 | 报告头元数据 | ☑ |
+| Q1 | 并行度 | A 3 / B 2 / C 4 | **B · 2 路**（偏离二轮推荐 A；Bench 后置） | 评审主席+Lead | 2026-11-12 | D2 §7 首批名单 | ☑ |
+| Q2 | DELETE 进否 W1 | A 进 / B 1.5 / C 分阶段进 | **C** | Lead | 2026-11-12 | W1 任务卡含阶段门 | ☑ |
+| Q3 | clippy 范围 | A 默认 / B 全 feature | **A** | Lead+A-Infra | 2026-11-12 | CI 注释 / 豁免 | ☑ |
+| Q4 | GO 豁免 | A 文档化 / B 清零 | **A** | 评审主席 | 2026-11-12 | GAP- 格式启用 | ☑ |
+| Q5 | 执行载体 | A actor / B 外部 / C 混合 | **A**（DELETE 可升 C） | Lead | 2026-11-12 | spawn 模板 | ☑ |
+| Q6 | main 直提 | A 禁 / B 许 / C 仅 Lead | **C** | Lead | 2026-11-12 | D2 §7 + 启动模板禁令 | ☑ |
+| X1 | 红灯驱动 B2/B4 | 允许失败 case 先落 / 不允许 | **允许**（标 `issue` 注释） | A-Test | 2026-11-12 | 用例注释规范 | ☑ |
+| W-1 | 修绿 CI 执行 | 现在跑 / 只填表 | **只填表（本轮）**；代码已在 `1dde714`，全绿 run id 待补 | Lead | spawn 前 | run id 入本表 | ☐ |
 
-（X1 来自 D2 补强项 5，一并拍板。）
+（X1 来自 D2 补强项 5。H1/H4/H5/X1 为二轮推荐默认，用户 2026-11-12 批注 Q1–Q6 时未改。）
 
 ---
 
