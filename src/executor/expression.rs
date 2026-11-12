@@ -1147,11 +1147,7 @@ fn const_cmp_str(
             flags[i] = true;
             continue;
         }
-        let (a, b) = if reversed {
-            (cv, &v[i])
-        } else {
-            (&v[i], cv)
-        };
+        let (a, b) = if reversed { (cv, &v[i]) } else { (&v[i], cv) };
         out.push(cmp_pair_typed(a.cmp(b), op));
     }
     (out, nulls_from_flags(&flags))
@@ -1661,7 +1657,12 @@ fn logic_typed(la: &[bool], ra: &[bool], op: BinaryOperator, ln: &Option<BitVec>
 
 // --- 字符串拼接（Typed）---
 
-fn concat_typed(la: &crate::common::column_data::StringArray, ra: &crate::common::column_data::StringArray, ln: &Option<BitVec>, rn: &Option<BitVec>) -> ColumnData {
+fn concat_typed(
+    la: &crate::common::column_data::StringArray,
+    ra: &crate::common::column_data::StringArray,
+    ln: &Option<BitVec>,
+    rn: &Option<BitVec>,
+) -> ColumnData {
     let n = la.len().min(ra.len());
     let mut out = Vec::with_capacity(n);
     let mut overflow = vec![false; n];
@@ -2237,7 +2238,6 @@ fn eval_cast(vec: &Vector, target_type: &DataType) -> Result<Vector> {
 pub fn cast_value_public(v: &Value, target: &DataType) -> Value {
     cast_value(v, target).unwrap_or(Value::Null)
 }
-
 
 /// SQLite 文本→整数 CAST 语义：取前导可选空白/符号 + 数字前缀；
 /// 无数字则 0（`CAST('user_01' AS INT)` → 0，`CAST('123abc' AS INT)` → 123）。

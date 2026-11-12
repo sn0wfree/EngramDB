@@ -218,7 +218,7 @@ fn main_plan_cache() {
         let t0 = Instant::now();
         for i in 0..n {
             let rows = vec![vec![Value::Int64(i as i64), Value::Varchar(format!("e{}", i))]];
-            engramdb::executor::operators::insert::execute(conn.database_mut(), "t", rows, false).unwrap();
+            engramdb::executor::operators::insert::execute(&mut conn.database_mut(), "t", rows, false).unwrap();
         }
         conn.sync_wal().unwrap();
         direct_times.push(t0.elapsed());

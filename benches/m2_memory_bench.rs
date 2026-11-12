@@ -141,7 +141,7 @@ fn main() {
     for _ in 0..ITERS {
         let start = Instant::now();
         for i in 0..50_000 {
-            let db = conn.database_mut();
+            let mut db = conn.database_mut();
             let rid = db.get_engine_table_mut("m").unwrap().lookup_primary_key(&Value::Int64(i));
             let _ = db.get_engine_table_mut("m").unwrap().get_row_by_id(rid.unwrap()).unwrap();
         }
@@ -149,7 +149,7 @@ fn main() {
 
         let start = Instant::now();
         for i in 0..50_000 {
-            let db = conn.database_mut();
+            let mut db = conn.database_mut();
             let rid = db.get_engine_table_mut("c").unwrap().lookup_primary_key(&Value::Int64(i));
             let _ = db.get_engine_table_mut("c").unwrap().get_row_by_id(rid.unwrap()).unwrap();
         }

@@ -692,8 +692,7 @@ fn try_execute_grouped_int(
                                     }
                                 };
                                 let k = key_to_i64(&v, t)?;
-                                let states =
-                                    map.entry(k).or_insert_with(|| new_states(aggregates));
+                                let states = map.entry(k).or_insert_with(|| new_states(aggregates));
                                 accumulate_all(states, chunk, row_idx, aggregates);
                             }
                             true
@@ -921,18 +920,12 @@ fn try_accumulate_chunk_typed(
 }
 
 #[inline]
-fn typed_key_at(
-    data: &crate::common::column_data::ColumnData,
-    row_idx: usize,
-    key_type: GroupKeyType,
-) -> Option<i64> {
+fn typed_key_at(data: &crate::common::column_data::ColumnData, row_idx: usize, key_type: GroupKeyType) -> Option<i64> {
     use crate::common::column_data::ColumnValue;
     match (&data.values, key_type) {
         (ColumnValue::Int64(v), GroupKeyType::Int64) => v.get(row_idx).copied(),
         (ColumnValue::Int32(v), GroupKeyType::Int32) => v.get(row_idx).map(|x| *x as i64),
-        (ColumnValue::Boolean(v), GroupKeyType::Boolean) => {
-            v.get(row_idx).map(|x| *x as i64)
-        }
+        (ColumnValue::Boolean(v), GroupKeyType::Boolean) => v.get(row_idx).map(|x| *x as i64),
         (ColumnValue::Timestamp(v), GroupKeyType::Timestamp) => v.get(row_idx).copied(),
         _ => None,
     }
@@ -952,9 +945,7 @@ fn typed_detect_key_type(data: &crate::common::column_data::ColumnData) -> Optio
 #[inline]
 fn accumulate_all_typed(states: &mut [PartialAggState], accessors: &[TypedAggCol], row_idx: usize) {
     for (state, acc) in states.iter_mut().zip(accessors.iter()) {
-        let null_at = |n: Option<&crate::common::column_data::BitVec>| {
-            n.map_or(false, |n| n.test(row_idx))
-        };
+        let null_at = |n: Option<&crate::common::column_data::BitVec>| n.map_or(false, |n| n.test(row_idx));
         match acc {
             TypedAggCol::Int64(v, nulls) => {
                 if row_idx < v.len() && !null_at(*nulls) {

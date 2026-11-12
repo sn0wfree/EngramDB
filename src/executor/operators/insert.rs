@@ -710,7 +710,10 @@ fn validate_foreign_keys(
                     if !parent_keys.contains(val) {
                         return Err(EngramDbError::ConstraintViolation(format!(
                             "FOREIGN KEY constraint failed: table '{}' col[{}] value {:?} not in '{}'.{} (row {})",
-                            table_def.name, local_i, val, fk.foreign_table,
+                            table_def.name,
+                            local_i,
+                            val,
+                            fk.foreign_table,
                             fk.foreign_column_names.first().map(|s| s.as_str()).unwrap_or("?"),
                             row_idx
                         )));
@@ -725,11 +728,7 @@ fn validate_foreign_keys(
                 }
             }
             for (row_idx, row) in rows.iter().enumerate() {
-                let tuple: Vec<Value> = fk
-                    .local_columns
-                    .iter()
-                    .filter_map(|&i| row.get(i).cloned())
-                    .collect();
+                let tuple: Vec<Value> = fk.local_columns.iter().filter_map(|&i| row.get(i).cloned()).collect();
                 if tuple.len() != fk.local_columns.len() {
                     continue;
                 }

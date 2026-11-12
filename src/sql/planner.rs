@@ -221,7 +221,9 @@ fn rewrite_window_expr_to_colrefs(
     window_funcs: &[crate::executor::physical_plan::WindowFunctionExpr],
 ) -> Expression {
     match expr {
-        Expression::Function { name, over: Some(_), .. } => {
+        Expression::Function {
+            name, over: Some(_), ..
+        } => {
             let key = name.to_lowercase();
             let col = window_funcs
                 .iter()
@@ -455,15 +457,12 @@ fn plan_create_table(stmt: CreateTableStmt, db: &Database) -> Result<PhysicalPla
             .local_columns
             .iter()
             .map(|name| {
-                stmt.columns
-                    .iter()
-                    .position(|c| &c.name == name)
-                    .ok_or_else(|| {
-                        EngramDbError::Parse(format!(
-                            "FOREIGN KEY column '{}' not found in table '{}'",
-                            name, stmt.table_name
-                        ))
-                    })
+                stmt.columns.iter().position(|c| &c.name == name).ok_or_else(|| {
+                    EngramDbError::Parse(format!(
+                        "FOREIGN KEY column '{}' not found in table '{}'",
+                        name, stmt.table_name
+                    ))
+                })
             })
             .collect::<Result<_>>()?;
         table_def.foreign_keys.push(crate::common::types::ForeignKeyDef {
@@ -1302,22 +1301,17 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
         stmt.select_list
             .iter()
             .map(|item| match item {
-                SelectItem::Expression(expr, alias) => SelectItem::Expression(
-                    rewrite_window_expr_to_colrefs(expr, &window_funcs),
-                    alias.clone(),
-                ),
+                SelectItem::Expression(expr, alias) => {
+                    SelectItem::Expression(rewrite_window_expr_to_colrefs(expr, &window_funcs), alias.clone())
+                }
                 other => other.clone(),
             })
             .collect()
     };
 
     // Projection（计算 SELECT 列表中的表达式）
-    let (proj_expressions, proj_names) = plan_projection(
-        &select_for_proj,
-        &scan_column_names,
-        needs_aggregate,
-        window_table_cols,
-    )?;
+    let (proj_expressions, proj_names) =
+        plan_projection(&select_for_proj, &scan_column_names, needs_aggregate, window_table_cols)?;
 
     if needs_aggregate {
         // 已在 HAVING 后经 apply_select_projection_after_aggregate 裁剪
@@ -1425,12 +1419,8 @@ pub fn plan_select(stmt: SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             for item in &stmt.order_by {
                 // 支持 ORDER BY 列名 或 ORDER BY <序号>
                 let idx = match &item.expr {
-                    Expression::ColumnRef { column, .. } => {
-                        output_columns.iter().position(|c| c == column)
-                    }
-                    Expression::Literal(crate::Value::Int64(n)) if *n >= 1 => {
-                        Some((*n as usize) - 1)
-                    }
+                    Expression::ColumnRef { column, .. } => output_columns.iter().position(|c| c == column),
+                    Expression::Literal(crate::Value::Int64(n)) if *n >= 1 => Some((*n as usize) - 1),
                     _ => None,
                 };
                 if let Some(idx) = idx {
@@ -1554,9 +1544,7 @@ fn plan_select_join(stmt: &SelectStmt, db: &Database) -> Result<PhysicalPlan> {
             .select_list
             .iter()
             .map(|item| match item {
-                SelectItem::Expression(expr, alias) => {
-                    SelectItem::Expression(qualify_column_refs(expr), alias.clone())
-                }
+                SelectItem::Expression(expr, alias) => SelectItem::Expression(qualify_column_refs(expr), alias.clone()),
                 other => other.clone(),
             })
             .collect();
@@ -2694,10 +2682,7 @@ fn expr_has_aggregate(expr: &Expression) -> bool {
 ///
 /// - 简单列引用 → `input` 列索引
 /// - 复杂参数（如 `SUM(amount * 2)`）→ `input_expr`，执行前求值为临时列
-fn build_aggregate_exprs(
-    agg_exprs: &[(String, Expression, bool)],
-    scan_column_names: &[String],
-) -> Vec<AggregateExpr> {
+fn build_aggregate_exprs(agg_exprs: &[(String, Expression, bool)], scan_column_names: &[String]) -> Vec<AggregateExpr> {
     agg_exprs
         .iter()
         .filter_map(|(func_name, arg_expr, distinct)| {
@@ -2817,8 +2802,7 @@ fn apply_select_projection_after_aggregate(
     for item in select_list {
         match item {
             SelectItem::Expression(expr, alias) => {
-                let rewritten =
-                    rewrite_having_aggregates(expr, group_by_indices, aggregates, scan_column_names);
+                let rewritten = rewrite_having_aggregates(expr, group_by_indices, aggregates, scan_column_names);
                 let name = alias.clone().unwrap_or_else(|| match expr {
                     Expression::ColumnRef { column, .. } => column.clone(),
                     Expression::Function { name, .. } => name.clone(),
@@ -2830,10 +2814,7 @@ fn apply_select_projection_after_aggregate(
             SelectItem::Wildcard => {
                 // GROUP BY 场景的 * ：只展开分组键（与 SQLite 一致）
                 for &gi in group_by_indices {
-                    let col = scan_column_names
-                        .get(gi)
-                        .cloned()
-                        .unwrap_or_else(|| format!("group_{}", gi));
+                    let col = scan_column_names.get(gi).cloned().unwrap_or_else(|| format!("group_{}", gi));
                     expressions.push(Expression::ColumnRef {
                         table: None,
                         column: col.clone(),
@@ -3078,12 +3059,7 @@ fn row_with_defaults(table_def: &crate::common::types::TableDef) -> Vec<Value> {
     table_def
         .columns
         .iter()
-        .map(|c| {
-            c.default_value
-                .as_deref()
-                .map(default_literal_to_value)
-                .unwrap_or(Value::Null)
-        })
+        .map(|c| c.default_value.as_deref().map(default_literal_to_value).unwrap_or(Value::Null))
         .collect()
 }
 
@@ -3736,7 +3712,10 @@ mod tests {
             }
         }
         // HAVING：聚合重写为输出列引用（HAVING 聚合不在 SELECT 中也能重写）
-        match peel_projection(&plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1")) {
+        match peel_projection(&plan_ok(
+            &mut conn,
+            "SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1",
+        )) {
             PhysicalPlan::Filter { input, condition } => {
                 assert!(matches!(input.as_ref(), PhysicalPlan::Aggregate { .. }));
                 let rewritten = format!("{condition:?}");
@@ -3745,7 +3724,10 @@ mod tests {
             other => panic!("expected HAVING Filter, got {other:?}"),
         }
         // HAVING 单独引用聚合：聚合节点必须包含该聚合（修复后）
-        match peel_projection(&plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept HAVING SUM(age) > 100")) {
+        match peel_projection(&plan_ok(
+            &mut conn,
+            "SELECT dept FROM t GROUP BY dept HAVING SUM(age) > 100",
+        )) {
             PhysicalPlan::Filter { input, condition } => {
                 match input.as_ref() {
                     PhysicalPlan::Aggregate { aggregates, .. } => {
@@ -3763,7 +3745,10 @@ mod tests {
         // GROUP BY + ORDER BY
         match plan_ok(&mut conn, "SELECT dept FROM t GROUP BY dept ORDER BY dept") {
             PhysicalPlan::Sort { input, .. } => {
-                assert!(matches!(peel_projection(input.as_ref()), PhysicalPlan::Aggregate { .. }));
+                assert!(matches!(
+                    peel_projection(input.as_ref()),
+                    PhysicalPlan::Aggregate { .. }
+                ));
             }
             other => panic!("expected Sort over Aggregate, got {other:?}"),
         }
@@ -4587,7 +4572,10 @@ mod tests {
         }
         // 无参数：占位符保留 → 无法短路
         let stmt = parse("SELECT * FROM t WHERE id = ?").unwrap();
-        match find_node(&plan_with_params(stmt, &mut *conn.database_mut(), &[]).unwrap(), "Filter") {
+        match find_node(
+            &plan_with_params(stmt, &mut *conn.database_mut(), &[]).unwrap(),
+            "Filter",
+        ) {
             Some(PhysicalPlan::Filter { condition, .. }) => {
                 // WHERE id = ? → BinaryOp 右操作数为占位符
                 assert!(matches!(condition, crate::sql::ast::Expression::BinaryOp { right, .. }

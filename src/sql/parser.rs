@@ -481,7 +481,11 @@ fn strip_using_hnsw(sql: &str) -> String {
 fn convert_statement(stmt: &sqlast::Statement) -> Result<Statement> {
     match stmt {
         sqlast::Statement::CreateTable {
-            name, columns, query, constraints, ..
+            name,
+            columns,
+            query,
+            constraints,
+            ..
         } => {
             let table_name = name.to_string();
             let mut cols = Vec::new();

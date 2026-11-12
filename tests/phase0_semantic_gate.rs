@@ -152,10 +152,8 @@ fn g4_on_conflict_semantics() {
     assert_eq!(q.rows[0][0], Value::Int64(1));
 
     // DO NOTHING
-    c.execute(
-        "INSERT INTO t VALUES (1, 'bob', 300) ON CONFLICT (id) DO NOTHING",
-    )
-    .expect("G4 FAIL: ON CONFLICT DO NOTHING 执行失败");
+    c.execute("INSERT INTO t VALUES (1, 'bob', 300) ON CONFLICT (id) DO NOTHING")
+        .expect("G4 FAIL: ON CONFLICT DO NOTHING 执行失败");
     let q = c.execute("SELECT name FROM t WHERE id = 1").unwrap();
     assert_eq!(q.rows[0][0], Value::Varchar("alice_upd".into()));
     let q = c.execute("SELECT COUNT(*) FROM t").unwrap();
@@ -167,10 +165,8 @@ fn g4_on_conflict_semantics() {
 #[test]
 fn g5_returning_id() {
     let mut c = open();
-    c.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
-    )
-    .unwrap();
+    c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+        .unwrap();
 
     let r = c
         .execute("INSERT INTO t (name) VALUES ('alice') RETURNING id")
@@ -183,9 +179,7 @@ fn g5_returning_id() {
         id
     );
 
-    let r = c
-        .execute("INSERT INTO t (name) VALUES ('bob') RETURNING id, name")
-        .unwrap();
+    let r = c.execute("INSERT INTO t (name) VALUES ('bob') RETURNING id, name").unwrap();
     assert_eq!(r.rows.len(), 1);
     assert!(matches!(r.rows[0][0], Value::Int64(2) | Value::Int32(2)));
     assert_eq!(r.rows[0][1], Value::Varchar("bob".into()));
@@ -215,11 +209,7 @@ fn g6_alter_add_column_idempotent() {
         Ok(_) => {
             // 成功则必须是 no-op：原值仍在、列不重复损坏
             let q = c.execute("SELECT extra FROM t WHERE id = 1").unwrap();
-            assert_eq!(
-                q.rows[0][0],
-                Value::Int64(7),
-                "G6 FAIL: 重复 ADD 后原值被写坏"
-            );
+            assert_eq!(q.rows[0][0], Value::Int64(7), "G6 FAIL: 重复 ADD 后原值被写坏");
             println!("G6 PASS: 重复 ADD COLUMN 为 no-op，数据完好");
         }
         Err(e) => {
@@ -316,11 +306,7 @@ fn a4_txn_rollback_undoes() {
     c.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
     c.execute("ROLLBACK").unwrap();
     let q = c.execute("SELECT COUNT(*) FROM t").unwrap();
-    assert_eq!(
-        q.rows[0][0],
-        Value::Int64(0),
-        "A4 FAIL: ROLLBACK 后仍有行"
-    );
+    assert_eq!(q.rows[0][0], Value::Int64(0), "A4 FAIL: ROLLBACK 后仍有行");
     println!("A4a PASS: 未读回滚，行数归零");
 
     // ② 读己之写后再回滚

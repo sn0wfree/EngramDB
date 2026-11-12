@@ -88,7 +88,8 @@ fn main() {
         // 模拟冷表（大行数 + 无访问）
         let id = conn.database_mut().table_id_by_name("t").unwrap();
         {
-            let table = conn.database_mut().get_engine_table_mut_by_id(id).unwrap();
+            let mut db = conn.database_mut();
+            let table = db.get_engine_table_mut_by_id(id).unwrap();
             if let engramdb::storage::engine::EngineTable::Columnar(t) = table {
                 t.def_mut().row_count = 200_000;
             }
@@ -199,7 +200,8 @@ fn main() {
 
         // 标记高频访问（触发 Memory 迁移）
         for i in 0..5 {
-            if let Some(id) = conn.database_mut().table_id_by_name(&format!("t{}", i)) {
+            let id = conn.database_mut().table_id_by_name(&format!("t{}", i));
+            if let Some(id) = id {
                 for _ in 0..200 {
                     conn.database_mut().record_access(id);
                 }

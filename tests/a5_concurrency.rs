@@ -18,8 +18,7 @@ fn a5_16_threads_shared_connection_no_lost_writes() {
     let conn = Arc::new(Mutex::new(conn));
     {
         let mut c = conn.lock().unwrap();
-        c.execute("CREATE TABLE t (id INT PRIMARY KEY, tid INT, v TEXT)")
-            .unwrap();
+        c.execute("CREATE TABLE t (id INT PRIMARY KEY, tid INT, v TEXT)").unwrap();
     }
 
     let n_threads = 16usize;
@@ -59,21 +58,16 @@ fn a5_16_threads_shared_connection_no_lost_writes() {
 
     // 每线程的行数也必须精确（不串扰）
     for tid in 0..n_threads as i64 {
-        let r = c
-            .execute(&format!("SELECT COUNT(*) FROM t WHERE tid = {}", tid))
-            .unwrap();
+        let r = c.execute(&format!("SELECT COUNT(*) FROM t WHERE tid = {}", tid)).unwrap();
         let n = match &r.rows[0][0] {
             engramdb::Value::Int64(i) => *i,
             engramdb::Value::Int32(i) => *i as i64,
             other => panic!("unexpected: {:?}", other),
         };
         assert_eq!(
-            n,
-            rows_per_thread as i64,
+            n, rows_per_thread as i64,
             "A5 FAIL: tid={} 行数 {} ≠ {}（串扰）",
-            tid,
-            n,
-            rows_per_thread
+            tid, n, rows_per_thread
         );
     }
     println!(
@@ -109,8 +103,7 @@ fn a5_16_threads_concurrent_txns() {
                 c.execute("BEGIN").unwrap();
                 for i in 0..rows_per_txn {
                     let id = ((tid * txns_per_thread + txn) * rows_per_txn + i) as i64;
-                    c.execute(&format!("INSERT INTO t VALUES ({}, {})", id, tid))
-                        .unwrap();
+                    c.execute(&format!("INSERT INTO t VALUES ({}, {})", id, tid)).unwrap();
                 }
                 c.execute("COMMIT").unwrap();
             }

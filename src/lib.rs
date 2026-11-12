@@ -155,9 +155,7 @@ impl Connection {
 
     /// 使用指定配置打开或创建数据库（同一 path 共享同一 Database）
     pub fn open_with_config(path: &str, config: crate::common::config::Config) -> Result<Self> {
-        let db = open_shared_db(path, || {
-            Database::open_with_config(path, config)
-        })?;
+        let db = open_shared_db(path, || Database::open_with_config(path, config))?;
         Ok(Self { db, closed: false })
     }
 
@@ -342,7 +340,8 @@ impl Connection {
                 } else {
                     sql::planner::eval_insert_rows(ins, &*self.db.lock().unwrap(), params)?
                 };
-                let count = executor::operators::insert::execute(&mut *self.db.lock().unwrap(), &ins.table_name, rows, false)?;
+                let count =
+                    executor::operators::insert::execute(&mut *self.db.lock().unwrap(), &ins.table_name, rows, false)?;
                 return Ok(QueryResult {
                     columns: vec!["rows_inserted".to_string()],
                     rows: vec![vec![crate::Value::Int64(count as i64)]],
@@ -385,7 +384,12 @@ impl Connection {
             if let crate::sql::ast::Statement::Insert(ins) = &stmt.ast {
                 for params in params_batch {
                     let rows = sql::planner::eval_insert_rows(ins, &*self.db.lock().unwrap(), params)?;
-                    total += executor::operators::insert::execute(&mut *self.db.lock().unwrap(), &ins.table_name, rows, false)?;
+                    total += executor::operators::insert::execute(
+                        &mut *self.db.lock().unwrap(),
+                        &ins.table_name,
+                        rows,
+                        false,
+                    )?;
                 }
                 if !self.db.lock().unwrap().insert_batcher().is_empty() {
                     self.flush_batches()?;

@@ -435,7 +435,6 @@ fn known_bug_aggregate_expression_ignored() {
     assert_same("agg expr", &mut eng, &lite, "SELECT SUM(amount * 2) FROM orders");
 }
 
-
 // ============================================================================
 // B4：扩大差分面（窗口 / CAST / CASE / 集合运算 / 字符串函数 / FULL JOIN）
 // ============================================================================
