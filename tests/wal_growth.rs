@@ -230,10 +230,7 @@ fn auto_checkpoint_due_semantics() {
         let id = tm.begin(IsolationLevel::default()).unwrap();
         tm.commit(id).unwrap();
     }
-    assert!(
-        !tm.auto_checkpoint_due(),
-        "(B) 不达默认阈值不应 due"
-    );
+    assert!(!tm.auto_checkpoint_due(), "(B) 不达默认阈值不应 due");
 
     // 调小阈值 → 写到达到 → due 翻转（无自动消费，顶部可观测 true）
     tm.set_wal_checkpoint_policy(4096, 0);
@@ -251,15 +248,10 @@ fn auto_checkpoint_due_semantics() {
 
     // 完整 checkpoint → 段滚动 → 复位为不触发
     tm.checkpoint().unwrap();
-    assert!(
-        !tm.auto_checkpoint_due(),
-        "(B) checkpoint（段滚动）后应复位为不触发"
-    );
+    assert!(!tm.auto_checkpoint_due(), "(B) checkpoint（段滚动）后应复位为不触发");
 
     // ---- (C) Connection 小阈值：自动 checkpoint 静默消费，数据完整 ----
-    conn.database_mut()
-        .txn_manager_mut()
-        .set_wal_checkpoint_policy(4096, 0);
+    conn.database_mut().txn_manager_mut().set_wal_checkpoint_policy(4096, 0);
     let mut prev_total = wal_stats(&db_path).total;
     let mut ckpt_drop = false;
     for k in 0..500 {
