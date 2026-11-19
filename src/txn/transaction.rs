@@ -10,7 +10,6 @@
 //! ```
 
 use crate::common::error::{EngramDbError, Result};
-use crate::executor::operators::insert::apply_to_storage;
 use crate::storage::Database;
 use crate::Value;
 
@@ -76,9 +75,9 @@ impl<'a> Transaction<'a> {
         self.db.on_commit();
         // P1.5 修复：之前丢弃 apply_ops 导致数据只停留在 MVCC/WAL，
         // 必须将写操作应用到存储层（否则读取路径看不到提交的数据）
-        apply_to_storage(&mut *self.db, result.apply_ops)?;
+        crate::storage::apply_ops::apply_transaction_ops(&mut *self.db, result.apply_ops)?;
         // A3：WAL 达到配置阈值（字节 OR 时间）→ 自动触发完整 checkpoint。
-        // 必须在 apply_to_storage 之后：主存储先落盘，WAL 段才可安全滚动回收。
+        // 必须在应用操作之后：主存储先落盘，WAL 段才可安全滚动回收。
         // 内存库（:memory:）无持久化语义，跳过。
         if !self.db.is_memory() && self.db.txn_manager().auto_checkpoint_due() {
             self.db.checkpoint()?;

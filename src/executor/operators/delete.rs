@@ -166,7 +166,7 @@ fn execute_with_txn(db: &mut Database, table_name: &str, condition: Option<Expre
 
     // 步骤 5：应用到存储层；失败必须 abort 事务（清理 MVCC 残留）
     debug!("Applying {} operations to storage...", result.apply_ops.len());
-    if let Err(e) = operators::insert::apply_to_storage(db, result.apply_ops) {
+    if let Err(e) = crate::storage::apply_ops::apply_transaction_ops(db, result.apply_ops) {
         let _ = db.txn_manager_mut().rollback(txn_id);
         return Err(e);
     }

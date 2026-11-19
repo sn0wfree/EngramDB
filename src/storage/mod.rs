@@ -18,6 +18,7 @@ pub mod vector_index;
 pub mod mmap_reader;
 
 pub mod async_compress;
+pub(crate) mod apply_ops;
 pub mod bloom;
 pub mod bloom_filter;
 pub mod capabilities;

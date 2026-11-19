@@ -57,7 +57,7 @@ pub type TxnResult<T> = std::result::Result<T, TxnError>;
 ///
 /// 设计背景：`TransactionManager.commit()` 时需要将 MVCC 版本应用到存储层，
 /// 但 Rust 借用规则不允许同时持有 `&mut TransactionManager` 和 `&mut Database`。
-/// 解决方案：`commit()` 返回待应用操作，由 executor 调用存储层。
+/// 解决方案：`commit()` 返回待应用操作，由存储层统一应用到引擎表。
 #[derive(Debug, Clone)]
 pub enum ApplyOp {
     Insert {
@@ -69,7 +69,7 @@ pub enum ApplyOp {
     ///
     /// 行 i 的 rowid = base_row_id + i，行数据以列式组织（每列一个 Vec）。
     /// 由 `collect_apply_ops` 在检测到连续同表 Insert 段时产出，
-    /// `apply_to_storage` 直接走 `table.insert_columns`（列式落盘，无转置）。
+    /// `apply_transaction_ops` 直接走 `table.insert_columns`（列式落盘，无转置）。
     InsertBatch {
         table_id: u32,
         base_row_id: u64,

@@ -174,7 +174,7 @@ impl TransactionManager {
             }
         }
 
-        // 收集待应用操作（方案 B：返回 apply_ops，由 executor 应用到存储层）
+        // 收集待应用操作，由提交路径交给 storage::apply_ops 写入引擎表。
         // 注意：必须在 GC 之前收集，因为 gc_key 会清掉旧版本，导致 has_committed_version_before 失效
         let apply_ops = self.collect_apply_ops(&write_set, txn_id)?;
 
@@ -250,7 +250,7 @@ impl TransactionManager {
 
         // P-W2c：合并连续同表 Insert 段为 InsertBatch
         // 条件：连续 ≥2 个 Insert、同 table_id、rowid 连续（base + i）
-        // 合并后行数据转置为列式，apply_to_storage 直接走 insert_columns
+        // 合并后行数据转置为列式，apply_transaction_ops 直接走 insert_columns
         if ops.len() >= 2 {
             ops = merge_insert_batches(ops);
         }
@@ -744,7 +744,7 @@ impl TransactionManager {
 /// 合并连续同表 Insert 段为 `ApplyOp::InsertBatch`
 ///
 /// 条件：≥2 个连续 Insert、同 table_id、rowid 连续（base_row_id + i）。
-/// 合并后行数据转置为列式（每列一个 Vec），供 `apply_to_storage` 走
+/// 合并后行数据转置为列式（每列一个 Vec），供 `apply_transaction_ops` 走
 /// `table.insert_columns` 列式落盘（无行→列转置）。
 ///
 /// Update/Delete/非连续 Insert 保持原样（顺序不变）。
