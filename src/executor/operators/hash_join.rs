@@ -114,6 +114,27 @@ fn extract_key(chunk: &DataChunk, row_idx: usize, key_cols: &[usize]) -> Vec<Val
         .collect()
 }
 
+/// B2/S2-M3：从 Typed 列提取 i64 连接键。
+///
+/// None = 列不支持整数键（回退 Value 主路径）；Some(None) = 行是 NULL；
+/// Some(Some(k)) = 有效键。仅 `Vector::Typed` 的 Int64/Timestamp 走此快路径。
+fn typed_int_key(col: &Vector, row: usize) -> Option<Option<i64>> {
+    use crate::common::column_data::ColumnValue;
+    match col {
+        Vector::Typed(d) => {
+            if d.nulls.as_ref().map_or(false, |n| n.test(row)) {
+                return Some(None);
+            }
+            match &d.values {
+                ColumnValue::Int64(v) => Some(Some(v[row])),
+                ColumnValue::Timestamp(v) => Some(Some(v[row])),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 // ============================================================================
 // INNER JOIN
 // ============================================================================
@@ -202,27 +223,6 @@ fn hash_join_inner_int(
     probe_cols: usize,
     build_cols: usize,
 ) -> Option<Vec<DataChunk>> {
-    use crate::common::column_data::ColumnValue;
-
-    /// 从 Typed 列提取 i64 键。
-    /// None = 列不支持整数键（回退主路径）；Some(None) = 行是 NULL（跳过）；
-    /// Some(Some(k)) = 有效键。
-    fn col_key(col: &Vector, row: usize) -> Option<Option<i64>> {
-        match col {
-            Vector::Typed(d) => {
-                if d.nulls.as_ref().map_or(false, |n| n.test(row)) {
-                    return Some(None);
-                }
-                match &d.values {
-                    ColumnValue::Int64(v) => Some(Some(v[row])),
-                    ColumnValue::Timestamp(v) => Some(Some(v[row])),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
     // Build 端
     let mut hash_table: FxHashMap<i64, Vec<(usize, usize)>> = FxHashMap::default();
     for (chunk_idx, chunk) in build_chunks.iter().enumerate() {
@@ -230,7 +230,7 @@ fn hash_join_inner_int(
             return None;
         }
         for row_idx in 0..chunk.count {
-            match col_key(&chunk.columns[build_key], row_idx) {
+            match typed_int_key(&chunk.columns[build_key], row_idx) {
                 None => return None,    // 列不支持 → 回退
                 Some(None) => continue, // NULL 键跳过
                 Some(Some(k)) => {
@@ -248,7 +248,7 @@ fn hash_join_inner_int(
             return None;
         }
         for probe_row in 0..probe_chunk.count {
-            let k = match col_key(&probe_chunk.columns[probe_key], probe_row) {
+            let k = match typed_int_key(&probe_chunk.columns[probe_key], probe_row) {
                 None => return None,
                 Some(None) => continue,
                 Some(Some(k)) => k,
@@ -292,6 +292,20 @@ fn hash_join_left(
     probe_cols: usize,
     build_cols: usize,
 ) -> Result<Vec<DataChunk>> {
+    // B2：单列整数键 LEFT JOIN 快路径（RIGHT/FULL 亦经此复用）
+    if probe_keys.len() == 1 && build_keys.len() == 1 {
+        if let Some(result) = hash_join_left_int(
+            probe_chunks,
+            build_chunks,
+            probe_keys[0],
+            build_keys[0],
+            probe_cols,
+            build_cols,
+        ) {
+            return Ok(result);
+        }
+    }
+
     let hash_table = build_hash_table(build_chunks, build_keys);
 
     let mut result_chunks = Vec::new();
@@ -353,6 +367,102 @@ fn hash_join_left(
     Ok(result_chunks)
 }
 
+/// B2：单列整数键 LEFT JOIN 快路径。
+///
+/// 与 `hash_join_inner_int` 同构：键列为 Typed Int64/Timestamp 时用
+/// `FxHashMap<i64, ...>`（8B key）替代 `Vec<Value>`；差异仅在语义——
+/// - probe NULL 键 / 无匹配 → 左行 + NULL 右列（外连接保留行）
+/// - build NULL 键不参与连接（与主路径一致）
+/// 类型不支持 → None → 回退主路径。
+fn hash_join_left_int(
+    probe_chunks: &[DataChunk],
+    build_chunks: &[DataChunk],
+    probe_key: usize,
+    build_key: usize,
+    probe_cols: usize,
+    build_cols: usize,
+) -> Option<Vec<DataChunk>> {
+    // Build 端
+    let mut hash_table: FxHashMap<i64, Vec<(usize, usize)>> = FxHashMap::default();
+    for (chunk_idx, chunk) in build_chunks.iter().enumerate() {
+        if build_key >= chunk.columns.len() {
+            return None;
+        }
+        for row_idx in 0..chunk.count {
+            match typed_int_key(&chunk.columns[build_key], row_idx) {
+                None => return None,    // 列不支持 → 回退
+                Some(None) => continue, // NULL 键跳过
+                Some(Some(k)) => {
+                    hash_table.entry(k).or_default().push((chunk_idx, row_idx));
+                }
+            }
+        }
+    }
+
+    let mut result_chunks = Vec::new();
+    let mut output_rows: Vec<Vec<Value>> = Vec::with_capacity(VECTOR_SIZE);
+
+    for probe_chunk in probe_chunks {
+        if probe_key >= probe_chunk.columns.len() {
+            return None;
+        }
+        for probe_row in 0..probe_chunk.count {
+            // NULL probe 键 → matches=None → 走 NULL 填充分支
+            let matches = match typed_int_key(&probe_chunk.columns[probe_key], probe_row) {
+                None => return None,
+                Some(None) => None,
+                Some(Some(k)) => hash_table.get(&k),
+            };
+
+            match matches {
+                Some(rows) => {
+                    // 有匹配：每个匹配一行
+                    for &(build_chunk_idx, build_row_idx) in rows {
+                        let build_chunk = &build_chunks[build_chunk_idx];
+                        let mut row = Vec::with_capacity(probe_cols + build_cols);
+
+                        for c in 0..probe_cols {
+                            row.push(probe_chunk.columns[c].get(probe_row));
+                        }
+                        for c in 0..build_cols {
+                            row.push(build_chunk.columns[c].get(build_row_idx));
+                        }
+
+                        output_rows.push(row);
+                        if output_rows.len() >= VECTOR_SIZE {
+                            result_chunks.push(DataChunk::from_rows(&output_rows));
+                            output_rows.clear();
+                        }
+                    }
+                }
+                None => {
+                    // 无匹配：左表行 + NULL 右表列
+                    let mut row = Vec::with_capacity(probe_cols + build_cols);
+
+                    for c in 0..probe_cols {
+                        row.push(probe_chunk.columns[c].get(probe_row));
+                    }
+                    for _ in 0..build_cols {
+                        row.push(Value::Null);
+                    }
+
+                    output_rows.push(row);
+                    if output_rows.len() >= VECTOR_SIZE {
+                        result_chunks.push(DataChunk::from_rows(&output_rows));
+                        output_rows.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    if !output_rows.is_empty() {
+        result_chunks.push(DataChunk::from_rows(&output_rows));
+    }
+
+    Some(result_chunks)
+}
+
 // ============================================================================
 // FULL OUTER JOIN
 // ============================================================================
@@ -365,8 +475,25 @@ fn hash_join_full(
     left_cols: usize,
     right_cols: usize,
 ) -> Result<Vec<DataChunk>> {
-    // 先做 LEFT JOIN（包含所有左表行）
+    // 先做 LEFT JOIN（包含所有左表行；单列整数键时内部走类型化快路径）
     let mut result = hash_join_left(left_chunks, right_chunks, left_keys, right_keys, left_cols, right_cols)?;
+
+    // B2：右表未匹配行检测的类型化快路径（Typed Int64/Timestamp 键）
+    if left_keys.len() == 1 && right_keys.len() == 1 {
+        if let Some(unmatched_right) = unmatched_right_int(
+            left_chunks,
+            right_chunks,
+            left_keys[0],
+            right_keys[0],
+            left_cols,
+            right_cols,
+        ) {
+            for batch in unmatched_right.chunks(VECTOR_SIZE) {
+                result.push(DataChunk::from_rows(batch));
+            }
+            return Ok(result);
+        }
+    }
 
     // 再追加右表中未匹配的行（右表独有）
     let hash_table_left = build_hash_table(left_chunks, left_keys);
@@ -412,6 +539,68 @@ fn hash_join_full(
     }
 
     Ok(result)
+}
+
+/// B2：FULL JOIN 右表未匹配行的类型化键检测。
+///
+/// 左表键列 Typed Int64/Timestamp → `FxHashSet<i64>` 成员判定替代
+/// `Vec<Value>` 全量比较；语义与主路径一致：
+/// - 左表 NULL 键不入集合（`build_hash_table` 同样跳过）
+/// - 右表 NULL 键行始终作为未匹配输出（FULL 保留行）
+/// 类型不支持 → None → 回退主路径。
+fn unmatched_right_int(
+    left_chunks: &[DataChunk],
+    right_chunks: &[DataChunk],
+    left_key: usize,
+    right_key: usize,
+    left_cols: usize,
+    right_cols: usize,
+) -> Option<Vec<Vec<Value>>> {
+    use fxhash::FxHashSet;
+
+    // Build 端：左表键集合
+    let mut left_key_set: FxHashSet<i64> = FxHashSet::default();
+    for chunk in left_chunks {
+        if left_key >= chunk.columns.len() {
+            return None;
+        }
+        for row_idx in 0..chunk.count {
+            match typed_int_key(&chunk.columns[left_key], row_idx) {
+                None => return None,    // 列不支持 → 回退
+                Some(None) => continue, // NULL 键不入集合
+                Some(Some(k)) => {
+                    left_key_set.insert(k);
+                }
+            }
+        }
+    }
+
+    // Probe 端：右表未匹配行（NULL 键行恒输出）
+    let mut unmatched_right: Vec<Vec<Value>> = Vec::new();
+    for right_chunk in right_chunks {
+        if right_key >= right_chunk.columns.len() {
+            return None;
+        }
+        for right_row in 0..right_chunk.count {
+            let is_unmatched = match typed_int_key(&right_chunk.columns[right_key], right_row) {
+                None => return None,
+                Some(None) => true, // NULL 键的右表行也要出现在 FULL JOIN 中
+                Some(Some(k)) => !left_key_set.contains(&k),
+            };
+            if is_unmatched {
+                let mut row = Vec::with_capacity(left_cols + right_cols);
+                for _ in 0..left_cols {
+                    row.push(Value::Null);
+                }
+                for c in 0..right_cols {
+                    row.push(right_chunk.columns[c].get(right_row));
+                }
+                unmatched_right.push(row);
+            }
+        }
+    }
+
+    Some(unmatched_right)
 }
 
 // ============================================================================
@@ -727,6 +916,78 @@ mod tests {
         assert_eq!(ts, fs);
         // 期望：1(300), 2(100), 3(400) → 3 行（NULL 键跳过）
         assert_eq!(ts.len(), 3);
+    }
+
+    /// B2：外连接（LEFT/RIGHT/FULL）Typed 整数键与 Flat 等价性（含 NULL 键）
+    #[test]
+    fn test_outer_join_typed_matches_flat() {
+        use crate::common::column_data::ColumnData;
+        // 左表：id（含 NULL）+ 值
+        let left_data = ColumnData::try_from_values(&vec![
+            Value::Int64(1),
+            Value::Null,
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+        ])
+        .unwrap();
+        let left_vals = left_data.to_values();
+        let payload = vec![
+            Value::Int64(10),
+            Value::Int64(20),
+            Value::Int64(30),
+            Value::Int64(40),
+            Value::Int64(50),
+        ];
+        let left_typed = DataChunk {
+            columns: vec![Vector::Typed(left_data), Vector::Flat(payload.clone())],
+            count: 5,
+        };
+        let left_flat = DataChunk {
+            columns: vec![Vector::Flat(left_vals), Vector::Flat(payload)],
+            count: 5,
+        };
+        // 右表：id（含 NULL）+ 值
+        let right_data =
+            ColumnData::try_from_values(&vec![Value::Int64(2), Value::Null, Value::Int64(1), Value::Int64(3)]).unwrap();
+        let right_vals = right_data.to_values();
+        let rpayload = vec![
+            Value::Int64(100),
+            Value::Int64(200),
+            Value::Int64(300),
+            Value::Int64(400),
+        ];
+        let right_typed = DataChunk {
+            columns: vec![Vector::Typed(right_data), Vector::Flat(rpayload.clone())],
+            count: 4,
+        };
+        let right_flat = DataChunk {
+            columns: vec![Vector::Flat(right_vals), Vector::Flat(rpayload)],
+            count: 4,
+        };
+
+        for jt in [JoinType::Left, JoinType::Right, JoinType::Full] {
+            let typed = execute(&[left_typed.clone()], &[right_typed.clone()], &[0], &[0], jt).unwrap();
+            let flat = execute(&[left_flat.clone()], &[right_flat.clone()], &[0], &[0], jt).unwrap();
+
+            let typed_rows: Vec<Vec<Value>> = typed.iter().flat_map(|c| c.to_rows()).collect();
+            let flat_rows: Vec<Vec<Value>> = flat.iter().flat_map(|c| c.to_rows()).collect();
+
+            let mut ts: Vec<String> = typed_rows.iter().map(|r| format!("{:?}", r)).collect();
+            let mut fs: Vec<String> = flat_rows.iter().map(|r| format!("{:?}", r)).collect();
+            ts.sort();
+            fs.sort();
+            assert_eq!(ts, fs, "typed/flat 不一致: {:?}", jt);
+
+            // 行数语义：LEFT=5（每左行恰一行）、RIGHT=4（每右行恰一行）、FULL=6（+1 条右 NULL 键行）
+            let expected = match jt {
+                JoinType::Left => 5,
+                JoinType::Right => 4,
+                JoinType::Full => 6,
+                _ => unreachable!(),
+            };
+            assert_eq!(ts.len(), expected, "行数不符: {:?}", jt);
+        }
     }
 
     #[test]

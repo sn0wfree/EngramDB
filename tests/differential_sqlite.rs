@@ -585,3 +585,38 @@ fn diff_union_all_order_by() {
         "SELECT id FROM users WHERE id < 3 UNION ALL SELECT id FROM users WHERE id >= 57 ORDER BY id",
     );
 }
+
+// ============================================================================
+// B2：外连接类型化键（LEFT/RIGHT/FULL，INT64 Typed 热路径）
+// ============================================================================
+
+/// B2：外连接差分——INT64 Typed 键快路径与 SQLite 对齐
+/// 覆盖：右表无匹配行（RIGHT/FULL 未匹配右行）、NULL 连接键、左表无订单行。
+#[test]
+fn diff_b2_outer_join_typed_keys() {
+    let (mut eng, lite) = fresh();
+    // 同步插入：uid 无匹配用户（未匹配右行）+ NULL 连接键行
+    eng.execute("INSERT INTO orders VALUES (9990, 999, 111)").unwrap();
+    lite.execute_batch("INSERT INTO orders VALUES (9990, 999, 111)").unwrap();
+    eng.execute("INSERT INTO orders VALUES (9991, NULL, 222)").unwrap();
+    lite.execute_batch("INSERT INTO orders VALUES (9991, NULL, 222)").unwrap();
+
+    assert_same(
+        "left join typed keys",
+        &mut eng,
+        &lite,
+        "SELECT users.id, orders.oid FROM users LEFT JOIN orders ON users.id = orders.uid WHERE users.id < 6 ORDER BY users.id, orders.oid",
+    );
+    assert_same(
+        "right join typed keys",
+        &mut eng,
+        &lite,
+        "SELECT users.id, orders.oid FROM users RIGHT JOIN orders ON users.id = orders.uid ORDER BY users.id, orders.oid",
+    );
+    assert_same(
+        "full join typed keys",
+        &mut eng,
+        &lite,
+        "SELECT users.id, orders.oid FROM users FULL OUTER JOIN orders ON users.id = orders.uid ORDER BY users.id, orders.oid",
+    );
+}
