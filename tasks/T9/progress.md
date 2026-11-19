@@ -36,15 +36,15 @@ git SHA(+branch+工作区改动数) · CPU(/proc/cpuinfo model × nproc) · 内�
 
 ## WSL 运行情况（如实记录）
 
-- 脚本 `bash -n` 语法检查通过；WSL2（Ubuntu 26.04.1，kernel 6.18.58.1-microsoft-standard-WSL2，Intel Core Ultra 5 338H × 12 vCPU，rustc 1.99.1）冒烟调用已启动。
-- **未跑完**：`cargo bench --no-run`（全量 bench 目标 release 编译）进行中被会话收口中断（日志停在 criterion/rand 编译，`target/bench_unified.log` ~62KB）；**8 个场景 0 个完成，无数字产出**。
-- 后续跑法（任一 WSL 前台会话）：
-  ```bash
-  bash scripts/bench_unified.sh          # 全量 U1–U8
-  bash scripts/bench_unified.sh u4 u8    # 分场景
-  ```
-  全部输出重定向 `target/bench_unified.log`，进度/摘要只回显每场景 `rc/耗时` 行；报告自动写 `scripts/benchmarks/unified-report.md`。
-- 已知环境约束：本会话无法后台常驻进程（工具调用结束即被杀），长跑须前台长超时。
+- 脚本 `bash -n` 语法检查通过（CRLF→LF 修复后）；WSL2 Ubuntu 26.04.1 · Intel Core Ultra 5 338H × 12 · rustc 1.99.1。
+- **全量补跑完成（2026-11-19/20 UTC）**：`bash scripts/bench_unified.sh`（nohup 分离）
+  - 编译 `cargo bench --no-run` rc=0 · **229s**
+  - U1/U3/U7 `v0_13_acceptance_bench` rc=0 · **1353s**
+  - U2 `write_bench` rc=0 · 4s · U4/U5/U6 `m1_acceptance_bench` rc=0 · 4s · U8 `wal_group_commit_bench` rc=0 · 4s
+  - **8/8 场景完成**，报告 `scripts/benchmarks/unified-report.md` 已入库
+- 关键数字（摘）：U1 A-1 2.44ms PASS；U7 COUNT 77µs PASS；U4 M1-1 352µs PASS；U2 批量最高 ~80 万行/s；U8 组提交 ~50 万 txn/s（fsync 近零成本，收益 1.01×）
+- 已知失败面（报告内）：A-1b/c/d 单事务大批量与 A-2 点查相对 SQLite FAIL（历史口径，非本次引入）
+- 原始日志：`target/bench_unified.log`（~360KB，不入库）
 
 ## 未动（所有权合规）
 
